@@ -45,16 +45,23 @@ the point.
 
 ## See it in action
 
-Narrated demos (AI voiceover) of real runs:
+Short, silent clips of VERDICT in motion. For the full narrated version:
+▶ **[4:35 walkthrough on YouTube](https://youtu.be/4RQnVden6L8)**.
 
-- ▶ **[Full walkthrough (4:35)](https://youtu.be/4RQnVden6L8)** — one command to a signed
-  `SUSPICIOUS` verdict, verifiable offline.
+**An investigation running**
 
-More screen captures — investigation GIFs, the live dashboard, the multi-host fleet rollup — are in
-the project repo's README (see *Project links*).
+<video src="https://github.com/TimothyVang/verdict-dfir-community/raw/main/media/investigation.mp4" controls muted width="800"></video>
 
-<!-- To add a play-in-place video here: drag an .mp4 into a GitHub Issue, copy the resulting
-     https://github.com/user-attachments/assets/<id> URL, and embed it as <video src="...">. -->
+**The live dashboard**
+
+<video src="https://github.com/TimothyVang/verdict-dfir-community/raw/main/media/dashboard.mp4" controls muted width="800"></video>
+
+More captures (fleet rollup, contradiction surfacing, tamper detection) are in the project repo's
+README — see *Project links*.
+
+<!-- These are committed clips, played via the github.com /raw/ URL (served with a video content
+     type). For a heavier narrated MP4 without bloating git, upload it to a Release or Issue and use
+     the resulting user-attachments URL as the <video src> instead. -->
 
 ---
 
