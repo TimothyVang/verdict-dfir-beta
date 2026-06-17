@@ -45,23 +45,19 @@ the point.
 
 ## See it in action
 
-Short, silent clips of VERDICT in motion. For the full narrated version:
+A run, end to end (animates inline). For the full narrated version with sound:
 ▶ **[4:35 walkthrough on YouTube](https://youtu.be/4RQnVden6L8)**.
 
-**An investigation running**
+![VERDICT investigating evidence — case_open, the typed DFIR pipeline, the verifier, and a signed SUSPICIOUS verdict](media/investigation.gif)
 
-<video src="https://github.com/TimothyVang/verdict-dfir-community/raw/main/media/investigation.mp4" controls muted width="800"></video>
+More captures (dashboard, fleet rollup, tamper detection) are in the project repo's README — see
+*Project links*.
 
-**The live dashboard**
-
-<video src="https://github.com/TimothyVang/verdict-dfir-community/raw/main/media/dashboard.mp4" controls muted width="800"></video>
-
-More captures (fleet rollup, contradiction surfacing, tamper detection) are in the project repo's
-README — see *Project links*.
-
-<!-- These are committed clips, played via the github.com /raw/ URL (served with a video content
-     type). For a heavier narrated MP4 without bloating git, upload it to a Release or Issue and use
-     the resulting user-attachments URL as the <video src> instead. -->
+<!-- Why a GIF, not <video>: GitHub strips <video> tags that point at committed/raw repo URLs (its
+     inline player only renders for upload-generated user-attachments URLs). To embed a real MP4 with
+     sound: drag the file into a GitHub Issue or a release-note editor, copy the
+     https://github.com/user-attachments/assets/<id> URL it returns, and paste THAT on its own line
+     (GitHub auto-renders a player) or as a <video src>. Markdown image of a GIF always renders. -->
 
 ---
 
