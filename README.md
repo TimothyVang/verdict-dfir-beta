@@ -64,6 +64,18 @@ with sound: ▶ **[4:35 walkthrough on YouTube](https://youtu.be/4RQnVden6L8)**.
 
 ![Committed self-correction](media/self-correction.gif)
 
+**Scaled to a fleet** — the 22-host SRL-2018 enterprise case, host-by-host inside the SANS SIFT VM
+
+![VERDICT running a 22-host case in SIFT](media/srl-sift.gif)
+
+**Contradiction surfacing** — the two analysis pools disagree; flagged before the judge merges
+
+![Contradiction surfacing](media/contradiction.gif)
+
+**One-command setup** — install + preflight doctor
+
+![Install and preflight doctor](media/install-doctor.gif)
+
 > The longer **narrated** walkthroughs (feature deep-dives, educational explainer, contributor call)
 > are multi-minute MP4s with audio — those don't embed inline on GitHub unless uploaded as a
 > release/issue asset, so the [YouTube walkthrough](https://youtu.be/4RQnVden6L8) stands in for them.
