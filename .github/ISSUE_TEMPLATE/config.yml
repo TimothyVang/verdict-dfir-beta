@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Code, bugs & build issues (project repo)"
+    url: https://github.com/TimothyVang/sans-hackathon
+    about: "VERDICT's code lives here. File code bugs, build failures, and PRs in the project repo (dev during the judging freeze; release after)."
+  - name: "Report a security vulnerability (private)"
+    url: https://github.com/TimothyVang/verdict-dfir-community/security/advisories/new
+    about: "Do not open public issues for security bugs. Use private vulnerability reporting."

@@ -1,0 +1,51 @@
+name: "Pick an open problem"
+description: "Claim one of the listed open problems, or propose a new contribution area."
+title: "[help-wanted] <short summary>"
+labels: ["help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for wanting to help. Use this to claim an open problem (see the
+        [README](../../blob/main/README.md#where-you-can-help-open-problems)) or to propose a new one.
+        Let's agree on the approach here before you write code — it keeps your work from hitting a
+        project invariant.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area?
+      options:
+        - "FP floor / calibration"
+        - "DKOM vs. acquisition smear"
+        - "Prompt-injection at the evidence boundary"
+        - "Coverage breadth (new evidence types / parsers)"
+        - "Evaluation corpus / over-claim metric"
+        - "Cross-host FP filters"
+        - "Docs & onboarding"
+        - "Something else (describe below)"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What do you want to do?
+      description: The change you're proposing and roughly how you'd approach it.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Background / skills
+      description: "Optional: relevant DFIR/AI experience, links, or prior art."
+    validations:
+      required: false
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Invariant check
+      description: These won't change. Confirm your idea is compatible.
+      options:
+        - label: "My idea does NOT add an `execute_shell`-style tool or route around the typed tool surface."
+          required: true
+        - label: "My idea keeps every Finding citing a `tool_call_id`, evidence read-only, and the audit log append-only."
+          required: true
