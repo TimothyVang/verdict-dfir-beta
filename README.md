@@ -115,6 +115,86 @@ where contributors come in.
 
 ---
 
+## From the community
+
+i posted this to r/computerforensics and r/digitalforensics and straight up asked people to break it.
+they came at it hard — which is exactly what i wanted. here are the real concerns and my honest
+answer to each. no spin. read the threads yourself, links at the bottom.
+
+### "ai slop, i wouldnt trust an ai for forensics"
+
+yeah no — thats the right default for anything with ai slapped on it, and honestly i wouldnt trust it
+either. so dont. i used ai to build this and i STILL dont trust it, thats the whole point. it cant
+state a finding without pointing at the exact tool output it pulled it from, and you can re-run that
+tool yourself and check. i dont trust the ai, i trust the receipts.
+
+![a run, end to end — every finding cites the tool output it came from](media/investigation.gif)
+
+and the custody is tamper-evident — edit a sealed verdict and `manifest_verify` fails:
+
+![tamper detection — altering a sealed verdict fails manifest_verify](media/manifest-tamper.gif)
+
+### "itll still hallucinate / misread the raw output" — u/ProofLegitimate9990
+
+this was the sharpest one and theyre right, so im not gonna dodge it. straight up: the verifier that
+**ships** checks that a finding CITES a tool output — not that the claim actually matches whats in it.
+so the model can still misread something real. **i did NOT solve that.**
+
+what i built to pull it down: two pools work the same evidence and have to agree, a single-source
+claim gets downgraded, execution needs 2+ artifact classes, and when a confidence tier flips it gets
+committed to the audit chain so you can watch it happen. that lowers it. it doesnt kill it.
+
+![two pools disagree — the contradiction gets flagged before the judge merges](media/contradiction.gif)
+
+![a confidence tier flip, committed to the audit chain](media/self-correction.gif)
+
+whats actually in progress (on a branch, **NOT** in the build youd run): a deterministic fidelity
+check that makes a finding declare the exact values it claims and rejects it if those values arent in
+the cited output. that kills the "claimed a value thats not even there" class of misread. it does NOT
+touch interpretation — "these two artifacts mean lateral movement" stays a hypothesis a human signs
+off on. preview, not shipped, not on by default. im not gonna tell you i solved hallucination,
+because i didnt.
+
+### "this is gonna replace analysts / wheres the accountability" — u/Drevicar
+
+nah, and honestly i agree with you. its a triage tool. it parses the 10tb so you review faster — it
+doesnt make the call and it doesnt take the accountability, you do. the analyst approves the plan and
+the verifier re-runs every cited tool before anything hits the report.
+
+### go run it yourself
+
+dont take my word for any of this. clone it, point it at real images, and tell me exactly where it
+breaks — id genuinely love to see it:
+
+```bash
+git clone https://github.com/TimothyVang/verdict-dfir.git
+cd verdict-dfir
+bash scripts/setup
+# grab a case from the SANS hackathon image set:
+#   https://sansorg.egnyte.com/fl/HhH7crTYT4JK#folder-link/HACKATHON-2026
+scripts/verdict <downloaded-image>
+```
+
+go make it lie and screenshot it. if you find where it breaks, [open an issue](../../issues/new/choose)
+— i WANT the critiques.
+
+**the threads:** [r/computerforensics — "where does this break?"](https://www.reddit.com/r/computerforensics/comments/1u3xcp6/) · [r/digitalforensics — "cant make a claim it cant prove"](https://www.reddit.com/r/digitalforensics/comments/1u76jjl/) · [r/computerforensics — "made it prove every word"](https://www.reddit.com/r/computerforensics/comments/1u76442/)
+
+<details>
+<summary>screenshots — the thread + my replies</summary>
+
+the post asking people to break it:
+
+![original r/computerforensics post](media/reddit-thread.png)
+
+my replies across the threads:
+
+![replies answering each concern](media/reddit-comments.png)
+
+</details>
+
+---
+
 ## Where you can help (open problems)
 
 These are where help is most useful right now — each one is grounded in the project's own limitation
