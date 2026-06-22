@@ -1224,6 +1224,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "forensicnomicon"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f66c898c0f3813cb476c7d1f9e78919566e753b8ce5d581ca8d0f364a55b04b5"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frnsc-prefetch"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1927,6 +1936,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "ntfs-core"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d32ea3b5f82db9c4160f02e91aeff667174b45ab8b7a308dc608fe500c53012"
+dependencies = [
+ "bitflags 2.11.1",
+ "chrono",
+ "forensicnomicon",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2836,6 +2857,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shrinkpath"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "307b247952f8504ac63e32eb91b455f793391ca12614701d88595050b7134d8d"
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3278,9 +3305,9 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "usnjrnl-forensic"
-version = "0.6.0"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "664651e67fa82f3e97dd1e1f09eb8f1564c19d85a46b742900d46cf2d8218279"
+checksum = "eaf9b46517fcd2be994e5f51e4eee22a4b04aa56f82a5d85d15e94b30e7cbe9f"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -3288,13 +3315,15 @@ dependencies = [
  "clap",
  "csv",
  "env_logger",
+ "forensicnomicon",
  "log",
- "mft",
+ "ntfs-core",
  "rayon",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "shrinkpath",
  "tempfile",
 ]
 
