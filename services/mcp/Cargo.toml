@@ -73,7 +73,7 @@ yara-x-proto = "=1.12.0"
 # usnjrnl-forensic — MIT, NTFS USN Journal parser with full-path
 # reconstruction via journal rewind. Used by `usnjrnl_query` to
 # detect file create/delete/rename activity over an incident window.
-usnjrnl-forensic = "=0.6.0"
+usnjrnl-forensic = "=0.7.3"
 
 # rusqlite (MIT) parses browser-history SQLite DBs (Chrome/Edge `History`,
 # Firefox `places.sqlite`) read-only in the `browser_history` tool. `bundled`
