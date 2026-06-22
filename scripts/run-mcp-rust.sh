@@ -10,4 +10,5 @@ if [ -x "${BIN}" ]; then
 fi
 [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 export PATH="$HOME/.cargo/bin:$PATH"
-exec cargo run --release -p findevil-mcp --quiet
+# --manifest-path keeps the cargo-run fallback CWD-independent (works from any dir).
+exec cargo run --manifest-path "${REPO}/Cargo.toml" --release -p findevil-mcp --quiet

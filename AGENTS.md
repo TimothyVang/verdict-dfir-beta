@@ -117,6 +117,8 @@ Smokes are CI predictors. They are not a substitute for a real investigation.
 - The web dashboard lives under `apps/web/` and uses SSE at `/api/audit`.
 - Runtime DFIR behavior and role prompts live under `agent-config/`.
 
+**Path-agnostic always.** Scripts and code must run regardless of the caller's CWD or machine. Derive the repo root at runtime — bash: `REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"`; Python: `Path(__file__).resolve().parent.parent`. Use `$HOME`/`~` (never a hard-coded `/home/<user>`), and make environment-specific paths env-overridable defaults (`${VAR:-default}`). Never assume the CWD is the repo root.
+
 Do not restore removed orchestrator code under `services/agent/` such as `graph.py`, `api.py`, `cli.py`, `supervisor.py`, `specialists/`, FastAPI, or LangGraph Product runtime files. Claude Code is the investigation orchestrator.
 
 ## Release Hygiene
