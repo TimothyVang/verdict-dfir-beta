@@ -20,6 +20,8 @@
 /docs/reports/** export-ignore
 /docs/internal/** export-ignore
 /docs/sample-run/** export-ignore
+# docs/commercial.md is a pre-publication DRAFT (open ethics/COI/ownership/license TODOs); keep it out of public exports.
+/docs/commercial.md export-ignore
 
 # Defense in depth: if private evidence or runtime state is ever force-added,
 # keep it out of generated source archives.

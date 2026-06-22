@@ -4,10 +4,11 @@ VERDICT shipped at a SANS AI hackathon. It works, the core idea holds up, and I 
 genuinely useful — but it can be a lot better, and I'd rather build it in the open with people who
 know DFIR and AI than grind it solo. If that's you: welcome, and thank you.
 
-> **Heads-up on where to contribute.** The public **release** repo (`verdict-dfir`) is in a judging
-> freeze right now, so I can't merge into it until judging closes. Open issues and PRs against the
-> **dev** repo (`TimothyVang/dev-verdict-github`) for now; they get promoted to release after the freeze.
-> The build/test/submit mechanics live in [`CONTRIBUTING.md`](../CONTRIBUTING.md) — this page is the
+> **Heads-up on where to contribute.** [Open issues here](https://github.com/TimothyVang/verdict-dfir-community/issues),
+> and send code as a pull request against the **`develop`** branch of this repo. The gates are local
+> (`bash scripts/run-all-smokes.sh` plus the per-language suites) — no GitHub Actions runners
+> required; a maintainer runs them on your branch and reviews, and two approvals merge it. The
+> build/test/submit mechanics live in [`CONTRIBUTING.md`](../CONTRIBUTING.md) — this page is the
 > "what is this and where do I help" map.
 
 ---

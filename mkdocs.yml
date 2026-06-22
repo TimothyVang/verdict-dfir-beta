@@ -79,6 +79,9 @@ nav:
       - Evidence Intake: using/evidence-intake.md
       - Reports: using/reports.md
       - Troubleshooting: troubleshooting.md
+  - Contributing:
+      - Contribution Model: contribution-model.md
+      - Help Wanted: help-wanted.md
   - Release:
       - Release Surface: release-surface.md
       - Release Evidence: release-evidence/README.md

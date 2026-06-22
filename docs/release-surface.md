@@ -5,10 +5,11 @@ repository does not drift into an unbounded development dump.
 
 ## Canonical Release Channel
 
-- Canonical repo: `https://github.com/TimothyVang/verdict-dfir`
-- Historical dev repo: `https://github.com/TimothyVang/dev-verdict-github`
-- Public docs: `https://timothyvang.github.io/verdict-dfir/`
-- Release tags: prefer semantic versions such as `v0.1.0`; `v-submit` remains a
+- Canonical public repo (clone, run, contribute): `https://github.com/TimothyVang/verdict-dfir-community`
+- Release assets (prebuilt MCP binaries, demo videos) and the published docs are
+  hosted on the original release repo `https://github.com/TimothyVang/verdict-dfir`:
+  `https://timothyvang.github.io/verdict-dfir/`
+- Release tags: prefer semantic versions such as `v0.2.0-beta.1`; `v-submit` remains a
   historical SANS Find Evil! submission tag.
 
 ## Ships In Source

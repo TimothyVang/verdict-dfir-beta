@@ -121,7 +121,7 @@ Do not restore removed orchestrator code under `services/agent/` such as `graph.
 
 ## Release Hygiene
 
-Development branches must be pushed to `origin` / `TimothyVang/dev-verdict-github` for review first. Do not push, tag, or publish to `release` / `TimothyVang/verdict-dfir` until the reviewed dev commit is explicitly approved for promotion.
+Open changes as pull requests against the `develop` branch for review first; never push directly to `main` (the published release line). Publish to a release line only after review and explicit approval — releases are cut with `git ship` (push + tag + GitHub Release; no CI runners). See [docs/contribution-model.md](docs/contribution-model.md).
 
 Do not commit or copy private/bulky evidence into public release snapshots:
 

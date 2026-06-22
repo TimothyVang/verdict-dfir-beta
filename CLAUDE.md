@@ -201,7 +201,7 @@ Operating notes for large cases (so a run does not have to be hand-driven):
 
 When modifying VERDICT, keep changes small and evidence-safe.
 
-- Push review branches to `origin` / `TimothyVang/dev-verdict-github` first. Do not push, tag, or publish to `release` / `TimothyVang/verdict-dfir` until the dev branch has been reviewed and explicitly approved for promotion.
+- **Branch model.** Contributors fork the repo and open pull requests against the `develop` branch; never push to `main` (the published release line). Maintainers integrate `develop`, and publish to a release line only after review and explicit approval. Releases are cut with `git ship` (push + tag + GitHub Release over plain `git` + the platform CLI — no CI runners). See [docs/contribution-model.md](docs/contribution-model.md).
 - Prefer surgical diffs over rewrites.
 - Follow existing Rust, Python, and web package boundaries.
 - Do not restore the removed Product orchestrator surfaces — the old `graph.py`, `api.py`, `cli.py`, `supervisor.py`, or `specialists/` runtime code under `services/agent/findevil_agent/`. These remain dropped (the L0 `amendment-a2-guard` job fails CI on their return).

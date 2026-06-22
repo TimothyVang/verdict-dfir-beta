@@ -14,6 +14,21 @@
 
 <p align="center"><b>DFIR for agents — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with a verdict you can verify offline.</b></p>
 
+<p align="center">
+  <a href="https://timothyvang.github.io/verdict-dfir/"><b>Docs</b></a> ·
+  <a href="QUICKSTART.md"><b>Quickstart</b></a> ·
+  <a href="https://youtu.be/4RQnVden6L8"><b>Demo</b></a> ·
+  <a href="docs/architecture.md"><b>Architecture</b></a> ·
+  <a href="docs/contribution-model.md"><b>Contribute</b></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/TimothyVang"><img src="https://img.shields.io/badge/GitHub-TimothyVang-181717?logo=github&logoColor=white" alt="GitHub"></a>
+  <a href="https://x.com/TimothyVang"><img src="https://img.shields.io/badge/X-@TimothyVang-000000?logo=x&logoColor=white" alt="X (Twitter)"></a>
+  <a href="https://www.linkedin.com/in/TimothyVang"><img src="https://img.shields.io/badge/LinkedIn-TimothyVang-0A66C2?logo=linkedin&logoColor=white" alt="LinkedIn"></a>
+  <a href="https://www.youtube.com/@TimothyVang"><img src="https://img.shields.io/badge/YouTube-@TimothyVang-FF0000?logo=youtube&logoColor=white" alt="YouTube"></a>
+</p>
+
 ---
 
 **VERDICT is DFIR for agents** — a typed, read-only, audit-chained forensic tool surface any AI agent
@@ -53,7 +68,7 @@ before any Finding reaches the report.
 **One-liner** — clones the repo and runs setup:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-community/main/install.sh | bash
 ```
 
 This is a convenience wrapper around the steps below, **not** a standalone binary
@@ -64,7 +79,7 @@ will not run a Case by itself — it gets you to a green `scripts/setup`. Prefer
 every step? Run them yourself:
 
 ```bash
-git clone --depth 1 https://github.com/TimothyVang/verdict-dfir.git verdict
+git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-community.git verdict
 cd verdict
 bash scripts/setup            # toolchain + DFIR binaries + both MCP servers + preflight doctor
 scripts/verdict <path-to-evidence>
@@ -265,11 +280,9 @@ human-owned. See it catch a misread on purpose with
 Details: [`docs/fact-fidelity.md`](docs/fact-fidelity.md).
 
 <p align="center">
-  <video src="https://github.com/TimothyVang/dev-verdict-github/raw/master/docs/showcase/fact-fidelity-demo.mp4" controls muted playsinline width="760">
-    <a href="docs/showcase/fact-fidelity-demo.mp4">▶ Watch the fact-fidelity demo (mp4)</a>
-  </video>
+  <img src="docs/showcase/fact-fidelity-demo.gif" alt="Fact-fidelity demo: an honest finding is approved while an injected misread is rejected before it reaches the verdict" width="760">
 </p>
-<p align="center"><sub>A <b>real run</b> — the compiled <code>findevil-mcp</code> re-runs the cited tool on real evidence: an honest finding is <b>approved</b>, an injected misread is <b>rejected</b> before it can reach the verdict. If the player doesn't load: <a href="docs/showcase/fact-fidelity-demo.mp4">mp4</a> · <a href="docs/showcase/fact-fidelity-demo.gif">gif</a>.</sub></p>
+<p align="center"><sub>A <b>real run</b> — the compiled <code>findevil-mcp</code> re-runs the cited tool on real evidence: an honest finding is <b>approved</b>, an injected misread is <b>rejected</b> before it can reach the verdict. Full-resolution <a href="docs/showcase/fact-fidelity-demo.mp4">mp4</a>.</sub></p>
 
 ## Capabilities
 
@@ -400,20 +413,30 @@ carries a real verdict and `manifest_verify.json` reports `overall: true`.
 
 Help is welcome — especially from people who know DFIR, memory forensics, or LLM evaluation.
 Start with [docs/help-wanted.md](docs/help-wanted.md) for the open problems (including the hard one:
-keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/submit mechanics. While
-the release repo is in a judging freeze, open issues and PRs against the dev repo
-([`TimothyVang/dev-verdict-github`](https://github.com/TimothyVang/dev-verdict-github)).
+keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/submit mechanics.
 
-## Commercial support & training
+- **Found a bug or have an idea?** [Open an issue](https://github.com/TimothyVang/verdict-dfir-community/issues).
+- **Sending code?** Fork this repo and open a pull request against the **`develop`** branch. The gates
+  are the local checks in [CONTRIBUTING.md](CONTRIBUTING.md) (`bash scripts/run-all-smokes.sh` plus the
+  per-language suites) — no GitHub Actions runners required. A maintainer runs them on your branch and
+  reviews; two approvals (including a maintainer) merge it automatically. Releases are cut by the
+  maintainer with `git ship`.
 
-<!-- DRAFT — staged in the dev repo, NOT for the public release. Do not promote until the ethics/COI,
-     ownership, and license decisions in docs/commercial.md are cleared, and replace the contact there
-     with a non-.mil channel. -->
+<p align="center">
+  <a href="https://github.com/TimothyVang/verdict-dfir-community/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TimothyVang/verdict-dfir-community" alt="VERDICT contributors">
+  </a>
+</p>
 
-VERDICT is free and open source (Apache-2.0) — self-host it, run it air-gapped, forever. If your team
-wants help getting it running fast — **on-prem deployment**, **DFIR-for-agents training**, or
-**support / SLA** — see [docs/commercial.md](docs/commercial.md). We never take custody of your
-evidence: everything runs on your infrastructure.
+## Star History
+
+If VERDICT is useful to you, a &#11088; helps other DFIR practitioners find it — and motivates the roadmap.
+
+<p align="center">
+  <a href="https://www.star-history.com/#TimothyVang/verdict-dfir-community&Date">
+    <img src="https://api.star-history.com/svg?repos=TimothyVang/verdict-dfir-community&type=Date" alt="VERDICT star history chart" width="640">
+  </a>
+</p>
 
 ## License
 
