@@ -205,7 +205,16 @@ pub fn plaso_parse(input: &PlasoParseInput) -> Result<PlasoParseOutput, PlasoPar
     };
 
     let stderr_tail = truncate_to(format!("{l2t_stderr}{psort_stderr}"), 4096);
-    let result = read_json_lines(&out_file, &input.parser, limit, stderr_tail);
+    let result = read_json_lines(&out_file, &input.parser, limit, stderr_tail).map(|mut out| {
+        // Make events reproducible (and /home-free): plaso embeds the absolute
+        // source path in display_name/filename/pathspec, which carries a per-run
+        // case + disk-extract UUID and the operator's /home prefix. Verbatim, it
+        // makes output_sha256 non-reproducible across runs (verify_finding replay
+        // drift) and leaks /home into the hashed output. Canonicalizing to the
+        // artifact basename makes the events evidence-determined, not run-determined.
+        canonicalize_event_paths(&mut out.events, &input.artifact_path);
+        out
+    });
     cleanup(&[&storage, &out_file]);
     result
 }
@@ -522,9 +531,116 @@ fn is_log_timestamp(s: &[u8]) -> bool {
         && s[19] == b','
 }
 
+/// Replace the absolute source path that plaso embeds in event fields
+/// (`display_name`, `filename`, the nested `pathspec` location, ...) with the
+/// artifact basename. The extracted-artifact path carries a per-run case +
+/// disk-extract UUID and the operator's `/home` prefix; embedded verbatim it
+/// makes `output_sha256` non-reproducible across runs (`verify_finding` replay
+/// drift) and leaks the operator path into the hashed output. The verifier
+/// replays by re-running the tool against the artifact at its (new) extract path,
+/// so a path-independent basename is what makes the replay reproduce.
+fn canonicalize_event_paths(
+    events: &mut [serde_json::Map<String, serde_json::Value>],
+    artifact: &Path,
+) {
+    let abs = artifact.to_string_lossy().into_owned();
+    if abs.is_empty() {
+        return;
+    }
+    let basename = artifact
+        .file_name()
+        .map_or_else(|| abs.clone(), |n| n.to_string_lossy().into_owned());
+    for event in events.iter_mut() {
+        for value in event.values_mut() {
+            replace_substring_in_value(value, &abs, &basename);
+        }
+    }
+}
+
+/// Recursively replace every occurrence of `needle` with `repl` in every string
+/// value of a JSON value (objects, arrays, and leaf strings).
+fn replace_substring_in_value(value: &mut serde_json::Value, needle: &str, repl: &str) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.contains(needle) {
+                *s = s.replace(needle, repl);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                replace_substring_in_value(item, needle, repl);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                replace_substring_in_value(v, needle, repl);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonicalize_event_paths_strips_volatile_source_path() {
+        let artifact = Path::new(
+            "/home/op/.findevil/cases/abc/extracted/disk/disk-extract-XYZ/ie/u/index.dat",
+        );
+        let mut events = vec![{
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "display_name".into(),
+                serde_json::Value::String(format!("OS:{}", artifact.display())),
+            );
+            m.insert(
+                "filename".into(),
+                serde_json::Value::String(artifact.display().to_string()),
+            );
+            m.insert(
+                "message".into(),
+                serde_json::Value::String("Visited http://example.test/".into()),
+            );
+            m
+        }];
+        canonicalize_event_paths(&mut events, artifact);
+        let e = &events[0];
+        assert_eq!(e["display_name"], serde_json::json!("OS:index.dat"));
+        assert_eq!(e["filename"], serde_json::json!("index.dat"));
+        // Forensic (non-path) content is untouched, and no /home leaks.
+        assert_eq!(
+            e["message"],
+            serde_json::json!("Visited http://example.test/")
+        );
+        assert!(!serde_json::to_string(e).unwrap().contains("/home/"));
+    }
+
+    #[test]
+    fn canonicalize_event_paths_is_replay_stable_across_extract_uuids() {
+        // The same evidence file, extracted to two different per-run UUID dirs
+        // (and even a different operator home), must canonicalize to identical
+        // events so a verify_finding replay reproduces the same output_sha256.
+        let a =
+            Path::new("/home/op/.findevil/cases/c1/extracted/disk/disk-extract-AAA/ie/index.dat");
+        let b = Path::new(
+            "/home/other/.findevil/cases/c1/extracted/disk/disk-extract-BBB/ie/index.dat",
+        );
+        let mk = |p: &Path| {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                "display_name".into(),
+                serde_json::Value::String(format!("OS:{}", p.display())),
+            );
+            m
+        };
+        let mut ea = vec![mk(a)];
+        let mut eb = vec![mk(b)];
+        canonicalize_event_paths(&mut ea, a);
+        canonicalize_event_paths(&mut eb, b);
+        assert_eq!(ea, eb);
+    }
 
     fn as_strings(args: &[OsString]) -> Vec<String> {
         args.iter()

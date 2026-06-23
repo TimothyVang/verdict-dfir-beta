@@ -5556,6 +5556,13 @@ def build_report_qa_signoff(
     for fid, finding in indexed_findings:
         if not _claims_execution(finding):
             continue
+        # HYPOTHESIS findings are explicitly scoped leads, not execution CLAIMS.
+        # The >=2-artifact-class rule (SOUL.md) governs CONFIRMED / INFERRED
+        # execution assertions; a hedged lead that merely mentions execution (e.g.
+        # a prefetch-noted recon/browsing HYPOTHESIS) is already correctly scoped
+        # and must not trip the customer-release gate that blocks the report.
+        if str(finding.get("confidence", "")).upper() == "HYPOTHESIS":
+            continue
         finding_classes = {
             str(event.get("artifact_class"))
             for event in events_by_finding.get(fid, [])
@@ -6525,7 +6532,12 @@ def _is_extracted_artifact_basename(name: str) -> bool:
     pulled from a single disk image, not separate hosts.
     """
     low = name.lower()
-    return low.endswith(".pf") or low in REGISTRY_HIVE_NAMES or name.startswith("$")
+    return (
+        low.endswith((".pf", ".dbx", ".evt", ".lnk"))
+        or low in REGISTRY_HIVE_NAMES
+        or low in {"index.dat", "info2"}
+        or name.startswith("$")
+    )
 
 
 def _artifact_host_fallback(path: Any) -> str:
@@ -13326,17 +13338,34 @@ class Investigation:
         return actions
 
     def _replay_corroboration_tcid(
-        self, py: SshMcpClient, tcid: str, index: dict[str, Any]
+        self,
+        py: SshMcpClient,
+        base_finding: dict[str, Any],
+        tcid: str,
+        index: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Replay one corroborating tool call via verify_finding; return its
-        replay_artifact (tool name + expected/actual SHA + match), or None."""
-        synth = {
-            "finding_id": f"corroboration::{tcid}",
-            "tool_call_id": tcid,
-            "case_id": self.handle["id"],
-        }
+        replay_artifact (tool name + expected/actual SHA + match), or None.
+
+        The synthetic verify-request is BASED ON the real finding so it carries the
+        required Finding model fields (case_id, event_id, ts, description, ...), then
+        re-pointed at the corroborating ``tcid``. The entailment / expectation inputs
+        describe the PRIMARY tool's output, so they are dropped — this replay attests
+        only that the second artifact class's tool call reproduces."""
+        synth = dict(finding_for_verifier(base_finding))
+        synth["tool_call_id"] = tcid
+        synth["finding_id"] = f"{synth.get('finding_id', 'f')}::corr::{tcid}"
+        for key in ("asserted_values", "expectation", "derived_from"):
+            synth.pop(key, None)
+        # This replay attests only that the corroborating tool call reproduces by
+        # SHA; it carries no asserted_values and no derived_from. CONFIRMED and
+        # INFERRED both require one of those (the fact-fidelity gate), so the synth
+        # must be HYPOTHESIS — the lead tier the model exempts — for the SHA replay
+        # to run without an entailment precondition. It never enters the verdict's
+        # findings; its only purpose is to drive the corroborating tool's replay.
+        synth["confidence"] = "HYPOTHESIS"
         verify_args: dict[str, Any] = {
-            "finding": finding_for_verifier(synth),
+            "finding": synth,
             "tool_call_index": index,
             "findevil_mcp_command": rust_replay_command(),
         }
@@ -13374,7 +13403,7 @@ class Investigation:
                     continue
                 if corr_tcid not in replay_cache:
                     replay_cache[corr_tcid] = self._replay_corroboration_tcid(
-                        py, corr_tcid, index
+                        py, finding, corr_tcid, index
                     )
                 artifact = replay_cache[corr_tcid]
                 if artifact:

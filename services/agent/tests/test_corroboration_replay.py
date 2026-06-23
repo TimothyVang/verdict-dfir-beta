@@ -31,10 +31,24 @@ _ARTIFACT = {
 class _FakePy:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.findings: list[dict] = []
 
     def call_tool(self, name, args, timeout=None):
         assert name == "verify_finding"
-        self.calls.append(args["finding"]["tool_call_id"])
+        finding = args["finding"]
+        # Mirror the real Finding model invariant (events.py _require_asserted_values):
+        # CONFIRMED needs asserted_values; INFERRED needs asserted_values OR
+        # derived_from; HYPOTHESIS (a lead) is exempt. The corroboration replay
+        # carries neither, so it must be HYPOTHESIS to dodge both rules.
+        conf = finding.get("confidence")
+        has_values = bool(finding.get("asserted_values"))
+        has_derived = bool(finding.get("derived_from"))
+        if conf == "CONFIRMED" and not has_values:
+            return {"_error": {"message": "ValidationError: CONFIRMED needs values"}}
+        if conf == "INFERRED" and not has_values and not has_derived:
+            return {"_error": {"message": "ValidationError: INFERRED needs values/derived"}}
+        self.calls.append(finding["tool_call_id"])
+        self.findings.append(finding)
         return {"replay_artifact": dict(_ARTIFACT)}
 
 
@@ -66,14 +80,32 @@ def test_corroborating_call_replayed_once_and_attached_to_each_finding() -> None
     fake = _fake_orchestrator()
     py = _FakePy()
     findings = [
-        {"finding_id": "f1", "tool_call_id": "tc-010", "confidence": "CONFIRMED"},
-        {"finding_id": "f2", "tool_call_id": "tc-011", "confidence": "CONFIRMED"},
+        {
+            "finding_id": "f1",
+            "tool_call_id": "tc-010",
+            "confidence": "CONFIRMED",
+            "asserted_values": {"exe": "cain.exe"},
+        },
+        {
+            "finding_id": "f2",
+            "tool_call_id": "tc-011",
+            "confidence": "CONFIRMED",
+            "asserted_values": {"exe": "cain.exe"},
+        },
     ]
 
     fake._verify_execution_corroborations(py, findings)
 
     # The shared UserAssist call is replayed exactly once (deduped)...
     assert py.calls == ["tc-214"]
+    # ...and the synthetic replay finding is downgraded to HYPOTHESIS (the lead
+    # tier the model exempts) carrying neither asserted_values nor derived_from,
+    # so neither the CONFIRMED nor the INFERRED fidelity rule rejects it.
+    synth = py.findings[0]
+    assert synth["confidence"] == "HYPOTHESIS"
+    assert "asserted_values" not in synth
+    assert "derived_from" not in synth
+    assert synth["finding_id"].endswith("::corr::tc-214")
     # ...but attached to both findings.
     assert fake.corroboration_replays["f1"][0]["tool_name"] == "registry_query"
     assert fake.corroboration_replays["f2"][0]["matched"] is True
