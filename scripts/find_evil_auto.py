@@ -433,8 +433,22 @@ def relativize_finding_paths(finding: dict[str, Any]) -> dict[str, Any]:
         return finding
     rel_path = _relativize_extracted_path(raw_path)
     if rel_path == raw_path:
-        # Not an extracted path under case_home (e.g. /evidence/ source) — nothing
-        # to relativize, so leave the whole finding (incl. description) verbatim.
+        # Not an extracted path under case_home. A SIFT ``/evidence/`` source path is
+        # already /home-free and must survive verbatim (replay + rebind match by
+        # basename). But a LOCAL-mode evidence source under the operator's home
+        # (e.g. ``scripts/verdict /home/user/.../evidence/nitroba.pcap``) would leak
+        # ``/home`` into the customer report, so record just the basename for it. The
+        # artifact_path is display/citation metadata, not replay-bearing, and the
+        # rebind gate matches by basename, so a basename stays correct.
+        if raw_path.startswith("/") and "/home/" in raw_path:
+            bname = _release_path(raw_path)  # no base -> basename
+            out = dict(finding)
+            out["artifact_path"] = bname
+            desc = finding.get("description")
+            if isinstance(desc, str) and raw_path in desc:
+                out["description"] = desc.replace(raw_path, bname)
+            return out
+        # nothing to relativize, so leave the whole finding (incl. description) verbatim.
         return finding
     out = dict(finding)
     out["artifact_path"] = rel_path
@@ -865,10 +879,13 @@ def cloud_provider_for_path(path: str) -> str | None:
 
 
 SUSPICIOUS_PREFETCH_TOOL_HINTS = (
-    ("CAIN", "Cain password-recovery/network hacking tool", "T1588.002"),
+    # Prefetch proves the binary RAN -> User Execution (T1204.002), NOT off-host
+    # acquisition (T1588.002) or web C2 (T1071.001). NetStumbler/Ethereal keep their
+    # correct function techniques (discovery / sniffing).
+    ("CAIN", "Cain password-recovery/network hacking tool", "T1204.002"),
     ("NETSTUMBLER", "NetStumbler wireless discovery tool", "T1046"),
     ("ETHEREAL", "Ethereal packet-capture tool", "T1040"),
-    ("MIRC", "mIRC client that can support IRC-based communications", "T1071.001"),
+    ("MIRC", "mIRC client that can support IRC-based communications", "T1204.002"),
     ("LOOKATLAN", "Look@LAN network discovery tool", "T1046"),
 )
 MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = int(
@@ -6500,6 +6517,40 @@ def _evidence_label(path: Any) -> str:
     return name or "supplied evidence"
 
 
+def _is_extracted_artifact_basename(name: str) -> bool:
+    """True if ``name`` is an extracted-artifact basename, never a hostname.
+
+    Prefetch files (``*.pf``), registry hives (SAM, SYSTEM, NTUSER.DAT, ...), and
+    NTFS metafiles (``$MFT``, ``$UsnJrnl``, ``$I30``, ...) are evidence ARTIFACTS
+    pulled from a single disk image, not separate hosts.
+    """
+    low = name.lower()
+    return low.endswith(".pf") or low in REGISTRY_HIVE_NAMES or name.startswith("$")
+
+
+def _artifact_host_fallback(path: Any) -> str:
+    """Host fallback that refuses extracted-artifact basenames as hostnames.
+
+    When a finding carries no host entity (the EVTX ``Computer`` field), the
+    artifact basename was used as the host. For a single disk image that turns each
+    Prefetch file / hive / ``$MFT`` into a fabricated "host", so the report claims
+    "findings span N hosts". Returning "" for those collapses them into one
+    (unknown) host group. A genuinely host-named evidence file in a directory case
+    (e.g. ``HOST-A.evtx``) is not an artifact class, so it still falls back to its
+    basename and separate hosts stay separate.
+    """
+    raw = str(path or "").replace("\\", "/")
+    # Anything extracted from a disk image is evidence, not a host. The extract
+    # layout is ``cases/<id>/extracted/disk/...`` (Prefetch, LNK, Recycle Bin INFO2,
+    # index.dat, $MFT, hives, legacy .evt, ...), so any path under ``/extracted/`` is
+    # never a host. This catches every extracted artifact class, not just the few
+    # whose basenames match _is_extracted_artifact_basename.
+    if "/extracted/" in raw:
+        return ""
+    name = _evidence_label(path)
+    return "" if _is_extracted_artifact_basename(name) else name
+
+
 def tag_finding_hosts(
     findings: list[dict[str, Any]], normalized_timeline: dict[str, Any]
 ) -> None:
@@ -6515,7 +6566,7 @@ def tag_finding_hosts(
         _actor, host = _lead_entities(
             events_by_finding.get(_finding_id(finding, index), [])
         )
-        finding["host"] = host or _evidence_label(finding.get("artifact_path"))
+        finding["host"] = host or _artifact_host_fallback(finding.get("artifact_path"))
 
 
 def _event_host(event: dict[str, Any], finding_host: dict[str, str]) -> str:
@@ -8467,6 +8518,10 @@ class Investigation:
         self.findings_pool_a: list[dict[str, Any]] = []
         self.findings_pool_b: list[dict[str, Any]] = []
         self.verifier_replays: dict[str, dict[str, Any]] = {}
+        # Per-finding replays of CORROBORATING tool calls (execution_corroboration):
+        # so the Reproducibility Appendix attests every artifact class a CONFIRMED
+        # finding cites, not only the primary tool_call_id. finding_id -> [artifact].
+        self.corroboration_replays: dict[str, list[dict[str, Any]]] = {}
         self.verifier_replay_failures: list[str] = []
         # Per-finding re-dispatch bookkeeping: a verifier rejection gets one
         # fresh verify_finding attempt before the finding is dropped
@@ -10773,7 +10828,9 @@ class Investigation:
             ),
             "confidence": "INFERRED",
             "pool_origin": "A",
-            "mitre_technique": "T1588.002",
+            # A hacking-tool file present on disk is Ingress Tool Transfer (the tool
+            # was brought onto the host), NOT off-host acquisition (T1588.002).
+            "mitre_technique": "T1105",
             "derived_from": [tcid],
         }
         self.findings_pool_a.append(finding)
@@ -11061,7 +11118,9 @@ class Investigation:
             ),
             "confidence": "HYPOTHESIS",
             "pool_origin": "B",
-            "mitre_technique": "T1071.001",
+            # Browser download URLs are an ingress/download lead (T1105), not web C2
+            # (T1071.001). A history entry shows a resource was requested, not C2.
+            "mitre_technique": "T1105",
             "derived_from": [tcid],
         }
         self.findings_pool_b.append(finding)
@@ -12461,7 +12520,9 @@ class Investigation:
                         "before naming a person; do not assert attribution from network "
                         "metadata alone."
                     ),
-                    "T1071.001",
+                    # Anonymous/webmail email over HTTP is identity-attribution
+                    # evidence in a harassment case, NOT adversary web C2 (T1071.001).
+                    None,
                     confidence=confidence,
                     derived_from=[tcid],
                 )
@@ -12485,7 +12546,9 @@ class Investigation:
                         "the source host's identity. Account ownership still requires "
                         "provider records."
                     ),
-                    "T1071.001",
+                    # Authenticated webmail is benign user activity / source-host
+                    # attribution, NOT adversary web C2 (T1071.001).
+                    None,
                     confidence="INFERRED",
                     derived_from=[tcid],
                 )
@@ -12506,7 +12569,9 @@ class Investigation:
                         "the suspect's identity. Account ownership still requires provider "
                         "records; do not name a person from network metadata alone."
                     ),
-                    "T1071.001",
+                    # Social-media login is source-host identity attribution, NOT
+                    # adversary web C2 (T1071.001).
+                    None,
                     confidence="INFERRED",
                     derived_from=[tcid],
                 )
@@ -12585,7 +12650,10 @@ class Investigation:
                     "Cross-flow timing link only; do not name a person from network "
                     "metadata alone."
                 ),
-                "T1071.001",
+                # Temporal correlation of a user's harassing-email sends with their
+                # browsing window is attribution evidence, NOT adversary web C2
+                # (T1071.001).
+                None,
                 confidence="INFERRED",
                 derived_from=[tcid],
             )
@@ -13250,7 +13318,67 @@ class Investigation:
             py, findings, fault_targets=fault_targets
         )
         results = self._redispatch_rejections(py, findings, results)
-        return self._record_verify_actions(py, findings, results)
+        actions = self._record_verify_actions(py, findings, results)
+        # Stage B½: replay each CONFIRMED finding's CORROBORATING tool call so the
+        # Reproducibility Appendix attests every cited artifact class, not just the
+        # primary tool_call_id (closes the "2-class claim, 1 replayed" gap).
+        self._verify_execution_corroborations(py, findings)
+        return actions
+
+    def _replay_corroboration_tcid(
+        self, py: SshMcpClient, tcid: str, index: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Replay one corroborating tool call via verify_finding; return its
+        replay_artifact (tool name + expected/actual SHA + match), or None."""
+        synth = {
+            "finding_id": f"corroboration::{tcid}",
+            "tool_call_id": tcid,
+            "case_id": self.handle["id"],
+        }
+        verify_args: dict[str, Any] = {
+            "finding": finding_for_verifier(synth),
+            "tool_call_index": index,
+            "findevil_mcp_command": rust_replay_command(),
+        }
+        if self.force_fresh_replay:
+            verify_args["force_fresh_replay"] = True
+        result = py.call_tool("verify_finding", verify_args, timeout=1800.0)
+        if "_error" in result:
+            return None
+        return result.get("replay_artifact") or None
+
+    def _verify_execution_corroborations(
+        self, py: SshMcpClient, findings: list[dict[str, Any]]
+    ) -> None:
+        """Replay the corroborating tool calls cited by CONFIRMED execution findings
+        so both artifact classes are replay-attested in the Reproducibility Appendix.
+
+        A CONFIRMED prefetch-execution finding is promoted when a UserAssist entry
+        records the same binary; both classes are cited in ``derived_from`` but only
+        the primary (prefetch) call was replayed. This replays each corroborating
+        tool call once (deduped — many findings share one UserAssist call) and stores
+        the result so ``_embed_verifier_replays`` can attach it. The primary replay
+        and audit chain are untouched."""
+        if not self.execution_corroboration:
+            return
+        index = self._tool_call_index()
+        by_id = {str(f.get("finding_id")): f for f in findings}
+        replay_cache: dict[str, dict[str, Any] | None] = {}
+        for fid, corr_tcids in self.execution_corroboration.items():
+            finding = by_id.get(str(fid))
+            if finding is None:
+                continue  # finding belongs to a different pool
+            primary = str(finding.get("tool_call_id") or "")
+            for corr_tcid in corr_tcids:
+                if not corr_tcid or corr_tcid == primary:
+                    continue
+                if corr_tcid not in replay_cache:
+                    replay_cache[corr_tcid] = self._replay_corroboration_tcid(
+                        py, corr_tcid, index
+                    )
+                artifact = replay_cache[corr_tcid]
+                if artifact:
+                    self.corroboration_replays.setdefault(str(fid), []).append(artifact)
 
     def _consume_fault_targets(
         self, py: SshMcpClient, findings: list[dict[str, Any]]
@@ -13588,7 +13716,11 @@ class Investigation:
         for finding in findings:
             finding_id = str(finding.get("finding_id") or "")
             replay = self.verifier_replays.get(finding_id)
-            enriched.append({**finding, **replay} if replay else finding)
+            merged = {**finding, **replay} if replay else dict(finding)
+            corr = self.corroboration_replays.get(finding_id)
+            if corr:
+                merged["corroboration_replays"] = corr
+            enriched.append(merged)
         return enriched
 
     def _apply_verifier_actions(

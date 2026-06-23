@@ -131,3 +131,33 @@ def test_evidence_single_file_finding_unaffected(monkeypatch, tmp_path: Path) ->
 
     assert normalized["artifact_path"] == "/evidence/Rocba-Memory.raw"
     assert normalized["description"] == finding["description"]
+
+
+def test_local_mode_home_evidence_path_basenamed(monkeypatch, tmp_path: Path) -> None:
+    # F4: a LOCAL-mode evidence source path under the operator's /home but NOT under
+    # case_home (e.g. scripts/verdict /home/user/.../evidence/nitroba.pcap) must not
+    # leak /home into the customer report. Its artifact_path is reduced to the
+    # basename and any verbatim occurrence in the description is rewritten. The
+    # replay path is unaffected (verifier replays by tool_call_id; the rebind gate
+    # matches by basename), so a basename is a correct /home-free display value.
+    monkeypatch.setenv("FINDEVIL_HOME", str(tmp_path / ".findevil"))
+    leaky = "/home/assessor/Desktop/PUG-Projects/dev-verdict-github/evidence/nitroba.pcap"
+
+    finding = {
+        "case_id": "case-paths",
+        "finding_id": "f-A-pcap",
+        "tool_call_id": "d" * 64,
+        "artifact_path": leaky,
+        "description": f"Anonymous-email contact observed in {leaky}.",
+        "confidence": "HYPOTHESIS",
+    }
+
+    normalized = fea.relativize_finding_paths(finding)
+
+    assert normalized["artifact_path"] == "nitroba.pcap"
+    assert "/home/" not in normalized["artifact_path"]
+    assert leaky not in normalized["description"]
+    assert "/home/" not in normalized["description"]
+    assert "nitroba.pcap" in normalized["description"]
+    # input never mutated
+    assert finding["artifact_path"] == leaky

@@ -1614,6 +1614,20 @@ def write_markdown(
                     ),
                 )
             )
+        for corr in f.get("corroboration_replays") or []:
+            # A CONFIRMED execution finding cites two artifact classes; this row
+            # attests the replay of the corroborating (e.g. UserAssist) class so the
+            # appendix is not "2-class claim, 1 replay".
+            replay_rows.append(
+                "| {finding} | `{tool}` | `{drift}` | {matched} | `{expected}` | `{actual}` |".format(
+                    finding=md_cell(str(f.get("finding_id", f"#{i}")) + " (corroboration)"),
+                    tool=md_cell(corr.get("tool_name", "")),
+                    drift=md_cell(corr.get("drift_class", "")),
+                    matched="yes" if corr.get("matched") else "no",
+                    expected=md_cell(str(corr.get("expected_sha256") or "")[:12]),
+                    actual=md_cell(str(corr.get("actual_sha256") or "")[:12]),
+                )
+            )
         findings_md_lines.append(
             f"### Finding {i} — confidence: {f.get('confidence', '?')}, "
             f"pool: {f.get('pool_origin', '?')}, "
@@ -2037,6 +2051,13 @@ def write_markdown(
     scope_interpretation_section = ""
     readiness_section = build_readiness_section(report_qa, release_gate)
 
+    # Display-safe evidence label for the customer report header: keep only the
+    # basename so an operator's absolute /home path never leaks into REPORT.md /
+    # .html / .pdf. The full path is preserved in verdict.json for operational use.
+    evidence_display = (
+        Path(evidence).name if evidence and evidence != "?" else evidence
+    )
+
     md.write_text(
         f"""[VERDICT · DFIR Case File]{{.kicker}}
 
@@ -2048,7 +2069,7 @@ def write_markdown(
 **Run ID:** `{manifest["run_id"]}`
 **Started:** {manifest["started_at"]}
 **Finalized:** {manifest["finalized_at"]}
-**Evidence:** `{md_cell(evidence)}`
+**Evidence:** `{md_cell(evidence_display)}`
 **Verdict:** **{verdict}**
 
 > **Cryptographic attestation:**
