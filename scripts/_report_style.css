@@ -1,26 +1,25 @@
-/* VERDICT — editorial "forensic case file" report theme.
-   Mirrors apps/web/lib/verdict-ui.tsx + apps/web/app/globals.css: warm near-black
-   paper, cream ink, JetBrains Mono / Fraunces / Archivo, purple brand accent, and
-   the green/amber/blue confidence color system. Kept in sync with _DEFAULT_CSS in
-   scripts/render_report.py. */
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* VERDICT v2 report theme.
+   Mirrors the brand bible and apps/web/lib/verdict-ui.tsx: Midnight Ink, Paper
+   Cream, Electric Cobalt, Soft Lilac, Seafoam, Signal Coral, and Butter Yellow.
+   Kept in sync with _DEFAULT_CSS in scripts/render_report.py. */
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
 :root {
-  --paper: #0e0c10;
-  --surface: #161318;
-  --inset: #0b0a0d;
-  --ink: #ece6da;
-  --muted: #8c8576;
-  --faint: #544f48;
-  --hairline: #2b2620;
-  --accent: #9b59b6;
-  --accent-light: #b98fce;
-  --alert: #d6452f;
-  --confirmed: #7fae6e;
-  --inferred: #c79a4a;
-  --hypothesis: #6f93b8;
+  --paper: #101426;
+  --surface: #12131a;
+  --inset: #0c1020;
+  --ink: #f5f1e8;
+  --muted: #b8a8ff;
+  --faint: #7f789c;
+  --hairline: #27304a;
+  --accent: #4d5dff;
+  --accent-light: #b8a8ff;
+  --alert: #ff6257;
+  --confirmed: #73d9c2;
+  --inferred: #ffd76a;
+  --hypothesis: #4d5dff;
   --mono: "JetBrains Mono", "Courier New", monospace;
-  --serif: "Fraunces", Georgia, "Times New Roman", serif;
+  --serif: "Archivo", Impact, system-ui, sans-serif;
   --grotesk: "Archivo", system-ui, -apple-system, sans-serif;
 }
 
@@ -29,7 +28,7 @@
 html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 
 body {
-  background: #0e0c10;
+  background: #101426;
   color: var(--ink);
   font-family: var(--mono);
   font-size: 13px;
@@ -40,15 +39,15 @@ body {
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
   background-image:
-    linear-gradient(rgba(236, 230, 218, 0.022) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(236, 230, 218, 0.022) 1px, transparent 1px);
+    linear-gradient(rgba(245, 241, 232, 0.026) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(245, 241, 232, 0.026) 1px, transparent 1px);
   background-size: 56px 56px;
 }
 
-/* Masthead — Fraunces display serif. */
+/* Masthead — heavy editorial sans. */
 h1 {
   font-family: var(--serif);
-  font-weight: 600;
+  font-weight: 900;
   color: var(--ink);
   font-size: 2.5em;
   letter-spacing: -0.5px;
@@ -57,7 +56,7 @@ h1 {
   border: none;
 }
 
-/* Tier banners (Technical Report / Internal) — page break + purple band. */
+/* Tier banners (Technical Report / Internal) — page break + cobalt band. */
 h1.tier-break {
   page-break-before: always;
   font-family: var(--grotesk);
@@ -66,7 +65,7 @@ h1.tier-break {
   font-size: 1.15em;
   font-weight: 700;
   color: var(--ink);
-  background: linear-gradient(90deg, rgba(155, 89, 182, 0.24), rgba(155, 89, 182, 0.04));
+  background: linear-gradient(90deg, rgba(77, 93, 255, 0.24), rgba(184, 168, 255, 0.06));
   border: none;
   border-left: 3px solid var(--accent);
   border-radius: 4px;
@@ -101,7 +100,7 @@ p, li { color: var(--ink); }
 a {
   color: var(--accent-light);
   text-decoration: none;
-  border-bottom: 1px solid rgba(155, 89, 182, 0.4);
+  border-bottom: 1px solid rgba(77, 93, 255, 0.45);
 }
 strong { color: var(--ink); font-weight: 700; }
 em { color: var(--muted); }
@@ -138,20 +137,20 @@ pre {
 }
 pre code { background: none; border: none; padding: 0; color: inherit; }
 
-/* Cryptographic-attestation blockquote — purple crypto card. */
+/* Cryptographic-attestation blockquote — cobalt crypto card. */
 blockquote {
   font-family: var(--mono);
   color: var(--ink);
   margin: 1.4em 0;
-  background: rgba(155, 89, 182, 0.1);
-  border: 1px solid rgba(155, 89, 182, 0.45);
+  background: rgba(77, 93, 255, 0.1);
+  border: 1px solid rgba(77, 93, 255, 0.45);
   border-left: 3px solid var(--accent);
   border-radius: 0 6px 6px 0;
   padding: 0.9em 1.3em;
 }
 blockquote strong { color: var(--accent-light); }
 
-/* Tables — dark surface, hairline grid, purple-tinted header. */
+/* Tables — dark surface, hairline grid, cobalt-tinted header. */
 table {
   border-collapse: collapse;
   margin: 1.3em 0;
@@ -161,7 +160,7 @@ table {
   border: 1px solid var(--hairline);
 }
 th {
-  background: rgba(155, 89, 182, 0.16);
+  background: rgba(77, 93, 255, 0.16);
   color: var(--accent-light);
   font-family: var(--grotesk);
   text-transform: uppercase;
@@ -183,7 +182,7 @@ td {
    the reading column instead of overflowing to the right (and so it fits the
    narrower PDF page). */
 th, td { overflow-wrap: anywhere; word-break: break-word; }
-tr:nth-child(even) td { background: rgba(236, 230, 218, 0.025); }
+tr:nth-child(even) td { background: rgba(245, 241, 232, 0.025); }
 
 hr { border: none; border-top: 1px solid var(--hairline); margin: 2.4em 0; }
 
@@ -206,7 +205,7 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 2.4em 0; }
 /* Semantic confidence + verdict keywords (wrapped post-render). */
 .conf-confirmed, .verdict-confirmed { color: var(--confirmed); font-weight: 700; }
 .conf-inferred, .verdict-inferred { color: var(--inferred); font-weight: 700; }
-.conf-hypothesis { color: var(--hypothesis); font-weight: 700; }
+.conf-hypothesis { color: var(--accent-light); font-weight: 700; }
 .verdict-alert { color: var(--alert); font-weight: 700; }
 
 /* ===================================================================== */
@@ -224,9 +223,9 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 2.4em 0; }
 .vchip { display: inline-block; font-family: var(--grotesk); font-size: 0.72em;
   font-weight: 700; letter-spacing: 0.5px; padding: 2px 10px; border-radius: 6px;
   margin-right: 8px; border: 1px solid currentColor; }
-.vchip-confirmed { color: var(--confirmed); background: rgba(127, 174, 110, 0.12); }
-.vchip-inferred { color: var(--inferred); background: rgba(199, 154, 74, 0.12); }
-.vchip-hypothesis { color: var(--hypothesis); background: rgba(111, 147, 184, 0.12); }
+.vchip-confirmed { color: var(--confirmed); background: rgba(115, 217, 194, 0.12); }
+.vchip-inferred { color: var(--inferred); background: rgba(255, 215, 106, 0.12); }
+.vchip-hypothesis { color: var(--accent-light); background: rgba(77, 93, 255, 0.12); border-color: var(--hypothesis); }
 
 /* Scorecard */
 .vsc { display: flex; gap: 0; padding: 0; overflow: hidden; }
@@ -255,7 +254,7 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 2.4em 0; }
   font-family: var(--mono); font-size: 0.82em; }
 .vcomp-label { flex: 0 0 220px; color: var(--ink); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; }
-.vcomp-track { flex: 1; height: 14px; background: rgba(236, 230, 218, 0.05);
+.vcomp-track { flex: 1; height: 14px; background: rgba(245, 241, 232, 0.05);
   border-radius: 7px; overflow: hidden; }
 .vcomp-fill { display: block; height: 100%; background: var(--accent);
   border-radius: 7px; }
@@ -271,7 +270,7 @@ hr { border: none; border-top: 1px solid var(--hairline); margin: 2.4em 0; }
 .vseq-item:last-child { padding-bottom: 0; }
 .vseq-dot { position: absolute; left: -7px; top: 4px; width: 11px; height: 11px;
   border-radius: 50%; background: var(--hypothesis); border: 2px solid var(--paper); }
-.vseq-evil .vseq-dot { background: var(--alert); box-shadow: 0 0 0 3px rgba(214, 69, 47, 0.25); }
+.vseq-evil .vseq-dot { background: var(--alert); box-shadow: 0 0 0 3px rgba(255, 98, 87, 0.25); }
 .vseq-ctx .vseq-dot { background: var(--faint); }
 .vseq-time { flex: 0 0 150px; font-family: var(--mono); font-size: 0.76em;
   color: var(--muted); padding-top: 2px; }

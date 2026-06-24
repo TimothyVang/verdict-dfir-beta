@@ -541,4 +541,41 @@ else
   log "SKIP digitalcorpora-lonewolf: set LONEWOLF_URL=<full direct/file:// bundle> and LONEWOLF_SHA256=<sha256> from https://digitalcorpora.org/corpora/scenarios/2018-lone-wolf-scenario/"
 fi
 
+# 6n. Public DFIR backlog candidates — opt-in only.
+#     These are strong direct/hashable dataset candidates from the backlog, not
+#     scoreable goldens until matching docs/goldens/<case-id>/ entries are added.
+#     Point each <NAME>_URL at the exact archive/sample to stage and pin the
+#     same file with <NAME>_SHA256; no bulky evidence is pulled by default.
+for spec in \
+  "DFRWS2023_TROUBLED_ELEVATOR:dfrws-2023-troubled-elevator:https://dfrws.org/forensic-challenges/" \
+  "M57_PATENTS:m57-patents:https://digitalcorpora.org/corpora/scenarios/m57-patents-scenario/" \
+  "DC_2012_NGDC:digitalcorpora-2012-ngdc:https://digitalcorpora.org/corpora/scenarios/2012-ngdc/" \
+  "DC_2019_NARCOS:digitalcorpora-2019-narcos:https://digitalcorpora.org/corpora/scenarios/2019-narcos/" \
+  "DC_2019_OWL:digitalcorpora-2019-owl:https://digitalcorpora.org/corpora/scenarios/2019-owl/" \
+  "DC_2019_TUCK:digitalcorpora-2019-tuck:https://digitalcorpora.org/corpora/scenarios/2019-tuck/" \
+  "MTA_PCAP:malware-traffic-analysis:https://www.malware-traffic-analysis.net/" \
+  "NETRESEC_PCAP:netresec-public-pcap:https://www.netresec.com/?page=PcapFiles" \
+  "MEMLABS_LAB4:memlabs-lab4:https://github.com/stuxnet999/MemLabs" \
+  "MEMLABS_LAB5:memlabs-lab5:https://github.com/stuxnet999/MemLabs" \
+  "MEMLABS_LAB6:memlabs-lab6:https://github.com/stuxnet999/MemLabs"; do
+  name="${spec%%:*}"
+  rest="${spec#*:}"
+  case_id="${rest%%:*}"
+  source_hint="${rest#*:}"
+  url_var="${name}_URL"
+  sha_var="${name}_SHA256"
+  url="${!url_var:-}"
+  expected_sha="${!sha_var:-}"
+
+  if [[ -z "${url}" ]]; then
+    log "SKIP ${case_id}: set ${url_var}=... and ${sha_var}=... from ${source_hint}"
+    continue
+  fi
+  if [[ -z "${expected_sha}" ]]; then
+    log "ERROR: ${url_var} is set but ${sha_var} is missing. Pin the direct fixture SHA-256 before staging ${case_id} from ${source_hint}."
+    exit 1
+  fi
+  fetch_fixture "${url}" "${case_id}/$(basename "${url%%\?*}")" "${expected_sha}"
+done
+
 log "done. See ${SHA_FILE} for checksums."

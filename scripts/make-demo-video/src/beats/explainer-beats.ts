@@ -14,7 +14,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 0,
     endS: 9,
     rubric: "Explainer",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     narration:
       "Let's talk about what VERDICT actually is — and why its answers are ones you can prove, not just ones you have to trust.",
   },
@@ -25,7 +25,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 9,
     endS: 36,
     rubric: "What it is",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     kicker: "What it is",
     headline: "A DFIR agent that shows its work",
     body:
@@ -45,7 +45,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 36,
     endS: 63,
     rubric: "The core loop",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "The core loop",
     headline: "Case → Findings → Verdict",
     body:
@@ -65,9 +65,9 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 63,
     endS: 89,
     rubric: "The tools",
-    accentColor: "#c79a4a",
+    accentColor: "#FFD76A",
     narration:
-      "What it's driving is a typed tool surface — forty-three of them: thirty-one forensic tools in Rust, twelve more in Python for crypto and analysis. And here's the load-bearing design choice. Not one of these tools can run an arbitrary command. There is no shell. Each one answers a single, narrow question, so the agent can be fast without ever being tricked into going off the rails.",
+      "What it's driving is a typed tool surface: Rust forensic tools plus Python helpers for crypto and analysis. And here's the load-bearing design choice. Not one of these tools can run an arbitrary command. There is no shell. Each one answers a single, narrow question, so the agent can be fast without ever being tricked into going off the rails.",
   },
   {
     number: 5,
@@ -76,7 +76,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 89,
     endS: 118,
     rubric: "Chain of custody",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "Chain of custody",
     headline: "A receipt for every claim",
     body:
@@ -96,7 +96,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 118,
     endS: 147,
     rubric: "Verdict words",
-    accentColor: "#d6452f",
+    accentColor: "#FF6257",
     kicker: "What the verdict means",
     headline: "Three words — and what they don't say",
     body:
@@ -116,7 +116,7 @@ export const EXPLAINER_BEATS: Beat[] = [
     startS: 147,
     endS: 158,
     rubric: "Open source",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     narration:
       "VERDICT is open source and ready today. Point it at supported evidence and you get answers in minutes instead of days — with a receipt for every single one.",
   },

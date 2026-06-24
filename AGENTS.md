@@ -46,6 +46,13 @@ Verdict words are scoped:
 - Do not add an `execute_shell` tool. DFIR subprocess behavior must stay behind allow-listed typed tools.
 - Both product servers neutralize attacker-controlled evidence text at the MCP output boundary before it reaches the model (`services/mcp/src/sanitize.rs`, `services/agent_mcp/findevil_agent_mcp/sanitize.py`): chat/role control tokens become an inert `[neutralized:<id>]` marker and Trojan-Source invisible Unicode (BIDI overrides/isolates, zero-width) is stripped. Only JSON string values are touched, so metadata is never mangled; the transform is deterministic so `verify_finding` replay reproduces the same `output_sha256`. Keep the two mirrors in sync and never route evidence text around this boundary.
 
+## Brand And Visual Surface
+
+- The v2 brand bible is `VERDICT_DFIR_SVG_Assets_v2/verdict-brand-board-reconstructed.png`; supporting production assets and rules live in `VERDICT_DFIR_SVG_Assets_v2/` and `docs/brand.md`.
+- Use the v2 palette for dashboard, report, README, GitHub, and Remotion/video surfaces: Midnight Ink `#101426`, Electric Cobalt `#4D5DFF`, Soft Lilac `#B8A8FF`, Paper Cream `#F5F1E8`, Seafoam `#73D9C2`, Signal Coral `#FF6257`, Butter Yellow `#FFD76A`, Near Black `#12131A`.
+- Canonical voice lines are “Show Me the Evidence,” “Evidence over assumption,” “Don't trust the model. Reproduce the finding,” and “Trace it. Test it. Trust it.”
+- Visuals are presentation only. They never create Findings, upgrade confidence, or soften scoped verdict wording.
+
 ## Running VERDICT
 
 Install and verify:

@@ -7,7 +7,7 @@ import { spread } from "./shared/pacing";
 
 // Beat 2 — "The chain of trust." The architecture as an editorial numbered
 // flow rather than boxes-and-arrows: the five trust boundaries run 01–05 down
-// an asymmetric column, each a Fraunces label with a mono sub-line, hairlines
+// an asymmetric column, each a heavy editorial label with a mono sub-line, hairlines
 // between, and two margin annotations. The data (the five layers + their
 // sublabels) is preserved verbatim from the old box diagram.
 
@@ -106,7 +106,7 @@ export function ArchDiagram() {
                   {b.no}
                 </span>
 
-                {/* The boundary name — Fraunces, the editorial voice */}
+                {/* The boundary name — v2 editorial voice */}
                 <span
                   style={{
                     fontFamily: SERIF,

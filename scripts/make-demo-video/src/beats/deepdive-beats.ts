@@ -12,7 +12,7 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 0,
     endS: 16,
     rubric: "Deep dive",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     kicker: "Feature deep dive",
     headline: "Four features — shown actually working",
     body:
@@ -27,7 +27,7 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 16,
     endS: 40,
     rubric: "The verifier",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "Feature 01 — the verifier",
     headline: "It catches its own mistakes",
     body:
@@ -53,7 +53,7 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 40,
     endS: 63,
     rubric: "The dashboard",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     kicker: "Feature 02 — the dashboard",
     headline: "The whole case, live",
     body:
@@ -79,7 +79,7 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 63,
     endS: 90,
     rubric: "Chain of custody",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "Feature 03 — chain of custody",
     headline: "Don't trust it — verify it",
     body:
@@ -105,9 +105,9 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 90,
     endS: 113,
     rubric: "The tools",
-    accentColor: "#c79a4a",
+    accentColor: "#FFD76A",
     narration:
-      "And feature four is the one you don't see flashing on screen, but it underpins all the rest: the tool surface. Forty-three typed tools — thirty-one in Rust, twelve in Python — and not a single one can run an arbitrary command. There is no shell to hijack. That boundary is what lets the agent be fast without ever being dangerous.",
+      "And feature four is the one you don't see flashing on screen, but it underpins all the rest: the tool surface. A narrow typed catalog spans Rust forensic tools and Python crypto-analysis helpers, and not a single one can run an arbitrary command. There is no shell to hijack. That boundary is what lets the agent be fast without ever being dangerous.",
   },
   {
     number: 6,
@@ -116,7 +116,7 @@ export const DEEPDIVE_BEATS: Beat[] = [
     startS: 113,
     endS: 123,
     rubric: "Open source",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     narration:
       "Every one of those features is in the open-source repo, with the same receipts you just watched. Point it at supported evidence and see it for yourself.",
   },

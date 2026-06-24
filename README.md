@@ -3,22 +3,23 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/MCP-compatible-8A2BE2.svg" alt="MCP compatible">
-  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-orange.svg" alt="45 typed read-only tools">
-  <a href="https://timothyvang.github.io/verdict-dfir/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-blue" alt="Documentation"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-4D5DFF.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/MCP-compatible-4D5DFF.svg" alt="MCP compatible">
+  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-FF6257.svg" alt="45 typed read-only tools">
+  <a href="https://timothyvang.github.io/verdict-dfir/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-73D9C2" alt="Documentation"></a>
   <img src="https://img.shields.io/badge/rust-1.88-orange.svg" alt="Rust 1.88">
   <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
   <img src="https://img.shields.io/badge/node-20-green.svg" alt="Node 20">
 </p>
 
-<p align="center"><b>DFIR for agents — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
+<p align="center"><b>Show Me the Evidence — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
 
 <p align="center">
   <a href="https://timothyvang.github.io/verdict-dfir/"><b>Docs</b></a> ·
   <a href="QUICKSTART.md"><b>Quickstart</b></a> ·
   <a href="https://youtu.be/4RQnVden6L8"><b>Demo</b></a> ·
   <a href="docs/architecture.md"><b>Architecture</b></a> ·
+  <a href="docs/brand.md"><b>Brand</b></a> ·
   <a href="docs/contribution-model.md"><b>Contribute</b></a>
 </p>
 
@@ -114,7 +115,12 @@ Public datasets you can download to try VERDICT, mapped to the path each exercis
 | **Nitroba University** (`nitroba.pcap`) | pcap → network triage | [digitalcorpora.org · Nitroba](https://digitalcorpora.org/corpora/scenarios/nitroba-university-harassment-scenario/) |
 | **NIST CFReDS** (disk, memory, mobile, more) | mixed | [cfreds.nist.gov](https://cfreds.nist.gov/) |
 | **Digital Corpora** (M57-Patents, scenarios) | disk / pcap | [digitalcorpora.org](https://digitalcorpora.org/) |
+| **Digital Corpora scenario backlog** (2012-ngdc, 2019-narcos, 2019-owl, 2019-tuck) | disk / mobile / mixed | [digitalcorpora.org · scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| **Digital Corpora parser corpora** (Android/iOS, NPS disk images, SQLite Forensic Corpus) | mobile / disk / SQLite | [digitalcorpora.org · corpora](https://digitalcorpora.org/corpora/) |
+| **DFRWS challenge backlog** (Troubled Elevator, IoT, multisource challenges) | disk / memory / network / IoT | [dfrws.org · forensic challenges](https://dfrws.org/forensic-challenges/) |
+| **Public PCAP exercise indexes** | pcap → network triage | [Malware-Traffic-Analysis.net](https://www.malware-traffic-analysis.net/) · [Netresec PCAP files](https://www.netresec.com/?page=PcapFiles) |
 | **Memory samples** (Volatility-style) | memory → `vol_*` | [github.com/pinesol93/MemoryForensicSamples](https://github.com/pinesol93/MemoryForensicSamples) |
+| **Memory CTF / sample backlog** (Volatility samples, MemLabs 4-6) | memory → `vol_*` | [Volatility Memory Samples](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples) · [MemLabs](https://github.com/stuxnet999/MemLabs) |
 | **Curated image / CTF lists** | everything | [DFIR.Training test images](https://www.dfir.training/downloads/test-images) · [AboutDFIR Challenges & CTFs](https://aboutdfir.com/education/challenges-ctfs/) · ["Where to find DFIR images" — soji256](https://soji256.medium.com/where-can-you-find-images-that-you-can-use-to-learn-forensics-141c6c8cdc9e) · [awesome-forensics](https://github.com/cugu/awesome-forensics) |
 
 **SANS DFIR.** The [SANS SIFT Workstation](https://www.sans.org/tools/sift-workstation) — VERDICT's recommended disk-image parity path — is a free download from the [SANS DFIR community page](https://digital-forensics.sans.org/community/downloads). Note: the enterprise multi-host scenario in our own showcase (a domain controller + file server, the kind used in [SANS FOR508](https://www.sans.org/cyber-security-courses/advanced-incident-response-threat-hunting-training)-style labs) is course lab material and **is not publicly redistributable** — use the public datasets above to reproduce that class of investigation.
@@ -153,7 +159,7 @@ interpretation; that stays the examiner's call.
 
 ## See it run
 
-Every capture below is a real run, not a mockup. Full gallery: [`docs/showcase/`](docs/showcase/).
+Every capture below is from a real VERDICT run, not a mockup — except the fact-fidelity clip, which replays a recorded tool output to isolate the real decision logic (flagged at that clip). Full gallery: [`docs/showcase/`](docs/showcase/).
 
 <p align="center">
   <img src="docs/showcase/dashboard-live.gif" alt="VERDICT live dashboard streaming the hash-chained audit, tool-cited findings, and the signed verdict during a real run" width="760">
@@ -265,9 +271,11 @@ claims require at least two artifact classes.
 > **Maturity note.** The long-tail verbs (`vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`,
 > `cloud_audit`, `journalctl_query`, `login_accounting`, `ausearch`, `nfdump_query`, `suricata_eve`,
 > `indx_parse`) are typed, allow-listed, and unit-tested against fixtures, but not yet exercised on
-> real evidence in a committed run. Committed sample runs prove the core
-> disk/registry/EVTX/MFT/Prefetch/YARA/USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and
-> `browser_history` paths.
+> real evidence in a committed run. Committed sample runs exercise the core disk / registry / EVTX /
+> MFT / Prefetch / Hayabusa / USN / PCAP and `vol_*` memory paths (each with a real tool call in a
+> committed `audit.jsonl`; see [Results](#results-whats-proven)). `yara_scan`, `sysmon_network_query`,
+> `zeek_summary`, `vel_collect`, and `browser_history` are typed and fixture-tested but not yet in a
+> committed real-evidence run.
 
 ## Architecture
 
@@ -308,7 +316,7 @@ Details: [`docs/fact-fidelity.md`](docs/fact-fidelity.md).
 <p align="center">
   <img src="docs/showcase/fact-fidelity-demo.gif" alt="Fact-fidelity demo: an honest finding is approved while an injected misread is rejected before it reaches the verdict" width="760">
 </p>
-<p align="center"><sub>A <b>real run</b> — the compiled <code>findevil-mcp</code> re-runs the cited tool on real evidence: an honest finding is <b>approved</b>, an injected misread is <b>rejected</b> before it can reach the verdict. Full-resolution <a href="docs/showcase/fact-fidelity-demo.mp4">mp4</a>.</sub></p>
+<p align="center"><sub>A demo of the <b>real</b> verifier + fact-fidelity (entailment) code: an honest finding is <b>approved</b>, an injected misread is <b>rejected</b> before it can reach the verdict. The decision is production code; the cited tool's re-run is <b>replayed from its recorded output</b> (no live MCP or evidence in this clip). For the same check firing on <b>real evidence</b> in a committed, offline-verifiable run, see <a href="docs/release-evidence/sample-run/">docs/release-evidence/sample-run/</a> (<code>entailment_ok: true</code>). Full-resolution <a href="docs/showcase/fact-fidelity-demo.mp4">mp4</a>.</sub></p>
 
 ## Capabilities
 
@@ -352,22 +360,23 @@ execution trace for reviewer spot-checks lives in
 [`docs/release-evidence/`](docs/release-evidence/): Finding `f-A-evtx-audit-log-cleared` maps to
 `evtx_query` tool call `tc-002`, with verifier replay and token usage recorded.
 
-## Results: what's proven
+## Results: what's reproducible
 
 VERDICT is scored on two axes against published answer keys: does it surface known activity, and does
-it refuse to overclaim when coverage is thin. Every number below is committed and reproducible with
-`scripts/score-recall.py`; full method and caveats in [`docs/accuracy-report.md`](docs/accuracy-report.md).
+it refuse to overclaim when coverage is thin. The scored rows below have committed receipts and are
+reproducible with `scripts/score-recall.py`; full method and caveats are in
+[`docs/accuracy-report.md`](docs/accuracy-report.md).
 
 | Case | Evidence | Recall (bar) | Run verdict | What it shows |
 |---|---|---|---|---|
 | **Nitroba** | network (PCAP) | **5/5 = 100%** (80%) | `INDETERMINATE` | Full network-evidence recall with no over-attribution. All five golden facts surfaced; attribution stays `INFERRED` / `HYPOTHESIS`, so the verdict scopes down. The strongest single result. |
 | **NIST Hacking Case** | disk (Windows XP) | **7/14 = 50%** (5/14 floor; bar 71%) | `SUSPICIOUS` | 8 CONFIRMED tool-artifact findings, including Prefetch-backed tool-use evidence with corroboration details in the report; shellbag staging, LNK and Recycle-Bin traces, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU. Below the bar, up from 1/14. Seven misses (search / USB / email / browser history, XP `.evt`, thumbcache, named-pipe) **published, not hidden**. |
-| **synthetic-benign** | negative control | 0 findings | `NO_EVIL` | False-positive floor: a benign image stays `NO_EVIL`. |
-| **alihadi-09-encrypt** | disk (FP control) | `INDETERMINATE` expected | (expected) | Dual-use crypto is not proof; an overconfident `SUSPICIOUS` fails the scorer. |
 
 Of 10 scoreable goldens, **1 is fully scored and passing** (Nitroba) and **1 is scored and
 failing-but-improving** (NIST); the other 8 are fixture-staged and **not yet run, with no number
-fabricated**. NIST recall is run-dependent (5/14 floor, 7/14 best committed).
+fabricated**. Staged controls include `synthetic-benign` (expected `NO_EVIL` / 0 findings) and
+`alihadi-09-encrypt` (dual-use crypto should not become an overconfident `SUSPICIOUS`). NIST recall is
+run-dependent (5/14 floor, 7/14 best committed).
 
 ### Artifact classes proven on committed runs
 
@@ -387,12 +396,8 @@ typed and fixture-tested, **not yet exercised on real evidence in a committed ru
 
 ### Wins, with the receipt
 
-**Evil caught with full custody, zero LLM calls.** A fresh deterministic run on the public `EID 1102`
+**Suspicious log clearing caught with full custody, zero LLM calls.** A fresh deterministic run on the public `EID 1102`
 Security-log-clear fixture, signed and offline-verifiable:
-
-<p align="center">
-  <img src="docs/showcase/results-report-eid1102.png" alt="VERDICT forensic report: a SUSPICIOUS verdict on a confirmed Security audit-log clearing (EID 1102, T1070.001) with the cryptographic attestation block (audit-log final hash and Merkle root)" width="760">
-</p>
 
 ```text
 seq  1  tool_call_start   case_open    tc-001
@@ -412,10 +417,6 @@ Run it and compare.
 
 **Custody you can verify offline.** Every run seals into a hash-chained `audit.jsonl`, a Merkle root
 over canonical tool outputs, and an ed25519-signed manifest:
-
-<p align="center">
-  <img src="docs/showcase/results-custody-chain.png" alt="Cryptographic chain of custody: hash-chained audit.jsonl records and per-output Merkle leaves folding into the ed25519-signed run.manifest.json" width="760">
-</p>
 
 ```text
 manifest_verify : overall true · audit_chain_ok · leaf_count_ok · merkle_root_ok · entailment_ok · ed25519 signature_verified

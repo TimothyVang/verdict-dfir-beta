@@ -5,6 +5,9 @@
 
 # Keep generated source archives focused on the public runtime/docs surface.
 /.agents/** export-ignore
+# Dev-only push guard (blocks direct pushes to the public beta/release repos);
+# not part of the public source surface.
+/.githooks/** export-ignore
 # Ignore the PRIVATE .claude subdirs individually — do NOT export-ignore all of
 # /.claude/**, or git archive prunes the whole subtree before it sees a
 # -export-ignore re-include, dropping .claude/skills/ (the public /verdict skill).

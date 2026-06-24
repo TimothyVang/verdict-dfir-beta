@@ -3,39 +3,37 @@
 import React from "react";
 
 // ---------------------------------------------------------------------------
-// VERDICT design system — single source of truth for every polished dashboard
-// panel. Ported 1:1 from scripts/make-demo-video/src/ (Remotion scenes) into a
-// Remotion-free, self-contained client module. Inline styles only, matching the
-// video components. GitHub-dark neutral scaffold + 5 semantic accents.
+// VERDICT v2 brand system — single source of truth for every polished dashboard
+// panel. Mirrors the brand bible at
+// VERDICT_DFIR_SVG_Assets_v2/verdict-brand-board-reconstructed.png and the
+// Remotion tokens in scripts/make-demo-video/src/components/shared/editorial.ts.
 // ---------------------------------------------------------------------------
 
-/** Color tokens — editorial "forensic case file" palette (mirrors the demo's
- *  scripts/make-demo-video/src/components/shared/editorial.ts). Warm near-black
- *  paper, cream ink, one brand accent + one alert, three desaturated confidence
- *  tiers. Key names are unchanged so all inline call-sites cascade for free. */
+/** Color tokens — v2 editorial evidence palette. Use one semantic accent per
+ *  composition: Seafoam=verified, Coral=rejected, Butter=review, Cobalt/Lilac=brand. */
 export const VERDICT = {
-  bg: "#0e0c10", // warm near-black "paper"
-  surface: "#161318", // raised exhibit panel
-  surfaceInset: "#0b0a0d", // code/quote block — a touch darker than paper
-  border: "#2b2620", // editorial hairline
-  borderSubtle: "#211d18", // fainter hairline
-  text: "#ece6da", // warm cream ink (not pure white)
-  muted: "#8c8576", // captions / furniture
-  mutedDark: "#544f48", // hairline-adjacent text
-  faint: "#2b2620",
+  bg: "#101426", // Midnight Ink
+  surface: "#12131A", // Near Black raised panel
+  surfaceInset: "#0C1020", // darker code/quote block
+  border: "#27304A", // editorial hairline on dark fields
+  borderSubtle: "#1B2136", // fainter hairline
+  text: "#F5F1E8", // Paper Cream ink
+  muted: "#B8A8FF", // Soft Lilac captions / furniture
+  mutedDark: "#7F789C", // subdued secondary text
+  faint: "#27304A",
   // Semantic accents (never use decoratively against their meaning):
-  confirmed: "#7fae6e", // green  = CONFIRMED / verified / clean / pass
-  inferred: "#c79a4a", // amber  = INFERRED / warning / running
-  hypothesis: "#6f93b8", // blue   = HYPOTHESIS / info / FRE-note
-  accentPurple: "#9b59b6", // purple = brand / crypto / Merkle / MITRE
-  accentPurpleLight: "#b98fce",
-  alertRed: "#d6452f", // red    = ERROR / contradiction / alert / flagged
+  confirmed: "#73D9C2", // Seafoam = VERIFIED / replay matched / pass
+  inferred: "#FFD76A", // Butter Yellow = review / note / attention
+  hypothesis: "#4D5DFF", // Electric Cobalt = hypothesis / info / brand-active
+  accentPurple: "#4D5DFF", // legacy key: Electric Cobalt brand accent
+  accentPurpleLight: "#B8A8FF", // Soft Lilac secondary brand accent
+  alertRed: "#FF6257", // Signal Coral = rejected / contradiction / failure
   // Per-beat section-accent extras (only place these appear):
-  beatTeal: "#1abc9c",
-  beatOrange: "#e67e22",
-  beatSlate: "#2c3e50",
-  white: "#ece6da", // retire pure white → ink (no harsh white on paper)
-  gridLine: "rgba(236,230,218,0.035)",
+  beatTeal: "#73D9C2",
+  beatOrange: "#FFD76A",
+  beatSlate: "#B8A8FF",
+  white: "#F5F1E8",
+  gridLine: "rgba(245,241,232,0.04)",
 } as const;
 
 /** The single font stack used across the ENTIRE UI, wordmark included.
@@ -44,10 +42,10 @@ export const VERDICT = {
 export const MONO =
   "var(--font-jbm), 'JetBrains Mono', 'Courier New', monospace";
 
-/** Editorial display serif (Fraunces) — mastheads/headlines/panel titles ONLY,
- *  at display sizes (>=22px). Never body copy, rows, or small captions. */
+/** Legacy SERIF alias kept for call-site compatibility. In v2 it resolves to the
+ *  heavy editorial sans, not a serif, matching the brand board. */
 export const SERIF =
-  "var(--font-fraunces), 'Fraunces', Georgia, 'Times New Roman', serif";
+  "var(--font-archivo), 'Archivo', Impact, system-ui, sans-serif";
 
 /** Editorial grotesque (Archivo) — kickers, labels, nav, furniture, section
  *  headings, chips. The "furniture" voice between serif headlines and mono data. */
@@ -68,18 +66,18 @@ interface ChipColors {
 
 /** Chip taxonomy: 15% alpha fill, solid full-accent border, full-accent text. */
 export const CHIP_COLORS: Record<ChipVariant, ChipColors> = {
-  CONFIRMED: { bg: "rgba(127,174,110,0.15)", border: VERDICT.confirmed, text: VERDICT.confirmed },
-  INFERRED: { bg: "rgba(199,154,74,0.15)", border: VERDICT.inferred, text: VERDICT.inferred },
-  HYPOTHESIS: { bg: "rgba(111,147,184,0.15)", border: VERDICT.hypothesis, text: VERDICT.hypothesis },
-  MITRE: { bg: "rgba(155,89,182,0.15)", border: VERDICT.accentPurple, text: VERDICT.accentPurple },
-  ERROR: { bg: "rgba(214,69,47,0.15)", border: VERDICT.alertRed, text: VERDICT.alertRed },
+  CONFIRMED: { bg: "rgba(115,217,194,0.15)", border: VERDICT.confirmed, text: VERDICT.confirmed },
+  INFERRED: { bg: "rgba(255,215,106,0.15)", border: VERDICT.inferred, text: VERDICT.inferred },
+  HYPOTHESIS: { bg: "rgba(77,93,255,0.15)", border: VERDICT.hypothesis, text: VERDICT.accentPurpleLight },
+  MITRE: { bg: "rgba(77,93,255,0.15)", border: VERDICT.accentPurple, text: VERDICT.accentPurpleLight },
+  ERROR: { bg: "rgba(255,98,87,0.15)", border: VERDICT.alertRed, text: VERDICT.alertRed },
 };
 
 /** Confidence-label color map (used outside chips too: audit rows, terminal text). */
 export const CONFIDENCE_COLOR: Record<string, string> = {
   CONFIRMED: VERDICT.confirmed,
   INFERRED: VERDICT.inferred,
-  HYPOTHESIS: VERDICT.hypothesis,
+  HYPOTHESIS: VERDICT.accentPurpleLight,
 };
 
 /** Resolve a confidence string to its semantic color, falling back to muted. */
@@ -107,7 +105,7 @@ export function GridOverlay({ opacity = 0.04 }: GridOverlayProps) {
         pointerEvents: "none",
         opacity,
         backgroundImage:
-          "linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)",
+          "linear-gradient(rgba(245,241,232,0.65) 1px, transparent 1px), linear-gradient(90deg, rgba(245,241,232,0.65) 1px, transparent 1px)",
         backgroundSize: "60px 60px",
       }}
     />
@@ -133,7 +131,7 @@ export function RadialGlow({ alpha = 0.14, position = "50% 45%" }: RadialGlowPro
         position: "absolute",
         inset: 0,
         pointerEvents: "none",
-        background: `radial-gradient(ellipse at ${position}, rgba(155,89,182,${alpha}) 0%, transparent 65%)`,
+          background: `radial-gradient(ellipse at ${position}, rgba(77,93,255,${alpha}) 0%, rgba(184,168,255,${alpha * 0.45}) 35%, transparent 65%)`,
       }}
     />
   );
@@ -300,8 +298,8 @@ interface PanelTitleProps {
   style?: React.CSSProperties;
 }
 
-/** Title block: serif display H1 in ink with a muted MONO subtitle 6-8px below.
- *  Title is Fraunces (display); subtitle stays JetBrains Mono (it's metadata). */
+/** Title block: heavy editorial H1 in ink with a muted MONO subtitle 6-8px below.
+ *  Title uses Archivo display; subtitle stays JetBrains Mono (it's metadata). */
 export function PanelTitle({ title, subtitle, size = 28, letterSpacing = -0.5, style }: PanelTitleProps) {
   return (
     <div style={style}>
@@ -357,7 +355,7 @@ interface HashBeadProps {
   hash: string;
   /** Previous record hash (mono, 11px #30363d). */
   prevHash: string;
-  /** Audit record kind, rendered in purple (#9b59b6). */
+  /** Audit record kind, rendered in Electric Cobalt. */
   kind?: string;
   /** Right-aligned confidence label, colored by semantic map. */
   confidence?: string;
@@ -378,8 +376,8 @@ export function HashBead({ hash, prevHash, kind, confidence, highlight, dim, sty
         gap: 12,
         padding: "8px 16px",
         borderRadius: RADIUS.pill,
-        background: highlight ? "rgba(155,89,182,0.12)" : "rgba(22,19,24,0.8)",
-        border: highlight ? "1px solid rgba(155,89,182,0.5)" : `1px solid ${VERDICT.border}`,
+        background: highlight ? "rgba(77,93,255,0.12)" : "rgba(18,19,26,0.84)",
+        border: highlight ? "1px solid rgba(77,93,255,0.5)" : `1px solid ${VERDICT.border}`,
         opacity: dim ? 0.35 : 1,
         fontFamily: MONO,
         fontSize: 14,
@@ -401,7 +399,8 @@ export function HashBead({ hash, prevHash, kind, confidence, highlight, dim, sty
 }
 
 // ---------------------------------------------------------------------------
-// BrandMark — check-as-V: cream check in a purple ring (from OutroScene).
+// BrandMark — v2 evidence-path V: cobalt and lilac branches converge into one
+// decision node. Keep in sync with VERDICT_DFIR_SVG_Assets_v2/svg_assets.
 // ---------------------------------------------------------------------------
 
 interface BrandMarkProps {
@@ -409,14 +408,14 @@ interface BrandMarkProps {
   size?: number;
   /** Show the "VERDICT" wordmark beside the mark. */
   withWordmark?: boolean;
-  /** Show the "DFIR at machine speed." tagline under the wordmark. */
+  /** Show the brand-bible tagline under the wordmark. */
   withTagline?: boolean;
   /** Lay the mark + wordmark vertically (hero) instead of inline. */
   vertical?: boolean;
   style?: React.CSSProperties;
 }
 
-/** Inline-SVG check-as-V brand mark, ported from OutroScene. */
+/** Inline SVG evidence-path V mark, sized to fit the existing square slot. */
 export function BrandMark({
   size = 96,
   withWordmark = false,
@@ -435,16 +434,16 @@ export function BrandMark({
         ...style,
       }}
     >
-      <svg width={size} height={size} viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg" aria-label="VERDICT logo">
-        <circle cx="40" cy="40" r="38" fill="#161318" stroke="#9b59b6" strokeWidth="2" />
-        <polyline
-          points="23,40 35,54 60,24"
-          fill="none"
-          stroke="#ece6da"
-          strokeWidth="8"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
+      <svg width={size} height={size} viewBox="0 0 120 136" xmlns="http://www.w3.org/2000/svg" aria-label="VERDICT logo">
+        <path d="M17 18 L31 12 L63 91 L50 103 Z" fill={VERDICT.accentPurple} />
+        <path d="M103 18 L89 12 L57 91 L70 103 Z" fill={VERDICT.accentPurpleLight} />
+        <circle cx="24" cy="18" r="14" fill={VERDICT.accentPurple} />
+        <circle cx="24" cy="18" r="7" fill={VERDICT.text} />
+        <circle cx="96" cy="18" r="14" fill={VERDICT.accentPurpleLight} />
+        <circle cx="96" cy="18" r="7" fill={VERDICT.text} />
+        <circle cx="60" cy="96" r="15" fill={VERDICT.text} />
+        <circle cx="60" cy="96" r="10" fill={VERDICT.bg} />
+        <rect x="56" y="108" width="8" height="28" rx="4" fill={VERDICT.bg} />
       </svg>
       {withWordmark && (
         <div style={{ display: "flex", flexDirection: "column", alignItems: vertical ? "center" : "flex-start" }}>
@@ -462,7 +461,7 @@ export function BrandMark({
                 marginTop: 8,
               }}
             >
-              DFIR at machine speed.
+              Evidence, not assumption.
             </span>
           )}
         </div>
@@ -554,7 +553,7 @@ interface SerifHeadlineProps {
   style?: React.CSSProperties;
 }
 
-/** Fraunces display headline (mastheads/H1). Static port of KineticHeadline. */
+/** Heavy editorial sans headline (mastheads/H1). Static port of KineticHeadline. */
 export function SerifHeadline({ children, size = 40, color = VERDICT.text, italic = false, weight = 600, style }: SerifHeadlineProps) {
   return (
     <div
@@ -738,8 +737,8 @@ export function CaseFurnitureHeader() {
   return (
     <div style={{ padding: "14px 32px 0", position: "relative", zIndex: 1 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", maxWidth: 1600, margin: "0 auto", ...label }}>
-        <span>Verdict — DFIR Case File</span>
-        <span style={{ letterSpacing: 4 }}>A Forensic Case File</span>
+        <span>VERDICT — Truth in the Trace</span>
+        <span style={{ letterSpacing: 4 }}>Show Me the Evidence</span>
       </div>
       <div style={{ maxWidth: 1600, margin: "10px auto 0", height: 1, background: VERDICT.border }} />
     </div>
@@ -760,8 +759,8 @@ export function CaseFurnitureFooter() {
     <div style={{ padding: "0 32px 20px", marginTop: 48, position: "relative", zIndex: 1 }}>
       <div style={{ maxWidth: 1600, margin: "0 auto 10px", height: 1, background: VERDICT.border }} />
       <div style={{ display: "flex", justifyContent: "space-between", maxWidth: 1600, margin: "0 auto", ...label }}>
-        <span>VERDICT · DFIR at machine speed</span>
-        <span>Apache-2.0 · signed manifest</span>
+        <span>Evidence over assumption</span>
+        <span>Reproducible · transparent · defensible</span>
       </div>
     </div>
   );

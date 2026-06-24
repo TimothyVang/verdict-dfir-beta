@@ -11,7 +11,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 0,
     endS: 8,
     rubric: "Quickstart",
-    accentColor: "#7fae6e",
+    accentColor: "#73D9C2",
     narration:
       "Here's the whole thing, start to finish — from a fresh checkout to a signed verdict, in two commands.",
   },
@@ -22,7 +22,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 8,
     endS: 27,
     rubric: "Step 1 — setup",
-    accentColor: "#7fae6e",
+    accentColor: "#73D9C2",
     kicker: "Step 1 — setup",
     headline: "One command to set up",
     body:
@@ -38,7 +38,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 27,
     endS: 52,
     rubric: "Step 2 — run",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "Step 2 — run a case",
     headline: "Point it at evidence",
     body:
@@ -54,7 +54,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 52,
     endS: 81,
     rubric: "The outputs",
-    accentColor: "#c79a4a",
+    accentColor: "#FFD76A",
     kicker: "The outputs",
     headline: "What lands when it finishes",
     body:
@@ -75,7 +75,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 81,
     endS: 97,
     rubric: "Interactive",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     kicker: "Interactive mode",
     headline: "Prefer to drive it by hand?",
     body:
@@ -91,7 +91,7 @@ export const QUICKSTART_BEATS: Beat[] = [
     startS: 97,
     endS: 107,
     rubric: "Done",
-    accentColor: "#7fae6e",
+    accentColor: "#73D9C2",
     narration:
       "That's the whole loop — setup once, point it at evidence, read the signed result. Open source, and ready to run today.",
   },

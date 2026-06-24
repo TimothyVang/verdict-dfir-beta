@@ -347,7 +347,10 @@ def verify_manifest(
       * ``signature_present``: True if ``signature`` is non-empty.
       * ``signature_verified``: True only for a cryptographically verified
         Ed25519 manifest; Sigstore and stub return explicit reason strings.
-      * ``overall``: AND of the above.
+      * ``overall``: chain + Merkle root + leaf count verify and a signature
+        bundle is present, and no present signature failed verification
+        (``stub`` / recorded ``sigstore`` are advisory). ``signature_verified``
+        and ``entailment_ok`` are reported as separate side-signals.
     """
     obj = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -436,11 +439,22 @@ def verify_manifest(
         except AuditLogError as exc:
             entailment_status = f"entailment re-check could not read the audit log: {exc}"
 
-    # `overall` stays presence-based (chain + merkle + count + a bundle exists)
-    # so dev/offline stub runs — every committed sample run — still verify
-    # end-to-end. `signature_verified` is the separate, honest crypto signal.
+    # `overall` requires the chain, Merkle root, and leaf count to verify and a
+    # signature bundle to be present. A `stub` (dev/offline placeholder) or a
+    # recorded `sigstore` bundle is advisory — it does not gate `overall`, so
+    # dev/offline stub runs still verify end-to-end. But a signature that is
+    # present and was cryptographically checked yet did NOT verify (a forged or
+    # corrupted `ed25519` bundle, or an unknown signer kind) is a hard failure:
+    # `overall` must not stay true for a signature that fails verification.
+    # `signature_verified` remains the separate, field-level crypto signal.
+    advisory_sig_kinds = ("stub", "sigstore")
+    sig_failed = sig_present and sig_kind not in advisory_sig_kinds and sig_verified is not True
     overall = (
-        audit_status is True and rebuild_status is True and count_status is True and sig_present
+        audit_status is True
+        and rebuild_status is True
+        and count_status is True
+        and sig_present
+        and not sig_failed
     )
     return ManifestVerification(
         audit_chain_ok=audit_status,

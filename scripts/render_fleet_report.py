@@ -52,24 +52,22 @@ CHROME = _resolve_bin(
 )
 
 # --------------------------------------------------------------------------- #
-# Design tokens — the dark "forensic case file" theme, in sync with
-# scripts/_report_style.css so the figures sit flush inside the dark report
-# (white-background charts looked out of place against the cream-on-near-black
-# paper). Editorial / threat-intel-briefing figure language.
+# Design tokens — VERDICT v2 brand theme, in sync with scripts/_report_style.css
+# so fleet figures sit flush inside the dark evidence-lab report.
 # --------------------------------------------------------------------------- #
-PAPER = "#0e0c10"
-SURFACE = "#161318"
-INSET = "#0b0a0d"
-INK = "#ece6da"
-MUTED = "#8c8576"
-FAINT = "#544f48"
-HAIRLINE = "#2b2620"
-ACCENT = "#9b59b6"  # purple brand
-ACCENT_LIGHT = "#b98fce"
-ALERT = "#d6452f"  # red — strongest signal
-INFERRED = "#c79a4a"  # amber
-HYPOTHESIS = "#6f93b8"  # blue
-CONFIRMED = "#7fae6e"  # green
+PAPER = "#101426"
+SURFACE = "#12131A"
+INSET = "#0C1020"
+INK = "#F5F1E8"
+MUTED = "#B8A8FF"
+FAINT = "#7F789C"
+HAIRLINE = "#27304A"
+ACCENT = "#4D5DFF"  # Electric Cobalt brand
+ACCENT_LIGHT = "#B8A8FF"
+ALERT = "#FF6257"  # Signal Coral — rejected / flagged
+INFERRED = "#FFD76A"  # Butter Yellow — review / attention
+HYPOTHESIS = "#4D5DFF"  # Electric Cobalt — hypothesis / info
+CONFIRMED = "#73D9C2"  # Seafoam — verified / pass
 FIG_BG = SURFACE  # margins included, so the PNG is dark to the edge
 
 SANS = "DejaVu Sans"

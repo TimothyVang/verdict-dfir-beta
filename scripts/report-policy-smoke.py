@@ -550,7 +550,7 @@ def main() -> int:
                 "pool_origin": "A",
                 "mitre_technique": "T1014",
                 "tool_call_id": "tc-psscan",
-                "artifact_path": "memory.img",
+                "artifact_path": "/home/operator/.findevil/cases/case-report-smoke/extracted/disk/disk-extract-abc/prefetch/WINDOWS/Prefetch/CAIN.EXE-23D61279.pf",
                 "description": "Process-view | divergence with `tick`\nand newline requires expert review.",
             }
         ]
@@ -1562,6 +1562,12 @@ def main() -> int:
         (
             "evidence path cannot inject image markdown",
             "![x](file:///etc/passwd)" not in text,
+        ),
+        (
+            "finding artifact display strips operator path",
+            "/home/operator/.findevil" not in text
+            and "case-extracted://disk-extract-abc/prefetch/WINDOWS/Prefetch/CAIN.EXE-23D61279.pf"
+            in text,
         ),
         (
             "legacy manifest command absent",

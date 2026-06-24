@@ -83,7 +83,7 @@ $python = Get-PythonCommand
 "=========================================="
 
 $rustMcpSmoke = @{
-    Label = "rust-mcp-smoke (31-tool catalog + core error paths)"
+    Label = "rust-mcp-smoke (32-tool catalog + core error paths)"
     Command = { & $python scripts/rust-mcp-smoke.py --release }
     Prereq = {
         $releaseDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo "target" }

@@ -223,6 +223,7 @@ def main() -> int:
                 "vol_psxview",
                 "vol_run",
                 "ez_parse",
+                "oe_dbx_parse",
                 "plaso_parse",
                 "mac_triage",
                 "cloud_audit",

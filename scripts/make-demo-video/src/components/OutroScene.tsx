@@ -6,7 +6,8 @@ import { Scene } from "./shared/Scene";
 
 // Beat 9 (colophon) — "Case closed." The closing page set as a magazine
 // colophon: a Case Closed stamp hit over the disposition, the VERDICT logotype
-// small in Fraunces, and the credits run as a left-aligned grotesque/mono
+// small in the v2 heavy editorial sans, and the credits run as a left-aligned
+// grotesque/mono
 // colophon block under a RuleLine. No centered metadata stack, no tech-grid.
 
 // Real credit lines preserved from the prior scene — set as label/value pairs
@@ -37,7 +38,7 @@ export function OutroScene() {
             <Stamp label="Case Closed" frame={frame} delay={14} color={C.alert} rotate={-6} size={34} />
           </div>
 
-          {/* The VERDICT logotype — Fraunces, small, with its creed beneath. */}
+          {/* The VERDICT logotype — v2 heavy editorial sans with its creed beneath. */}
           <div style={{ marginTop: 8 }}>
             <KineticHeadline text="Verdict" frame={frame} delay={26} size={108} weight={900} />
           </div>
@@ -46,14 +47,13 @@ export function OutroScene() {
               marginTop: 14,
               opacity: interpolate(frame - 48, [0, 16], [0, 1], clampOpts),
               fontFamily: SERIF,
-              fontStyle: "italic",
               fontSize: 32,
-              fontWeight: 400,
+              fontWeight: 700,
               color: C.inkMuted,
               letterSpacing: -0.3,
             }}
           >
-            DFIR at machine speed.
+            Evidence, not assumption.
           </div>
 
           {/* The creed, set as small caps grotesque furniture. */}
@@ -70,7 +70,7 @@ export function OutroScene() {
                 color: C.ink,
               }}
             >
-              Investigate · Verify · Prove
+              Trace it · Test it · Trust it
             </span>
           </div>
         </div>

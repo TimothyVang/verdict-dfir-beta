@@ -143,12 +143,13 @@ behind expert review. Do not downgrade this blocker without an explicit policy c
 
 ## 6. Styling & dependencies
 
-`scripts/_report_style.css` drives the entire look — warm near-black paper, cream ink,
-JetBrains Mono / Fraunces / Archivo type, the purple brand accent, and the
-green/amber/blue confidence color system (CONFIRMED / INFERRED / HYPOTHESIS). pandoc is
-pointed at it via `--css`. To restyle the report, edit that one file and re-render; it
-is kept in sync with the `_DEFAULT_CSS` fallback baked into `render_report.py` (used
-only if the CSS file is missing).
+`scripts/_report_style.css` drives the entire look — Midnight Ink, Paper Cream,
+Archivo / JetBrains Mono type, Electric Cobalt and Soft Lilac brand accents, and
+the Seafoam / Butter Yellow / Electric Cobalt semantic confidence colors
+(`CONFIRMED` / `INFERRED` / `HYPOTHESIS`). pandoc is pointed at it via `--css`.
+To restyle the report, edit that one file and re-render; it is kept in sync with
+the `_DEFAULT_CSS` fallback baked into `render_report.py` (used only if the CSS
+file is missing). The canonical visual rules are in [`../brand.md`](../brand.md).
 
 **pandoc is required** for any HTML or PDF output. If pandoc is not found (and no
 `PANDOC_BIN` override resolves), the renderer prints a warning and **skips the render**

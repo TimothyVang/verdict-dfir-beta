@@ -24,6 +24,7 @@ what an agent did.
 | Interpret verdict words | [Verdict Semantics](verdict-semantics.md) |
 | Check measured accuracy | [Accuracy Report](accuracy-report.md) |
 | Inspect the tool surface | [MCP Servers and Tools](reference/mcp-and-tools.md) |
+| Use the visual system | [VERDICT Brand](brand.md) |
 
 ## Canonical Repository
 
@@ -37,3 +38,10 @@ remote and should not be treated as a separate product release channel.
 Every reportable Finding must cite a current-case `tool_call_id`. The verifier
 re-runs the cited tool, compares output hashes, and blocks uncited or drifting
 Findings before the final Verdict is signed.
+
+## Visual System
+
+The v2 brand bible is `VERDICT_DFIR_SVG_Assets_v2/verdict-brand-board-reconstructed.png`.
+Dashboard, report, GitHub, and video surfaces should use the production assets
+and palette documented in [VERDICT Brand](brand.md). Visual styling is presentation
+only and never upgrades confidence or creates Findings.

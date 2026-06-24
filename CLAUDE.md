@@ -104,6 +104,10 @@ Do not add a broad filesystem, shell, Docker, Kubernetes, browser, GitHub, fetch
 
 Both product servers neutralize attacker-controlled evidence text at the MCP output boundary before it reaches the model (`services/mcp/src/sanitize.rs` for Rust, `services/agent_mcp/findevil_agent_mcp/sanitize.py` for Python). The sanitizer replaces chat/role control tokens (`<|im_start|>`, `[INST]`, `<<SYS>>`, …) with an inert `[neutralized:<id>]` marker and strips invisible Unicode that hides or reorders text (BIDI overrides/isolates and zero-width code points — the Trojan Source class), stripping the invisible code points first so a token cannot be split to evade matching. Only JSON string values are touched, so tool-derived metadata (hashes, counts, enums, timestamps, IDs) is never mangled, and only counts are logged so the record cannot re-leak the payload. Sanitization is deterministic: a `verify_finding` replay reproduces the same `output_sha256`, so the audit chain attests exactly what the model saw. Keep the two mirrors in sync and keep the transform deterministic; never route evidence text around this boundary.
 
+## Brand And Visual Surface
+
+The v2 brand bible is `VERDICT_DFIR_SVG_Assets_v2/verdict-brand-board-reconstructed.png`; supporting production assets and rules live in `VERDICT_DFIR_SVG_Assets_v2/` and are summarized in `docs/brand.md`. Use the v2 palette and voice for dashboard, report, README, GitHub, and Remotion/video surfaces before inventing new treatments. Canonical voice lines are “Show Me the Evidence,” “Evidence over assumption,” “Don't trust the model. Reproduce the finding,” and “Trace it. Test it. Trust it.” Visuals are presentation only: they never create Findings, upgrade confidence, or soften the scoped verdict language above.
+
 ## Running A Case
 
 Preferred one-shot run:

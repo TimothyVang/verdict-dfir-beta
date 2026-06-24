@@ -303,14 +303,16 @@ export default function DashboardPage() {
           >
             Case — pick an investigation to open ({cases.length} available)
           </label>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, minWidth: 0 }}>
             <select
               id="case-select"
               value={casePath}
               onChange={(e) => setCasePath(e.target.value)}
               disabled={conn !== "disconnected"}
               style={{
-                flex: "1 1 360px",
+                flex: "1 1 260px",
+                minWidth: 0,
+                maxWidth: "100%",
                 background: VERDICT.bg,
                 border: `1px solid ${VERDICT.border}`,
                 borderRadius: 8,

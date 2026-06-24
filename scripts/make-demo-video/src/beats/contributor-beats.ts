@@ -12,7 +12,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 0,
     endS: 12,
     rubric: "Contribute",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     narration:
       "VERDICT is open source, and it's built to be built on. If forensics, Rust, Python, or trustworthy AI is your thing — here's how to jump in.",
   },
@@ -23,7 +23,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 12,
     endS: 40,
     rubric: "Why",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     kicker: "Why contribute",
     headline: "Forensics tooling, in the open",
     body:
@@ -43,7 +43,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 40,
     endS: 70,
     rubric: "Non-negotiables",
-    accentColor: "#d6452f",
+    accentColor: "#FF6257",
     kicker: "The non-negotiables",
     headline: "Four lines that never move",
     body:
@@ -64,7 +64,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 70,
     endS: 94,
     rubric: "On-ramp",
-    accentColor: "#7fae6e",
+    accentColor: "#73D9C2",
     kicker: "The on-ramp",
     headline: "Clone, set up, pick an issue",
     body:
@@ -81,7 +81,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 94,
     endS: 121,
     rubric: "Done means proven",
-    accentColor: "#6f93b8",
+    accentColor: "#4D5DFF",
     kicker: "What 'done' means",
     headline: "Smokes predict CI — a live run proves it",
     body:
@@ -101,7 +101,7 @@ export const CONTRIBUTOR_BEATS: Beat[] = [
     startS: 121,
     endS: 132,
     rubric: "Join in",
-    accentColor: "#9b59b6",
+    accentColor: "#4D5DFF",
     narration:
       "That's the invitation. The repo's open, the issues are tagged, and the guardrails have your back. Come help build forensics tooling people can actually trust.",
   },

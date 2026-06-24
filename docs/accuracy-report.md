@@ -41,6 +41,11 @@ Local drop-zone evidence that has a committed answer key is listed separately in
 [`evidence-answer-keys.md`](evidence-answer-keys.md); those compact EVTX and fleet-host keys are
 calibration cases for fast local live runs, not substitutes for the larger public benchmark batch.
 
+The candidate public corpus backlog in [`DATASET.md`](DATASET.md) is explicitly unscored: a source
+does not enter the accuracy table until a specific fixture is pinned, staged, and paired with a
+verified expected-findings answer key. Until then, backlog entries are practice, parser-validation,
+or needs-walkthrough candidates, not claimed recall coverage.
+
 ## Current Public Corpus
 
 The repository ships small answer-key JSON files in `goldens/`. Large fixtures are

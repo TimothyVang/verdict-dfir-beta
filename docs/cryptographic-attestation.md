@@ -26,6 +26,8 @@ file collects the load-bearing claims in one place.
 
 ## The three-link chain
 
+![Chain of custody — manifest_finalize output: the hash-chained audit.jsonl, one Merkle leaf per tool_call_output, and audit_log_final_hash + merkle_root_hex bound into an ed25519-signed run.manifest.json](showcase/results-custody-chain.png)
+
 Every VERDICT investigation produces a `run.manifest.json`
 backed by composed cryptographic primitives across three tiers:
 
@@ -160,8 +162,11 @@ is what the verifier consumes.
    honest cryptographic status — never `true` for a stub bundle (a
    deterministic placeholder is not proof), and a sigstore bundle is
    recorded for offline verification by a party that supplies the
-   expected signer identity. `overall` gates on presence, so the
-   committed stub-signed sample runs verify end-to-end.
+   expected signer identity. `overall` requires a bundle to be present
+   and treats a `stub` or recorded `sigstore` bundle as advisory (so
+   dev/offline stub runs verify end-to-end), but a present `ed25519`
+   bundle that does **not** cryptographically verify fails `overall` —
+   a forged or corrupted signature cannot pass.
 
 If all checks pass, `overall=true`. Any one fails → `overall=false`
 with a precise diagnostic naming the field and the expected vs actual

@@ -25,8 +25,8 @@ export function RuleLine({ frame = 0, delay = 0, width = "100%", color = C.hairl
   return <div style={{ height: thickness, width, background: color, transform: `scaleX(${p})`, transformOrigin: "left", ...style }} />;
 }
 
-// KineticHeadline — Fraunces headline that wipes up into view behind its own
-// top edge (clip-path reveal) with a small rise. The editorial signature move.
+// KineticHeadline — heavy editorial sans headline that wipes up into view behind
+// its own top edge (clip-path reveal) with a small rise. The v2 signature move.
 export function KineticHeadline({ text, frame, delay = 0, size = 96, color = C.ink, italic = false, weight = 700, style }: {
   text: string; frame: number; delay?: number; size?: number; color?: string; italic?: boolean; weight?: number; style?: React.CSSProperties;
 }) {
@@ -45,7 +45,7 @@ export function KineticHeadline({ text, frame, delay = 0, size = 96, color = C.i
   );
 }
 
-// PullQuote — oversized serif quote for a beat's key claim.
+// PullQuote — oversized editorial quote for a beat's key claim.
 export function PullQuote({ children, frame, delay = 0, size = 60, color = C.ink, style }: {
   children: React.ReactNode; frame: number; delay?: number; size?: number; color?: string; style?: React.CSSProperties;
 }) {

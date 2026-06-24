@@ -182,6 +182,18 @@ evidence values it read, tamper-evident and re-checkable offline. Scope: this
 re-confirms the sealed slice; it does not re-extract from the original full
 output, which is never persisted.
 
+## Committed receipt — the veto firing on real evidence
+
+`docs/release-evidence/sample-run/` is a committed, `/home`-free, offline-verifiable
+run on a real `DE_1102_security_log_cleared.evtx` where the entailment check is
+**load-bearing, not replay-only**. The `verifier_action` records *"tool re-run
+output_sha256 matches audit log; entailment confirmed from evidence: rows[*]=…"*;
+the replay artifact carries `entailment.passed: true` with the parser-re-extracted
+`{event_id: 1102, channel: Security}` matched at `rows[*]` (`failures: []`); and
+[`manifest_verify.json`](release-evidence/sample-run/manifest_verify.json) reports
+`overall: true` with `entailment_ok: true`. `scripts/sample-run-trace-smoke.py`
+guards this fixture in the local gate, so the receipt cannot silently rot.
+
 ## Rollout status (honest)
 
 **Default-ON as of 2026-06-22 (Stage A).** The gate is enforced by default; opt
@@ -189,10 +201,13 @@ out with `FIND_EVIL_REQUIRE_ASSERTED_VALUES=0`. Every CONFIRMED emitter declares
 its facts (registry Run-key, EVTX EID 1102, the prefetch execution lead) and
 every INFERRED finding declares `asserted_values` or cites `derived_from`.
 
-The previously-pending **live full-coverage run** has been done and gates this
-flip: `SCHARDT.dd` with the gate on — **recall 10/14 = 71% held** (no legitimate
-finding dropped), **0 gate rejections** (verifier: 24 approved, 4 downgraded, 0
-rejected), `manifest_verify` **overall: true**. The reject path still has teeth
+The full-coverage run that gates this flip is committed: `SCHARDT.dd` with the
+gate on, `manifest_verify` **overall: true**. Committed recall for this case is
+run-dependent and below the 71% bar — **7/14 = 50%** on the richer runs
+(`docs/release-evidence/l3-local-sift.json`) and **5/14 = 36%** on leaner runs
+(`docs/sample-run/nist-hacking-case-sift/recall-score.json`). The gate governs
+fact-fidelity — which structured values a CONFIRMED finding may assert — not
+recall, so enabling it did not drop any legitimate finding. The reject path still has teeth
 (`test_entailment.py`, `test_verifier.py::TestEntailmentCheck`,
 `test_fault_injection.py` pass), and `services/agent/tests/test_gate_coverage.py`
 re-checks that run's emitted CONFIRMED/INFERRED findings against the gate.

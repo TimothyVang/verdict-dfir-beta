@@ -1,9 +1,15 @@
 # `docs/showcase/` — VERDICT showcase (see it run)
 
 The whole workflow, end to end: **install → invoke → investigate → watch → verdict.**
-Every capture below is a real run against real evidence (an EVTX directory + a NIST disk image),
-not a mockup. In the terminal captures the operator's home path is shown as `~` for privacy;
-the dashboard/report show the SIFT VM's standard `sansforensics` user. Nothing else is edited.
+Every screen capture below is a real run against real evidence (an EVTX directory + a NIST disk
+image), not a mockup — the one exception is the chain-of-custody figure in §6, which is a labeled
+diagram of the `manifest_finalize` output structure, not a capture. In the terminal captures the
+operator's home path is shown as `~` for privacy; the dashboard/report show the SIFT VM's standard
+`sansforensics` user. Nothing else is edited.
+
+Showcase visuals should use the v2 assets and palette documented in
+[`../brand.md`](../brand.md). Styling is presentation only; it never creates a
+Finding or upgrades a confidence tier.
 
 ## 1 · Install — one preflight, then green
 
@@ -43,6 +49,21 @@ report — every finding traceable to a tool call, the whole chain verifiable of
 | Verdict | Tool-cited findings | Analyst report |
 |---|---|---|
 | ![hero](dashboard-hero.png) | ![findings](dashboard-findings.png) | ![report](report.png) |
+
+A focused example — the rendered report for the EID-1102 *Security log cleared* case, the same
+evidence as the committed, offline-verifiable
+[`docs/release-evidence/sample-run/`](../release-evidence/sample-run/) receipt:
+
+![EID-1102 forensic investigation report](results-report-eid1102.png)
+
+## 6 · Verify it offline — the chain of custody
+
+A diagram (not a screen capture) of what `manifest_finalize` seals: the hash-chained
+`audit.jsonl`, one Merkle leaf per `tool_call_output`, and the `audit_log_final_hash` +
+`merkle_root_hex` bound into an ed25519-signed `run.manifest.json` that `manifest_verify` replays
+offline.
+
+![Chain of custody — manifest_finalize output](results-custody-chain.png)
 
 ---
 

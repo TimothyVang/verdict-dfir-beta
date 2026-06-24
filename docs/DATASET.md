@@ -289,6 +289,35 @@ decision it is NOT a scoring gate (training-data contamination is not modeled). 
   the live-test gate when coverage is limited, but it will score below the recall target until
   supported artifacts are parsed.
 
+### Candidate public corpus backlog
+
+These URL references are backlog candidates only. They are not scored until a
+specific fixture is staged with a verified hash and a committed
+`goldens/<case-id>/expected-findings.json` answer key.
+
+Status definitions:
+- **Scoreable golden candidate**: likely usable for public scoring after fixture pinning and manual answer-key review.
+- **Needs walkthrough**: public data needs an analyst walkthrough before promotion or rejection.
+- **Practice**: useful for analyst/agent practice, but not a headline benchmark because solutions, flags, or walkthroughs are public.
+- **Parser validation**: useful for ingestion and parser coverage, not incident-outcome recall.
+
+| Candidate | Artifact class | Status | URL reference |
+|---|---|---|---|
+| DFRWS 2023 Troubled Elevator | multisource challenge | Scoreable golden candidate | [DFRWS forensic challenges](https://dfrws.org/forensic-challenges/) |
+| Digital Corpora m57-patents | disk / email | Practice | [Digital Corpora scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| Digital Corpora 2012-ngdc | disk / mixed | Needs walkthrough | [Digital Corpora scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| Digital Corpora 2019-narcos | disk / mobile / mixed | Needs walkthrough | [Digital Corpora scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| Digital Corpora 2019-owl | disk / mixed | Needs walkthrough | [Digital Corpora scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| Digital Corpora 2019-tuck | disk / mixed | Needs walkthrough | [Digital Corpora scenarios](https://digitalcorpora.org/corpora/scenarios/) |
+| Digital Corpora Android 7-13 / iOS 13 | mobile | Parser validation | [Digital Corpora mobile](https://digitalcorpora.org/corpora/mobile/) |
+| Digital Corpora NPS disk images | disk | Parser validation | [Digital Corpora disk images](https://digitalcorpora.org/corpora/disk-images/) |
+| Digital Corpora SQLite Forensic Corpus | SQLite | Parser validation | [Digital Corpora corpora](https://digitalcorpora.org/corpora/) |
+| Malware-Traffic-Analysis.net PCAP exercises | network (pcap) | Practice | [Malware-Traffic-Analysis.net](https://www.malware-traffic-analysis.net/) |
+| Netresec public PCAP index | network (pcap) | Parser validation | [Netresec PCAP files](https://www.netresec.com/?page=PcapFiles) |
+| DFRWS 2017/2018/2021 IoT or multisource challenges | IoT / disk / network / mixed | Needs walkthrough | [DFRWS forensic challenges](https://dfrws.org/forensic-challenges/) |
+| Volatility memory samples beyond Cridex | memory | Parser validation | [Volatility Memory Samples](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples) |
+| MemLabs Labs 4-6 | memory | Practice | [MemLabs](https://github.com/stuxnet999/MemLabs) |
+
 ### Run results (recall against golden)
 
 *(Populated as each obtainable dataset is run + scored. No fabricated numbers — gated/

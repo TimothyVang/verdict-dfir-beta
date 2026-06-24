@@ -24,6 +24,7 @@ are needed to build, operate, or audit VERDICT from a clone:
 | `scripts/` | Install, preflight, run, smoke, scoring, and release tooling. |
 | `apps/web/` | Local dashboard and offline report renderer. |
 | `docs/` | Operator, architecture, accuracy, and release evidence docs. |
+| `VERDICT_DFIR_SVG_Assets_v2/` | Canonical v2 brand bible, production SVGs, usage guide, and asset QA report. |
 | `goldens/` | Small answer-key JSON files for recall scoring. |
 | `packer/` | SIFT warm-image build recipe used by L3 workflows. |
 | `.claude/skills/` | Claude Code slash-skill entrypoints such as `/verdict`. |
@@ -52,3 +53,11 @@ work, but they are not part of a clean source archive or judge/customer bundle.
 
 Release ZIPs produced for submissions should remain small, deterministic, and
 limited to the assets listed by the release workflow or submission packager.
+
+## Brand Surface
+
+The canonical visual system is documented in `docs/brand.md` and sourced from
+`VERDICT_DFIR_SVG_Assets_v2/`. Public README, GitHub badges or imagery, report
+CSS, dashboard UI, and Remotion/video output should use the v2 assets and palette.
+Visual assets are never evidence and do not change the scoped meaning of a
+Verdict or Finding confidence tier.

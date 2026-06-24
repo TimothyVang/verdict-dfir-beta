@@ -303,6 +303,11 @@ class TestVerifyManifest:
         # Body no longer matches the signed bytes: honest reason string, not True.
         assert result.signature_verified is not True
         assert "ed25519" in str(result.signature_verified)
+        # A present ed25519 signature that fails verification must fail overall —
+        # a forged/corrupted signature cannot pass (chain+merkle+count still OK here).
+        assert result.audit_chain_ok is True
+        assert result.merkle_root_ok is True
+        assert result.overall is False
 
     def test_ed25519_tampered_bundle_fails_signature_verification(self, tmp_path: Path) -> None:
         import base64 as _b64
@@ -331,6 +336,8 @@ class TestVerifyManifest:
         result = verify_manifest(path)
         assert result.signature_verified is not True
         assert "ed25519" in str(result.signature_verified)
+        # A flipped signature bit must fail overall, not just the side-signal.
+        assert result.overall is False
 
     def test_records_signer_kind_and_honest_verification(self, tmp_path: Path) -> None:
         log = _seed_log(tmp_path / "audit.jsonl")

@@ -55,17 +55,39 @@ CHROME: str | None = _resolve_tool(
     "chrome",
 )
 
-# VERDICT figure palette — recolored from the material defaults to the brand
-# accents (purple/green/amber/blue/red) so exhibits read on-brand. Figures are
-# presented as light "mounted exhibits" on the dark report (see img CSS), so they
-# keep a warm near-white background.
-V_PURPLE = "#9b59b6"
-V_GREEN = "#7fae6e"
-V_AMBER = "#c79a4a"
-V_BLUE = "#6f93b8"
-V_RED = "#d6452f"
-V_INK = "#2b2620"
-V_MUTED = "#544f48"
+# VERDICT v2 figure palette. Figures remain light "mounted exhibits" on the dark
+# report, but semantic strokes/fills match the v2 brand-bible colors.
+V_PURPLE = "#4D5DFF"  # legacy name: Electric Cobalt brand/info
+V_GREEN = "#73D9C2"  # Seafoam verified/pass
+V_AMBER = "#FFD76A"  # Butter Yellow review/attention
+V_BLUE = "#4D5DFF"  # Electric Cobalt hypothesis/info
+V_RED = "#FF6257"  # Signal Coral rejected/flagged
+V_INK = "#101426"
+V_MUTED = "#7F789C"
+
+
+def display_artifact_path(value: Any) -> str:
+    """Return a report-safe artifact label without operator-local paths."""
+
+    raw = str(value or "").strip()
+    if not raw or raw == "n/a":
+        return "n/a"
+
+    normalized = raw.replace("\\", "/")
+    if "/extracted/disk/" in normalized:
+        return "case-extracted://" + normalized.split("/extracted/disk/", 1)[1]
+
+    if "/.findevil/cases/" in normalized:
+        case_tail = normalized.split("/.findevil/cases/", 1)[1]
+        if "/" in case_tail:
+            return "case://" + case_tail.split("/", 1)[1]
+        return "case://artifact"
+
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:/", normalized):
+        return PurePosixPath(normalized).name or "artifact"
+
+    return raw
+
 
 plt.rcParams.update(
     {
@@ -102,7 +124,7 @@ def fig_audit_chain(
     ax.set_xlim(0, 10)
     ax.set_ylim(0, 6)
 
-    def box(x, y, w, h, txt, color="#e3f2fd", border="#9b59b6", fs=9):
+    def box(x, y, w, h, txt, color="#eef0ff", border=V_PURPLE, fs=9):
         p = FancyBboxPatch(
             (x, y),
             w,
@@ -130,7 +152,7 @@ def fig_audit_chain(
                 (x2, y2),
                 arrowstyle="-|>",
                 mutation_scale=12,
-                color="#9b59b6",
+                color=V_PURPLE,
                 linewidth=1.2,
             )
         )
@@ -150,7 +172,7 @@ def fig_audit_chain(
         "audit.jsonl (hash-chained)",
         fontsize=9,
         fontweight="bold",
-        color="#9b59b6",
+        color=V_PURPLE,
     )
     for i, rec in enumerate(audit[:5]):
         ph = rec.get("prev_hash", "") or "<genesis>"
@@ -160,8 +182,8 @@ def fig_audit_chain(
             3.6,
             0.45,
             f"seq={rec['seq']} kind={rec['kind'][:14]}\nprev_hash={ph[:14]}…",
-            color="#f3e5f5",
-            border="#9b59b6",
+            color="#eef0ff",
+            border=V_PURPLE,
             fs=7,
         )
 
@@ -171,8 +193,8 @@ def fig_audit_chain(
         3.6,
         0.5,
         f"audit_log_final_hash:\n{manifest['audit_log_final_hash'][:32]}…",
-        color="#fff3e0",
-        border="#c79a4a",
+        color="#fff8dd",
+        border=V_AMBER,
     )
 
     ax.text(
@@ -181,7 +203,7 @@ def fig_audit_chain(
         "Merkle leaves (per tool_call_output)",
         fontsize=9,
         fontweight="bold",
-        color="#9b59b6",
+        color=V_PURPLE,
     )
     for i in range(min(manifest["leaf_count"], 4)):
         box(
@@ -190,8 +212,8 @@ def fig_audit_chain(
             3.6,
             0.45,
             f"leaf {i}: tool_call output_hash digest",
-            color="#e3f2fd",
-            border="#9b59b6",
+            color="#eef0ff",
+            border=V_PURPLE,
             fs=8,
         )
 
@@ -201,8 +223,8 @@ def fig_audit_chain(
         3.6,
         0.5,
         f"merkle_root_hex:\n{manifest['merkle_root_hex'][:32]}…",
-        color="#fffde7",
-        border="#c79a4a",
+        color="#fff8dd",
+        border=V_AMBER,
     )
 
     sig_sha = manifest["signature"]["payload_sha256"]
@@ -214,8 +236,8 @@ def fig_audit_chain(
         0.7,
         f"run.manifest.json (signature tier: {sig_kind})\n"
         f"signature_payload_sha256: {sig_sha[:32]}…",
-        color="#e8f5e9",
-        border="#7fae6e",
+        color="#e8fbf7",
+        border=V_GREEN,
         fs=8,
     )
 
@@ -277,9 +299,7 @@ def fig_psscan_timeline(psscan: list[dict[str, Any]], out: Path) -> None:
     times = [e["dt"] for e in events]
     pids = [e["pid"] for e in events]
     sizes = [max(20, min(200, e["threads"] * 3)) for e in events]
-    colors = [
-        "#d6452f" if e["name"].lower() not in common else "#9b59b6" for e in events
-    ]
+    colors = [V_RED if e["name"].lower() not in common else V_PURPLE for e in events]
     ax.scatter(
         times, pids, c=colors, s=sizes, alpha=0.7, edgecolors="black", linewidths=0.5
     )
@@ -287,15 +307,15 @@ def fig_psscan_timeline(psscan: list[dict[str, Any]], out: Path) -> None:
     ax.set_ylabel("PID")
     ax.set_title(
         f"Process creation timeline ({len(events)} processes via psscan)\n"
-        "Red = uncommon image name; Blue = standard Windows process"
+        "Coral = uncommon image name; Cobalt = standard Windows process"
     )
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
     ax.grid(True, alpha=0.3)
     ax.legend(
         handles=[
-            mpatches.Patch(color="#9b59b6", label="Standard Windows process"),
-            mpatches.Patch(color="#d6452f", label="Uncommon image name"),
+            mpatches.Patch(color=V_PURPLE, label="Standard Windows process"),
+            mpatches.Patch(color=V_RED, label="Uncommon image name"),
         ],
         loc="upper left",
         fontsize=8,
@@ -347,16 +367,16 @@ def fig_timeline_overview(events: list[dict[str, Any]], out: Path) -> bool:
     classes = sorted({row["artifact_class"] for row in parsed})
     class_to_y = {name: i for i, name in enumerate(classes)}
     colors = {
-        "context": "#9b59b6",
-        "triage_lead": "#c79a4a",
-        "finding_support": "#d6452f",
+        "context": V_PURPLE,
+        "triage_lead": V_AMBER,
+        "finding_support": V_RED,
     }
     for row in parsed:
         ax.scatter(
             row["dt"],
             class_to_y[row["artifact_class"]],
             s=55,
-            color=colors.get(row["significance"], "#9b59b6"),
+            color=colors.get(row["significance"], V_PURPLE),
             edgecolor="black",
             linewidth=0.4,
             alpha=0.8,
@@ -369,9 +389,9 @@ def fig_timeline_overview(events: list[dict[str, Any]], out: Path) -> bool:
     ax.grid(True, axis="x", alpha=0.3)
     ax.legend(
         handles=[
-            mpatches.Patch(color="#9b59b6", label="Context"),
-            mpatches.Patch(color="#c79a4a", label="Triage lead"),
-            mpatches.Patch(color="#d6452f", label="Finding support"),
+            mpatches.Patch(color=V_PURPLE, label="Context"),
+            mpatches.Patch(color=V_AMBER, label="Triage lead"),
+            mpatches.Patch(color=V_RED, label="Finding support"),
         ],
         loc="upper left",
         fontsize=8,
@@ -416,9 +436,9 @@ def fig_entity_timeline(events: list[dict[str, Any]], out: Path) -> bool:
     actors = sorted(top)
     actor_to_y = {name: i for i, name in enumerate(actors)}
     colors = {
-        "context": "#9b59b6",
-        "triage_lead": "#c79a4a",
-        "finding_support": "#d6452f",
+        "context": V_PURPLE,
+        "triage_lead": V_AMBER,
+        "finding_support": V_RED,
     }
     fig, ax = plt.subplots(figsize=(12, 1.6 + 0.42 * len(actors)))
     for row in rows:
@@ -426,7 +446,7 @@ def fig_entity_timeline(events: list[dict[str, Any]], out: Path) -> bool:
             row["dt"],
             actor_to_y[row["actor"]],
             s=60,
-            color=colors.get(row["significance"], "#9b59b6"),
+            color=colors.get(row["significance"], V_PURPLE),
             edgecolor="black",
             linewidth=0.4,
             alpha=0.85,
@@ -439,9 +459,9 @@ def fig_entity_timeline(events: list[dict[str, Any]], out: Path) -> bool:
     ax.grid(True, axis="x", alpha=0.3)
     ax.legend(
         handles=[
-            mpatches.Patch(color="#9b59b6", label="Context"),
-            mpatches.Patch(color="#c79a4a", label="Triage lead"),
-            mpatches.Patch(color="#d6452f", label="Finding support"),
+            mpatches.Patch(color=V_PURPLE, label="Context"),
+            mpatches.Patch(color=V_AMBER, label="Triage lead"),
+            mpatches.Patch(color=V_RED, label="Finding support"),
         ],
         loc="upper left",
         fontsize=8,
@@ -488,7 +508,7 @@ def fig_attack_story_timeline(attack_story: dict[str, Any], out: Path) -> bool:
             str(beat.get("order") or idx),
             ha="center",
             va="center",
-            color="white",
+            color=V_INK if confidence in {"CONFIRMED", "INFERRED"} else "white",
             fontsize=8,
             fontweight="bold",
         )
@@ -535,7 +555,7 @@ def fig_process_view_comparison(tool_calls: list[dict[str, Any]], out: Path) -> 
     fig, ax = plt.subplots(figsize=(8.5, 4.5))
     tools = [row[0] for row in rows]
     counts = [row[1] for row in rows]
-    colors = ["#9b59b6", "#c79a4a", "#d6452f"][: len(rows)]
+    colors = [V_PURPLE, V_AMBER, V_RED][: len(rows)]
     ax.bar(tools, counts, color=colors, edgecolor="black", linewidth=0.6)
     for i, (_, count, tcid) in enumerate(rows):
         ax.text(i, count, f"{count}\n{tcid}", ha="center", va="bottom", fontsize=8)
@@ -1614,6 +1634,22 @@ def write_markdown(
                     ),
                 )
             )
+        for corr in f.get("corroboration_replays") or []:
+            # A CONFIRMED execution finding cites two artifact classes; this row
+            # attests the replay of the corroborating (e.g. UserAssist) class so the
+            # appendix is not "2-class claim, 1 replay".
+            replay_rows.append(
+                "| {finding} | `{tool}` | `{drift}` | {matched} | `{expected}` | `{actual}` |".format(
+                    finding=md_cell(
+                        str(f.get("finding_id", f"#{i}")) + " (corroboration)"
+                    ),
+                    tool=md_cell(corr.get("tool_name", "")),
+                    drift=md_cell(corr.get("drift_class", "")),
+                    matched="yes" if corr.get("matched") else "no",
+                    expected=md_cell(str(corr.get("expected_sha256") or "")[:12]),
+                    actual=md_cell(str(corr.get("actual_sha256") or "")[:12]),
+                )
+            )
         findings_md_lines.append(
             f"### Finding {i} — confidence: {f.get('confidence', '?')}, "
             f"pool: {f.get('pool_origin', '?')}, "
@@ -1625,7 +1661,7 @@ def write_markdown(
             f"- `tool_call_id`: `{md_cell(f.get('tool_call_id', 'n/a'))}`"
         )
         findings_md_lines.append(
-            f"- artifact: `{md_cell(f.get('artifact_path', 'n/a'))}`"
+            f"- artifact: `{md_cell(display_artifact_path(f.get('artifact_path')))}`"
         )
         caveat = {
             "CONFIRMED": "Confirmed — the cited tool output is reproducible; this does "
@@ -2037,18 +2073,23 @@ def write_markdown(
     scope_interpretation_section = ""
     readiness_section = build_readiness_section(report_qa, release_gate)
 
+    # Display-safe evidence label for the customer report header: keep only the
+    # basename so an operator's absolute /home path never leaks into REPORT.md /
+    # .html / .pdf. The full path is preserved in verdict.json for operational use.
+    evidence_display = Path(evidence).name if evidence and evidence != "?" else evidence
+
     md.write_text(
         f"""[VERDICT · DFIR Case File]{{.kicker}}
 
 # VERDICT — Forensic Investigation Report
 
-[DFIR at machine speed · signed, replayable chain of custody]{{.tagline}}
+[Show Me the Evidence · signed, replayable chain of custody]{{.tagline}}
 
 **Case ID:** `{manifest["case_id"]}`
 **Run ID:** `{manifest["run_id"]}`
 **Started:** {manifest["started_at"]}
 **Finalized:** {manifest["finalized_at"]}
-**Evidence:** `{md_cell(evidence)}`
+**Evidence:** `{md_cell(evidence_display)}`
 **Verdict:** **{verdict}**
 
 > **Cryptographic attestation:**
@@ -2360,25 +2401,25 @@ def render_html_pdf(
 
 
 _DEFAULT_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;700&display=swap');
-:root { --paper:#0e0c10; --surface:#161318; --inset:#0b0a0d; --ink:#ece6da;
-  --muted:#8c8576; --faint:#544f48; --hairline:#2b2620; --accent:#9b59b6;
-  --accent-light:#b98fce; --alert:#d6452f; --confirmed:#7fae6e; --inferred:#c79a4a;
-  --hypothesis:#6f93b8; --mono:"JetBrains Mono","Courier New",monospace;
-  --serif:"Fraunces",Georgia,serif; --grotesk:"Archivo",system-ui,sans-serif; }
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+:root { --paper:#101426; --surface:#12131a; --inset:#0c1020; --ink:#f5f1e8;
+  --muted:#b8a8ff; --faint:#7f789c; --hairline:#27304a; --accent:#4d5dff;
+  --accent-light:#b8a8ff; --alert:#ff6257; --confirmed:#73d9c2; --inferred:#ffd76a;
+  --hypothesis:#4d5dff; --mono:"JetBrains Mono","Courier New",monospace;
+  --serif:"Archivo",Impact,system-ui,sans-serif; --grotesk:"Archivo",system-ui,sans-serif; }
 @page { margin: 0; }
 html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-body { background:#0e0c10; color:var(--ink); font-family:var(--mono); font-size:13px;
+body { background:#101426; color:var(--ink); font-family:var(--mono); font-size:13px;
   line-height:1.7; max-width:1040px; margin:0 auto; padding:1.5cm 1.6cm 2cm;
   -webkit-print-color-adjust:exact; print-color-adjust:exact;
-  background-image:linear-gradient(rgba(236,230,218,0.022) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(236,230,218,0.022) 1px,transparent 1px);
+  background-image:linear-gradient(rgba(245,241,232,0.026) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(245,241,232,0.026) 1px,transparent 1px);
   background-size:56px 56px; }
-h1 { font-family:var(--serif); font-weight:600; color:var(--ink); font-size:2.5em;
+h1 { font-family:var(--serif); font-weight:900; color:var(--ink); font-size:2.5em;
   letter-spacing:-0.5px; line-height:1.05; margin:0 0 0.35em; border:none; }
 h1.tier-break { page-break-before:always; font-family:var(--grotesk);
   text-transform:uppercase; letter-spacing:4px; font-size:1.15em; font-weight:700;
-  color:var(--ink); background:linear-gradient(90deg,rgba(155,89,182,0.24),rgba(155,89,182,0.04));
+  color:var(--ink); background:linear-gradient(90deg,rgba(77,93,255,0.24),rgba(184,168,255,0.06));
   border:none; border-left:3px solid var(--accent); border-radius:4px;
   padding:0.65em 0.9em; margin:0 0 1.4em; }
 h2 { font-family:var(--grotesk); text-transform:uppercase; letter-spacing:2.5px;
@@ -2387,7 +2428,7 @@ h2 { font-family:var(--grotesk); text-transform:uppercase; letter-spacing:2.5px;
 h3 { font-family:var(--grotesk); text-transform:uppercase; letter-spacing:1.5px;
   font-size:0.9em; font-weight:600; color:var(--muted); margin:1.8em 0 0.7em; }
 p, li { color:var(--ink); }
-a { color:var(--accent-light); text-decoration:none; border-bottom:1px solid rgba(155,89,182,0.4); }
+a { color:var(--accent-light); text-decoration:none; border-bottom:1px solid rgba(77,93,255,0.45); }
 strong { color:var(--ink); font-weight:700; }
 em { color:var(--muted); }
 img { max-width:100%; display:block; margin:1.8em auto; background:#fbfaf6;
@@ -2399,24 +2440,24 @@ pre { background:var(--inset); color:var(--ink); padding:1.1em 1.4em; border-rad
   border:1px solid var(--hairline); overflow-x:auto; }
 pre code { background:none; border:none; padding:0; color:inherit; }
 blockquote { font-family:var(--mono); color:var(--ink); margin:1.4em 0;
-  background:rgba(155,89,182,0.1); border:1px solid rgba(155,89,182,0.45);
+  background:rgba(77,93,255,0.1); border:1px solid rgba(77,93,255,0.45);
   border-left:3px solid var(--accent); border-radius:0 6px 6px 0; padding:0.9em 1.3em; }
 blockquote strong { color:var(--accent-light); }
 table { border-collapse:collapse; margin:1.3em 0; width:100%; font-size:0.84em;
   background:var(--surface); border:1px solid var(--hairline); }
-th { background:rgba(155,89,182,0.16); color:var(--accent-light); font-family:var(--grotesk);
+th { background:rgba(77,93,255,0.16); color:var(--accent-light); font-family:var(--grotesk);
   text-transform:uppercase; letter-spacing:0.4px; font-weight:600; font-size:0.95em;
   padding:0.55em 0.8em; border:1px solid var(--hairline); text-align:left; }
 td { padding:0.5em 0.8em; border:1px solid var(--hairline); color:var(--ink); vertical-align:top; }
 th, td { overflow-wrap:anywhere; word-break:break-word; }
-tr:nth-child(even) td { background:rgba(236,230,218,0.025); }
+tr:nth-child(even) td { background:rgba(245,241,232,0.025); }
 hr { border:none; border-top:1px solid var(--hairline); margin:2.4em 0; }
 .kicker { font-family:var(--grotesk); text-transform:uppercase; letter-spacing:5px;
   font-size:0.72em; font-weight:600; color:var(--accent); }
 .tagline { font-family:var(--mono); color:var(--muted); letter-spacing:1px; font-size:0.86em; }
 .conf-confirmed, .verdict-confirmed { color:var(--confirmed); font-weight:700; }
 .conf-inferred, .verdict-inferred { color:var(--inferred); font-weight:700; }
-.conf-hypothesis { color:var(--hypothesis); font-weight:700; }
+.conf-hypothesis { color:var(--accent-light); font-weight:700; }
 .verdict-alert { color:var(--alert); font-weight:700; }
 """
 
