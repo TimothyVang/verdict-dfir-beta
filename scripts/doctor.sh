@@ -184,7 +184,7 @@ fi
 # findevil-agent-mcp — Python, 13 crypto/ACH/memory/ACP tools. Needs the uv
 # venv synced + the package present (run-mcp-python.sh does `uv run … -m`).
 if [ -d "services/agent_mcp/.venv" ] && [ -d "services/agent_mcp/findevil_agent_mcp" ]; then
-  row ok "findevil-agent-mcp" "Python · 12 tools · services/agent_mcp/.venv"
+  row ok "findevil-agent-mcp" "Python · 13 tools · services/agent_mcp/.venv"
 else
   row err "findevil-agent-mcp" "venv not synced — run: bash scripts/install.sh"
   REMEDIES+=("findevil-agent-mcp: bash scripts/install.sh   # uv sync --directory services/agent_mcp")

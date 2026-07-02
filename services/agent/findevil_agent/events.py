@@ -18,6 +18,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from findevil_agent.verdict_reasons import IndeterminateReason
+
 # ---------------------------------------------------------------------------
 # Shared base.
 # ---------------------------------------------------------------------------
@@ -178,6 +180,14 @@ class Finding(_BaseEvent):
     # than a new model. Optional + default-None so existing findings stay valid;
     # the refutation gate is opt-in via FIND_EVIL_REQUIRE_EXPECTATION=1.
     expectation: AssertedValue | None = None
+    # "Why not a higher tier?" — the deterministic anti-overclaim rationale a
+    # finding records to justify why it stops where it does rather than claiming
+    # more (e.g. "lateral-movement: no Logon Type 3/10 on the destination, so
+    # capped at INFERRED"). Pairs with the correlator's per-claim-type confidence
+    # CEILING table (see correlator.apply_confidence_ceiling). Optional + default
+    # None so existing findings stay valid; the gate that requires it on every
+    # INFERRED finding is opt-in via FIND_EVIL_REQUIRE_WHY_NOT_HIGHER=1.
+    why_not_higher: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -257,6 +267,35 @@ class Finding(_BaseEvent):
             )
         return self
 
+    @model_validator(mode="after")
+    def _require_tool_call_id_for_anchored(self) -> Finding:
+        """Evidence-anchor firewall, **default-on**; opt out via
+        ``FIND_EVIL_REQUIRE_TOOL_CALL_ID=0``.
+
+        ``tool_call_id`` is already a required field, but Pydantic accepts an
+        empty string. A CONFIRMED/INFERRED finding is an asserted fact (or an
+        inference over facts), so it MUST carry a non-blank tool-call anchor at
+        construction time — a blank-cited anchored finding can never exist as a
+        Finding object, closing the window between construction and the verifier
+        veto. HYPOTHESIS is a lead, not an asserted fact, so it is exempt.
+
+        Unlike :meth:`_require_asserted_values`, a blank anchor has no legitimate
+        use, so this is unconditional except for the ``=0`` escape hatch kept for
+        parity. The verifier preflight (``verifier.py``) stays as defense-in-depth
+        for findings that arrive via ``model_construct`` or the MCP wire; the
+        ``verify_finding`` tool turns this ValidationError into a graceful
+        ``rejected`` action at that untrusted-input boundary.
+        """
+        if os.environ.get("FIND_EVIL_REQUIRE_TOOL_CALL_ID") == "0":
+            return self
+        if self.confidence in ("CONFIRMED", "INFERRED") and not (self.tool_call_id or "").strip():
+            raise ValueError(
+                f"{self.confidence} finding {self.finding_id} has a blank tool_call_id; "
+                "a CONFIRMED/INFERRED finding must cite a tool call as its evidence "
+                "anchor (HYPOTHESIS leads are exempt)"
+            )
+        return self
+
 
 class VerifierAction(_BaseEvent):
     event_type: Literal["VerifierAction"] = "VerifierAction"
@@ -286,9 +325,20 @@ class RunVerdict(_BaseEvent):
     event_type: Literal["RunVerdict"] = "RunVerdict"
     verdict: Literal["CONFIRMED_EVIL", "SUSPICIOUS", "BENIGN", "INCONCLUSIVE"]
     confidence_score: float  # 0.0 to 1.0
+    # Human-readable breakdown of how confidence_score was reached — the
+    # evidence-type-weighted components plus any named bonuses (e.g.
+    # "base 0.90 direct (f-2) +0.05 lateral-movement corroboration = 0.95").
+    # Default-empty so verdicts produced before scoring was wired stay valid.
+    score_basis: str = ""
     finding_count: int
     manifest_path: str
     manifest_verify_path: str | None = None
+    # Additive, custody-neutral annotation: typed reason-code(s) for a
+    # non-committal (INDETERMINATE/abstain) verdict. Empty for a committed
+    # SUSPICIOUS / scoped NO_EVIL word. Derived deterministically by
+    # ``verdict_reasons.derive_indeterminate_reasons`` — never changes the
+    # verdict WORD, the audit chain, or any scoring math.
+    reason_codes: list[IndeterminateReason] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

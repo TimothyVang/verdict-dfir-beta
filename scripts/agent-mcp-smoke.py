@@ -757,6 +757,8 @@ def main() -> int:
                 "expert_miss_capture",
                 # read-only accuracy diagnostic (13th Python tool)
                 "accuracy_compare",
+                # read-only AI/agent-tradecraft signature lead tool (14th Python tool)
+                "find_ai_signatures",
             ]
         )
         if names != expected:

@@ -50,7 +50,7 @@ Optional **sidecar files** in the Case dir are read only if present:
 `customer_release_gate.final.json` (final release-gate state). Each is best-effort:
 absent or malformed JSON degrades gracefully instead of failing the render.
 
-> Only the **45 product tools** (32 Rust + 13 Python) are audit-chained, so every
+> Only the **46 product tools** (32 Rust + 14 Python) are audit-chained, so every
 > Finding the report prints cites a `tool_call_id` traceable back through `audit.jsonl`.
 > See `docs/reference/mcp-and-tools.md` for the tool surface.
 
@@ -143,10 +143,13 @@ behind expert review. Do not downgrade this blocker without an explicit policy c
 
 ## 6. Styling & dependencies
 
-`scripts/_report_style.css` drives the entire look — Midnight Ink, Paper Cream,
-Archivo / JetBrains Mono type, Electric Cobalt and Soft Lilac brand accents, and
-the Seafoam / Butter Yellow / Electric Cobalt semantic confidence colors
-(`CONFIRMED` / `INFERRED` / `HYPOTHESIS`). pandoc is pointed at it via `--css`.
+`scripts/_report_style.css` drives the entire look — a light Paper-Cream
+"annotated case file": near-black ink, Inter body, Archivo Narrow condensed
+mastheads, JetBrains Mono for evidence/data, filled Seafoam / Butter Yellow /
+Electric Cobalt confidence chips, and Electric Cobalt section labels. On the cream
+surface the semantic colors use a darker text tone (the `--*-text` vars) so Seafoam
+and Butter stay readable. Confidence keywords are `CONFIRMED` / `INFERRED` /
+`HYPOTHESIS`. pandoc is pointed at it via `--css`.
 To restyle the report, edit that one file and re-render; it is kept in sync with
 the `_DEFAULT_CSS` fallback baked into `render_report.py` (used only if the CSS
 file is missing). The canonical visual rules are in [`../brand.md`](../brand.md).

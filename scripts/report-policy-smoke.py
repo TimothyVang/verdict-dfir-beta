@@ -840,6 +840,100 @@ def main() -> int:
         # the combined text keeps the existing section-marker assertions valid while
         # the split itself is checked separately below.
         text = main_text + "\n" + internal_text
+        # ---- Item #19: offline self-verifiable report (embedded audit + grep) ----
+        # (a) The embedded-audit helper round-trips audit.jsonl base64 with no
+        # server, and the injector splices the block in just before </body>.
+        item19_audit_text = (
+            '{"kind":"tool_call_output","payload":{"tool_call_id":"tc-confirmed-19"}}\n'
+            '{"kind":"finding_approved","payload":{"finding_id":"f-confirmed-19"}}\n'
+        )
+        item19_embed = rr.build_offline_audit_embed(item19_audit_text)
+        item19_embed_gt = item19_embed.find(
+            ">", item19_embed.find('id="verdict-embedded-audit-jsonl"')
+        )
+        item19_embed_b64 = item19_embed[
+            item19_embed_gt + 1 : item19_embed.find("</script>", item19_embed_gt)
+        ]
+        try:
+            item19_roundtrip = (
+                base64.b64decode(item19_embed_b64).decode("utf-8") == item19_audit_text
+            )
+        except Exception:
+            item19_roundtrip = False
+        item19_embed_has_download = (
+            'download="audit.jsonl"' in item19_embed
+            and "data:application/x-ndjson;base64," in item19_embed
+        )
+        item19_injected = rr.inject_offline_audit_embed(
+            "<html><body><p>report</p></body></html>", item19_audit_text
+        )
+        item19_inject_before_body = (
+            "verdict-offline-audit" in item19_injected
+            and item19_injected.index("verdict-offline-audit")
+            < item19_injected.index("</body>")
+        )
+        item19_inject_skips_empty = (
+            "verdict-offline-audit"
+            not in rr.inject_offline_audit_embed("<html><body></body></html>", "  ")
+        )
+        # (b) The CONFIRMED grep affordance is emitted only for CONFIRMED findings
+        # with a usable tool_call_id; leads are never dressed up as reproducible.
+        item19_confirmed_aff = rr.confirmed_reverify_affordance(
+            {"confidence": "CONFIRMED", "tool_call_id": "tc-confirmed-19"}
+        )
+        item19_inferred_aff = rr.confirmed_reverify_affordance(
+            {"confidence": "INFERRED", "tool_call_id": "tc-inferred-19"}
+        )
+        item19_missing_tcid_aff = rr.confirmed_reverify_affordance(
+            {"confidence": "CONFIRMED", "tool_call_id": ""}
+        )
+        item19_aff_unit_ok = (
+            len(item19_confirmed_aff) == 1
+            and "grep tc-confirmed-19 audit.jsonl" in item19_confirmed_aff[0]
+            and item19_inferred_aff == []
+            and item19_missing_tcid_aff == []
+        )
+        # Integration: a CONFIRMED finding gets the grep line through write_markdown;
+        # an INFERRED finding in the same report does not.
+        item19_case_dir = case_dir / "item19-confirmed"
+        item19_case_dir.mkdir()
+        item19_md = rr.write_markdown(
+            item19_case_dir,
+            manifest,
+            [
+                {
+                    "finding_id": "f-confirmed-19",
+                    "confidence": "CONFIRMED",
+                    "pool_origin": "A",
+                    "mitre_technique": "T1059",
+                    "tool_call_id": "tc-confirmed-19",
+                    "artifact_path": "artifact.json",
+                    "description": "Confirmed artifact recorded for review.",
+                },
+                {
+                    "finding_id": "f-inferred-19",
+                    "confidence": "INFERRED",
+                    "pool_origin": "A",
+                    "mitre_technique": "T1070",
+                    "tool_call_id": "tc-inferred-19",
+                    "artifact_path": "artifact.json",
+                    "description": "Inferred lead recorded for review.",
+                },
+            ],
+            contras=0,
+            kept=2,
+            downgraded=0,
+            evidence="memory.img",
+            verdict="SUSPICIOUS",
+            has_psscan=False,
+        )
+        item19_md_text = item19_md.read_text(encoding="utf-8")
+        item19_integration_ok = (
+            "grep tc-confirmed-19 audit.jsonl" in item19_md_text
+            and "grep tc-inferred-19 audit.jsonl" not in item19_md_text
+        )
+        # The existing INFERRED finding (tc-psscan) gets no grep affordance.
+        item19_inferred_no_grep = "grep tc-psscan audit.jsonl" not in main_text
         public_text = "\n".join(
             path.read_text(encoding="utf-8")
             for path in (
@@ -1418,6 +1512,22 @@ def main() -> int:
         )
 
     checks = [
+        (
+            "item19 embedded audit.jsonl round-trips offline with download link",
+            item19_roundtrip and item19_embed_has_download,
+        ),
+        (
+            "item19 audit embed injected before </body>, skipped when empty",
+            item19_inject_before_body and item19_inject_skips_empty,
+        ),
+        (
+            "item19 grep affordance emitted only for CONFIRMED + tool_call_id",
+            item19_aff_unit_ok,
+        ),
+        (
+            "item19 CONFIRMED finding renders grep affordance, INFERRED does not",
+            item19_integration_ok and item19_inferred_no_grep,
+        ),
         (
             "expert rules contain report QA claim IDs",
             not missing_claim_rule_ids,

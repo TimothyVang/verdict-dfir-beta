@@ -62,6 +62,193 @@ _TOOL_CLASS = {
 }
 
 
+# The 32 audit-chained Rust DFIR product tools (the ``findevil-mcp`` surface, per
+# CLAUDE.md / docs/reference/mcp-and-tools.md). This is the evidence-analysis
+# surface a Case may choose to exercise — it is the denominator for the
+# "allowed-but-not-run" untested-surface table. The 13 Python custody/ACH tools
+# in ``findevil-agent-mcp`` (verify/judge/correlate/manifest …) are the pipeline
+# spine that runs on every Case, not a per-Case analysis choice, so they are
+# deliberately not in this set.
+_PRODUCT_DFIR_TOOLS = frozenset(
+    {
+        "case_open",
+        "disk_mount",
+        "disk_extract_artifacts",
+        "disk_unmount",
+        "evtx_query",
+        "prefetch_parse",
+        "mft_timeline",
+        "registry_query",
+        "yara_scan",
+        "usnjrnl_query",
+        "hayabusa_scan",
+        "sysmon_network_query",
+        "zeek_summary",
+        "pcap_triage",
+        "vol_pslist",
+        "vol_malfind",
+        "vol_psscan",
+        "vol_psxview",
+        "vol_run",
+        "ez_parse",
+        "oe_dbx_parse",
+        "plaso_parse",
+        "mac_triage",
+        "cloud_audit",
+        "journalctl_query",
+        "login_accounting",
+        "ausearch",
+        "nfdump_query",
+        "suricata_eve",
+        "indx_parse",
+        "vel_collect",
+        "browser_history",
+    }
+)
+
+# Keywords that mark a verifier rejection as a fact-fidelity / entailment veto
+# (the SHA replay reproduced, but an asserted value was not entailed) rather than
+# a hash-drift / replay failure. See docs/fact-fidelity.md.
+_FIDELITY_REASON_HINTS = ("entail", "fidelity", "asserted", "not supported by")
+
+
+def _iter_audit(case_dir: Path) -> list[dict[str, Any]]:
+    """Read-only parse of ``audit.jsonl`` into a list of records (empty if absent).
+
+    Never touches the sealed chain — it only reads — and tolerates a truncated
+    final line so a half-flushed run dir still yields what it has.
+    """
+    path = case_dir / "audit.jsonl"
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def _suppression_funnel(
+    case_dir: Path,
+    audit: list[dict[str, Any]],
+    reported_n: int,
+    verdict_doc: dict[str, Any],
+) -> dict[str, Any]:
+    """Deterministic raw-candidate -> reported funnel by named suppression class.
+
+    Prefers the hash-chained ``audit.jsonl`` (``verifier_action`` +
+    ``correlation_outcomes`` records); falls back to the ``verdict.json`` mirror
+    (``rejected_finding_leads`` + ``findings_summary.correlation_outcomes``) when
+    no audit log is present. Read-only — it derives counts, it never mutates the
+    chain or the scoring math.
+    """
+    verifier_rejected = 0
+    fact_fidelity_vetoed = 0
+    correlator_downgraded = 0
+    below_confidence_leads_only = 0
+
+    if audit:
+        source = "audit.jsonl"
+        for rec in audit:
+            kind = rec.get("kind")
+            payload = rec.get("payload") or {}
+            if kind == "verifier_action":
+                action = str(payload.get("action") or "").lower()
+                if action == "rejected":
+                    reason = str(payload.get("reason") or "").lower()
+                    if payload.get("replay_matched") is not False and any(
+                        h in reason for h in _FIDELITY_REASON_HINTS
+                    ):
+                        fact_fidelity_vetoed += 1
+                    else:
+                        verifier_rejected += 1
+            elif kind == "correlation_outcomes":
+                for outcome in payload.get("outcomes") or []:
+                    action = str(outcome.get("action") or "").lower()
+                    if action == "downgraded":
+                        correlator_downgraded += 1
+                    elif action in ("rejected", "dropped", "suppressed"):
+                        below_confidence_leads_only += 1
+    else:
+        source = "verdict.json"
+        leads = verdict_doc.get("rejected_finding_leads") or []
+        verifier_rejected = len(leads)
+        summary = verdict_doc.get("findings_summary") or {}
+        for outcome in summary.get("correlation_outcomes") or []:
+            action = str(outcome.get("action") or "").lower()
+            if action == "downgraded":
+                correlator_downgraded += 1
+            elif action in ("rejected", "dropped", "suppressed"):
+                below_confidence_leads_only += 1
+        if not summary.get("correlation_outcomes"):
+            correlator_downgraded = int(summary.get("soul_md_downgraded") or 0)
+
+    classes = {
+        "verifier_rejected": verifier_rejected,
+        "fact_fidelity_vetoed": fact_fidelity_vetoed,
+        "correlator_downgraded": correlator_downgraded,
+        "below_confidence_leads_only": below_confidence_leads_only,
+    }
+    # raw = reported + the classes that REMOVE a candidate from the reported set.
+    # correlator_downgraded is a tier change (the finding is still reported at a
+    # lower confidence), so it is surfaced but NOT subtracted from raw.
+    removed = verifier_rejected + fact_fidelity_vetoed + below_confidence_leads_only
+    return {
+        "reported_findings_n": reported_n,
+        "raw_candidate_findings_n": reported_n + removed,
+        "classes": classes,
+        "source": source,
+        "note": (
+            "raw -> reported funnel. verifier_rejected / fact_fidelity_vetoed / "
+            "below_confidence_leads_only REMOVE a candidate (counted into raw); "
+            "correlator_downgraded only lowers a reported finding's tier and is NOT "
+            "subtracted. Derived read-only from the run dir; not a goldens score."
+        ),
+    }
+
+
+def _untested_surface(
+    audit: list[dict[str, Any]], verdict_doc: dict[str, Any]
+) -> dict[str, Any]:
+    """Product DFIR tools available but never exercised in this Case.
+
+    Exercised tools come from ``audit.jsonl`` ``tool_call_start`` records, or the
+    ``verdict.json`` ``tool_calls`` mirror when no audit log is present.
+    """
+    exercised: set[str] = set()
+    if audit:
+        for rec in audit:
+            if rec.get("kind") == "tool_call_start":
+                tool = (rec.get("payload") or {}).get("tool")
+                if tool:
+                    exercised.add(str(tool))
+    if not exercised:
+        for call in verdict_doc.get("tool_calls") or []:
+            tool = call.get("tool")
+            if tool:
+                exercised.add(str(tool))
+
+    exercised_product = sorted(exercised & _PRODUCT_DFIR_TOOLS)
+    allowed_not_run = sorted(_PRODUCT_DFIR_TOOLS - exercised)
+    return {
+        "product_dfir_tools_n": len(_PRODUCT_DFIR_TOOLS),
+        "exercised_tools": exercised_product,
+        "exercised_n": len(exercised_product),
+        "allowed_not_run": allowed_not_run,
+        "allowed_not_run_n": len(allowed_not_run),
+        "note": (
+            "Product MCP DFIR tools (findevil-mcp) available but not exercised in "
+            "this Case. Untested surface is coverage context, not a defect — many "
+            "tools do not apply to a given evidence type."
+        ),
+    }
+
+
 def _newest_case_with_findings() -> Path | None:
     root = Path("tmp/auto-runs")
     if not root.is_dir():
@@ -94,6 +281,10 @@ def score(case_dir: Path) -> dict[str, Any]:
 
     findings: list[dict[str, Any]] = verdict_doc.get("findings") or []
     n = len(findings)
+
+    audit = _iter_audit(case_dir)
+    suppression_funnel = _suppression_funnel(case_dir, audit, n, verdict_doc)
+    untested_surface = _untested_surface(audit, verdict_doc)
 
     cited = [f for f in findings if f.get("tool_call_id")]
     replay_attempted = [f for f in findings if f.get("replay_matched") is not None]
@@ -197,6 +388,9 @@ def score(case_dir: Path) -> dict[str, Any]:
         "overclaim_snuck_through": snuck_through,
         "r3_fidelity": r3,
         "r4_corroboration": r4,
+        # --- Discipline funnel + untested surface (goldens-free) -----------
+        "suppression_funnel": suppression_funnel,
+        "untested_surface": untested_surface,
         # --- Honesty boundary ---------------------------------------------
         "not_measured": [
             "value-fidelity / entailment (Provability R3) — the entailment check on master",
@@ -252,6 +446,19 @@ def _print_report(r: dict[str, Any]) -> None:
     print(
         f"  R4 breadth: {r4['distinct_class_count']} artifact classes {r4['artifact_classes_present']}; "
         f"{r4['confirmed_findings_n']} CONFIRMED (per-finding >=2-class enforced upstream, not re-derived)"
+    )
+    sf = r["suppression_funnel"]
+    sc = sf["classes"]
+    print(
+        f"  funnel   : {sf['raw_candidate_findings_n']} raw -> {sf['reported_findings_n']} reported "
+        f"(verifier_rejected={sc['verifier_rejected']}, fidelity_vetoed={sc['fact_fidelity_vetoed']}, "
+        f"correlator_downgraded={sc['correlator_downgraded']}, leads_only={sc['below_confidence_leads_only']}; "
+        f"src={sf['source']})"
+    )
+    us = r["untested_surface"]
+    print(
+        f"  surface  : {us['exercised_n']}/{us['product_dfir_tools_n']} DFIR tools exercised; "
+        f"{us['allowed_not_run_n']} allowed-but-not-run"
     )
 
 

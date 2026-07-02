@@ -12,6 +12,125 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.3.0-beta.1] - 2026-07-02
+
+The v2 brand system plus a large round of detection, custody, and report-QA
+hardening that landed since beta.2. (`ship-beta` snapshots the whole tree, so
+this covers every change since v0.2.0-beta.2, not only the brand work.)
+
+### Added — detection & correlation
+
+- **`find_ai_signatures`** — a typed, read-only lead tool for AI-tradecraft
+  signatures. Product tool surface is now 46 Rust + 14 Python.
+- **Correlator false-positive suppression family** — benign-exoneration library,
+  cross-host hygiene (suppress OS-signed / too-common pivots, no attribution),
+  a per-technique corroboration gate family, per-claim confidence ceilings,
+  counter-evidence suppressors, and demote-only temporal-coupling checks. The
+  correlator is split into focused submodules behind a facade.
+- **Contradiction & grounding** — named cross-source anti-forensics detector
+  family, cross-citation same-entity contradiction, suppression-funnel +
+  untested-surface ledger, and categorical-impossibility pre-gate lints.
+- **Judge** — injection-affected findings route to human review.
+
+### Added — custody & verification
+
+- **Path relativization** — all display `*_path` values are relativized, so no
+  host paths appear in released args, tool output, or reports.
+- **Stdlib-only offline manifest verifier** (`scripts/manifest-verify-offline.py`)
+  — re-derives the hash chain, Merkle root, leaf count, and Ed25519 signature
+  with zero production imports.
+- **Deterministic evidence-traceability index** — a no-LLM finding→audit join.
+- **Browser-side custody re-verifier** — the dashboard independently re-derives
+  the chain (JCS + SHA-256 + Merkle + Ed25519) client-side.
+
+### Added — accuracy & evaluation
+
+- **Measured ATT&CK coverage matrix** from YAML golden assertions, per-tactic
+  recall breakdown, and false negatives surfaced by name.
+- **Content-addressed replay scorer** + model-free scorer guard; an
+  evidence-agnostic artifact-identifier normalizer for matching.
+- **Fact-fidelity** — a blind held-out adversarial validation arm.
+- `docs/LIMITATIONS.md` and scoped caveats folded into the accuracy report.
+
+### Added — report & report-QA
+
+- **Self-verifiable offline `REPORT.html`** — embedded `audit.jsonl` with a
+  per-CONFIRMED grep so a reader can re-check offline.
+- **Report-QA hard gates** — parse-quality gate (a failed parse cannot clear a
+  case), reverse-coverage audits, and a conditional key-question gate for
+  false-negative leads.
+- **Restricted-conclusions linter** for banned escalation terms, a
+  Self-Correction narrative rendered from `verdict_revision` records, and typed
+  INDETERMINATE / ABSTAIN reason-codes.
+
+### Added — MCP & security
+
+- **Injection-alert sidecar ledger** (counts-only) and error-channel
+  sanitization in both product servers.
+- **Subprocess-tree reaping on timeout** (positive-PID group reap) for
+  `vol_run` / `plaso_parse`.
+
+### Changed — v2 brand system
+
+- **Dashboard** rebranded to the v2 editorial system — Inter body, filled
+  confidence chips, condensed headings, a case-file stamp; monospace is now
+  data-only.
+- **Analyst report** — light Paper-Cream annotated case-file theme, with light
+  fleet-report figures.
+- **Demo video** — v2 type roles, Midnight Ink backgrounds, self-hosted fonts
+  (no `fonts.gstatic.com` at render time), and a re-captured clean dashboard clip.
+- **Docs/showcase** — v2 type-role documentation (`docs/brand.md`) and
+  regenerated screenshots.
+
+### Fixed
+
+- Dashboard clip and a stray orphan showcase asset had host paths baked into the
+  pixels; the clip was re-captured from a `/home`-free case and the orphan asset
+  was removed.
+
+## [v0.2.0-beta.2] - 2026-06-24
+
+Project containment + portability. The project is now self-contained and
+clone-and-go: runtime, toolchain, and agent file actions stay inside the project
+folder, derived at runtime so a fresh clone works on any machine.
+
+### Added — runtime + agent containment
+
+- **`scripts/lib/project-env.sh`** — redirects `TMPDIR`, the `FINDEVIL_HOME` case
+  store, `XDG_*`, the npm/npx cache, and the Rust/uv/pnpm toolchain caches into a
+  gitignored `.project-local/`. Sourced by every `scripts/run-mcp-*.sh` launcher
+  (incl. new `n8n`/`playwright`/`puppeteer` wrappers) and by `scripts/verdict`, so
+  nothing escapes the folder regardless of the caller's CWD.
+- **Repo-layout + agent guardrails** — `scripts/repo-layout-smoke.py` keeps the
+  root to config + public docs only; `scripts/hooks/guard-root-writes.py` and
+  `scripts/hooks/guard-outside-project.py` (PreToolUse hooks) block stray root
+  files and confine the agent's built-in `Write`/`Edit` to the project.
+- **`scripts/containment-smoke.py`** — regression lock; fails if any launcher,
+  `scripts/verdict`, `.mcp.json`, or project hook stops being contained.
+- **Portable per-machine setup** — `scripts/setup-containment.sh` regenerates the
+  agent env block from the runtime-derived root; wired into `scripts/setup`.
+- **`.claude/settings.json`** — shared, committed agent-containment config
+  (path-guard hooks; no secrets/machine paths). `settings.local.json` stays
+  machine-local and private.
+- **Docs** — `docs/repo-layout.md`, `docs/agent-containment.md`; portability +
+  containment rules added to `CLAUDE.md` and `AGENTS.md`.
+
+### Fixed
+
+- **plaso run-logs no longer litter the repo root** — `log2timeline`/`psort` now
+  write their per-stage logs to `TMPDIR` via `--logfile` (`plaso_parse.rs`),
+  instead of dropping `log2timeline-*.log.gz` / `psort-*.log.gz` in the CWD.
+- Removed an invalid `npm_config_store_dir` env key that emitted a `store-dir`
+  warning on every npm invocation.
+
+### Changed — release surface
+
+- `.gitignore`/`.gitattributes` narrowed so `.claude/settings.json` ships (shared
+  rules) while `.claude/settings.local.json` never does; `docs/superpowers/**`
+  (operator design scratch) is export-ignored.
+- `scripts/ship-beta.sh` audit updated to allow `.claude/settings.json` and to
+  guard `docs/superpowers/` as private.
+
 ## [v0.2.0-beta.1] - 2026-06-22
 
 First public beta. Headline changes since `v0.1.5`:

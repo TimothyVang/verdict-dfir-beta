@@ -45,6 +45,25 @@ Every finding carries one of three confidence levels, defined in `agent-config/S
 
 The agent's `verifier` re-runs the cited tool calls on every finding before merge. A finding whose tool-call output disagrees with the original gets downgraded one tier. Findings without a `tool_call_id` are vetoed entirely.
 
+### Restricted-conclusions linter (banned escalation terms)
+
+On the *overclaim* side, a deterministic linter (`scripts/report-escalation-linter.py`, wired into `scripts/run-all-smokes.sh`) scans Finding descriptions and narrative blocks in the rendered output for a compiled list of **banned escalation terms** — conclusion-escalation vocabulary such as `compromised`, `pass-the-hash`, `exfiltration confirmed`, `attacker`, `proves`, `definitely`, and `clearly shows`. The rule is a hard gate:
+
+* a banned term is allowed **only** when that record is backed by **≥2 distinct artifact classes** (the same SOUL.md corroboration bar the correlator enforces); a banned term in a single-class record is a **FAIL**;
+* even when backed, a bare assertion with no hedge verb (`consistent with`, `suggests`, `cannot exclude`) is flagged as a **WARN** so the conclusion is softened to scoped language.
+
+Matching is word-boundary aware and hyphen/underscore tolerant, so a banned substring buried in a machine identifier or filename (e.g. `compromised-host_log.evtx`) never trips the gate. This mirrors the `no_forbidden_unqualified_language` QA check (which gates the *exoneration* direction — "host is clean", "evidence is absent") and is custody-neutral: it never touches the audit chain, the manifest, or `verify_finding`, and never changes scoring math. The banned list stays general (no image-specific literals) so the evidence-agnostic gate is satisfied.
+
+### Counter-evidence FP suppressors (when a boring explanation fits)
+
+Where the corroboration gate asks "is this claim corroborated?", a complementary set of **counter-evidence suppressors** (`services/agent/findevil_agent/correlator_suppressors.py`) asks the opposite question — "does a *boring* explanation fit?" — and, when one does, demotes or annotates the finding so an analyst is not chasing a known-benign tell. All three are deterministic, **downgrade / HOLD / NOTE-only** (they never raise a tier and never clear a finding), evidence-agnostic, and **opt-in** via `FIND_EVIL_REQUIRE_FP_SUPPRESSORS=1` (default-OFF, custody-neutral — no audit-chain / manifest / scoring edits):
+
+1. **Known-good-hash whitelist.** A finding whose asserted file hash is on a curated known-good list describes a legitimate file → **demote**. The built-in set is a small, verifiable set of trivially-benign content hashes (the empty / zero-length artifact across MD5 / SHA-1 / SHA-256); operators extend it with their own known-good corpus (e.g. an NSRL export) via `FIND_EVIL_KNOWN_GOOD_HASHES` (comma/space-separated). No image-specific values.
+2. **Legitimate-system-path masquerade check.** A core Windows system binary observed in its **canonical** system directory (e.g. `svchost.exe` in `\Windows\System32`) is the real OS instance → **demote**. If the *same* binary name is seen in a **non-canonical** path, that is the actual masquerade tell and the finding is **left intact** — never demoted.
+3. **Process-frequency / baseline NOTE.** A subject process on the standard Windows baseline (svchost, explorer, lsass, services, …) has a high base rate; the finding is **annotated only** (confidence unchanged) so the analyst confirms *this* instance before asserting.
+
+Hard safety rail: the two *demoting* suppressors never fire on a **non-clearable signature** (credential-dumping, log/event-log clearing, backup/shadow-copy destruction, defense-tool impairment — reused from the benign-clearance library). A System32 path or a coincidental known-good hash must never soften those classes. The suppressors compose with the corroboration gates as the stricter, more honest result (both only ever lower a tier).
+
 ---
 
 ## The four operational habits (analyst applies on top)
@@ -79,6 +98,21 @@ If yes to ≥2 of those, upgrade your confidence. If no, leave it as INFERRED.
 Before running the agent against real evidence, run it against `goldens/synthetic-benign/` (a clean Windows install with no tradecraft). The expected output is **zero findings, verdict NO_EVIL**. If the agent produces any findings against the benign baseline, those represent your environment's *false-positive floor* — file the rule that fired as a known FP and either tune it out or flag any matches against real evidence as suspect.
 
 The benign baseline is the single highest-leverage thing you can do to calibrate the agent. Don't skip it.
+
+> **Reading the accuracy report honestly (Tier A vs Tier B).** A recall/precision
+> number (Tier B) is only meaningful against an external answer key; a clean or
+> key-less run shows it as `null` ("no_external_answer_key"), never a fabricated
+> figure, while the key-free grounding view (Tier A: citation / replay / custody)
+> stays populated. The report fails closed if a Tier B number ever appears without a
+> resolved key. See [fact-fidelity.md](fact-fidelity.md#tier-a-vs-tier-b--never-assert-recall-without-an-external-key).
+
+> **Precision is confidence-aware.** A false positive is only counted against
+> precision for an unmatched **asserted** (CONFIRMED/HIGH) finding — a finding the
+> run already scoped down to INFERRED / HYPOTHESIS does not cost precision, because
+> the run did not over-claim it. Every unmatched asserted finding is listed in the
+> report's `candidate_fp_for_human_review` (with `candidate_fp_n`) rather than
+> silently counted: on a closed-world key it is the precision FP set; on an
+> open-world key it is surfaced for review but not asserted as a provable FP.
 
 ---
 

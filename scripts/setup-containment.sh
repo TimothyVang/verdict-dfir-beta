@@ -63,4 +63,28 @@ settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 print(f"updated {settings} env block -> {len(env)} vars rooted at {os.environ['PROJECT_LOCAL']}")
 PY
 
+# --- opencode credential visibility (optional, local-only) -----------------
+# Containment redirects XDG_DATA_HOME into .project-local/share, and opencode
+# resolves its credential file from $XDG_DATA_HOME/opencode/auth.json. So a
+# contained opencode never sees the operator's global OAuth at
+# ~/.local/share/opencode/auth.json and fails with "OpenAI API key is missing".
+# Symlink the project-local auth file to the global one so the existing login is
+# visible here and token refreshes stay in sync. We only ever LINK (never copy
+# secret contents), only when a global credential already exists, and never
+# clobber a real local credential file. .project-local/ is gitignored, so the
+# link is local-only and the credential is never committed.
+OPENCODE_GLOBAL_AUTH="${HOME}/.local/share/opencode/auth.json"
+OPENCODE_LOCAL_AUTH="${XDG_DATA_HOME}/opencode/auth.json"
+if [ -e "${OPENCODE_GLOBAL_AUTH}" ]; then
+  if [ -s "${OPENCODE_LOCAL_AUTH}" ] && [ ! -L "${OPENCODE_LOCAL_AUTH}" ]; then
+    echo "opencode: leaving existing local auth.json alone (not a symlink)"
+  else
+    mkdir -p "$(dirname "${OPENCODE_LOCAL_AUTH}")"
+    ln -sfn "${OPENCODE_GLOBAL_AUTH}" "${OPENCODE_LOCAL_AUTH}"
+    echo "opencode: linked ${OPENCODE_LOCAL_AUTH} -> ${OPENCODE_GLOBAL_AUTH}"
+  fi
+else
+  echo "opencode: no global auth.json found; skipping (run 'opencode auth login' if needed)"
+fi
+
 echo "done. The agent env now points at this folder. Restart Claude Code to load it."

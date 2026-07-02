@@ -144,3 +144,58 @@ def test_finding_to_pool_dict_pure() -> None:
     assert d["derived_from"] == ["tc-1", "tc-2"]
     assert d["asserted_values"] == [{"path": "a", "expected": "b", "match": "exact"}]
     assert "mitre_technique" not in d  # None fields omitted
+
+
+# P0-5b unblock: the LLM emitter can now supply counter_hypothesis through
+# record_finding, so the benign-explanation gate is satisfiable in agent mode.
+
+
+def test_record_finding_plumbs_counter_hypothesis() -> None:
+    _seen, car = _fake_call_and_record(tcid="tc-007")
+    bridge = AgentToolBridge(case_id=_CASE, pool_origin="A", call_and_record=car)
+    bridge.dispatch("evtx_query", {"path": "/e/x.evtx"})
+    ack = bridge.dispatch(
+        "record_finding",
+        {
+            "tool_call_id": "tc-007",
+            "confidence": "CONFIRMED",
+            "artifact_path": "/e/x.evtx",
+            "description": "evil.exe process creation",
+            "mitre_technique": "T1059",
+            "asserted_values": [
+                {"path": "rows[*].Image", "expected": "evil.exe", "match": "contains"}
+            ],
+            "counter_hypothesis": "benign: a vendor updater could spawn it, but the binary "
+            "is in a user-writable temp path and is unsigned",
+        },
+    )
+    assert "recorded" in ack.lower()
+    d = bridge.findings[0]
+    # Flows through to the pool dict (and thus verdict.json).
+    assert "counter_hypothesis" in d
+    assert "vendor updater" in d["counter_hypothesis"]
+
+
+def test_benign_gate_rejects_execution_without_counter_hypothesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the gate ON, a CONFIRMED finding lacking counter_hypothesis is rejected
+    # at construction; the bridge returns an error the model can self-correct from.
+    monkeypatch.setenv("FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS_FINDING", "1")
+    _seen, car = _fake_call_and_record(tcid="tc-007")
+    bridge = AgentToolBridge(case_id=_CASE, pool_origin="A", call_and_record=car)
+    bridge.dispatch("evtx_query", {"path": "/e/x.evtx"})
+    ack = bridge.dispatch(
+        "record_finding",
+        {
+            "tool_call_id": "tc-007",
+            "confidence": "CONFIRMED",
+            "artifact_path": "/e/x.evtx",
+            "description": "evil.exe process creation",
+            "asserted_values": [
+                {"path": "rows[*].Image", "expected": "evil.exe", "match": "contains"}
+            ],
+        },
+    )
+    assert "error" in ack.lower() and "counter_hypothesis" in ack
+    assert bridge.findings == []

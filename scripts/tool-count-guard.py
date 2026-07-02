@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_EXPECTED_RUST = 32
-DEFAULT_EXPECTED_PYTHON = 13
+DEFAULT_EXPECTED_PYTHON = 14
 
 
 class DocRule(NamedTuple):

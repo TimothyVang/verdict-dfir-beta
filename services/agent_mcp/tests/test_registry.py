@@ -23,13 +23,14 @@ EXPECTED_TOOL_NAMES = {
     "pool_handoff",
     "expert_miss_capture",
     "accuracy_compare",
+    "find_ai_signatures",
 }
 
 
 class TestRegistry:
-    def test_all_specs_returns_thirteen_tools(self) -> None:
+    def test_all_specs_returns_fourteen_tools(self) -> None:
         specs = all_specs()
-        assert len(specs) == 13
+        assert len(specs) == 14
 
     def test_all_specs_returns_only_tool_specs(self) -> None:
         specs = all_specs()

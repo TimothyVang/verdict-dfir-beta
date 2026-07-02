@@ -107,6 +107,18 @@ class TestOutputShape:
         # no audit_log_path given -> nothing appended, no record kind reported
         assert result.audit_record_kind is None
 
+    async def test_surfaces_scope_caveats(self, tmp_path: Path) -> None:
+        # The diagnostic carries the golden's epistemic class so a public-documented
+        # (possibly training-contaminated) recall number is never read as proof.
+        case_dir = _case_dir(tmp_path, "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
+        result = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        assert result.validation_class == "public-documented"
+        assert result.corpus_identity == "public"
+        assert result.contamination_caveat  # non-empty for a public-documented corpus
+        assert result.does_not_measure  # non-empty list of scope caveats
+
     async def test_output_extra_forbid(self, tmp_path: Path) -> None:
         case_dir = _case_dir(tmp_path, "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
         result = await SPEC.handler(
@@ -150,6 +162,52 @@ class TestNonFindingAuditRecord:
         )
         # No audit.jsonl created anywhere under the case dir.
         assert not (case_dir / "audit.jsonl").exists()
+
+
+class TestContentAddressedCacheKey:
+    """The diagnostic surfaces a content-addressed key so a 'live' number cannot be
+    silently faked: identical inputs replay the same key, any drift flips it."""
+
+    async def test_output_carries_sha256_cache_key(self, tmp_path: Path) -> None:
+        case_dir = _case_dir(tmp_path, "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
+        result = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        assert isinstance(result.cache_key, str)
+        assert len(result.cache_key) == 64
+        assert all(c in "0123456789abcdef" for c in result.cache_key)
+
+    async def test_identical_inputs_replay_same_key(self, tmp_path: Path) -> None:
+        case_dir = _case_dir(tmp_path, "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
+        first = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        second = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        assert first.cache_key == second.cache_key
+
+    async def test_edited_verdict_flips_key(self, tmp_path: Path) -> None:
+        case_dir = _case_dir(tmp_path, "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
+        before = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        # Hand-edit verdict.json — the key must change, so a stale number cannot be
+        # passed off as tied to the new artifact.
+        (case_dir / "verdict.json").write_text(
+            json.dumps(
+                {
+                    "case_id": "nist-hacking-case",
+                    "verdict": "CONFIRMED_EVIL",
+                    "findings": _SEVEN_OF_FOURTEEN[:6],
+                }
+            ),
+            encoding="utf-8",
+        )
+        after = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(case_dir), golden_path=str(_NIST_GOLDEN))
+        )
+        assert before.cache_key != after.cache_key
 
 
 class TestGoldenResolution:

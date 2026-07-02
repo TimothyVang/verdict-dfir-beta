@@ -19,8 +19,11 @@
   --color-inferred: #ffd76a;
   --color-hypothesis: #4d5dff;
 
+  --font-body: var(--font-inter), "Inter", system-ui, -apple-system, sans-serif;
+  --font-condensed: var(--font-anarrow), "Archivo Narrow", "Arial Narrow", system-ui, sans-serif;
   --font-serif: var(--font-archivo), Impact, system-ui, sans-serif;
   --font-grotesk: var(--font-archivo), system-ui, sans-serif;
+  --font-hand: var(--font-caveat), "Caveat", cursive;
   --font-mono: var(--font-jbm), "JetBrains Mono", monospace;
 }
 
@@ -29,7 +32,7 @@
 body {
   background: #101426;
   color: #f5f1e8;
-  font-family: var(--font-jbm), "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-inter), "Inter", system-ui, -apple-system, sans-serif;
 }
 
 /* Subtle editorial reveal for page containers / panels. Mirrors the demo's

@@ -15,7 +15,7 @@ Codex compatibility means: Codex can read the same repo instructions and, if its
 | `findevil-mcp` | Rust DFIR tool surface over evidence and forensic artifacts | 32 |
 | `findevil-agent-mcp` | Python audit, manifest, verifier, ACH, memory, ACP, and expert-feedback support tools | 13 |
 
-Expected total: 45 product tools. The other four registered servers are non-product operator conveniences.
+Expected total: 46 product tools. The other four registered servers are non-product operator conveniences.
 
 These are the only product-default MCP servers — the only two in the audit chain. `.mcp.json` *also* registers four **non-product** servers (`n8n-mcp`, `playwright`, `puppeteer`, and `qmd` dev-memory recall) for post-verdict automation, browser tasks, and memory; they touch no evidence and emit no Findings, so seeing six entries in `.mcp.json` is expected, not a misconfiguration (full inventory: [`reference/mcp-and-tools.md`](reference/mcp-and-tools.md)). Do not add generic filesystem, Docker, Kubernetes, GitHub, fetch, or shell MCPs as defaults.
 

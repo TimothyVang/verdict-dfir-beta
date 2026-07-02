@@ -181,6 +181,41 @@ log, which is why customer release requires `signer=sigstore`.
 
 ---
 
+## Navigating the chain: the evidence traceability index
+
+`manifest_verify` and `scripts/trace-finding` answer "is the chain
+intact?". The companion **evidence traceability index** answers "show me
+the exact line that backs this claim". It is a deterministic, no-LLM,
+read-only join over `verdict.json` + `audit.jsonl` that maps, for every
+Finding:
+
+    claim (description) -> asserted entities/values
+                        -> finding_id
+                        -> each cited tool_call_id
+                        -> the exact audit.jsonl line number + output_sha256
+
+```bash
+# Human table:
+python -m scripts.evidence_traceability_index <run-dir>
+# Machine-readable JSON (for tooling / report embedding):
+python -m scripts.evidence_traceability_index <run-dir> --json
+```
+
+It re-walks the same canonical/`prev_hash` chain checks as the verifier:
+a citation is `RESOLVED` only when its `tool_call_id` maps to a
+`tool_call_output` record whose audit line is in canonical form on an
+unbroken chain. A missing `tool_call_output` or a tampered line surfaces
+the citation — and its owning Finding — as `UNRESOLVED`, and the process
+exits non-zero. Re-running over the same directory is byte-identical.
+
+This index is a **presentation / forensic-navigation aid only**. Per the
+project guardrails, indexes and visuals never create Findings, satisfy
+citations, or upgrade confidence; it only *navigates* the custody spine,
+it does not change it. `scripts/build-offline-report.py --run-dir <run-dir>`
+embeds the same table into the offline `report.html`.
+
+---
+
 ## What FRE 902(14) requires and why this meets it
 
 [Federal Rule of Evidence 902(14)](https://www.law.cornell.edu/rules/fre/rule_902)
@@ -320,6 +355,9 @@ Honest disclosure (per `docs/false-positives.md` and SOUL.md):
 - `agent-config/JUDGING.md` (after-the-fact self-assessment rubric;
   scored out-of-band by `scripts/self-score.py`, not part of the chain)
 - `scripts/trace-finding` (offline replay helper for completed case directories)
+- `scripts/evidence_traceability_index.py` (deterministic, read-only
+  finding -> tool_call_id -> audit line + output_sha256 join; navigation
+  aid, never creates Findings)
 - `scripts/agent-mcp-smoke.py` (the negative test runs in CI on
   every L1 build per `docker/l1-compose.yml`)
 - [Federal Rule of Evidence 902(14)](https://www.law.cornell.edu/rules/fre/rule_902)

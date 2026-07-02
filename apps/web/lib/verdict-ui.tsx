@@ -36,21 +36,31 @@ export const VERDICT = {
   gridLine: "rgba(245,241,232,0.04)",
 } as const;
 
-/** The single font stack used across the ENTIRE UI, wordmark included.
- *  `--font-jbm` is the next/font-hosted JetBrains Mono (see app/layout.tsx);
- *  falls back to a system mono if the variable is absent. */
+/** Clean-sans BODY role (v2 brand board panel 7) — body copy, controls, chips,
+ *  and most product UI text. The role the product lacked when everything was mono. */
+export const BODY =
+  "var(--font-inter), 'Inter', system-ui, -apple-system, sans-serif";
+
+/** Heavy CONDENSED editorial headline (Archivo Narrow) — "TRUTH IN THE TRACE."
+ *  mastheads and display type. */
+export const CONDENSED =
+  "var(--font-anarrow), 'Archivo Narrow', 'Arial Narrow', system-ui, sans-serif";
+
+/** Editorial furniture grotesque (Archivo) — kickers, uppercase labels, nav,
+ *  section headings, stamps. The voice between headlines and body. */
+export const GROTESK =
+  "var(--font-archivo), 'Archivo', system-ui, -apple-system, sans-serif";
+
+/** Restrained handwritten face (Caveat) — annotations only. */
+export const HAND = "var(--font-caveat), 'Caveat', cursive";
+
+/** Evidence/data ONLY: hashes, paths, timestamps, tool output, terminal rows. */
 export const MONO =
   "var(--font-jbm), 'JetBrains Mono', 'Courier New', monospace";
 
-/** Legacy SERIF alias kept for call-site compatibility. In v2 it resolves to the
- *  heavy editorial sans, not a serif, matching the brand board. */
-export const SERIF =
-  "var(--font-archivo), 'Archivo', Impact, system-ui, sans-serif";
-
-/** Editorial grotesque (Archivo) — kickers, labels, nav, furniture, section
- *  headings, chips. The "furniture" voice between serif headlines and mono data. */
-export const GROTESK =
-  "var(--font-archivo), 'Archivo', system-ui, -apple-system, sans-serif";
+/** Legacy alias: existing SerifHeadline / PullQuote / PanelTitle call sites now
+ *  resolve to the condensed editorial headline role. */
+export const SERIF = CONDENSED;
 
 /** Border-radius scale: pills/rows 6, tiles/insets/notes 8, cards/panels 10-12. */
 export const RADIUS = { pill: 6, tile: 8, card: 12 } as const;
@@ -64,13 +74,15 @@ interface ChipColors {
   text: string;
 }
 
-/** Chip taxonomy: 15% alpha fill, solid full-accent border, full-accent text. */
+/** Chip taxonomy: FILLED solid pastel pills with ink/cream text, matching the v2
+ *  brand-board badge/chip assets (seafoam VERIFIED, coral REJECTED, lilac REPLAY).
+ *  Semantic fills carry state meaning; light fills take ink text, saturated take cream. */
 export const CHIP_COLORS: Record<ChipVariant, ChipColors> = {
-  CONFIRMED: { bg: "rgba(115,217,194,0.15)", border: VERDICT.confirmed, text: VERDICT.confirmed },
-  INFERRED: { bg: "rgba(255,215,106,0.15)", border: VERDICT.inferred, text: VERDICT.inferred },
-  HYPOTHESIS: { bg: "rgba(77,93,255,0.15)", border: VERDICT.hypothesis, text: VERDICT.accentPurpleLight },
-  MITRE: { bg: "rgba(77,93,255,0.15)", border: VERDICT.accentPurple, text: VERDICT.accentPurpleLight },
-  ERROR: { bg: "rgba(255,98,87,0.15)", border: VERDICT.alertRed, text: VERDICT.alertRed },
+  CONFIRMED: { bg: VERDICT.confirmed, border: VERDICT.confirmed, text: "#12131A" },
+  INFERRED: { bg: VERDICT.inferred, border: VERDICT.inferred, text: "#12131A" },
+  HYPOTHESIS: { bg: VERDICT.hypothesis, border: VERDICT.hypothesis, text: "#F5F1E8" },
+  MITRE: { bg: VERDICT.accentPurpleLight, border: VERDICT.accentPurpleLight, text: "#12131A" },
+  ERROR: { bg: VERDICT.alertRed, border: VERDICT.alertRed, text: "#F5F1E8" },
 };
 
 /** Confidence-label color map (used outside chips too: audit rows, terminal text). */
@@ -163,9 +175,10 @@ function ChipBase({
         padding: "4px 14px",
         fontSize,
         fontWeight: 700,
-        fontFamily: MONO,
+        fontFamily: GROTESK,
         color: colors.text,
         letterSpacing: 1,
+        textTransform: "uppercase",
         ...style,
       }}
     >
@@ -238,7 +251,7 @@ export function Surface({
         border: `1px solid ${borderColor}`,
         borderRadius: radius,
         padding,
-        fontFamily: MONO,
+        fontFamily: BODY,
         color: VERDICT.text,
         boxSizing: "border-box",
         ...style,
@@ -273,7 +286,7 @@ export function TintedCard({ children, accent, padding = 20, radius = RADIUS.car
         border: `1.5px solid ${soft ? `${accent}8c` : accent}`,
         borderRadius: radius,
         padding,
-        fontFamily: MONO,
+        fontFamily: BODY,
         color: VERDICT.text,
         boxSizing: "border-box",
         ...style,
@@ -307,7 +320,7 @@ export function PanelTitle({ title, subtitle, size = 28, letterSpacing = -0.5, s
         {title}
       </div>
       {subtitle && (
-        <div style={{ fontFamily: MONO, fontSize: 16, fontWeight: 400, color: VERDICT.muted, marginTop: 8, letterSpacing: 0.5 }}>
+        <div style={{ fontFamily: BODY, fontSize: 16, fontWeight: 400, color: VERDICT.muted, marginTop: 8, letterSpacing: 0.5 }}>
           {subtitle}
         </div>
       )}
@@ -447,13 +460,13 @@ export function BrandMark({
       </svg>
       {withWordmark && (
         <div style={{ display: "flex", flexDirection: "column", alignItems: vertical ? "center" : "flex-start" }}>
-          <span style={{ fontFamily: MONO, fontSize: wordmarkSize, fontWeight: 800, color: VERDICT.text, letterSpacing: 10 }}>
+          <span style={{ fontFamily: GROTESK, fontSize: wordmarkSize, fontWeight: 800, color: VERDICT.text, letterSpacing: 10 }}>
             VERDICT
           </span>
           {withTagline && (
             <span
               style={{
-                fontFamily: MONO,
+                fontFamily: BODY,
                 fontSize: Math.max(14, Math.round(wordmarkSize * 0.25)),
                 fontWeight: 400,
                 color: VERDICT.muted,
@@ -491,7 +504,7 @@ export function Watermark() {
       }}
     >
       <BrandMark size={28} />
-      <span style={{ fontFamily: MONO, fontSize: 15, color: VERDICT.text, fontWeight: 700, letterSpacing: 3 }}>
+      <span style={{ fontFamily: GROTESK, fontSize: 15, color: VERDICT.text, fontWeight: 700, letterSpacing: 3 }}>
         VERDICT
       </span>
     </div>

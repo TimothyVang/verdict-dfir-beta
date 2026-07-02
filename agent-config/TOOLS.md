@@ -5,11 +5,13 @@ The agent has access to two MCP servers, both auto-spawned by Claude Code via `.
 | Server | Lang | Tools |
 |---|---|---|
 | `findevil-mcp` | Rust (`services/mcp/`) | 32 typed DFIR tools |
-| `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 13 crypto + ACH + memory + ACP + expert-feedback + accuracy tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
+| `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 14 crypto + ACH + memory + ACP + expert-feedback + accuracy + AI-signature tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
 
 Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the canonical JSON output). Findings cite tool calls by `tool_call_id`. The verifier vetoes any finding that doesn't.
 
-> **This file is the agent read-order catalog of the 45 typed PRODUCT tools** (the only verbs in
+> **Finding-authoring invariant.** Every CONFIRMED execution/intent Finding MUST populate `counter_hypothesis` with the benign explanation considered and discarded (presumption of benignity). Empty on such a Finding is a gate failure under `FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS_FINDING`; the correlator downgrades it and the schema/verifier reject it.
+
+> **This file is the agent read-order catalog of the 46 typed PRODUCT tools** (the only verbs in
 > the audit chain). The *full* set of MCP servers actually registered in `.mcp.json` (incl. the
 > operator-runtime `n8n-mcp`, `playwright`, `puppeteer` that emit no Findings) and the external
 > DFIR binaries + dependency pins are inventoried in
@@ -254,6 +256,11 @@ Use when: a human expert edits the auto-drafted PDF before release. Records a `k
 Args: `{case_dir, golden_path?, audit_log_path?, coverage_manifest_path?}`
 Returns: `{case_id, recall_percent, precision_percent, f1, hallucination_rate, negative_coverage, verdict_match, pass, matched[], unmatched[], extra[], false_positives[], ...}`
 Use when: a finished Case's `verdict.json` needs to be scored against a curated golden (TP/FP/FN, precision/recall/F1, hallucination rate). Read-only ground-truth accuracy diagnostic only. HONEST SCOPE: **this is a DIAGNOSTIC, never a Finding** — it emits no `tool_call_id`, satisfies no Finding citation, mutates no evidence, and is never a Merkle leaf; it measures how the run scored against ground truth and never adds to or alters the Verdict.
+
+### find_ai_signatures
+Args: `{case_id, text?, paths?, categories?, limit?, preview_chars?}` — provide at least one of `text` / `paths`
+Returns: `{case_id, confidence_tier: "HYPOTHESIS", lead_only: true, disclaimer, matches[], sources_scanned, chars_scanned, signatures_evaluated, read_errors[], truncated}` where each match is `{signature_id, category, description, source, occurrences, first_offset, preview}`
+Use when: you want to know whether **LLM-assisted tooling or an autonomous agent framework** is fingerprinted in a recovered script, log slice, note, or text artifact. Typed read-only signature scanner (NOT a filesystem/shell surface): it reads only the inline `text` and the explicit `paths` you pass, opens files for read only, and never mutates evidence. The curated GENERAL signature list keys on LLM output boilerplate (refusals, "as an AI language model"), agent-framework module names (LangChain/LangGraph, LlamaIndex, Auto-GPT/BabyAGI, CrewAI, AutoGen, Semantic Kernel), the ReAct scratchpad shape, LLM API-client fingerprints (`api.openai.com`, `api.anthropic.com`, SDK imports, `system_fingerprint`), prompt scaffolding, and general model-family identifiers (`gpt-`/`claude-`/`llama-`/`mistral-`/`gemini-`) — no image-specific values. HONEST SCOPE: every match is a **HYPOTHESIS-tier LEAD** (`confidence_tier="HYPOTHESIS"`, `lead_only=true`). It suggests AI/agent involvement; it is **never** execution proof and **never** an attribution. A signature alone never satisfies the SOUL.md >=2-artifact-class corroboration gate — pair it with an independent artifact class before raising confidence. A file that cannot be read is reported in `read_errors` and skipped.
 
 ---
 

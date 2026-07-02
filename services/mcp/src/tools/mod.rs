@@ -16,6 +16,7 @@
 //!   * Every tool is testable in isolation via integration tests
 //!     under `services/mcp/tests/`.
 
+pub mod argsafe;
 pub mod ausearch;
 pub mod browser_history;
 pub mod case_open;
@@ -34,6 +35,7 @@ pub mod oe_dbx_parse;
 pub mod pcap_triage;
 pub mod plaso_parse;
 pub mod prefetch_parse;
+pub mod proc_runner;
 pub mod regf;
 pub mod registry_query;
 pub mod suricata_eve;

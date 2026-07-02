@@ -65,6 +65,93 @@ try:
 except ImportError:
     _PLAYBOOK_AVAILABLE = False
 
+# Typed reason-codes for a non-committal verdict. Prefer the canonical
+# derivation in findevil_agent.verdict_reasons (3.11+ agent venv); the host
+# engine runs under bare python3 (3.10 here), which cannot import the package —
+# the same reason the playbook import above is guarded. The fallback is an
+# inline, stdlib-only mirror that emits the SAME string codes in the SAME
+# canonical order, so verdict.json is identical under either interpreter.
+try:
+    from findevil_agent.verdict_reasons import (
+        derive_indeterminate_reasons as _derive_indeterminate_reasons,
+    )
+
+    _VERDICT_REASONS_AVAILABLE = True
+except ImportError:
+    _VERDICT_REASONS_AVAILABLE = False
+
+    # Canonical ordering mirror of findevil_agent.verdict_reasons (most
+    # decision-blocking first; REFUTED appended last).
+    _INDETERMINATE_REASON_ORDER = (
+        "CONTRADICTION",
+        "INSUFFICIENT_COVERAGE",
+        "DEGRADED_MODE",
+        "REFUTED",
+    )
+
+    def _derive_indeterminate_reasons(
+        *,
+        contradiction_count: int = 0,
+        artifact_class_count: int = 0,
+        leads_only: bool = False,
+        tool_failure_count: int = 0,
+        refuted_count: int = 0,
+        min_artifact_classes: int = 2,
+    ) -> tuple[str, ...]:
+        """Inline mirror of derive_indeterminate_reasons (bare-python3 host).
+
+        Pure and deterministic: same inputs always yield the same ordered
+        tuple of string codes in ``_INDETERMINATE_REASON_ORDER``.
+        """
+        triggered: set[str] = set()
+        if contradiction_count > 0:
+            triggered.add("CONTRADICTION")
+        if artifact_class_count < min_artifact_classes or leads_only:
+            triggered.add("INSUFFICIENT_COVERAGE")
+        if tool_failure_count > 0:
+            triggered.add("DEGRADED_MODE")
+        if refuted_count > 0:
+            triggered.add("REFUTED")
+        return tuple(r for r in _INDETERMINATE_REASON_ORDER if r in triggered)
+
+
+# Verdict words that abstain from a committed call. ``reason_codes`` annotates
+# only these — never SUSPICIOUS (committed) or NO_EVIL (scoped clean). The
+# engine emits INDETERMINATE; INCONCLUSIVE is the equivalent RunVerdict-event
+# word, accepted here so the same annotation holds for either spelling.
+_NON_COMMITTAL_VERDICTS = frozenset({"INDETERMINATE", "INCONCLUSIVE"})
+
+
+def compute_verdict_reason_codes(
+    verdict: str,
+    *,
+    contradiction_count: int = 0,
+    artifact_class_count: int = 0,
+    leads_only: bool = False,
+    tool_failure_count: int = 0,
+    refuted_count: int = 0,
+) -> list[str]:
+    """Reason-codes annotating a non-committal verdict (additive, custody-neutral).
+
+    Returns the ordered string reason-codes for an INDETERMINATE/INCONCLUSIVE
+    verdict, or an empty list for a committed SUSPICIOUS / scoped NO_EVIL word.
+    NEVER changes the verdict WORD — it only annotates an already-decided
+    non-committal verdict. The codes are derived deterministically from signals
+    the engine already tracks; the surface never touches the audit chain, the
+    manifest, or any scoring math.
+    """
+    if str(verdict).upper() not in _NON_COMMITTAL_VERDICTS:
+        return []
+    reasons = _derive_indeterminate_reasons(
+        contradiction_count=contradiction_count,
+        artifact_class_count=artifact_class_count,
+        leads_only=leads_only,
+        tool_failure_count=tool_failure_count,
+        refuted_count=refuted_count,
+    )
+    return [str(r) for r in reasons]
+
+
 # ---------------------------------------------------------------------------
 # Hermes memory glue (inline). The host engine runs under bare ``python3``
 # (3.10 here), which cannot import the 3.11+ ``findevil_agent`` package — the
@@ -330,6 +417,34 @@ def _release_path(p: str | Path, base: str | Path | None = None) -> str:
     return path.name
 
 
+def _relativize_repo_paths(obj: Any, base: str | Path) -> Any:
+    """Return a copy of OBJ with every absolute path under BASE rewritten to its
+    BASE-relative POSIX form, so verdict.json / run.manifest.json carry no
+    machine-specific ``/home/<user>/.../<repo>`` prefix.
+
+    Applied once at each serialization boundary (before the manifest hashes the
+    file), so the signed chain attests the relative content and a fresh clone
+    reproduces it byte-for-byte. Only whole-string path *values* under BASE are
+    rewritten; prose, scalars, and paths outside BASE are returned verbatim. Pure
+    — never mutates OBJ. These are descriptive provenance fields (evidence_path,
+    evidence_inventory, coverage_manifest, image_path); replay resolves tool-call
+    ``*_path`` args separately, so relativizing here does not affect
+    verify_finding.
+    """
+    prefix = str(Path(base).resolve()) + os.sep
+
+    def _rel(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {key: _rel(val) for key, val in node.items()}
+        if isinstance(node, list):
+            return [_rel(item) for item in node]
+        if isinstance(node, str) and node.startswith(prefix):
+            return node[len(prefix) :]
+        return node
+
+    return _rel(obj)
+
+
 def _case_home_base() -> Path | None:
     """The portable case-store root, mirroring findevil_agent.config.resolve_case_home.
 
@@ -377,12 +492,48 @@ def _relativize_extracted_path(value: str) -> str:
         return value
 
 
+def _relativize_repo_root_path(value: str) -> str:
+    """Record a repo-local source ``*_path`` /home-free for the signed audit chain.
+
+    Companion to :func:`_relativize_extracted_path`, anchored on the REPO ROOT
+    instead of the case store. The EVIDENCE source path (e.g.
+    ``<repo>/evidence/<image>.dd``) lives under the repo but OUTSIDE the case
+    store, so ``_relativize_extracted_path`` passes it through and it leaks
+    ``/home/<user>/...`` into ``tool_call_start.arguments`` (the
+    ``image_path`` / ``evidence_path`` keys — the 30 ``image_path`` leaks). The
+    repo root is reconstructable identically at record (this engine,
+    ``Path(__file__).resolve().parent.parent``) and at replay (the verifier
+    resolves the same anchor), so a path under it is recorded RELATIVE to the repo
+    root (``evidence/<image>.dd``) and re-absolutized before re-dispatch — keeping
+    the chain /home-free AND letting replay still find the file.
+
+    Mirrors ``_relativize_extracted_path``: only an absolute path genuinely under
+    ``REPO_ROOT`` is rewritten. Evidence OUTSIDE the repo (an operator-chosen path
+    elsewhere on the host) has no repo anchor to resolve against at replay, so it
+    passes through unchanged — a documented residual; the committed corpus always
+    lives under ``evidence/``.
+    """
+    if not value:
+        return value
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return value
+    try:
+        return candidate.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return value
+
+
 def _release_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
     """Copy ``arguments`` with every ``*_path`` value recorded /home-free.
 
     Mirrors the verifier's ``*_path`` convention (``mft_path``, ``evtx_path``,
-    ``artifact_path``, …). Only string ``*_path`` values under ``case_home`` are
-    relativized; all other keys/values are copied verbatim. Never mutates the input.
+    ``artifact_path``, …). A ``*_path`` value under the case store is relativized
+    against ``case_home`` (``cases/<id>/...``); a value NOT under the case store
+    but under the repo (the evidence source — ``image_path`` / ``evidence_path``
+    -> ``evidence/<image>.dd``) is relativized against ``REPO_ROOT``. Everything
+    else — non-path keys, and paths under neither anchor — is copied verbatim.
+    Never mutates the input.
     """
     if not arguments:
         return {}
@@ -394,7 +545,15 @@ def _release_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
             and isinstance(val, str)
             and val.strip()
         ):
-            out[key] = _relativize_extracted_path(val)
+            # Case store first — the verifier resolves a ``cases/...`` value back
+            # to absolute via case_home. Only when the path is NOT under the case
+            # store (so left unchanged) try the repo root, which covers the
+            # evidence source path. A path under neither anchor stays absolute
+            # (documented residual: evidence outside the repo).
+            relativized = _relativize_extracted_path(val)
+            if relativized == val:
+                relativized = _relativize_repo_root_path(val)
+            out[key] = relativized
         else:
             out[key] = val
     return out
@@ -1856,26 +2015,62 @@ def registry_persistence_candidates(
 # USBSTOR / MountedDevices / Services keys are queried (budget starvation).
 _BACKUP_HIVE_MARKERS = ("\\repair\\", "/repair/", "\\regback\\", "/regback/")
 
+# Triage priority by hive CLASS (lower = queried earlier), keyed on the general
+# Windows hive filename — never any image-specific value. The machine hives
+# (SYSTEM / SOFTWARE / SAM) occur once per host and carry the highest-value,
+# single-source keys: SYSTEM alone holds the USB device-insertion history
+# (``Enum\USBSTOR``) and drive-letter mappings (``MountedDevices``) plus the
+# Services list. The per-user hives (NTUSER.DAT / UsrClass.dat) repeat once per
+# profile, so on a multi-user disk they can exhaust the per-run registry_query
+# budget (and the [:20] hive cap) before the SYSTEM hive is ever reached —
+# starving the USB / MountedDevices lane. Ranking the machine hives ahead of the
+# per-user hives keeps that lane covered on ANY image regardless of profile
+# count, while per-user hives are still queried as budget allows.
+_HIVE_CLASS_PRIORITY: dict[str, int] = {
+    "system": 0,
+    "software": 1,
+    "sam": 2,
+    "ntuser.dat": 3,
+    "usrclass.dat": 4,
+}
+_DEFAULT_HIVE_PRIORITY = 5
+
 
 def _prioritize_registry_hives(
     entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Sort discovered registry hives so live hives precede backup copies.
+    """Sort discovered registry hives so the highest-value live hives are triaged
+    first and backup copies last.
 
-    Pure, stable function. A disk extraction can hold BOTH the live SYSTEM hive
-    (``WINDOWS/system32/config/system``) and a stale backup (``WINDOWS/repair/
-    system``); the modern equivalent is ``config\\RegBack``. Triaging the backup
-    first can exhaust the registry_query budget before the live hive's USBSTOR /
-    MountedDevices keys are ever queried, silently losing a real lead. This
-    de-prioritizes the backup copies (they are still queried if budget remains —
-    never dropped) while preserving the relative order of everything else.
+    Pure, stable function. Two ordering signals, applied in this precedence:
+
+    1. **Live before backup.** A disk extraction can hold BOTH the live SYSTEM
+       hive (``WINDOWS/system32/config/system``) and a stale backup
+       (``WINDOWS/repair/system``); the modern equivalent is ``config\\RegBack``.
+       Triaging the backup first can exhaust the registry_query budget before the
+       live hive's USBSTOR / MountedDevices keys are ever queried. Backup copies
+       are de-prioritized (still queried if budget remains — never dropped).
+    2. **Machine hives before per-user hives.** Among live hives, SYSTEM /
+       SOFTWARE / SAM are ranked ahead of the (potentially many) per-user
+       NTUSER.DAT / UsrClass.dat hives so the SYSTEM hive's USB device-insertion
+       history (``Enum\\USBSTOR``) and ``MountedDevices`` keys are never starved by
+       the per-run budget on a multi-user image (see ``_HIVE_CLASS_PRIORITY``).
+
+    The sort is stable, so the relative order of hives sharing a (backup, class)
+    rank is preserved.
     """
 
     def _is_backup(entry: dict[str, Any]) -> int:
         path = str(entry.get("path") or "").lower()
         return 1 if any(m in path for m in _BACKUP_HIVE_MARKERS) else 0
 
-    return sorted(entries or [], key=_is_backup)
+    def _hive_class_rank(entry: dict[str, Any]) -> int:
+        name = PurePosixPath(
+            str(entry.get("path") or "").replace("\\", "/")
+        ).name.lower()
+        return _HIVE_CLASS_PRIORITY.get(name, _DEFAULT_HIVE_PRIORITY)
+
+    return sorted(entries or [], key=lambda e: (_is_backup(e), _hive_class_rank(e)))
 
 
 # Packet-capture / sniffing / network-recon toolkit tells in a service name or
@@ -2812,6 +3007,69 @@ def legacy_evt_service_candidates(events: list[dict[str, Any]]) -> list[dict[str
     return out
 
 
+# Outlook Express stores each mail/news folder as its own ``.dbx`` file; the
+# trash folder is "Deleted Items.dbx". Messages the user deletes land here and
+# stay parseable until OE compacts the store, so message headers recovered from
+# this folder are recovered DELETED email. The signature is the OE default trash
+# folder name (a general product artifact) — never an image-specific value.
+def _is_oe_deleted_items_store(source_name: Any) -> bool:
+    """True when an OE ``.dbx`` source filename is the "Deleted Items" trash folder.
+
+    Keys on the OE default trash-folder name only; the per-folder ``.dbx`` naming
+    is a general Outlook Express artifact, not tied to any image.
+    """
+    base = str(source_name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if base.endswith(".dbx"):
+        base = base[:-4]
+    return base.strip().startswith("deleted items")
+
+
+def oe_dbx_deleted_email_candidates(
+    stores: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Classify parsed OE ``.dbx`` stores into recovered-deleted-email candidates.
+
+    Pure function (unit-testable without a mount). A store qualifies when it is a
+    validated OE message store (``is_oe_dbx`` and ``is_message_store``) whose
+    *source folder* is the Outlook Express "Deleted Items" trash AND from which
+    ``oe_dbx_parse`` recovered at least one message header (a subject count, a
+    subject, or a sender). Messages in the Deleted Items store were deleted by the
+    user and remained recoverable, so this is a recovered-deleted-email lead
+    distinct from the newsgroup-affiliation finding. Keyed on the general OE trash
+    folder name, never an image-specific value. Downstream the lead stays a
+    HYPOTHESIS; an empty or compacted trash recovers nothing and yields no
+    candidate (false-positive safety).
+    """
+    out: list[dict[str, Any]] = []
+    for store in stores or []:
+        if not isinstance(store, dict):
+            continue
+        if not (store.get("is_oe_dbx") and store.get("is_message_store")):
+            continue
+        if not _is_oe_deleted_items_store(store.get("source_name")):
+            continue
+        subjects = [s for s in (store.get("subjects") or []) if str(s).strip()]
+        senders = [s for s in (store.get("senders") or []) if str(s).strip()]
+        try:
+            subject_count = int(store.get("message_subject_count") or 0)
+        except (TypeError, ValueError):
+            subject_count = 0
+        if not (subject_count or subjects or senders):
+            continue
+        out.append(
+            {
+                "kind": "deleted_email",
+                "source_name": str(store.get("source_name") or ""),
+                "persisted_path": store.get("persisted_path"),
+                "tool_call_id": store.get("tool_call_id"),
+                "message_count": subject_count or len(subjects),
+                "subjects": subjects[:6],
+                "senders": senders[:6],
+            }
+        )
+    return out
+
+
 # URL/path tells that mark an MSIE history row as an illicit / tool download
 # rather than ordinary browsing. ``warez``/``crack``/``keygen``/``serialz`` are
 # piracy markers; an executable/installer extension fetched over the web is a
@@ -3438,6 +3696,42 @@ TOOL_ARTIFACT_CLASSES = {
     "vol_run": "memory",
     "yara_scan": "yara",
     "zeek_summary": "network",
+}
+
+# Typed tools whose invocation "examines" a coarse artifact class. Keyed on the
+# same coarse classes Investigation._case_completeness reports (memory, evtx,
+# disk/filesystem, network, velociraptor) so the reverse coverage audit and the
+# completeness record agree on what counts as opening a class. Used by the
+# applicable-but-uninvoked reverse audit: an AVAILABLE class with zero of these
+# tools run is a coverage hole the report must not paper over. Evidence-agnostic
+# (keys on tool names and artifact classes, never an image-specific value).
+APPLICABLE_TOOLS_BY_CLASS: dict[str, frozenset[str]] = {
+    "memory": frozenset(
+        {"vol_pslist", "vol_psscan", "vol_psxview", "vol_malfind", "vol_run"}
+    ),
+    "evtx": frozenset({"evtx_query", "hayabusa_scan"}),
+    "disk/filesystem": frozenset(
+        {
+            "disk_mount",
+            "disk_extract_artifacts",
+            "mft_timeline",
+            "usnjrnl_query",
+            "prefetch_parse",
+            "registry_query",
+            "indx_parse",
+            "yara_scan",
+        }
+    ),
+    "network": frozenset(
+        {
+            "pcap_triage",
+            "zeek_summary",
+            "sysmon_network_query",
+            "nfdump_query",
+            "suricata_eve",
+        }
+    ),
+    "velociraptor": frozenset({"vel_collect"}),
 }
 
 ATTACK_COVERAGE_TARGETS: tuple[dict[str, Any], ...] = (
@@ -4388,6 +4682,21 @@ def build_coverage_manifest(
         )
 
     status_counts = Counter(str(row["status"]) for row in rows)
+    # Breadth signal for the coverage-discounted confidence (P0-6): classes
+    # actually available for THIS evidence type (excluding the synthetic
+    # "unsupported" row) vs. how many a tool actually parsed. coverage_ratio
+    # caps at 1.0 and is the multiplier a thin investigation can't escape.
+    applicable_classes = sum(
+        1 for row in rows if row["available"] and not row["unsupported"]
+    )
+    consulted_classes = sum(
+        1 for row in rows if row["parsed"] and not row["unsupported"]
+    )
+    coverage_ratio = (
+        round(min(1.0, consulted_classes / applicable_classes), 4)
+        if applicable_classes
+        else 0.0
+    )
     return {
         "version": 1,
         "case_id": case_id,
@@ -4408,11 +4717,38 @@ def build_coverage_manifest(
             "status_counts": dict(sorted(status_counts.items())),
             "attack_blind_spot_count": attack_coverage.get("blind_spot_count", 0),
             "analysis_limitation_count": len(analysis_limitations),
+            "applicable_classes": applicable_classes,
+            "consulted_classes": consulted_classes,
+            "coverage_ratio": coverage_ratio,
         },
         "artifact_classes": rows,
         "attack_coverage_summary": attack_coverage.get("summary", ""),
         "analysis_limitations": list(analysis_limitations),
     }
+
+
+# Bare-host mirror of findevil_agent.judge.CONFIDENCE_VALUE — this 3.10 engine
+# cannot import the 3.11 findevil_agent package. Keep both in sync.
+_CONFIDENCE_VALUE = {"CONFIRMED": 1.0, "INFERRED": 0.6, "HYPOTHESIS": 0.3}
+
+
+def _coverage_discounted_confidence(
+    confidence_tiers: list[str], applicable_classes: int, consulted_classes: int
+) -> float:
+    """Case-level confidence in [0, 1] a thin investigation cannot inflate (P0-6).
+
+    ``mean(CONFIDENCE_VALUE[tier]) * (consulted / applicable)``. Mirror of
+    :func:`findevil_agent.judge.compute_coverage_discounted_score` (see that
+    docstring); duplicated only because the host engine cannot import the 3.11
+    package. Keep the two formulas identical.
+    """
+    if applicable_classes <= 0 or not confidence_tiers:
+        return 0.0
+    coverage_ratio = min(1.0, consulted_classes / applicable_classes)
+    finding_score = sum(_CONFIDENCE_VALUE.get(t, 0.0) for t in confidence_tiers) / len(
+        confidence_tiers
+    )
+    return round(finding_score * coverage_ratio, 4)
 
 
 def coverage_unexamined_available_classes(
@@ -4446,6 +4782,333 @@ def coverage_unexamined_available_classes(
         if artifact_class:
             gaps.append(str(artifact_class))
     return gaps
+
+
+# Parse-quality buckets keyed on coverage-manifest status. A class counts as
+# "examined" for a NO_EVIL clearance ONLY when a parser actually ran without error
+# -- "parsed" / "partial" / "attempted_no_rows" (a clean parse that returned no
+# rows is how a class is legitimately cleared). A "failed" status (the tool
+# errored) is parse_quality 0: the class was touched but not examined, so a tool
+# failure cannot mark it examined. A never-attempted ("available_not_attempted")
+# or "not_supplied" / "unsupported" class is examinable by neither set.
+_PARSE_QUALITY_EXAMINED_STATUSES = frozenset({"parsed", "partial", "attempted_no_rows"})
+_PARSE_QUALITY_FAILED_STATUSES = frozenset({"failed"})
+
+
+def coverage_parse_quality(
+    coverage_manifest: dict[str, Any] | None,
+) -> tuple[set[str], set[str]]:
+    """Split coverage-manifest artifact classes into (examined, failed).
+
+    ``examined`` = a parser ran without error (``parsed`` / ``partial`` /
+    ``attempted_no_rows``). ``failed`` = a parser was attempted but errored
+    (status ``failed``), so the class was touched yet not actually examined. A
+    class can appear in neither set (never attempted, not supplied, unsupported
+    custody). This is the parse-quality dimension the negative-completeness gate
+    needs so a FAILED or deferred parse cannot mark a class examined for a
+    clearance. Pure and deterministic.
+    """
+    examined: set[str] = set()
+    failed: set[str] = set()
+    if not coverage_manifest:
+        return examined, failed
+    for row in coverage_manifest.get("artifact_classes", []):
+        if not isinstance(row, dict) or row.get("unsupported"):
+            continue
+        artifact_class = row.get("artifact_class")
+        if not artifact_class:
+            continue
+        status = str(row.get("status"))
+        if status in _PARSE_QUALITY_EXAMINED_STATUSES:
+            examined.add(str(artifact_class))
+        elif status in _PARSE_QUALITY_FAILED_STATUSES:
+            failed.add(str(artifact_class))
+    return examined, failed
+
+
+def _finding_cited_tool_call_ids(findings: list[dict[str, Any]]) -> set[str]:
+    """Every tool_call_id any Finding cites (primary ``tool_call_id`` + derived).
+
+    Mirror of ``evidence_traceability_index._finding_citations`` kept here so the
+    reverse coverage audit needs no cross-module import. Deterministic and
+    evidence-agnostic.
+    """
+    cited: set[str] = set()
+    for finding in findings:
+        primary = finding.get("tool_call_id")
+        if primary:
+            cited.add(str(primary))
+        for tcid in finding.get("derived_from") or []:
+            if tcid:
+                cited.add(str(tcid))
+    return cited
+
+
+def build_coverage_reverse_audits(
+    verdict: str,
+    findings: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    case_completeness: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Two mandatory pre-finalize REVERSE coverage audits.
+
+    Forward custody asks "does every Finding cite a tool call?". These two ask
+    the reverse questions a polished report can hide:
+
+    (a) ``coverage_reverse_uninvoked_tools`` -- applicable-but-uninvoked tool
+        diff. For every artifact class the evidence actually CONTAINS (available),
+        were any of the typed tools that examine that class invoked? An available
+        class with ZERO applicable tools run is a coverage hole. For a NO_EVIL
+        clearance this is a hard FAIL (you cannot scope-clear a class you never
+        opened); for any other verdict it is a named limitation (WARN).
+
+    (b) ``coverage_reverse_uncited_sources`` -- indexed-but-uncited-source flag.
+        Which successfully indexed (non-custody) tool outputs are cited by no
+        Finding? Uncited tool output is the NORMAL state of any real run (negative
+        results, corroboration that produced no Finding), so this is a mandatory
+        non-blocking DISCLOSURE (PASS) that names the uncited sources for analyst
+        review -- a WARN/FAIL here would block every legitimate clean clearance.
+
+    Returns ``_qa_check``-shaped rows the caller appends to the report-QA checks.
+    Pure and deterministic.
+    """
+    checks: list[dict[str, Any]] = []
+    is_clearance = verdict == "NO_EVIL"
+    tools_run = {str(tc.get("tool")) for tc in tool_calls if tc.get("tool")}
+    available_classes = sorted(
+        {
+            str(row.get("artifact_class"))
+            for row in case_completeness.get("checks", [])
+            if row.get("artifact_class") and row.get("available")
+        }
+    )
+    uninvoked = [
+        cls
+        for cls in available_classes
+        if cls in APPLICABLE_TOOLS_BY_CLASS
+        and not (APPLICABLE_TOOLS_BY_CLASS[cls] & tools_run)
+    ]
+    if uninvoked:
+        _qa_check(
+            checks,
+            "coverage_reverse_uninvoked_tools",
+            "FAIL" if is_clearance else "WARN",
+            (
+                "NO_EVIL clearance reaches over artifact class(es) the evidence "
+                "contains but no applicable typed tool ever examined; absence is "
+                "not proof of no evil."
+                if is_clearance
+                else "Artifact class(es) the evidence contains were never examined "
+                "by an applicable typed tool; coverage gap recorded as a named "
+                "limitation."
+            ),
+            [f"available_but_uninvoked={uninvoked}"],
+        )
+    else:
+        _qa_check(
+            checks,
+            "coverage_reverse_uninvoked_tools",
+            "PASS",
+            "Every available artifact class was examined by at least one applicable typed tool.",
+            available_classes,
+        )
+
+    cited = _finding_cited_tool_call_ids(findings)
+    indexed = {
+        str(tc.get("tool_call_id"))
+        for tc in tool_calls
+        if tc.get("tool_call_id")
+        and not tc.get("error")
+        and TOOL_ARTIFACT_CLASSES.get(str(tc.get("tool"))) not in (None, "custody")
+    }
+    uncited = sorted(indexed - cited)
+    _qa_check(
+        checks,
+        "coverage_reverse_uncited_sources",
+        "PASS",
+        (
+            f"{len(uncited)} of {len(indexed)} indexed tool output(s) are cited by "
+            "no Finding (uncited tool output is normal for negative results; "
+            "disclosed for analyst review)."
+            if uncited
+            else "Every indexed tool output is cited by a Finding."
+        ),
+        uncited[:20],
+    )
+    return checks
+
+
+# Conditional key-question ("if you found X you must have checked Y") technique
+# sets. Evidence-agnostic: keyed on MITRE technique IDs and artifact-class names,
+# never an image-specific value. Kept small and curated so the rule engine stays
+# deterministic.
+_KQ_EXECUTION_TECHNIQUES = frozenset(
+    {
+        "T1059",
+        "T1059.001",
+        "T1059.003",
+        "T1059.005",
+        "T1203",
+        "T1204",
+        "T1204.002",
+        "T1053.005",
+        "T1047",
+        "T1569",
+        "T1569.002",
+        "T1106",
+        "T1129",
+    }
+)
+# Host artifact classes that show a binary actually ran (distinct from the event
+# log or network that usually surfaces the triggering lead).
+_KQ_EXECUTION_CLASSES = frozenset({"prefetch", "memory"})
+_KQ_LATERAL_TECHNIQUES = frozenset(
+    {
+        "T1021",
+        "T1021.001",
+        "T1021.002",
+        "T1021.006",
+        "T1078",
+        "T1210",
+        "T1550",
+        "T1570",
+        "T1534",
+    }
+)
+# Any artifact class other than the Windows event log -- a log-clearing Finding
+# needs a second class because the event log cannot recover what it lost.
+_KQ_NON_EVTX_CLASSES = frozenset(
+    {
+        "memory",
+        "disk/filesystem",
+        "network",
+        "prefetch",
+        "registry",
+        "mft",
+        "usnjrnl",
+        "yara",
+        "velociraptor",
+        "timeline",
+        "browser_history",
+        "linux",
+        "macos",
+        "cloud",
+    }
+)
+
+KEY_QUESTION_RULES: tuple[dict[str, Any], ...] = (
+    {
+        "rule_id": "download-implies-execution",
+        "when_techniques": frozenset({"T1105", "T1566", "T1566.001"}),
+        "require_techniques": _KQ_EXECUTION_TECHNIQUES,
+        "require_classes": _KQ_EXECUTION_CLASSES,
+        "limitation": (
+            "An ingress/download lead was identified but execution was not "
+            "corroborated by a host process artifact (Prefetch or memory) or an "
+            "execution Finding; whether the delivered payload ran is unverified."
+        ),
+    },
+    {
+        "rule_id": "persistence-implies-execution",
+        "when_techniques": frozenset(
+            {
+                "T1547",
+                "T1547.001",
+                "T1053",
+                "T1053.005",
+                "T1543",
+                "T1543.003",
+                "T1546",
+                "T1574",
+                "T1137",
+                "T1197",
+            }
+        ),
+        "require_techniques": _KQ_EXECUTION_TECHNIQUES,
+        "require_classes": _KQ_EXECUTION_CLASSES,
+        "limitation": (
+            "A persistence mechanism was identified but execution was not "
+            "corroborated by a host process artifact (Prefetch or memory) or an "
+            "execution Finding; whether the persistent payload ran is unverified."
+        ),
+    },
+    {
+        "rule_id": "credential-access-implies-lateral-check",
+        "when_techniques": frozenset(
+            {"T1003", "T1003.001", "T1003.002", "T1555", "T1212"}
+        ),
+        "require_techniques": _KQ_LATERAL_TECHNIQUES,
+        "require_classes": frozenset({"network"}),
+        "limitation": (
+            "Credential-access activity was identified but downstream use was not "
+            "checked: no lateral-movement/valid-account Finding and no network "
+            "class examined; whether the credentials were reused is unverified."
+        ),
+    },
+    {
+        "rule_id": "lateral-movement-implies-network-check",
+        "when_techniques": frozenset(
+            {"T1021", "T1021.001", "T1021.002", "T1021.006", "T1047", "T1570"}
+        ),
+        "require_techniques": frozenset(
+            {"T1071", "T1071.001", "T1041", "T1105", "T1090", "T1572"}
+        ),
+        "require_classes": frozenset({"network"}),
+        "limitation": (
+            "Lateral-movement activity was identified but the source host / "
+            "network channel was not examined (no network class, no network "
+            "Finding); the initiating host is unverified."
+        ),
+    },
+    {
+        "rule_id": "log-clearing-implies-second-class",
+        "when_techniques": frozenset({"T1070", "T1070.001"}),
+        "require_techniques": frozenset(),
+        "require_classes": _KQ_NON_EVTX_CLASSES,
+        "limitation": (
+            "Event-log clearing was identified but no second artifact class "
+            "beyond the event log was examined; what the clearing removed cannot "
+            "be recovered from the event log alone."
+        ),
+    },
+)
+
+
+def evaluate_key_question_rules(
+    findings: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    case_completeness: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Conditional false-negative / key-question rule engine.
+
+    Pure-Python "if you found X you must have checked Y" rules. When a Finding of
+    a triggering category exists but the follow-up question's evidence class was
+    never examined (and no corroborating Finding answers it), the rule is UNMET
+    and becomes a NAMED limitation -- never a hard clean. Deterministic and
+    evidence-agnostic (keys on MITRE techniques + examined artifact classes).
+
+    "Checked" means a tool examined the class (touched / tool-invoked); the
+    follow-up class is deliberately distinct from where the triggering lead
+    usually comes (e.g. execution wants Prefetch/memory, not the event log that
+    surfaced the persistence entry). Returns a list of ``{rule_id, limitation}``
+    for unmet rules (empty when all triggered rules are satisfied or none fire).
+    """
+    finding_techniques = {
+        str(f.get("mitre_technique")) for f in findings if f.get("mitre_technique")
+    }
+    examined_classes = _touched_artifact_classes(case_completeness) | _tool_classes(
+        tool_calls
+    )
+    unmet: list[dict[str, Any]] = []
+    for rule in KEY_QUESTION_RULES:
+        if not (finding_techniques & rule["when_techniques"]):
+            continue
+        satisfied = bool(finding_techniques & rule["require_techniques"]) or bool(
+            examined_classes & rule["require_classes"]
+        )
+        if not satisfied:
+            unmet.append({"rule_id": rule["rule_id"], "limitation": rule["limitation"]})
+    return unmet
 
 
 def _finding_id(finding: dict[str, Any], index: int) -> str:
@@ -5222,17 +5885,92 @@ _AGENT_OVERCLAIM_MITRE_PREFIXES = _EXECUTION_MITRE_PREFIXES + (
 )
 
 
+# Map a parsed artifact class to the OS platform it can ONLY exist on. Classes that
+# are OS-ambiguous (network/memory/yara/custody/timeline/browser/cloud) are absent —
+# they establish no platform.
+_CLASS_PLATFORM = {
+    "evtx": "windows",
+    "registry": "windows",
+    "prefetch": "windows",
+    "mft": "windows",
+    "usnjrnl": "windows",
+    "disk/filesystem": "windows",
+    "linux": "linux",
+    "macos": "macos",
+}
+
+
+def _platform_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str | None:
+    """Best-effort image platform from the artifact classes actually parsed.
+
+    Returns a single platform ONLY when the exercised OS-specific tools agree
+    (e.g. EVTX + registry + prefetch -> windows); returns None on no signal or a
+    cross-platform mix, so the platform-consistency falsifier never fires against
+    an unestablished platform.
+    """
+    platforms = {
+        _CLASS_PLATFORM.get(TOOL_ARTIFACT_CLASSES.get(str(tc.get("tool") or "")))
+        for tc in tool_calls
+    }
+    platforms.discard(None)
+    return platforms.pop() if len(platforms) == 1 else None
+
+
+def _categorical_refutations(
+    finding: dict[str, Any],
+    *,
+    capture_time: str | None,
+    platform: str | None,
+) -> list[dict[str, Any]]:
+    """Categorical-impossibility refutations for one agent finding, or ``[]``.
+
+    Wraps ``findevil_agent.categorical_impossibility.falsify_finding`` (temporal-
+    physics: a finding timestamp after the evidence capture time; platform-
+    consistency: an OS-exclusive claim foreign to the image platform). Imported
+    lazily so the deterministic engine — which never calls this — stays importable
+    under bare python3. A no-context call (no capture_time and no platform) and a
+    finding that cannot be projected to a typed Finding are both no-ops, never crashes.
+    """
+    if capture_time is None and platform is None:
+        return []
+    try:
+        from findevil_agent.categorical_impossibility import falsify_finding
+        from findevil_agent.events import Finding
+
+        fobj = Finding(**finding_for_verifier(finding))
+    except Exception:
+        return []
+    return [
+        {
+            "reason": r.reason.value,
+            "message": r.message,
+            "impossible_values": r.impossible_values,
+        }
+        for r in falsify_finding(fobj, capture_time=capture_time, platform=platform)
+    ]
+
+
 def discipline_agent_findings(
-    findings: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+    findings: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    *,
+    capture_time: str | None = None,
+    platform: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split agent findings into (kept, dropped_leads).
 
-    A finding is dropped when it asserts an execution or exfiltration/C2 MITRE
-    technique but cites fewer than two distinct current-case artifact classes (its own
-    ``tool_call_id`` plus any ``derived_from``, mapped through ``TOOL_ARTIFACT_CLASSES``).
-    Confidence does NOT matter: the report-QA execution/exfil gates flag a HYPOTHESIS
-    lead the same as a CONFIRMED claim, so a single-class execution/exfil lead is
-    demoted to a logged audit lead, not a customer-visible finding.
+    A finding is dropped when EITHER:
+      * it asserts an execution or exfiltration/C2 MITRE technique but cites fewer
+        than two distinct current-case artifact classes (its own ``tool_call_id``
+        plus any ``derived_from``, mapped through ``TOOL_ARTIFACT_CLASSES``);
+        confidence does NOT matter — the report-QA execution/exfil gates flag a
+        HYPOTHESIS lead the same as a CONFIRMED claim; or
+      * it is CATEGORICALLY IMPOSSIBLE given the case context — a timestamp after the
+        evidence capture time, or an OS-exclusive artifact claim foreign to the image
+        platform (``capture_time`` / ``platform``; a no-context call skips this gate).
+
+    Either way the finding is demoted to a logged audit lead, not a customer-visible
+    finding.
     """
     tool_by_tcid = {
         str(tc.get("tool_call_id")): tc.get("tool")
@@ -5270,6 +6008,21 @@ def discipline_agent_findings(
                     }
                 )
                 continue
+        refutations = _categorical_refutations(
+            finding, capture_time=capture_time, platform=platform
+        )
+        if refutations:
+            dropped.append(
+                {
+                    "finding_id": finding.get("finding_id"),
+                    "mitre_technique": mitre,
+                    "confidence": confidence,
+                    "reason": "categorical impossibility: "
+                    + "; ".join(r["message"] for r in refutations),
+                    "categorical_refutations": refutations,
+                }
+            )
+            continue
         kept.append(finding)
     return kept, dropped
 
@@ -5696,6 +6449,41 @@ def build_report_qa_signoff(
             "Verdict wording remains scoped to supplied evidence.",
         )
 
+    # Negative-completeness parse-quality gate: a NO_EVIL clearance cannot rest on
+    # a class whose parse FAILED or was deferred. The legacy no_evil_is_scoped
+    # branch above keys on "touched"/tool-invoked classes, which a tool that
+    # ERRORED still satisfies; parse quality closes that hole. Only assessed when
+    # the coverage manifest (which carries per-class parse status) is supplied.
+    if verdict == "NO_EVIL" and coverage_manifest:
+        examined_parsed, failed_parsed = coverage_parse_quality(coverage_manifest)
+        if not examined_parsed:
+            _qa_check(
+                checks,
+                "clearance_requires_successful_parse",
+                "FAIL",
+                "NO_EVIL clearance rests on no successfully parsed artifact class; "
+                "every attempted parse failed or was deferred -- a tool failure "
+                "cannot satisfy a clearance.",
+                sorted(failed_parsed) or ["no_examined_classes"],
+            )
+        elif failed_parsed:
+            _qa_check(
+                checks,
+                "clearance_requires_successful_parse",
+                "WARN",
+                "Artifact class(es) failed to parse; their coverage cannot back "
+                "the scoped-clean verdict and remain a named limitation.",
+                sorted(failed_parsed),
+            )
+        else:
+            _qa_check(
+                checks,
+                "clearance_requires_successful_parse",
+                "PASS",
+                "Every artifact class backing the scoped-clean verdict parsed successfully.",
+                sorted(examined_parsed),
+            )
+
     if timeline_events:
         _qa_check(
             checks,
@@ -5827,6 +6615,40 @@ def build_report_qa_signoff(
             "attack_coverage_blind_spots",
             "PASS",
             "No ATT&CK blind spots recorded by the coverage matrix.",
+        )
+
+    # Mandatory pre-finalize REVERSE coverage audits (additive HARD gate): an
+    # available-but-uninvoked artifact class FAILs a NO_EVIL clearance (and WARNs
+    # otherwise); uncited indexed sources are disclosed for analyst review. A FAIL
+    # here flows into `failed` below -> overall FAIL -> packet BLOCKED, which keeps
+    # the run out of customer-release state ahead of manifest_finalize.
+    checks.extend(
+        build_coverage_reverse_audits(verdict, findings, tool_calls, case_completeness)
+    )
+
+    # Conditional false-negative / key-question gate (#13): "if you found X you
+    # must have checked Y". Unmet rules are NAMED limitations (WARN), never a hard
+    # clean -- they downgrade the packet to expert-review draft but do not block
+    # finalize on their own.
+    unmet_key_questions = evaluate_key_question_rules(
+        findings, tool_calls, case_completeness
+    )
+    if unmet_key_questions:
+        _qa_check(
+            checks,
+            "key_question_conditional_rules",
+            "WARN",
+            "Conditional key-question rule(s) unmet: a Finding implies a follow-up "
+            "check that was not performed; recorded as named limitation(s), not a "
+            "clean clearance.",
+            [str(rule["rule_id"]) for rule in unmet_key_questions],
+        )
+    else:
+        _qa_check(
+            checks,
+            "key_question_conditional_rules",
+            "PASS",
+            "No conditional key-question rule is triggered-and-unmet.",
         )
 
     failed = [row for row in checks if row["status"] == "FAIL"]
@@ -9041,21 +9863,26 @@ class Investigation:
         # carry the same /home-free value. ``/evidence/`` and other non-case paths
         # pass through untouched.
         released_args = _release_arguments(arguments)
-        released_extra = dict(extra or {})
-        if isinstance(released_extra.get("artifact_path"), str):
-            released_extra["artifact_path"] = _relativize_extracted_path(
-                released_extra["artifact_path"]
-            )
-        # ``disk_mount`` records its mount-root display copy as ``extra["fs_root"]``
-        # (``<case_home>/cases/<id>/extracted/.../mount``), echoed into the
-        # tool_call_output audit record AND ``tool_calls[].fs_root``. Like
-        # ``artifact_path`` it is display-only (not in ``arguments``, never read by the
-        # verifier/replay path), so relativize it in lockstep to keep the chain and
-        # verdict.json /home-free; a mount point outside the case store passes through.
-        if isinstance(released_extra.get("fs_root"), str):
-            released_extra["fs_root"] = _relativize_extracted_path(
-                released_extra["fs_root"]
-            )
+        # Record every DISPLAY path /home-free. ``_release_arguments`` relativizes
+        # all ``*_path`` keys in the display-copy dict (``artifact_path``,
+        # ``source_path``, …) against the case store then the repo root — the SAME
+        # transform used for arguments — so the audit chain, ``self.tool_calls``,
+        # and verdict.json stay /home-free for public commit. Crucially this is the
+        # DISPLAY/audit copy only: the LIVE tool output the engine chains into the
+        # next tool is untouched (relativizing THAT was the reverted custody-B
+        # mistake — it fed relative paths downstream and broke the pipeline), and
+        # ``output_hash`` is the tool's real output digest (a parameter here,
+        # unchanged), so manifest_verify + replay parity are unaffected.
+        released_extra = _release_arguments(dict(extra or {}))
+        # ``disk_mount``'s mount-root display copy is ``extra["fs_root"]`` — a path
+        # that does NOT end in ``_path``, so relativize it explicitly (case store
+        # then repo root). Display-only; never read by the verifier/replay path.
+        fs_root = released_extra.get("fs_root")
+        if isinstance(fs_root, str) and fs_root.strip():
+            rel_fs_root = _relativize_extracted_path(fs_root)
+            if rel_fs_root == fs_root:
+                rel_fs_root = _relativize_repo_root_path(fs_root)
+            released_extra["fs_root"] = rel_fs_root
         tcid = self._next_tcid()
         self._audit(
             py,
@@ -9170,7 +9997,11 @@ class Investigation:
             # replace each KEPT finding's free-form prose with a gate-safe description
             # composed from its structured facts (the model's prose trips the naive
             # report-QA keyword gates). The original rationale is audit-chained first.
-            kept, dropped = discipline_agent_findings(bridge.findings, self.tool_calls)
+            kept, dropped = discipline_agent_findings(
+                bridge.findings,
+                self.tool_calls,
+                platform=_platform_from_tool_calls(self.tool_calls),
+            )
             for lead in dropped:
                 self._audit(py, "agent_finding_disciplined", lead)
             for finding in kept:
@@ -9374,10 +10205,15 @@ class Investigation:
             "agent_message",
             {
                 "role": "supervisor",
-                "content": f"begin directory investigation of {self.evidence}",
+                "content": (
+                    "begin directory investigation of "
+                    f"{_release_path(self.evidence, REPO_ROOT)}"
+                ),
             },
         )
-        self._audit(py, "case_inventory", inventory)
+        # Record a portable (repo-relative) copy in the chain; the working
+        # `inventory` / handle keep absolute canonical paths for file access.
+        self._audit(py, "case_inventory", _relativize_repo_paths(inventory, REPO_ROOT))
         if inventory["summary"].get("truncated"):
             self.analysis_limitations.append(
                 "Evidence inventory hit its file limit and is truncated; scoped NO_EVIL and customer release are blocked until the case is narrowed or rerun with a larger limit."
@@ -9426,7 +10262,13 @@ class Investigation:
             "agent_message",
             {
                 "role": "supervisor",
-                "content": f"begin investigation of {self.evidence}",
+                # Record the opener /home-free: relativize the absolute evidence
+                # path against the repo root (mirrors the directory-investigation
+                # opener above). This is a descriptive, non-replay record, so a
+                # plain relativize is correct — no resolve-on-read needed.
+                "content": (
+                    f"begin investigation of {_release_path(self.evidence, REPO_ROOT)}"
+                ),
             },
         )
         case_open_args = {
@@ -10176,7 +11018,10 @@ class Investigation:
         if mount_error:
             limitation = (
                 "Auto disk mount/extract did not complete; disk-content conclusions "
-                f"require SIFT/libewf/loop support or pre-extracted artifacts. disk_mount failed: {mount_error}"
+                "require Sleuth Kit + libewf locally "
+                "(sudo apt-get install -y sleuthkit libewf-tools) or the SANS SIFT VM "
+                "(scripts/verdict --sift); raw .E01/.dd stay custody-only otherwise. "
+                f"disk_mount failed: {mount_error}"
             )
             self.analysis_limitations.append(limitation)
             self._audit(
@@ -11199,6 +12044,7 @@ class Investigation:
         except OSError:
             return
         hacking_stores: list[tuple[str, str, dict[str, Any]]] = []
+        parsed_stores: list[dict[str, Any]] = []
         for index, dbx in enumerate(dbx_files):
             # Persist the store outside the mount so the cited path survives unmount.
             persisted = staging / f"{index:03d}_{dbx.name}"
@@ -11222,13 +12068,32 @@ class Investigation:
                 },
                 arguments=args,
             )
-            if not error and out.get("is_oe_dbx") and out.get("hacking_newsgroups"):
-                hacking_stores.append((str(persisted), tcid, out))
+            if not error and out.get("is_oe_dbx"):
+                # Record EVERY parsed OE store (source name kept) so the deleted-
+                # email-recovery detector can see the "Deleted Items" trash folder
+                # even when it carries no hacking newsgroups.
+                parsed_stores.append(
+                    {
+                        "source_name": dbx.name,
+                        "persisted_path": str(persisted),
+                        "tool_call_id": tcid,
+                        "is_oe_dbx": bool(out.get("is_oe_dbx")),
+                        "is_message_store": bool(out.get("is_message_store")),
+                        "message_subject_count": out.get("message_subject_count"),
+                        "subjects": out.get("subjects") or [],
+                        "senders": out.get("senders") or [],
+                    }
+                )
+                if out.get("hacking_newsgroups"):
+                    hacking_stores.append((str(persisted), tcid, out))
+        deleted_candidates = oe_dbx_deleted_email_candidates(parsed_stores)
         print(
             f"  oe_dbx_parse: {len(dbx_files)} .dbx store(s), "
-            f"{len(hacking_stores)} with hacking newsgroups"
+            f"{len(hacking_stores)} with hacking newsgroups, "
+            f"{len(deleted_candidates)} Deleted-Items store(s) with recovered email"
         )
         self._emit_newsgroup_affiliation_finding(hacking_stores)
+        self._emit_deleted_email_recovery_finding(deleted_candidates)
 
     def _emit_newsgroup_affiliation_finding(
         self, stores: list[tuple[str, str, dict[str, Any]]]
@@ -11284,6 +12149,79 @@ class Investigation:
         print(
             f"  pool-B OE newsgroup-affiliation finding: {finding['finding_id']} "
             f"(HYPOTHESIS, {len(groups)} hacking group(s) across {len(stores)} folder(s))"
+        )
+
+    def _emit_deleted_email_recovery_finding(
+        self, candidates: list[dict[str, Any]]
+    ) -> None:
+        """Emit ONE Pool B HYPOTHESIS lead: deleted email recovered from the
+        Outlook Express "Deleted Items" store.
+
+        Distinct from the newsgroup-affiliation finding: this reports that
+        messages the user DELETED were recovered from the OE trash folder
+        (``.dbx``). Recovery of deleted content is a data-recovery artifact, not
+        proof of intent or any specific intrusion, so it stays a HYPOTHESIS and
+        carries no ATT&CK technique (an artifact, like the affiliation lead).
+        Per the host-artifact guardrail it asserts neither actor identity nor
+        intent. Cites the trash store with the most recovered messages as the
+        primary ``tool_call_id``; the rest ride in ``derived_from``.
+        """
+        if not candidates:
+            return
+        primary = max(candidates, key=lambda c: int(c.get("message_count") or 0))
+        primary_path = str(
+            primary.get("persisted_path") or primary.get("source_name") or ""
+        )
+        primary_tcid = str(primary.get("tool_call_id") or "")
+        total = sum(int(c.get("message_count") or 0) for c in candidates)
+        subjects = sorted({s for c in candidates for s in (c.get("subjects") or [])})[
+            :6
+        ]
+        subjects_text = (
+            "; ".join(subjects)
+            if subjects
+            else "headers recovered (subjects unavailable)"
+        )
+        folders = sorted(
+            {
+                str(c.get("source_name") or "").replace("\\", "/").rsplit("/", 1)[-1]
+                for c in candidates
+            }
+        )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for(
+                "f-B-oe-deleted-email", primary_path, force_suffix=True
+            ),
+            "tool_call_id": primary_tcid,
+            "artifact_path": primary_path,
+            "description": (
+                "hypothesis: deleted email recovered from the Outlook Express "
+                f"'Deleted Items' store ({', '.join(folders)}): {total} message(s). "
+                f"Recovered subjects include: {subjects_text}. Parsed from the OE "
+                "Deleted Items .dbx folder via oe_dbx_parse (the OE signature was "
+                "validated). Messages in the Deleted Items store were deleted by the "
+                "user and remained recoverable from the store; recovering them is a "
+                "data-recovery artifact. It is not, on its own, evidence of intent or "
+                "any specific intrusion, and actor identity and intent are out of "
+                "scope for host artifacts. Corroborate with tool, execution, or "
+                "network evidence before operational claims."
+            ),
+            "confidence": "HYPOTHESIS",
+            "pool_origin": "B",
+            "derived_from": sorted(
+                {
+                    str(c.get("tool_call_id") or "")
+                    for c in candidates
+                    if c.get("tool_call_id")
+                }
+            ),
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B OE deleted-email-recovery finding: {finding['finding_id']} "
+            f"(HYPOTHESIS, {total} recovered message(s) across "
+            f"{len(candidates)} store(s))"
         )
 
     def _corroborate_execution_with_userassist(
@@ -14165,6 +15103,20 @@ class Investigation:
         self.analysis_limitations = clean_analysis_limitations(
             self.analysis_limitations
         )
+        # Conditional key-question limitations (#13): surface unmet "if you found
+        # X you must have checked Y" rules as NAMED limitations in the report and
+        # coverage manifest. These are WARN-level narrative limitations, never a
+        # hard clean.
+        key_question_limitations = [
+            f"Key-question rule {rule['rule_id']} unmet: {rule['limitation']}"
+            for rule in evaluate_key_question_rules(
+                merged, self.tool_calls, case_completeness
+            )
+        ]
+        if key_question_limitations:
+            self.analysis_limitations = clean_analysis_limitations(
+                [*self.analysis_limitations, *key_question_limitations]
+            )
         # Build the coverage manifest before report QA so the negative-completeness
         # gate (no_evil_is_scoped) can read the same available/examined record that
         # ships in the report.
@@ -14543,6 +15495,9 @@ class Investigation:
             }
         if packet_attestation:
             extra["packet_attestation"] = packet_attestation
+        # Same portability pass for the manifest provenance (image_path,
+        # evidence_inventory.summary) before manifest_finalize signs it.
+        extra = _relativize_repo_paths(extra, REPO_ROOT)
         mf = py.call_tool(
             "manifest_finalize",
             {
@@ -14765,6 +15720,24 @@ class Investigation:
                     "signature_payload_sha256": mf["signature"]["payload_sha256"],
                 }
             )
+        # Additive, custody-neutral annotation: WHY a non-committal verdict
+        # abstained. Empty for a committed SUSPICIOUS / scoped NO_EVIL word — it
+        # never changes the verdict WORD, only annotates an already-decided
+        # non-committal one. Derived deterministically from signals the engine
+        # already tracks: unresolved contradictions, distinct artifact classes
+        # examined (consulted_classes, below the 2-class gate), leads-only (all
+        # HYPOTHESIS), tool/parse failures, and refuted/rejected finding leads.
+        reason_codes = compute_verdict_reason_codes(
+            verdict,
+            contradiction_count=contras,
+            artifact_class_count=_int_metric(
+                coverage_manifest.get("summary", {}).get("consulted_classes")
+            ),
+            leads_only=bool(merged)
+            and all(m.get("confidence") == "HYPOTHESIS" for m in merged),
+            tool_failure_count=sum(1 for tc in self.tool_calls if tc.get("error")),
+            refuted_count=len(self.verifier_rejected_leads),
+        )
         verdict_obj = {
             "case_id": self.handle["id"],
             "run_id": self.run_id,
@@ -14776,6 +15749,7 @@ class Investigation:
             "started_at": self.started_at,
             "finalized_at": mf.get("finalized_at"),
             "verdict": verdict,
+            "reason_codes": reason_codes,
             "analysis_limitations": self.analysis_limitations,
             "findings_summary": {
                 "total_merged": len(merged),
@@ -14790,6 +15764,18 @@ class Investigation:
                         1 for m in merged if m.get("confidence") == "HYPOTHESIS"
                     ),
                 },
+                # P0-6: breadth-discounted confidence — a strong claim from a thin
+                # investigation (few of the available artifact classes consulted)
+                # cannot post a high number.
+                "coverage_discounted_confidence": _coverage_discounted_confidence(
+                    [str(m.get("confidence") or "") for m in merged],
+                    _int_metric(
+                        coverage_manifest.get("summary", {}).get("applicable_classes")
+                    ),
+                    _int_metric(
+                        coverage_manifest.get("summary", {}).get("consulted_classes")
+                    ),
+                ),
                 "contradictions_surfaced": contras,
                 "soul_md_kept": kept,
                 "soul_md_downgraded": downgraded,
@@ -14855,6 +15841,10 @@ class Investigation:
             "cryptographic_attestation": cryptographic_attestation,
             "agent": "find-evil-auto MVP",
         }
+        # Strip the machine-specific repo-root prefix from descriptive provenance
+        # paths before hashing, so the committed sample-run is portable (no
+        # /home/<user> leak) and the signed manifest attests the relative content.
+        verdict_obj = _relativize_repo_paths(verdict_obj, REPO_ROOT)
         verdict_json = json.dumps(verdict_obj, indent=2, sort_keys=True)
         verdict_bytes = verdict_json.encode("utf-8")
         if LOCAL_MODE:
@@ -15669,6 +16659,22 @@ def main() -> int:
         help="Max provider<->tool rounds per agent pod (default: 40).",
     )
     args = p.parse_args()
+
+    # Fail fast on --agent with a cloud provider but no egress ack — before any
+    # case_open / engine spin-up — instead of raising EvidenceEgressError deep in
+    # the run. The --agent path already runs under the services/agent venv, so the
+    # factory import resolves here.
+    if args.agent and not args.acknowledge_evidence_egress:
+        from findevil_agent.agentloop.factory import provider_requires_egress_ack
+
+        if provider_requires_egress_ack(args.agent_provider):
+            print(
+                "find-evil-auto: --agent provider sends evidence text off-host; pass "
+                "--acknowledge-evidence-egress to proceed, or use an on-prem provider "
+                "(--agent-provider local|dgx).",
+                file=sys.stderr,
+            )
+            return 2
 
     global LOCAL_MODE
     if args.local or os.environ.get("FIND_EVIL_LOCAL") == "1":

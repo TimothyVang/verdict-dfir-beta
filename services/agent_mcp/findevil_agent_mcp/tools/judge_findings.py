@@ -46,6 +46,15 @@ class JudgeFindingsInput(BaseModel):
         gt=0.0,
         description="Wall-clock budget for the merge (Spec #2 §8.1 default 120s).",
     )
+    injection_affected_tool_call_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "tool_call_ids whose tool output was injection-neutralized at the "
+            "MCP-output boundary (correlated from the injection_alerts.jsonl "
+            "sidecar ledger). Any merged finding citing -- or derived from -- one "
+            "of these is flagged needs_human_review; the merge math is unchanged."
+        ),
+    )
 
     @model_validator(mode="after")
     def _require_verifier_actions(self) -> JudgeFindingsInput:
@@ -124,6 +133,12 @@ class MergedFindingRecord(BaseModel):
     credibility_a: float
     credibility_b: float
     corroborated: bool
+    # Safety escalation: True when this finding's cited (or derived-from) evidence
+    # was injection-neutralized at the MCP-output boundary. Additive + default
+    # False, so consumers reading only the merge math are unaffected. The flag
+    # NEVER alters merged_confidence -- it routes the finding to human review, it
+    # does not silently upgrade or drop it.
+    needs_human_review: bool = False
 
 
 class JudgeFindingsOutput(BaseModel):
@@ -132,6 +147,10 @@ class JudgeFindingsOutput(BaseModel):
     merged: list[MergedFindingRecord]
     budget_exceeded: bool
     budget_detail: str | None
+    # finding_ids of merged findings routed to human review because their
+    # evidence was injection-affected (the needs_human_review subset). Default
+    # empty keeps the common, no-injection case backward-compatible.
+    human_review_finding_ids: list[str] = Field(default_factory=list)
 
 
 async def _handle(inp: BaseModel) -> JudgeFindingsOutput:
@@ -161,24 +180,49 @@ async def _handle(inp: BaseModel) -> JudgeFindingsOutput:
             budget_detail=str(exc),
         )
 
-    records = [
-        MergedFindingRecord(
-            finding=m.finding.model_dump(),
-            merged_confidence=m.merged_confidence,
-            chosen_pool=m.chosen_pool,
-            pool_a_score=m.pool_a_score,
-            pool_b_score=m.pool_b_score,
-            credibility_a=m.credibility_a,
-            credibility_b=m.credibility_b,
-            corroborated=m.corroborated,
+    affected = set(inp.injection_affected_tool_call_ids)
+    records: list[MergedFindingRecord] = []
+    human_review_finding_ids: list[str] = []
+    for m in merged:
+        finding = m.finding.model_dump()
+        flagged = _is_injection_affected(finding, affected)
+        if flagged:
+            human_review_finding_ids.append(str(finding.get("finding_id") or ""))
+        records.append(
+            MergedFindingRecord(
+                finding=finding,
+                merged_confidence=m.merged_confidence,
+                chosen_pool=m.chosen_pool,
+                pool_a_score=m.pool_a_score,
+                pool_b_score=m.pool_b_score,
+                credibility_a=m.credibility_a,
+                credibility_b=m.credibility_b,
+                corroborated=m.corroborated,
+                needs_human_review=flagged,
+            )
         )
-        for m in merged
-    ]
     return JudgeFindingsOutput(
         merged=records,
         budget_exceeded=False,
         budget_detail=None,
+        human_review_finding_ids=human_review_finding_ids,
     )
+
+
+def _is_injection_affected(finding: dict[str, Any], affected: set[str]) -> bool:
+    """True when a finding's cited or derived-from evidence was injection-affected.
+
+    A finding is routed to human review when the tool_call_id it cites is in the
+    injection-affected set, or -- for inferences -- when any tool_call_id it was
+    ``derived_from`` is. This is a conservative safety escalation: it never
+    changes the finding's confidence, it only surfaces it for human review.
+    """
+    if not affected:
+        return False
+    if str(finding.get("tool_call_id") or "") in affected:
+        return True
+    derived = finding.get("derived_from") or []
+    return any(str(item) in affected for item in derived)
 
 
 SPEC = ToolSpec(
@@ -197,7 +241,13 @@ SPEC = ToolSpec(
         "permits them). budget_seconds defaults to 120s (Spec #2 §8.1); a 0-second "
         "budget force-fails on the first iteration for tests. "
         "Returns merged[] (each entry has the full math: pool_a_score, pool_b_score, "
-        "credibility_a, credibility_b, corroborated) plus budget_exceeded flag."
+        "credibility_a, credibility_b, corroborated) plus budget_exceeded flag. "
+        "Injection-escalation hook: pass injection_affected_tool_call_ids (correlated "
+        "from the injection_alerts.jsonl sidecar ledger) and any merged finding citing "
+        "-- or derived_from -- one of those tool calls is flagged needs_human_review "
+        "and listed in human_review_finding_ids. This routes injection-affected "
+        "evidence to a human; it never changes the merge math or the finding's "
+        "confidence."
     ),
     input_model=JudgeFindingsInput,
     output_model=JudgeFindingsOutput,

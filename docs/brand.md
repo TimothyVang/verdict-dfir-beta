@@ -29,6 +29,33 @@ Use these files before inventing new visuals:
 Semantic colors carry meaning. Do not use Seafoam, Coral, or Butter as purely
 decorative accents in investigation UI, reports, or video.
 
+## Typography
+
+Four type roles, matching the brand board's specimen (panel 7). Keep them
+distinct — the long-standing failure mode was collapsing everything into
+monospace, which reads as a terminal.
+
+| Role | Face | Use |
+|---|---|---|
+| Editorial headline | Archivo Narrow (heavy, condensed) | Mastheads, display type, verdict words ("TRUTH IN THE TRACE"). |
+| Body / UI | Inter | Body copy, controls, chips, badges, narrative — prose, not data. |
+| Furniture | Archivo | Kickers, uppercase labels, nav, section headings, stamps. |
+| Data | JetBrains Mono | Evidence/data ONLY: hashes, paths, timestamps, tool output, terminal rows, `tool_call_id`s. |
+| Annotation | Caveat | Restrained handwritten margin notes only. |
+
+Rules:
+
+- Never set body/UI copy in monospace — the brief explicitly says avoid
+  "fake terminals". Mono is for evidence/data.
+- On light (Paper Cream) surfaces the semantic colors need a darker TEXT tone so
+  Seafoam/Butter stay readable; keep the saturated hex only for FILLS (chips,
+  rails). See the `--*-text` vars in `scripts/_report_style.css`.
+- Filled state chips are solid pastel pills with ink/cream text (the brand
+  badge/chip assets), not hollow outlines.
+- Fonts are self-hosted — no `fonts.gstatic.com` at build/render time: web via
+  `next/font`, report via `@import`, video via local woff2 + the `FontFace` API
+  (`scripts/make-demo-video/public/fonts/` loaded in `src/fonts.ts`).
+
 ## Voice
 
 Canonical phrases:

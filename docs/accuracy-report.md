@@ -72,8 +72,8 @@ as of this report:
 
 | # | Case | Class | Golden outcome | Recall bar | Result | Status |
 |---|---|---|---|---|---|---|
-| 1 | `nitroba` | network (pcap) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 80% | **5/5 = 100%** · run `INDETERMINATE` | **PASS** in historical run packet; regenerate from fixtures |
-| 2 | `nist-hacking-case` | disk (XP) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 71% | **7/14 = 50%** · run `SUSPICIOUS` | **FAIL** — narrowed gap, up from 7%; compact receipt in `docs/release-evidence/l3-local-sift.json` |
+| 1 | `nitroba` | network (pcap) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 80% | **5/5 = 100%** · run `INDETERMINATE` | **PASS** — committed sample run `docs/sample-run/nitroba/`; custody-verified (`manifest_verify` overall true, replay 9/9) |
+| 2 | `nist-hacking-case` | disk (XP) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 71% | **5/14 = 36%** committed run (recomputable) · up to **7/14 = 50%** on richer 27-finding runs · run `SUSPICIOUS` | **FAIL** — up from 7%; floor recomputed in `accuracy-report.json`, best-run receipt `docs/release-evidence/l3-local-sift.json` |
 | 3 | `nist-data-leakage` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 60% | — | staged, scheduled (local TSK / SIFT parity) |
 | 4 | `alihadi-09-encrypt` | disk (FP control) | **INDETERMINATE** | 50% | — | staged, scheduled (local TSK / SIFT parity) |
 | 5 | `alihadi-01-webserver` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 60% | — | staged, scheduled (local TSK / SIFT parity) |
@@ -81,11 +81,16 @@ as of this report:
 | 7 | `m57-jean` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 60% | — | staged, scheduled (local TSK / SIFT parity) |
 | 8 | `alihadi-07-sysinternals` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 50% | — | staged, scheduled (local TSK / SIFT parity) |
 | 9 | `volatility-cridex` | memory | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 50% | — | staged, scheduled |
-| 10 | `synthetic-benign` | negative control | **NO_EVIL** (0 findings) | 100% | — | staged, scheduled |
+| 10 | `synthetic-benign` | negative control | **NO_EVIL** (0 findings) | 100% | **0/0 = 100%** · run `INDETERMINATE` | **PASS** — committed sample run `docs/sample-run/synthetic-benign/`; custody-verified |
+| 11 | `synthetic-decoy` | decoy / FP control | **NO_EVIL** (0 planted bait asserted) | 100% | **0/0 = 100%**, 0 planted bait · run `INDETERMINATE` | **PASS** — committed sample run `docs/sample-run/synthetic-decoy/`; custody-verified |
 
-**Honest summary:** 1 of 10 fully scored and passing (`nitroba`, 100%); 1 scored and failing but
-**measurably improving** (`nist-hacking-case`, **50% = 7/14, up from 7% = 1/14**). The recorded run
-now recalls seven of the golden's fourteen canonical claims — hacking-tool execution (Prefetch /
+**Honest summary:** 3 of 11 fully scored and passing (`nitroba` 100%; `synthetic-benign` 100% NO_EVIL
+control; `synthetic-decoy` 100% with 0 planted bait asserted — all three committed under
+`docs/sample-run/` and custody-verified); 1 scored and failing but
+**measurably improving** (`nist-hacking-case`: the committed run the recomputable report scores is
+**5/14 = 36%**; the best observed is **7/14 = 50%** on richer 27-finding runs, both up from
+**7% = 1/14**). That richer 27-finding run
+recalls seven of the golden's fourteen canonical claims — hacking-tool execution (Prefetch /
 UserAssist, 8 CONFIRMED), on-disk tool artifacts, **shellbag** navigation to staged files,
 removable-media **LNK** traces, **Recycle Bin** staging artifacts, the **suspiciously-named account
 `Mr. Evil`** (SAM, T1136.001), and the **recently-opened-file MRU**. It still misses the ACMru search
@@ -95,7 +100,8 @@ to the legacy golden's `CONFIRMED_EVIL` label). The receipt is recorded in
 `docs/release-evidence/l3-local-sift.json`; to reproduce the score, regenerate a run with
 `scripts/verdict` and pass that run directory to `scripts/score-recall.py` with
 `--golden goldens/nist-hacking-case`. The
-remaining 8 goldens are fixture-staged and pending batch execution — **scheduled, not yet run.** We
+remaining 7 goldens (rows 3-9, the gated disk/memory cases) are fixture-staged and pending batch
+execution — **scheduled, not yet run.** We
 publish the gap, and the progress, rather than hide either. The adversarial posture is tracked in
 [`red-team-challenge.md`](red-team-challenge.md): unsupported artifact evil, benign admin activity,
 single-source execution traps, log clearing, DKOM-vs-smear, exfil-without-network, and parser-failure
@@ -139,9 +145,12 @@ per scored case when a trustworthy answer key and completed run output exist.
 Misses are documented explicitly so partial coverage cannot be mistaken for
 clearance:
 
-- `nist-hacking-case` recalls **7/14 expected claims (50%)** on the standard
-  committed runs — six 27-finding SCHARDT runs each reproduce exactly 7/14 under
-  the current hardened maximum-bipartite matcher — still below the 71% bar. The
+- `nist-hacking-case` recalls **7/14 expected claims (50%)** on the richer
+  27-finding runs — six such SCHARDT runs each reproduce exactly 7/14 under
+  the current hardened maximum-bipartite matcher — still below the 71% bar. (The
+  full sample run committed under `docs/sample-run/`, which the recomputable
+  `accuracy-report.json` scores, is a leaner 19-finding run at **5/14 = 36%**; see
+  the run-to-run variance note below.) The
   seven matched: `nhc-004` (hacking-tool files in the MFT), `nhc-005` (prefetch
   execution), `nhc-007` (shellbag staging-share navigation), `nhc-008` (LNK
   removable-media traces), `nhc-009` (Recycle Bin staging), `nhc-010` (SAM account
@@ -219,9 +228,9 @@ exercise. The checks we expect judges to run are:
 - **False positives found:** `alihadi-09-encrypt` remains an explicit control for
   benign or dual-use encryption-tool presence. The correct answer is scoped
   `INDETERMINATE`, not a confident suspicious verdict from tool presence alone.
-- **Missed artifacts:** the public NIST Hacking Case score is 7/14 recall (50%) on
-  the standard committed runs (5/14 on leaner runs — see the run-to-run variance
-  note above). The missing ACMru/search history, USB history, email carving, browser
+- **Missed artifacts:** the public NIST Hacking Case score is **5/14 recall (36%)** on
+  the committed sample run the recomputable report scores, up to **7/14 (50%)** on
+  richer 27-finding runs (see the run-to-run variance note above). The missing ACMru/search history, USB history, email carving, browser
   history, XP `.evt`, thumbcache, and named-pipe artifacts are published as misses
   rather than hidden behind a broad accuracy claim.
 - **Hallucination and overclaim classes caught:** uncited Findings, replay hash
@@ -277,6 +286,44 @@ product's 99%-automation / 1%-expert-signoff doctrine, `agent-config/EXPERT.md`)
    caught, corrected in the open, and engineered against.
 
 ## Evidence Integrity
+
+### Fact-fidelity rejection rate (measured, not anecdotal)
+
+The four cases above are caught *instances*. This is the same fence graded as a *rate*. Scope first,
+so it is not over-read: this measures the **deterministic structured-value entailment check**
+(`services/agent/findevil_agent/entailment.py`) over **recorded tool-output fixtures** spanning the
+production artifact classes (registry Run-key, prefetch, command-line rows). It is **not** a live
+end-to-end run; it grades the fence that stops a misread fact from reaching a verdict, which is the
+layer most prone to a confident-but-wrong assertion.
+
+`scripts/fact-fidelity-rate.py` seeds deliberately-**false** asserted values — each a known-wrong
+mutation of a value that genuinely matches the evidence, plus the structural cases (a path that
+resolves to nothing, a malformed path) — across every match mode (`exact`, `contains`, `int`,
+`iso_ts`, `record`), then runs each through the real `check_entailment` and counts how many are
+rejected. The fabrications are false **by construction** (ground truth), and the check is run
+independently, so the number is not tautological. A control axis confirms the **true** values are
+still accepted (a check that rejected everything would trivially score 1.0 on rejection).
+
+Latest run (regenerate with the command below):
+
+| Axis | Result | Target |
+|---|---|---|
+| Seeded false values **rejected** | **15 / 15 = 100%** | 1.0 |
+| True values **accepted** (control) | **5 / 5 = 100%** | 1.0 |
+| Match modes exercised | `exact, contains, int, iso_ts, record` (all 5) | all |
+
+Any rejection escape (a false value the check accepts) is a verifier bug and fails the gate; the
+gate also fails on an empty corpus, so zero coverage cannot read as a pass. The metric is wired into
+`scripts/run-all-smokes.sh` as a standing check.
+
+```bash
+uv run --directory services/agent python ../../scripts/fact-fidelity-rate.py --json tmp/fact-fidelity-rate.json
+```
+
+This complements, and does not replace, the recall axis (§2): recall asks *did it surface the real
+evil*; this asks *can a structured fact that is not in the evidence reach the report* (target: no).
+
+---
 
 Evidence integrity is enforced architecturally rather than only by prompt text:
 
@@ -335,6 +382,13 @@ bash scripts/run-all-smokes.sh
 - Accuracy should be reported per case and per artifact class, not as a broad
   product-wide clean-bill statement.
 
+For the validation-scope caveats — what a score does NOT measure and the
+per-`validation_class` (synthetic / public-documented / held-out) training-data
+contamination caveat — see [`LIMITATIONS.md`](LIMITATIONS.md). Every
+`accuracy_compare` diagnostic now carries `validation_class`, `corpus_identity`,
+`contamination_caveat`, and a `does_not_measure` block inline with the score.
+
 Related docs: [`DATASET.md`](DATASET.md), [`false-positives.md`](false-positives.md),
+[`LIMITATIONS.md`](LIMITATIONS.md),
 [`cryptographic-attestation.md`](cryptographic-attestation.md), and
 [`live-test-matrix.md`](live-test-matrix.md).

@@ -9,7 +9,7 @@ asserts none of them is a bare execution-or-mutation verb.
 
 Source-of-truth driven, not a hardcoded duplicate list:
 
-* Python (``findevil-agent-mcp``, 13 tools) — imported from the live
+* Python (``findevil-agent-mcp``, 14 tools) — imported from the live
   registry via :func:`findevil_agent_mcp.tools.all_specs`.
 * Rust (``findevil-mcp``, 32 tools) — parsed out of the registration
   site ``services/mcp/src/server.rs`` (``build_registry()``), which is
@@ -156,7 +156,7 @@ class TestNoForbiddenVerbs:
     def test_python_registry_enumerates_expected_count(self) -> None:
         # Sanity: the Python product surface is 14 audit-chained tools.
         names = python_tool_names()
-        assert len(names) == 13, f"expected 13 Python tools, got {len(names)}: {sorted(names)}"
+        assert len(names) == 14, f"expected 14 Python tools, got {len(names)}: {sorted(names)}"
 
     def test_rust_server_has_no_forbidden_verb(self) -> None:
         for name in sorted(rust_tool_names()):

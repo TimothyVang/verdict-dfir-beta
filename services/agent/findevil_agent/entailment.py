@@ -41,6 +41,21 @@ _IPV4 = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1
 # path is corroborating context; the bare filename it ends in is the anchor).
 _FILENAME = re.compile(r"^[^\\/]+\.[A-Za-z0-9][A-Za-z0-9_-]{0,7}$")
 
+# Token-boundary contains matching. Plain substring containment lets an
+# incidental fragment launder a claim ("cain" must not match inside "mccain"),
+# so a contains anchor must align to TOKEN boundaries: a match whose
+# alphanumeric edge is glued to an adjacent alphanumeric in the evidence is an
+# incidental substring, not a whole-token hit, and is rejected. A "token" is a
+# maximal run of these characters.
+_ALNUM = re.compile(r"[0-9A-Za-z]")
+_ALNUM_RUN = re.compile(r"[0-9A-Za-z]+")
+# Minimum length of a needle's alphanumeric run for boundary enforcement to
+# apply. A needle whose longest alphanumeric run is shorter than this (or which
+# has none, e.g. a bare separator) carries no laundering-prone token, so it
+# keeps the legacy plain-containment behavior rather than strict alignment —
+# tightening only where it cannot weaken a true-positive anchor.
+_MIN_TOKEN_LEN = 2
+
 
 @dataclass(frozen=True)
 class MatchedValue:
@@ -361,9 +376,53 @@ def _matches(expected: str, leaf: Any, mode: str) -> bool:
         return e is not None and lf is not None and e == lf
     leaf_str = "" if leaf is None else str(leaf)
     if mode == "contains":
-        return expected.strip().lower() in leaf_str.lower()
+        return _contains_token(expected, leaf_str)
     # exact
     return leaf_str.strip() == expected.strip()
+
+
+def _contains_token(needle: str, haystack: str) -> bool:
+    """Deterministic, token-boundary-aware substring containment.
+
+    Closes the incidental-substring laundering hole: a contains anchor only
+    matches when it sits on TOKEN boundaries, so ``"cain"`` no longer matches
+    inside ``"mccain"`` yet still matches the standalone token ``"Cain"``.
+    Matching is per line of the (possibly multi-line) evidence, so a phrase
+    cannot be assembled across a newline in the archived raw tool output. Pure
+    and case-insensitive — a recheck replay over the sealed value reproduces the
+    identical decision.
+
+    Empty needles keep their established "field present" semantics (they match
+    any leaf, including a JSON ``null`` read as an empty string). Needles whose
+    longest alphanumeric run is below :data:`_MIN_TOKEN_LEN` fall back to plain
+    containment, since such a fragment carries no laundering-prone token and
+    boundary enforcement there could only weaken a legitimate anchor.
+    """
+    needle = needle.strip().lower()
+    if not needle:
+        return True
+    runs = _ALNUM_RUN.findall(needle)
+    enforce = bool(runs) and max(len(run) for run in runs) >= _MIN_TOKEN_LEN
+    for line in haystack.lower().splitlines() or [""]:
+        start = 0
+        while True:
+            idx = line.find(needle, start)
+            if idx < 0:
+                break
+            if not enforce or _token_aligned(needle, line, idx):
+                return True
+            start = idx + 1
+    return False
+
+
+def _token_aligned(needle: str, line: str, idx: int) -> bool:
+    """True when the occurrence of ``needle`` at ``line[idx:]`` is not glued to an
+    adjacent alphanumeric on either of its alphanumeric edges (a whole-token hit,
+    not an incidental fragment of a larger word)."""
+    end = idx + len(needle)
+    left_ok = not _ALNUM.match(needle[0]) or idx == 0 or not _ALNUM.match(line[idx - 1])
+    right_ok = not _ALNUM.match(needle[-1]) or end >= len(line) or not _ALNUM.match(line[end])
+    return left_ok and right_ok
 
 
 def _matches_record(expected: str, leaf: Any) -> bool:
@@ -383,7 +442,9 @@ def _matches_record(expected: str, leaf: Any) -> bool:
     for key, want in constraints.items():
         if key not in leaf:
             return False
-        if str(want).strip().lower() not in str(leaf[key]).lower():
+        # Same token-boundary rule as the contains matcher: a co-location
+        # constraint must hit a whole token, not an incidental substring.
+        if not _contains_token(str(want), str(leaf[key])):
             return False
     return True
 

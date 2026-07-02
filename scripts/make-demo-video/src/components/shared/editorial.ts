@@ -2,7 +2,7 @@
 // Mirrors VERDICT_DFIR_SVG_Assets_v2/verdict-brand-board-reconstructed.png:
 // Midnight Ink, Paper Cream, Electric Cobalt, Soft Lilac, Seafoam, Signal Coral,
 // and Butter Yellow. Semantic colors carry meaning and should not be decorative.
-export { SERIF, GROTESK, MONO } from "../../fonts";
+export { SERIF, GROTESK, MONO, BODY, HAND, CONDENSED } from "../../fonts";
 
 export const C = {
   paper: "#101426", // Midnight Ink

@@ -109,6 +109,70 @@ def _write_sample_run(run_dir: Path) -> None:
     )
 
 
+def _write_no_finding_run(run_dir: Path, verdict_word: str) -> None:
+    """Create a valid run with ZERO findings and the given verdict word.
+
+    A scoped NO_EVIL / INDETERMINATE control's custody value is exactly that the
+    chain, manifest, and verdict all verify with nothing to trace, so trace-finding
+    must ACCEPT it. A SUSPICIOUS verdict with zero findings is inconsistent (asserts
+    evil with nothing traced) and must stay INCOMPLETE. The fixture has one tool
+    call (non-trivial chain), no finding_approved record, a verdict artifact hash,
+    and a zero-leaf manifest.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    verdict = {
+        "case_id": "trace-smoke-nofind",
+        "verdict": verdict_word,
+        "findings": [],
+    }
+    verdict_bytes = _canonicalize(verdict) + b"\n"
+    (run_dir / "verdict.json").write_bytes(verdict_bytes)
+
+    records: list[dict[str, object]] = []
+    prev_hash = ""
+    for kind, payload in (
+        (
+            "tool_call_start",
+            {
+                "tool": "evtx_query",
+                "tool_call_id": "tc-1",
+                "args": {"case_id": "trace-smoke-nofind"},
+            },
+        ),
+        (
+            "tool_call_output",
+            {"tool": "evtx_query", "tool_call_id": "tc-1", "output_hash": "b" * 64},
+        ),
+        (
+            "verdict_artifact",
+            {"path": "verdict.json", "sha256": _sha256(verdict_bytes)},
+        ),
+    ):
+        record = {
+            "kind": kind,
+            "payload": payload,
+            "prev_hash": prev_hash,
+            "seq": len(records),
+            "ts": "2026-06-14T00:00:00Z",
+        }
+        raw = _canonicalize(record)
+        records.append(record)
+        prev_hash = _sha256(raw)
+
+    (run_dir / "audit.jsonl").write_bytes(
+        b"\n".join(_canonicalize(record) for record in records) + b"\n"
+    )
+    manifest = {
+        "audit_log_final_hash": prev_hash,
+        "audit_log_record_count": len(records),
+        "leaves": [],
+    }
+    (run_dir / "run.manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _run_trace(run_dir: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(TRACE), str(run_dir)],
@@ -264,6 +328,36 @@ def main() -> int:
             print(non_list_leaves.stderr, file=sys.stderr)
             return 1
 
+        # A scoped zero-finding control (NO_EVIL / INDETERMINATE) is a valid,
+        # offline-verifiable run -- trace-finding must ACCEPT it (0/0 findings is
+        # the correct result, not a custody failure).
+        for word in ("NO_EVIL", "INDETERMINATE"):
+            control_run = Path(tmp) / f"no-finding-{word.lower()}"
+            _write_no_finding_run(control_run, word)
+            control = _run_trace(control_run)
+            if control.returncode != 0 or "TRACE OK" not in control.stdout:
+                print(
+                    f"zero-finding {word} control unexpectedly failed trace",
+                    file=sys.stderr,
+                )
+                print(control.stdout, file=sys.stderr)
+                print(control.stderr, file=sys.stderr)
+                return 1
+
+        # But a verdict that ASSERTS evil (SUSPICIOUS) with zero findings is
+        # inconsistent and must stay INCOMPLETE.
+        suspicious_empty = Path(tmp) / "no-finding-suspicious"
+        _write_no_finding_run(suspicious_empty, "SUSPICIOUS")
+        susp = _run_trace(suspicious_empty)
+        if susp.returncode == 0:
+            print(
+                "zero-finding SUSPICIOUS run unexpectedly traced successfully",
+                file=sys.stderr,
+            )
+            print(susp.stdout, file=sys.stderr)
+            print(susp.stderr, file=sys.stderr)
+            return 1
+
         _tamper_verdict(run_dir)
         tampered = _run_trace(run_dir)
         if tampered.returncode == 0:
@@ -272,7 +366,10 @@ def main() -> int:
             print(tampered.stderr, file=sys.stderr)
             return 1
 
-    print("trace-finding-smoke: tampered verdict and manifest rejected")
+    print(
+        "trace-finding-smoke: tampered verdict and manifest rejected; "
+        "scoped zero-finding controls accepted; SUSPICIOUS-with-zero-findings rejected"
+    )
     return 0
 
 

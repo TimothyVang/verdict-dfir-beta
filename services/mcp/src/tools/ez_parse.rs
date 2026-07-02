@@ -215,8 +215,20 @@ pub fn ez_parse(input: &EzParseInput) -> Result<EzParseOutput, EzParseError> {
         )));
     }
 
+    let args = build_ez_args(spec, &input.artifact_path, &outdir);
+    // Defense-in-depth pre-spawn gate: refuse a poisoned $EZTOOLS_DIR that
+    // resolves to a denied binary, and reject NUL bytes in the artifact path.
+    if let Err(e) = crate::tools::argsafe::guard_spawn(&binary, &args) {
+        let _ = std::fs::remove_dir_all(&outdir);
+        return Err(EzParseError::SubprocessFailed {
+            binary: spec.binary.to_string(),
+            exit_code: -1,
+            stderr: e.to_string(),
+        });
+    }
+
     let mut cmd = Command::new(&binary);
-    cmd.args(build_ez_args(spec, &input.artifact_path, &outdir));
+    cmd.args(args);
 
     let proc = cmd.output().map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {

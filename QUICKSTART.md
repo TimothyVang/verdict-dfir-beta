@@ -16,7 +16,14 @@ scripts/verdict <path-to-evidence>    # investigate -> live dashboard -> signed 
 type **`investigate evidence/`**. (Or hands-free in a session: `/verdict <path>` runs the pipeline
 and attempts SIFT VM setup when disk evidence needs it.)
 
-No evidence yet? `bash scripts/fetch-fixtures.sh` stages public datasets (into `fixtures/`).
+No evidence yet? `bash scripts/fetch-fixtures.sh` stages public datasets (into `fixtures/`). A view-only Google Drive artifact folder is also available at <https://drive.google.com/drive/folders/1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv?usp=drive_link>; CLI users can download it with their own authenticated rclone Google Drive remote:
+
+```bash
+rclone config create gdrive drive scope drive
+rclone copy --drive-root-folder-id 1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv gdrive: ./verdict-dfir-artifacts --progress
+scripts/verdict ./verdict-dfir-artifacts/network-captures/nitroba/nitroba.pcap
+```
+
 Canonical install detail — prerequisites and how to verify — is in [INSTALL.md](INSTALL.md).
 
 **Everything below is "going deeper"** — environment choices (SIFT VM vs. local) and the full
@@ -54,7 +61,7 @@ bash scripts/sift-vm-bootstrap.sh
 
 This converts the OVA, boots the VM headless, installs Rust + DFIR tools inside, sets up the SSH transport, and rewrites `.mcp.json.sift` to point at the running VM. Runs ~15 min on first invocation; subsequent runs detect existing state and skip.
 
-> **Hypervisor note:** `scripts/verdict <path> --sift` invokes the SIFT helper under the hood. The helper is VMware-only today (uses `vmrun.exe`); a VirtualBox path is stubbed but not implemented (see `scripts/find-evil-sift` lines 10–12). If you only have VirtualBox, use Path B.
+> **Hypervisor note:** `scripts/verdict <path> --sift` invokes the SIFT helper under the hood. It supports **VMware Workstation** (primary, via `vmrun`/`ovftool`) or **KVM/libvirt** (Linux fallback — `scripts/sift-vm-bootstrap.sh` auto-installs qemu/libvirt and imports the OVA). **VirtualBox is not supported.** If you only have VirtualBox, use VMware or KVM/libvirt, or run local-host mode (Path B).
 
 ### Path B — Local Windows host (faster iteration)
 

@@ -66,6 +66,11 @@ EXCLUDED_PATH_PARTS = (
     ".venv",
     "__pycache__",
     ".git",
+    # Contained runtime + toolchain state (gitignored; see docs/agent-containment.md).
+    # Holds the Rust/uv/pnpm/npm caches and the case store — tens of GB / hundreds of
+    # thousands of files. A fresh CI checkout has none, but a built local tree does,
+    # and walking it makes this smoke effectively never finish locally.
+    ".project-local",
     # Claude Code subagent worktrees created under the project-local
     # .claude directory. These are ignored runtime checkouts, not part
     # of the active publication tree, and can legitimately contain

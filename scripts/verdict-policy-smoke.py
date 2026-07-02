@@ -708,9 +708,13 @@ def main() -> int:
                 raw_disk_entry.get("sha256"),
             ),
             (
-                "raw disk directory case_open audit records exact arguments",
+                # The audit records the RELEASED (relativized) arguments — the
+                # /home-free provenance form — not the raw absolute dispatch args
+                # (evidence *_path is recorded repo-relative; the verifier
+                # re-absolutizes at replay). So compare against the released form.
+                "raw disk directory case_open audit records released (relativized) arguments",
                 disk_case_open_audit_args,
-                disk_case_open_args,
+                fea._release_arguments(disk_case_open_args),
             ),
             (
                 "raw disk mount uses registered Rust case id",
@@ -1295,6 +1299,46 @@ def main() -> int:
         ok = actual == expected
         marker = "OK  " if ok else "FAIL"
         print(f"  [{marker}] coverage-manifest: {label}")
+        if not ok:
+            print(f"         expected: {expected!r}")
+            print(f"         actual  : {actual!r}")
+            failures += 1
+
+    # ----- P0-6: coverage-discounted confidence -----------------------------
+    # The manifest must expose the breadth counts, and the host-engine mirror
+    # _coverage_discounted_confidence must match the canonical judge.py formula.
+    # The expected values below are identical to test_judge.py's, so a change to
+    # one formula without the other breaks one of the two suites (parity guard).
+    summary = coverage_manifest.get("summary", {})
+    cdc = fea._coverage_discounted_confidence  # noqa: SLF001 - smoke covers policy
+    coverage_discount_cases = [
+        ("manifest exposes applicable_classes", "applicable_classes" in summary, True),
+        ("manifest exposes consulted_classes", "consulted_classes" in summary, True),
+        (
+            "coverage_ratio in [0,1]",
+            0.0 <= summary.get("coverage_ratio", -1.0) <= 1.0,
+            True,
+        ),
+        (
+            "consulted never exceeds applicable",
+            summary.get("consulted_classes", 0) <= summary.get("applicable_classes", 0),
+            True,
+        ),
+        (
+            "thin investigation (1/5 CONFIRMED) scores 0.2",
+            cdc(["CONFIRMED"], 5, 1),
+            0.2,
+        ),
+        ("full coverage (3/3 CONFIRMED) scores 1.0", cdc(["CONFIRMED"], 3, 3), 1.0),
+        ("mixed tiers 2/4 scores 0.4", cdc(["CONFIRMED", "INFERRED"], 4, 2), 0.4),
+        ("no findings scores 0.0", cdc([], 3, 3), 0.0),
+        ("zero applicable guards div-by-zero", cdc(["CONFIRMED"], 0, 0), 0.0),
+    ]
+    for label, actual, expected in coverage_discount_cases:
+        process_checks += 1
+        ok = actual == expected
+        marker = "OK  " if ok else "FAIL"
+        print(f"  [{marker}] coverage-discount: {label}")
         if not ok:
             print(f"         expected: {expected!r}")
             print(f"         actual  : {actual!r}")
@@ -2038,6 +2082,12 @@ def main() -> int:
                 return check.get("status")
         return None
 
+    def qa_check_evidence(report_qa: dict[str, Any], check_id: str) -> list[str]:
+        for check in report_qa.get("checks", []):
+            if check.get("check_id") == check_id:
+                return [str(item) for item in check.get("evidence", [])]
+        return []
+
     def single_tool_overclaim_qa(
         *,
         finding_id: str,
@@ -2493,6 +2543,188 @@ def main() -> int:
         [],
         expert_rules,
     )
+    # Item #9 -- mandatory pre-finalize REVERSE coverage audits.
+    # (a) NO_EVIL clearance over an available-but-uninvoked artifact class -> FAIL.
+    reverse_uninvoked_clearance_qa = build_report_qa_signoff(
+        [],
+        [{"tool": "case_open", "tool_call_id": "tc-open"}],
+        "NO_EVIL",
+        {"checks": [{"artifact_class": "memory", "available": True, "touched": False}]},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+    )
+    # (a) Same gap under a non-clearance verdict -> named limitation (WARN, not FAIL).
+    reverse_uninvoked_suspicious_qa = build_report_qa_signoff(
+        [
+            {
+                "finding_id": "f-evtx",
+                "tool_call_id": "tc-evtx",
+                "description": "Suspicious logon recorded in one event.",
+            }
+        ],
+        [{"tool": "evtx_query", "tool_call_id": "tc-evtx"}],
+        "SUSPICIOUS",
+        {
+            "checks": [
+                {"artifact_class": "evtx", "available": True, "touched": True},
+                {"artifact_class": "memory", "available": True, "touched": False},
+            ]
+        },
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+    )
+    # (a) Clearance whose only available class WAS examined -> PASS. (b) The
+    # uncited-source disclosure names the indexed-but-uncited tool output.
+    reverse_examined_clearance_qa = build_report_qa_signoff(
+        [],
+        [{"tool": "evtx_query", "tool_call_id": "tc-evtx"}],
+        "NO_EVIL",
+        {"checks": [{"artifact_class": "evtx", "available": True, "touched": True}]},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+    )
+
+    # Item #10 -- negative-completeness parse-quality gate. A NO_EVIL clearance
+    # cannot rest on a class whose parse FAILED (the tool errored). Build coverage
+    # manifests carrying real per-class parse status and feed them to report QA.
+    def parse_quality_manifest(label: str, checks_in, tool_calls_in):
+        return build_coverage_manifest(
+            case_id=f"case-pq-{label}",
+            evidence_path=f"{label}/",
+            case_completeness={"evidence_type": "directory", "checks": checks_in},
+            attack_coverage=coverage,
+            tool_calls=tool_calls_in,
+            evidence_inventory=None,
+            velociraptor_zip_extractions=None,
+            analysis_limitations=[],
+        )
+
+    parse_failed_checks = [
+        {"artifact_class": "evtx", "available": True, "touched": True}
+    ]
+    parse_failed_calls = [
+        {"tool": "evtx_query", "tool_call_id": "tc-evtx", "error": "parser failed"}
+    ]
+    parse_failed_manifest = parse_quality_manifest(
+        "failed", parse_failed_checks, parse_failed_calls
+    )
+    parse_failed_clearance_qa = build_report_qa_signoff(
+        [],
+        parse_failed_calls,
+        "NO_EVIL",
+        {"checks": parse_failed_checks},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+        coverage_manifest=parse_failed_manifest,
+    )
+    parse_mixed_checks = [
+        {"artifact_class": "evtx", "available": True, "touched": True},
+        {"artifact_class": "memory", "available": True, "touched": True},
+    ]
+    parse_mixed_calls = [
+        {"tool": "evtx_query", "tool_call_id": "tc-evtx", "row_count": 5},
+        {"tool": "vol_pslist", "tool_call_id": "tc-mem", "error": "volatility failed"},
+    ]
+    parse_mixed_manifest = parse_quality_manifest(
+        "mixed", parse_mixed_checks, parse_mixed_calls
+    )
+    parse_mixed_clearance_qa = build_report_qa_signoff(
+        [],
+        parse_mixed_calls,
+        "NO_EVIL",
+        {"checks": parse_mixed_checks},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+        coverage_manifest=parse_mixed_manifest,
+    )
+    parse_clean_checks = [
+        {"artifact_class": "evtx", "available": True, "touched": True}
+    ]
+    parse_clean_calls = [
+        {"tool": "evtx_query", "tool_call_id": "tc-evtx", "row_count": 5}
+    ]
+    parse_clean_manifest = parse_quality_manifest(
+        "clean", parse_clean_checks, parse_clean_calls
+    )
+    parse_clean_clearance_qa = build_report_qa_signoff(
+        [],
+        parse_clean_calls,
+        "NO_EVIL",
+        {"checks": parse_clean_checks},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+        coverage_manifest=parse_clean_manifest,
+    )
+
+    # Item #13 -- conditional key-question gate. A download/ingress Finding with no
+    # execution check (no Prefetch/memory class, no execution Finding) -> unmet
+    # rule -> WARN named limitation.
+    key_question_unmet_qa = build_report_qa_signoff(
+        [
+            {
+                "finding_id": "f-download",
+                "tool_call_id": "tc-net",
+                "mitre_technique": "T1105",
+                "description": "Ingress tool transfer observed in network telemetry.",
+            }
+        ],
+        [{"tool": "pcap_triage", "tool_call_id": "tc-net"}],
+        "SUSPICIOUS",
+        {"checks": [{"artifact_class": "network", "available": True, "touched": True}]},
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+    )
+    # Same trigger, but an execution Finding + Prefetch class examined satisfy it.
+    key_question_met_qa = build_report_qa_signoff(
+        [
+            {
+                "finding_id": "f-download",
+                "tool_call_id": "tc-net",
+                "mitre_technique": "T1105",
+                "description": "Ingress tool transfer observed in network telemetry.",
+            },
+            {
+                "finding_id": "f-exec",
+                "tool_call_id": "tc-pf",
+                "mitre_technique": "T1059.001",
+                "description": "PowerShell execution corroborated by Prefetch.",
+            },
+        ],
+        [
+            {"tool": "pcap_triage", "tool_call_id": "tc-net"},
+            {"tool": "prefetch_parse", "tool_call_id": "tc-pf"},
+        ],
+        "SUSPICIOUS",
+        {
+            "checks": [
+                {"artifact_class": "network", "available": True, "touched": True},
+                {
+                    "artifact_class": "disk/filesystem",
+                    "available": True,
+                    "touched": True,
+                },
+            ]
+        },
+        {"blind_spot_count": 0},
+        {"events": []},
+        [],
+        expert_rules,
+    )
+
     story = build_executive_attack_story(
         timeline_findings,
         "SUSPICIOUS",
@@ -2786,6 +3018,164 @@ def main() -> int:
             "report QA rejects Velociraptor-only network exfil coverage",
             vel_network_only_exfil_qa.get("status"),
             "FAIL",
+        ),
+        (
+            "reverse audit FAILs NO_EVIL over available-but-uninvoked class",
+            qa_check_status(
+                reverse_uninvoked_clearance_qa, "coverage_reverse_uninvoked_tools"
+            ),
+            "FAIL",
+        ),
+        (
+            "reverse audit blocks finalize on uninvoked clearance",
+            reverse_uninvoked_clearance_qa.get("status"),
+            "FAIL",
+        ),
+        (
+            "reverse audit downgrades non-clearance uninvoked class to WARN",
+            qa_check_status(
+                reverse_uninvoked_suspicious_qa, "coverage_reverse_uninvoked_tools"
+            ),
+            "WARN",
+        ),
+        (
+            "reverse audit PASSes clearance whose class was examined",
+            qa_check_status(
+                reverse_examined_clearance_qa, "coverage_reverse_uninvoked_tools"
+            ),
+            "PASS",
+        ),
+        (
+            "reverse uncited-source disclosure is non-blocking",
+            qa_check_status(
+                reverse_examined_clearance_qa, "coverage_reverse_uncited_sources"
+            ),
+            "PASS",
+        ),
+        (
+            "reverse uncited-source disclosure names the uncited tool output",
+            "tc-evtx"
+            in qa_check_evidence(
+                reverse_examined_clearance_qa, "coverage_reverse_uncited_sources"
+            ),
+            True,
+        ),
+        (
+            "parse-quality gate FAILs NO_EVIL when the only parse failed",
+            qa_check_status(
+                parse_failed_clearance_qa, "clearance_requires_successful_parse"
+            ),
+            "FAIL",
+        ),
+        (
+            "parse-quality FAIL blocks finalize for failed-only clearance",
+            parse_failed_clearance_qa.get("status"),
+            "FAIL",
+        ),
+        (
+            "parse-quality gate WARNs NO_EVIL when one class failed but another parsed",
+            qa_check_status(
+                parse_mixed_clearance_qa, "clearance_requires_successful_parse"
+            ),
+            "WARN",
+        ),
+        (
+            "parse-quality gate names the failed class as a limitation",
+            "memory"
+            in qa_check_evidence(
+                parse_mixed_clearance_qa, "clearance_requires_successful_parse"
+            ),
+            True,
+        ),
+        (
+            "parse-quality gate PASSes NO_EVIL when every class parsed",
+            qa_check_status(
+                parse_clean_clearance_qa, "clearance_requires_successful_parse"
+            ),
+            "PASS",
+        ),
+        (
+            "coverage_parse_quality marks a failed parse not-examined",
+            fea.coverage_parse_quality(parse_failed_manifest),
+            (set(), {"evtx"}),
+        ),
+        (
+            "coverage_parse_quality marks a clean parse examined",
+            fea.coverage_parse_quality(parse_clean_manifest),
+            ({"evtx"}, set()),
+        ),
+        (
+            "coverage_parse_quality is empty without a manifest",
+            fea.coverage_parse_quality(None),
+            (set(), set()),
+        ),
+        (
+            "key-question gate WARNs when a download lead has no execution check",
+            qa_check_status(key_question_unmet_qa, "key_question_conditional_rules"),
+            "WARN",
+        ),
+        (
+            "key-question gate names the unmet rule",
+            "download-implies-execution"
+            in qa_check_evidence(
+                key_question_unmet_qa, "key_question_conditional_rules"
+            ),
+            True,
+        ),
+        (
+            "key-question gate PASSes when the execution follow-up was checked",
+            qa_check_status(key_question_met_qa, "key_question_conditional_rules"),
+            "PASS",
+        ),
+        (
+            "key-question engine flags download without execution corroboration",
+            [
+                rule["rule_id"]
+                for rule in fea.evaluate_key_question_rules(
+                    [{"mitre_technique": "T1105"}],
+                    [{"tool": "pcap_triage", "tool_call_id": "tc-net"}],
+                    {"checks": [{"artifact_class": "network", "touched": True}]},
+                )
+            ],
+            ["download-implies-execution"],
+        ),
+        (
+            "key-question engine clears download when Prefetch was examined",
+            fea.evaluate_key_question_rules(
+                [{"mitre_technique": "T1105"}],
+                [{"tool": "prefetch_parse", "tool_call_id": "tc-pf"}],
+                {"checks": [{"artifact_class": "disk/filesystem", "touched": True}]},
+            ),
+            [],
+        ),
+        (
+            "key-question engine flags log-clearing with only the event log",
+            [
+                rule["rule_id"]
+                for rule in fea.evaluate_key_question_rules(
+                    [{"mitre_technique": "T1070.001"}],
+                    [{"tool": "evtx_query", "tool_call_id": "tc-evtx"}],
+                    {"checks": [{"artifact_class": "evtx", "touched": True}]},
+                )
+            ],
+            ["log-clearing-implies-second-class"],
+        ),
+        (
+            "key-question engine clears log-clearing with a second class examined",
+            fea.evaluate_key_question_rules(
+                [{"mitre_technique": "T1070.001"}],
+                [
+                    {"tool": "evtx_query", "tool_call_id": "tc-evtx"},
+                    {"tool": "vol_pslist", "tool_call_id": "tc-mem"},
+                ],
+                {
+                    "checks": [
+                        {"artifact_class": "evtx", "touched": True},
+                        {"artifact_class": "memory", "touched": True},
+                    ]
+                },
+            ),
+            [],
         ),
         (
             "attack story preserves evidence-bound tool call",
@@ -3245,6 +3635,85 @@ def main() -> int:
             print(f"         actual  : {actual!r}")
             failures += 1
 
+    # ----- reason_codes: additive, custody-neutral annotation of a
+    #       non-committal verdict. compute_verdict_reason_codes derives the
+    #       ordered string codes for INDETERMINATE/INCONCLUSIVE and NEVER
+    #       changes the verdict WORD: present + nonempty when a signal fires on
+    #       a non-committal word, ALWAYS empty for a committed SUSPICIOUS /
+    #       scoped NO_EVIL regardless of the signals. -----
+    reason_code_checks = 0
+    crc = fea.compute_verdict_reason_codes
+    rc_cases: list[tuple[str, Any, Any]] = [
+        (
+            "INDETERMINATE, single artifact class -> INSUFFICIENT_COVERAGE",
+            crc("INDETERMINATE", artifact_class_count=1),
+            ["INSUFFICIENT_COVERAGE"],
+        ),
+        (
+            "INDETERMINATE, all signals -> four codes in canonical order",
+            crc(
+                "INDETERMINATE",
+                contradiction_count=2,
+                artifact_class_count=1,
+                leads_only=True,
+                tool_failure_count=3,
+                refuted_count=1,
+            ),
+            ["CONTRADICTION", "INSUFFICIENT_COVERAGE", "DEGRADED_MODE", "REFUTED"],
+        ),
+        (
+            "INDETERMINATE, leads-only with broad coverage -> INSUFFICIENT_COVERAGE",
+            crc("INDETERMINATE", artifact_class_count=5, leads_only=True),
+            ["INSUFFICIENT_COVERAGE"],
+        ),
+        (
+            "INDETERMINATE, contradiction with sufficient coverage -> CONTRADICTION",
+            crc("INDETERMINATE", contradiction_count=1, artifact_class_count=3),
+            ["CONTRADICTION"],
+        ),
+        (
+            "INDETERMINATE, tool failure with sufficient coverage -> DEGRADED_MODE",
+            crc("INDETERMINATE", tool_failure_count=1, artifact_class_count=2),
+            ["DEGRADED_MODE"],
+        ),
+        (
+            "INCONCLUSIVE alias is treated as non-committal",
+            crc("INCONCLUSIVE", refuted_count=1, artifact_class_count=2),
+            ["REFUTED"],
+        ),
+        (
+            "INDETERMINATE with no triggering signal -> empty (render falls back)",
+            crc("INDETERMINATE", artifact_class_count=2),
+            [],
+        ),
+        (
+            "SUSPICIOUS never carries reason_codes (committed word)",
+            crc(
+                "SUSPICIOUS",
+                contradiction_count=2,
+                artifact_class_count=1,
+                leads_only=True,
+                tool_failure_count=3,
+                refuted_count=1,
+            ),
+            [],
+        ),
+        (
+            "NO_EVIL never carries reason_codes (scoped clean word)",
+            crc("NO_EVIL", artifact_class_count=1, tool_failure_count=2),
+            [],
+        ),
+    ]
+    for label, actual, expected in rc_cases:
+        reason_code_checks += 1
+        ok = actual == expected
+        marker = "OK  " if ok else "FAIL"
+        print(f"  [{marker}] reason_codes: {label}")
+        if not ok:
+            print(f"         expected: {expected!r}")
+            print(f"         actual  : {actual!r}")
+            failures += 1
+
     print()
     print("=" * 60)
     total = (
@@ -3259,6 +3728,7 @@ def main() -> int:
         + contradiction_checks
         + cve_checks
         + host_checks
+        + reason_code_checks
     )
     if failures == 0:
         print(f"OK - all {total} verdict + evidence/process cases pass.")

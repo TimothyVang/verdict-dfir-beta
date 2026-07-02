@@ -208,6 +208,34 @@ Storage policy:
 - **Not bundled in the release archive.** Fixture URLs documented here; operators fetch via `scripts/fetch-fixtures.sh`.
 - **Cached in GHA via `actions/cache`** keyed on `fixtures/sha256sums.txt` hash.
 
+### Operator-hosted artifact mirror
+
+A view-only Google Drive folder is available as an operator-hosted convenience mirror for larger DFIR artifacts used during local VERDICT testing:
+
+<https://drive.google.com/drive/folders/1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv?usp=drive_link>
+
+It is organized by artifact class:
+
+- `disk-images/`
+- `memory-images/`
+- `network-captures/`
+- `windows-event-logs/`
+- `mixed-cases/`
+- `security-datasets/`
+- `synthetic-controls/`
+- `derived-artifacts/`
+- `manifests/`
+
+Browser downloads work from the Drive link. For rclone, Google Drive's backend still requires each downloader to use their own authenticated Google Drive remote, even for a view-only link-shared folder:
+
+```sh
+rclone config create gdrive drive scope drive
+rclone copy --drive-root-folder-id 1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv gdrive: ./verdict-dfir-artifacts --progress
+scripts/verdict ./verdict-dfir-artifacts/network-captures/nitroba/nitroba.pcap
+```
+
+This mirror is not a GitHub release asset and is not the source of truth for licensing or provenance. Honor each upstream dataset's terms and use the canonical source URLs above when redistribution terms require it.
+
 ---
 
 ## Public DFIR benchmark suite (one scenario per artifact class)
@@ -325,14 +353,14 @@ unfetchable-on-host datasets are marked "staged, run pending evidence".)*
 
 | Case id | Run? | Verdict | Recall | Notes |
 |---|---|---|---|---|
-| `nitroba` | yes (local, tshark) | INDETERMINATE | **5/5 (100%) — PASS** (bar=80%; local, not committed) | Network-playbook gaps fixed (see below). Surfaces all five: anonymous-email contact, source host (192.168.15.4), Gmail-cookie attribution, authenticated Facebook login, and the send-vs-browsing timeline correlation. |
+| `nitroba` | yes (local, tshark) | INDETERMINATE | **5/5 (100%) — PASS** (bar=80%; committed under `docs/sample-run/nitroba`, custody-verified) | Network-playbook gaps fixed (see below). Surfaces all five: anonymous-email contact, source host (192.168.15.4), Gmail-cookie attribution, authenticated Facebook login, and the send-vs-browsing timeline correlation. |
 | `otrf-apt3-mordor` | staged, run pending evidence | — | — | strongest Windows EVTX/Sysmon/JSON candidate; sparse clone only, no raw evidence committed |
 | `memlabs-lab1` | staged, run pending evidence | — | — | Windows memory CTF; requires extracted memory dump URL or local file URL |
 | `memlabs-lab2` | staged, run pending evidence | — | — | Windows memory CTF; requires extracted memory dump URL or local file URL |
 | `memlabs-lab3` | staged, run pending evidence | — | — | Windows memory CTF; requires extracted memory dump URL or local file URL |
 | `digitalcorpora-lonewolf` | staged, run pending evidence | — | — | large Windows disk+memory scenario; teacher guide gated |
 | `nist-data-leakage` | staged, run pending evidence | — | — | needs `--sift` (disk) |
-| `nist-hacking-case` | yes (committed local summary) | SUSPICIOUS | 7/14 (50%); 5/14 on leaner runs | coverage gap (not custody); run-dependent and reproducible under the hardened maximum-bipartite matcher (six 27-finding SCHARDT runs each hit 7/14; 19-finding runs hit 5/14). Up from 1/14 after disk-artifact emitters and native fallback triage: matches nhc-004 (hacking-tool files in Program Files/Desktop, from the MFT), nhc-005 (prefetch execution), nhc-007 (NTUSER shellbag navigation to a `\\4.220.254\Temp` staging share + tool folders), nhc-008 (LNK removable-media traces, HYPOTHESIS tier), nhc-009 (Recycle Bin staging artifacts, HYPOTHESIS tier), nhc-010 (suspiciously-named SAM account "Mr. Evil"), and nhc-011 (OpenSaveMRU recently-opened installers). Still below the 71% bar — the remaining seven: nhc-001 (ACMru/search history), nhc-002 (USB history), nhc-003 (email carving), nhc-006 (IE index.dat/browser history), nhc-012 (XP `.evt`, not EVTX), nhc-013 (thumbcache), and nhc-014 (named-pipe enum) are not yet parsed. **Run-to-run variance disclosed:** leaner 19-finding runs omit the HYPOTHESIS-tier nhc-008/nhc-009 and score 5/14 (36%). |
+| `nist-hacking-case` | yes (committed local summary) | SUSPICIOUS | 5/14 (36%) committed full run; up to 7/14 (50%) on richer 27-finding runs | coverage gap (not custody); run-dependent and reproducible under the hardened maximum-bipartite matcher (six 27-finding SCHARDT runs each hit 7/14; 19-finding runs hit 5/14). Up from 1/14 after disk-artifact emitters and native fallback triage: matches nhc-004 (hacking-tool files in Program Files/Desktop, from the MFT), nhc-005 (prefetch execution), nhc-007 (NTUSER shellbag navigation to a `\\4.220.254\Temp` staging share + tool folders), nhc-008 (LNK removable-media traces, HYPOTHESIS tier), nhc-009 (Recycle Bin staging artifacts, HYPOTHESIS tier), nhc-010 (suspiciously-named SAM account "Mr. Evil"), and nhc-011 (OpenSaveMRU recently-opened installers). Still below the 71% bar — the remaining seven: nhc-001 (ACMru/search history), nhc-002 (USB history), nhc-003 (email carving), nhc-006 (IE index.dat/browser history), nhc-012 (XP `.evt`, not EVTX), nhc-013 (thumbcache), and nhc-014 (named-pipe enum) are not yet parsed. **Run-to-run variance disclosed:** leaner 19-finding runs omit the HYPOTHESIS-tier nhc-008/nhc-009 and score 5/14 (36%). |
 | `alihadi-09-encrypt` | staged, run pending evidence | — | — | false-positive control; expect INDETERMINATE |
 | `alihadi-01-webserver` | staged, run pending evidence | — | — | disk+memory correlation |
 | `dfrws-2008-linux` | staged, run pending evidence | — | — | Linux memory+disk+network |

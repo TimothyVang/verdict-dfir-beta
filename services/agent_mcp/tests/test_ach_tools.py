@@ -242,14 +242,15 @@ class TestJudgeFindings:
 
 class TestCorrelateFindings:
     async def test_non_execution_claim_kept(self) -> None:
-        # T1071 = application-layer protocol; not an execution technique
-        # per the correlator's whitelist, so this finding stays as-is.
+        # A non-execution finding that binds to no corroboration gate (no
+        # execution claim, no tactic prefix/prose) stays as-is. (T1071 is no
+        # longer a neutral example — it now binds to the COMMAND_AND_CONTROL gate.)
         result = await CORRELATE_SPEC.handler(
             CorrelateFindingsInput(
                 findings=[
                     _finding(
-                        description="Network connection observed",
-                        mitre_technique="T1071.001",
+                        description="User profile directory observed on disk",
+                        mitre_technique=None,
                         confidence="CONFIRMED",
                     )
                 ]
@@ -259,6 +260,27 @@ class TestCorrelateFindings:
         assert len(result.outcomes) == 1
         assert result.outcomes[0].action == "kept"
         assert result.refined[0]["confidence"] == "CONFIRMED"
+
+    async def test_no_gate_record_keeps_neutral_defaults(self) -> None:
+        # A finding that matched no corroboration gate leaves the additive
+        # structured fields at their neutral defaults — old consumers reading only
+        # finding_id/action/reason are unaffected.
+        result = await CORRELATE_SPEC.handler(
+            CorrelateFindingsInput(
+                findings=[
+                    _finding(
+                        description="User profile directory observed on disk",
+                        mitre_technique=None,
+                        confidence="CONFIRMED",
+                    )
+                ]
+            )
+        )
+        outcome = result.outcomes[0]
+        assert outcome.gate is None
+        assert outcome.severity is None
+        assert outcome.required_pairs == []
+        assert outcome.missing_classes == []
 
     async def test_amcache_only_execution_downgraded(self) -> None:
         # T1059 (command interpreter) makes this an execution claim; the
@@ -278,3 +300,49 @@ class TestCorrelateFindings:
         assert result.outcomes[0].action == "downgraded"
         assert "Amcache" in result.outcomes[0].reason
         assert result.refined[0]["confidence"] == "INFERRED"
+
+    async def test_execution_gate_record_surfaced(self) -> None:
+        # The execution gate fires on this Amcache-only execution claim; the shim
+        # must surface the structured gate record the correlator computed, so
+        # verdict.json's findings_summary.correlation_outcomes records which class
+        # would corroborate.
+        result = await CORRELATE_SPEC.handler(
+            CorrelateFindingsInput(
+                findings=[
+                    _finding(
+                        description="Amcache shows the binary executed at 10:42",
+                        mitre_technique="T1059.001",
+                        confidence="CONFIRMED",
+                    )
+                ]
+            )
+        )
+        outcome = result.outcomes[0]
+        assert outcome.gate == "EXECUTION"
+        assert outcome.severity == "high"
+        # Any one of these independent pairs satisfies the execution gate.
+        assert outcome.required_pairs
+        assert all(isinstance(p, str) for p in outcome.required_pairs)
+        # Prefetch is the closest missing class for an Amcache-only claim.
+        assert "prefetch" in outcome.missing_classes
+
+    async def test_gate_record_serializes_into_output_dict(self) -> None:
+        # The fields must survive JSON serialization (the verdict.json path), not
+        # just be present on the Pydantic instance.
+        result = await CORRELATE_SPEC.handler(
+            CorrelateFindingsInput(
+                findings=[
+                    _finding(
+                        description="Amcache shows the binary executed at 10:42",
+                        mitre_technique="T1059.001",
+                        confidence="CONFIRMED",
+                    )
+                ]
+            )
+        )
+        dumped = result.model_dump()["outcomes"][0]
+        assert dumped["gate"] == "EXECUTION"
+        assert dumped["severity"] == "high"
+        assert isinstance(dumped["required_pairs"], list)
+        assert isinstance(dumped["missing_classes"], list)
+        assert "prefetch" in dumped["missing_classes"]

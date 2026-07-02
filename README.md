@@ -5,7 +5,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-4D5DFF.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/MCP-compatible-4D5DFF.svg" alt="MCP compatible">
-  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-FF6257.svg" alt="45 typed read-only tools">
+  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-FF6257.svg" alt="46 typed read-only tools">
   <a href="https://timothyvang.github.io/verdict-dfir/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-73D9C2" alt="Documentation"></a>
   <img src="https://img.shields.io/badge/rust-1.88-orange.svg" alt="Rust 1.88">
   <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
@@ -58,7 +58,7 @@ operation; it does not validate the interpretation.
 
 <p align="center"><sub><b>Drives:</b> memory images · EVTX · disk images (<code>.E01</code>/<code>.dd</code>) · packet captures · registry · MFT · Prefetch · Velociraptor · whole multi-host case folders</sub></p>
 
-- **Plug it into your agent** — two standard MCP stdio servers (32 Rust + 13 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
+- **Plug it into your agent** — two standard MCP stdio servers (32 Rust + 14 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
 - **Stay read-only by design** — no `execute_shell`; every tool is a narrow, schema-validated read-only verb, and evidence is hashed first and never mutated.
 - **Verify it offline** — runs seal into a hash-chained audit log → Merkle root → signed manifest; `manifest_verify` confirms the whole chain offline.
 
@@ -106,6 +106,20 @@ Prefer Claude Code interactively? Run `claude` in the repo and type `/verdict <e
 ## Get test evidence
 
 The repo's `evidence/` directory ships empty — real forensic images are far too large to host on GitHub. Drop your own evidence into `evidence/` (or point `$FINDEVIL_EVIDENCE_ROOT` at wherever you keep it) and run `scripts/verdict <image>`.
+
+An operator-hosted, view-only Google Drive folder also carries an organized DFIR artifact set used for local VERDICT testing:
+
+<https://drive.google.com/drive/folders/1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv?usp=drive_link>
+
+The folder is organized by artifact class (`disk-images/`, `memory-images/`, `network-captures/`, `windows-event-logs/`, `mixed-cases/`, `security-datasets/`, and `derived-artifacts/`). Browser downloads work from the Drive link. For CLI downloads, rclone still needs the downloader to configure their own Google Drive remote, even though the folder is view-only:
+
+```bash
+rclone config create gdrive drive scope drive
+rclone copy --drive-root-folder-id 1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv gdrive: ./verdict-dfir-artifacts --progress
+scripts/verdict ./verdict-dfir-artifacts/network-captures/nitroba/nitroba.pcap
+```
+
+The Drive folder is a convenience artifact mirror, not a GitHub release asset. Honor upstream dataset licenses and prefer the canonical public sources below when redistribution terms require using the original host.
 
 Public datasets you can download to try VERDICT, mapped to the path each exercises:
 
@@ -240,7 +254,7 @@ Three design choices carry the weight:
 1. **A typed MCP tool surface — no `execute_shell`.** 45 narrow, schema-validated product tools: 32
    Rust DFIR tools (`case_open`, `vol_pslist`/`psscan`/`psxview`, `mft_timeline`, `evtx_query`,
    `hayabusa_scan`, `yara_scan`, `registry_query`, `prefetch_parse`, `pcap_triage`, and allow-listed
-   long-tail wrappers) plus 13 Python crypto/analysis tools. Copyleft and source-available engines
+   long-tail wrappers) plus 14 Python crypto/analysis tools. Copyleft and source-available engines
    (Hayabusa, pandoc, tshark, Volatility 3, Velociraptor) are invoked as subprocesses only, keeping
    the Apache-2.0 tree license-clean.
 2. **A cryptographic chain of custody.** Hash-chained audit log → Merkle root over canonical-JSON
@@ -285,7 +299,7 @@ subprocesses** → **two typed MCP servers** → the **Claude Code agent loop** 
 custody** → the **presentation** layer, with trust boundaries marked.
 
 <p align="center">
-  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 13 Python tools), the Claude Code agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
+  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 14 Python tools), the Claude Code agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
 </p>
 
 The same pipeline mapped to the repository — entrypoints (`scripts/`), the agent loop governed by
@@ -370,13 +384,14 @@ reproducible with `scripts/score-recall.py`; full method and caveats are in
 | Case | Evidence | Recall (bar) | Run verdict | What it shows |
 |---|---|---|---|---|
 | **Nitroba** | network (PCAP) | **5/5 = 100%** (80%) | `INDETERMINATE` | Full network-evidence recall with no over-attribution. All five golden facts surfaced; attribution stays `INFERRED` / `HYPOTHESIS`, so the verdict scopes down. The strongest single result. |
-| **NIST Hacking Case** | disk (Windows XP) | **7/14 = 50%** (5/14 floor; bar 71%) | `SUSPICIOUS` | 8 CONFIRMED tool-artifact findings, including Prefetch-backed tool-use evidence with corroboration details in the report; shellbag staging, LNK and Recycle-Bin traces, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU. Below the bar, up from 1/14. Seven misses (search / USB / email / browser history, XP `.evt`, thumbcache, named-pipe) **published, not hidden**. |
+| **NIST Hacking Case** | disk (Windows XP) | **5/14 = 36%** committed run (up to 7/14 = 50% on richer 27-finding runs; bar 71%) | `SUSPICIOUS` | 8 CONFIRMED tool-artifact findings — Prefetch-backed tool-use, on-disk tool files (MFT), shellbag staging, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU; richer runs also surface LNK + Recycle-Bin traces (7/14). Below the bar, up from 1/14. Misses (search / USB / email / browser history, XP `.evt`, thumbcache, named-pipe) **published, not hidden**. |
 
-Of 10 scoreable goldens, **1 is fully scored and passing** (Nitroba) and **1 is scored and
-failing-but-improving** (NIST); the other 8 are fixture-staged and **not yet run, with no number
-fabricated**. Staged controls include `synthetic-benign` (expected `NO_EVIL` / 0 findings) and
-`alihadi-09-encrypt` (dual-use crypto should not become an overconfident `SUSPICIOUS`). NIST recall is
-run-dependent (5/14 floor, 7/14 best committed).
+Of 11 scoreable goldens, **3 are fully scored and passing** (Nitroba 100%; the `synthetic-benign`
+and `synthetic-decoy` controls 100% — 0 findings / 0 planted-bait asserted, custody-verified) and
+**1 is scored and failing-but-improving** (NIST); the other 7 are fixture-staged and **not yet run,
+with no number fabricated**. A staged control is `alihadi-09-encrypt` (dual-use crypto should not
+become an overconfident `SUSPICIOUS`). NIST recall is run-dependent (**5/14 = 36% committed**, 7/14 =
+50% best).
 
 ### Artifact classes proven on committed runs
 

@@ -5,6 +5,7 @@
 //
 // Per A3 plan Task 4.2.
 
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
@@ -12,6 +13,11 @@ import chokidar, { type FSWatcher } from "chokidar";
 
 import type { AgentEvent } from "@/lib/events";
 import { repoRoot } from "@/lib/repo-root";
+import {
+  canonicalizeJson,
+  extractContentRecord,
+  type JsonValue,
+} from "@/lib/verify-chain";
 
 /**
  * Default allow-listed case roots, resolved against the repo root. repoRoot()
@@ -311,8 +317,11 @@ function parseLine(line: string): AuditLine | null {
       kind,
       ts,
       payload: (obj.payload ?? obj) as AgentEvent | Record<string, unknown>,
+      // On-disk lines carry no line_hash field, so derive the per-line chain
+      // hash here from the shared canonicalizer. A producer that DID embed one
+      // is trusted as-is.
       line_hash:
-        typeof obj.line_hash === "string" ? obj.line_hash : undefined,
+        typeof obj.line_hash === "string" ? obj.line_hash : computeLineHash(obj),
       raw_line: line,
     };
   } catch {
@@ -320,4 +329,19 @@ function parseLine(line: string): AuditLine | null {
     // Future: surface as a `kind=tail_parse_error` synthetic event.
     return null;
   }
+}
+
+/**
+ * SHA-256 of the canonical content-field projection of a parsed audit record —
+ * the per-line hash the custody chain commits to. Shares the JCS canonicalizer
+ * and CONTENT_FIELDS selection with the browser re-verifier
+ * (lib/verify-chain), so the server-streamed line_hash equals what an
+ * in-browser SubtleCrypto re-derivation produces for the same line. Read-only:
+ * it derives a value and never mutates the audit chain.
+ */
+function computeLineHash(obj: Record<string, unknown>): string {
+  const canonical = canonicalizeJson(
+    extractContentRecord(obj as Record<string, JsonValue>),
+  );
+  return createHash("sha256").update(canonical, "utf-8").digest("hex");
 }

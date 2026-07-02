@@ -53,22 +53,23 @@ CHROME = _resolve_bin(
 
 # --------------------------------------------------------------------------- #
 # Design tokens — VERDICT v2 brand theme, in sync with scripts/_report_style.css
-# so fleet figures sit flush inside the dark evidence-lab report.
+# and render_report.py's figure palette, so fleet figures sit flush inside the
+# light Paper-Cream case-file report.
 # --------------------------------------------------------------------------- #
-PAPER = "#101426"
-SURFACE = "#12131A"
-INSET = "#0C1020"
-INK = "#F5F1E8"
-MUTED = "#B8A8FF"
-FAINT = "#7F789C"
-HAIRLINE = "#27304A"
+PAPER = "#F5F1E8"  # Paper Cream page
+SURFACE = "#fbfaf6"  # light figure surface (matches render_report figures)
+INSET = "#efe9dc"  # light inset panel
+INK = "#101426"  # Midnight Ink — body/data text on light
+MUTED = "#7F789C"  # readable mid-gray on cream
+FAINT = "#9A927F"  # fainter secondary text on cream
+HAIRLINE = "#CFC8BA"  # light editorial rule
 ACCENT = "#4D5DFF"  # Electric Cobalt brand
-ACCENT_LIGHT = "#B8A8FF"
+ACCENT_LIGHT = "#4D5DFF"  # accent stays cobalt on cream (lilac is unreadable on light)
 ALERT = "#FF6257"  # Signal Coral — rejected / flagged
-INFERRED = "#FFD76A"  # Butter Yellow — review / attention
+INFERRED = "#B8860B"  # darker amber (text-safe on cream; Butter Yellow itself is unreadable on light)
 HYPOTHESIS = "#4D5DFF"  # Electric Cobalt — hypothesis / info
-CONFIRMED = "#73D9C2"  # Seafoam — verified / pass
-FIG_BG = SURFACE  # margins included, so the PNG is dark to the edge
+CONFIRMED = "#268A72"  # darker seafoam (text-safe on cream)
+FIG_BG = SURFACE  # margins included, so the PNG is light to the edge
 
 SANS = "DejaVu Sans"
 MONO = "DejaVu Sans Mono"
@@ -854,6 +855,71 @@ def fig_temporal_clusters(corr: dict, fig_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _append_hygiene_section(out: list[str], corr: dict) -> None:
+    """Render the cross-host hygiene rollup (shared binaries + network pivots).
+
+    Mirrors fleet_correlate's structured ``cross_host_hygiene`` block: OS /
+    Microsoft-signed shared binaries and too-common pivots (bulk registrar /
+    CDN / free-TLS issuer) are suppressed, non-OS shared binaries are grouped
+    for review, and a cross-host campaign LEAD is shown only on a discriminating
+    pivot. Host artifacts never establish attribution."""
+    hygiene = corr.get("cross_host_hygiene")
+    if not hygiene:
+        return
+    out.append("## Cross-host hygiene (shared binaries & network pivots)")
+    out.append("")
+    if not hygiene.get("available", False):
+        out.append(f"*{hygiene.get('note', 'cross-host hygiene unavailable')}.*")
+        out.append("")
+        return
+    outcomes = hygiene.get("outcomes", [])
+    leads = [o for o in outcomes if o["decision"] == "campaign_lead"]
+    review = [o for o in outcomes if o["decision"] == "shared_binaries_review"]
+    suppressed = [o for o in outcomes if o["decision"] == "suppressed"]
+    out.append(
+        "*OS / Microsoft-signed shared binaries and too-common network pivots "
+        "(bulk registrar / CDN / free-TLS issuer) are suppressed — a shared hash "
+        "or registrar between hosts is internet noise, not a campaign. A "
+        "cross-host campaign LEAD is emitted only on a discriminating pivot, and "
+        "host artifacts never establish attribution (HYPOTHESIS-tier at most).*"
+    )
+    out.append("")
+    out.append(
+        f"**Cross-host actor-link:** "
+        f"{'YES — discriminating pivot present' if hygiene.get('actor_link') else 'no'}  "
+        f"**Co-occurrence only:** {'yes' if hygiene.get('co_occurrence') else 'no'}  "
+        f"**Attribution:** {hygiene.get('attribution', False)} (invariant)"
+    )
+    out.append("")
+    if leads:
+        out.append(
+            f"**{len(leads)} discriminating cross-host pivot(s)** — HYPOTHESIS-tier "
+            "campaign lead(s) for an analyst to confirm:"
+        )
+        for o in leads:
+            out.append(
+                f"- `{o['value']}` ({o['kind']}, {len(set(o['hosts']))} hosts) — {o['reason']}"
+            )
+        out.append("")
+    if review:
+        out.append(
+            f"**{len(review)} non-OS shared binary group(s) (review)** — same hash "
+            "on multiple hosts; pull and YARA-scan before concluding:"
+        )
+        for o in review:
+            out.append(f"- `{o['value']}` ({len(set(o['hosts']))} hosts)")
+        out.append("")
+    if suppressed:
+        out.append(
+            f"*{len(suppressed)} shared artifact(s) suppressed as expected baseline "
+            "noise (OS-signed binaries / too-common pivots) — not cross-host signal.*"
+        )
+        out.append("")
+    if not outcomes:
+        out.append("*No binary hashes or network pivots were shared across >=2 hosts.*")
+        out.append("")
+
+
 def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
     md = fleet_dir / "FLEET_REPORT.md"
     h = corr.get("host_count", 0)
@@ -969,6 +1035,8 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
         for name, count in cross_high[:15]:
             out.append(f"- `{name}` ({count} hosts)")
         out.append("")
+
+    _append_hygiene_section(out, corr)
 
     out.append("## Multi-host temporal clusters (lateral-movement candidates)")
     out.append("")

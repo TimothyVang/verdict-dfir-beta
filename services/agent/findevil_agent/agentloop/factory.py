@@ -59,6 +59,20 @@ class EvidenceEgressError(RuntimeError):
     """Raised when a cloud provider is requested without an explicit egress ack."""
 
 
+def resolve_provider(provider: str | None = None) -> str:
+    """Resolve the effective provider id (explicit arg > env > default), lowercased."""
+    return (provider or os.environ.get("FINDEVIL_AGENT_PROVIDER") or DEFAULT_PROVIDER).lower()
+
+
+def provider_requires_egress_ack(provider: str | None = None) -> bool:
+    """True if the resolved provider transmits evidence text off-host (needs the ack).
+
+    Lets a caller fail fast at CLI-parse time instead of raising EvidenceEgressError
+    deep in the run, after case_open and engine spin-up.
+    """
+    return resolve_provider(provider) in _CLOUD_PROVIDERS
+
+
 def build_provider(
     *,
     provider: str | None = None,
@@ -68,7 +82,7 @@ def build_provider(
     transport: Any | None = None,
 ) -> ChatProvider:
     """Build the selected provider, enforcing the custody egress gate first."""
-    provider = (provider or os.environ.get("FINDEVIL_AGENT_PROVIDER") or DEFAULT_PROVIDER).lower()
+    provider = resolve_provider(provider)
 
     if provider not in _KNOWN_PROVIDERS:
         raise ValueError(

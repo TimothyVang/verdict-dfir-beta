@@ -14,6 +14,8 @@ has the required artifacts:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -25,13 +27,24 @@ from html import escape
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import matplotlib
+try:
+    import matplotlib
 
-matplotlib.use("Agg")  # headless
-import matplotlib.dates as mdates  # noqa: E402
-import matplotlib.patches as mpatches  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch  # noqa: E402
+    matplotlib.use("Agg")  # headless
+    import matplotlib.dates as mdates  # noqa: E402
+    import matplotlib.patches as mpatches  # noqa: E402
+    import matplotlib.pyplot as plt  # noqa: E402
+    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - figure rendering needs matplotlib
+    # The figure generators below need matplotlib, but the text/markdown
+    # rendering path (and its reader of the read-only verdict_revision audit
+    # records) does not. Degrade gracefully so the module is importable where
+    # only the prose Self-Correction renderer is exercised.
+    matplotlib = None  # type: ignore[assignment]
+    mdates = mpatches = plt = None  # type: ignore[assignment]
+    FancyArrowPatch = FancyBboxPatch = None  # type: ignore[assignment,misc]
+
+from report_entailment import entailment_evidence_lines  # noqa: E402
 
 
 def _resolve_tool(env_var: str, *fallback_names: str) -> str | None:
@@ -55,8 +68,9 @@ CHROME: str | None = _resolve_tool(
     "chrome",
 )
 
-# VERDICT v2 figure palette. Figures remain light "mounted exhibits" on the dark
-# report, but semantic strokes/fills match the v2 brand-bible colors.
+# VERDICT v2 figure palette. Figures are light cream exhibits flush with the
+# light Paper-Cream case-file report, with semantic strokes/fills in the v2
+# brand-bible colors.
 V_PURPLE = "#4D5DFF"  # legacy name: Electric Cobalt brand/info
 V_GREEN = "#73D9C2"  # Seafoam verified/pass
 V_AMBER = "#FFD76A"  # Butter Yellow review/attention
@@ -89,26 +103,27 @@ def display_artifact_path(value: Any) -> str:
     return raw
 
 
-plt.rcParams.update(
-    {
-        "font.family": "DejaVu Sans",
-        "font.size": 10,
-        "axes.titlesize": 12,
-        "axes.titleweight": "bold",
-        "savefig.dpi": 150,
-        "savefig.bbox": "tight",
-        "figure.facecolor": "#fbfaf6",
-        "axes.facecolor": "#fbfaf6",
-        "savefig.facecolor": "#fbfaf6",
-        "text.color": V_INK,
-        "axes.edgecolor": "#cfc8ba",
-        "axes.labelcolor": V_INK,
-        "axes.titlecolor": V_INK,
-        "xtick.color": V_MUTED,
-        "ytick.color": V_MUTED,
-        "grid.color": "#e6e0d4",
-    }
-)
+if plt is not None:
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 10,
+            "axes.titlesize": 12,
+            "axes.titleweight": "bold",
+            "savefig.dpi": 150,
+            "savefig.bbox": "tight",
+            "figure.facecolor": "#fbfaf6",
+            "axes.facecolor": "#fbfaf6",
+            "savefig.facecolor": "#fbfaf6",
+            "text.color": V_INK,
+            "axes.edgecolor": "#cfc8ba",
+            "axes.labelcolor": V_INK,
+            "axes.titlecolor": V_INK,
+            "xtick.color": V_MUTED,
+            "ytick.color": V_MUTED,
+            "grid.color": "#e6e0d4",
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +623,30 @@ def md_cell(value: Any) -> str:
     return text
 
 
+def confirmed_reverify_affordance(finding: dict[str, Any]) -> list[str]:
+    """Copy-paste offline re-verification line for a CONFIRMED finding.
+
+    Returns Markdown lines giving a reader a one-line ``grep <tool_call_id>
+    audit.jsonl`` they can run against the audit.jsonl embedded in ``REPORT.html``,
+    so a CONFIRMED finding can be re-verified fully offline with no server. Returns
+    an empty list for any non-CONFIRMED finding (leads must never be dressed up as
+    reproducible) or a finding without a usable ``tool_call_id``. Presentation-only:
+    it never changes the finding, its confidence, or the verdict.
+    """
+    if str(finding.get("confidence", "")).strip().upper() != "CONFIRMED":
+        return []
+    tcid = str(finding.get("tool_call_id") or "").strip()
+    if not tcid or tcid.lower() == "n/a":
+        return []
+    # Keep the id safe inside a backtick code span; tool_call_ids are audit-chain
+    # identifiers, so this only guards against an accidental span break.
+    safe_tcid = tcid.replace("`", "'")
+    return [
+        f"- re-verify offline: `grep {safe_tcid} audit.jsonl` — runs against the "
+        "embedded audit.jsonl in this report (see Offline Re-Verification below).",
+    ]
+
+
 def _short_title(description: Any, mitre: Any = None) -> str:
     """A clean, word-boundary-safe title from a finding/event description.
 
@@ -1062,11 +1101,30 @@ def html_event_sequence(events: list[dict[str, Any]]) -> str:
     )
 
 
+# Verdict words that abstain from a committed call. Only these carry a
+# rendered "Why indeterminate" block; SUSPICIOUS / NO_EVIL never do.
+_NON_COMMITTAL_VERDICTS = frozenset({"INDETERMINATE", "INCONCLUSIVE"})
+
+# Human-readable labels for the typed reason-codes (mirrors the docstrings on
+# findevil_agent.verdict_reasons.IndeterminateReason). Presentation only — the
+# codes annotate the scoped verdict and never change it.
+_REASON_CODE_LABELS = {
+    "CONTRADICTION": "an unreconciled conflict between findings or pools",
+    "INSUFFICIENT_COVERAGE": (
+        "too few artifact classes examined, or only uncorroborated leads"
+    ),
+    "DEGRADED_MODE": "a tool or parse path failed, so coverage is partial",
+    "REFUTED": "one or more findings were refuted or falsified",
+}
+
+
 def build_bluf_section(
     attack_story: dict[str, Any] | None,
     verdict: str,
     merged: list[dict[str, Any]],
     host_groups: list[dict[str, Any]] | None = None,
+    score_basis: str = "",
+    reason_codes: list[str] | None = None,
 ) -> str:
     """Bottom Line Up Front: verdict + one-line story + the top next step."""
     story = attack_story or {}
@@ -1083,6 +1141,25 @@ def build_bluf_section(
         f"**Verdict: {md_cell(verdict)}.** {md_cell(story.get('headline', ''))}\n\n",
         f"{md_cell(story.get('customer_summary', ''))}\n\n",
     ]
+    # Evidence-type-weighted confidence breakdown (correlator score_basis): a
+    # presentation-only annotation that shows HOW the confidence_score was
+    # reached. Never evidence; never upgrades the scoped verdict above.
+    if score_basis:
+        parts.append(f"**Confidence basis:** {md_cell(score_basis)}\n\n")
+    # Why-indeterminate: when the verdict is non-committal, name the typed
+    # reason-code(s) for the abstain. Presentation only — these annotate the
+    # scoped verdict and never change it. Empty codes render nothing.
+    codes = reason_codes or []
+    if str(verdict).upper() in _NON_COMMITTAL_VERDICTS and codes:
+        labelled = "\n".join(
+            f"* **{md_cell(code)}** — {md_cell(_REASON_CODE_LABELS.get(code, code))}"
+            for code in codes
+        )
+        parts.append(
+            "**Why indeterminate:** the verdict abstains for the reason(s) below; "
+            "they explain the non-committal call and do not change it.\n\n"
+            f"{labelled}\n\n"
+        )
     # Scope honesty: when findings span more than one host, name them and say the
     # evidence does not establish them as a single incident.
     groups = host_groups or []
@@ -1477,6 +1554,107 @@ def build_indicators_section(indicators: dict[str, Any] | None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Self-Correction narrative block (read-only over the verdict_revision records)
+# ---------------------------------------------------------------------------
+
+# Default-ON env flag. Set to a falsey value to suppress the rendered block.
+SELF_CORRECTION_ENV = "FINDEVIL_REPORT_SELF_CORRECTION"
+_SELF_CORRECTION_OFF = {"0", "false", "no", "off"}
+
+_SELF_CORRECTION_MECHANISM_LABEL = {
+    "verify_hash_drift": "verifier replayed the cited tool call and its "
+    "output hash drifted",
+    "correlation_downgrade": "the SOUL.md >=2-artifact-class rule was applied "
+    "during correlation",
+    "tool_failure_resequence": "a tool failure forced a re-sequence of the Finding",
+}
+
+
+def self_correction_enabled() -> bool:
+    """Whether the rendered Self-Correction block is enabled (default ON).
+
+    Gated by ``FINDEVIL_REPORT_SELF_CORRECTION``; any of ``0/false/no/off``
+    (case-insensitive) suppresses the section. The default is ON so the audited
+    self-correction arc shows up without configuration.
+    """
+    raw = os.environ.get(SELF_CORRECTION_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _SELF_CORRECTION_OFF
+
+
+def verdict_revisions_from_audit(
+    audit: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Read committed ``verdict_revision`` payloads from the audit chain.
+
+    Strictly read-only over already-hash-chained ``audit.jsonl`` records (the
+    custody chain is never mutated): each record carries ``kind`` and a
+    ``payload`` dict, so this returns the payloads of every ``verdict_revision``
+    record in chain order. Malformed rows (missing/non-dict payload) are skipped.
+    """
+    out: list[dict[str, Any]] = []
+    for rec in audit or []:
+        if not isinstance(rec, dict) or rec.get("kind") != "verdict_revision":
+            continue
+        payload = rec.get("payload")
+        if isinstance(payload, dict):
+            out.append(payload)
+    return out
+
+
+def render_self_correction_section(
+    verdict_revisions: list[dict[str, Any]] | None,
+) -> str:
+    """Render the prose Self-Correction block from verdict_revision records.
+
+    Each committed conclusion flip becomes an INITIAL claim -> EVIDENCE (the
+    trigger ``tool_call_id``) -> CORRECTION (the mechanism) -> FINAL verdict
+    narrative. Returns an empty string when there are no records, so a Case with
+    zero flips renders no empty section.
+    """
+    revisions = [rev for rev in (verdict_revisions or []) if isinstance(rev, dict)]
+    if not revisions:
+        return ""
+    blocks: list[str] = []
+    for rev in revisions[:20]:
+        from_v = md_cell(rev.get("from_verdict", "?"))
+        to_v = md_cell(rev.get("to_verdict", "?"))
+        trigger = md_cell(rev.get("trigger_tool_call_id", "n/a"))
+        mechanism = rev.get("mechanism", "")
+        verification = _SELF_CORRECTION_MECHANISM_LABEL.get(
+            mechanism, md_cell(str(mechanism) or "an audited self-check")
+        )
+        reason = md_cell(rev.get("reason", "")) or "no per-flip reason recorded"
+        finding = md_cell(rev.get("finding_id", "n/a"))
+        blocks.append(
+            f"### Self-Correction — Finding `{finding}`\n\n"
+            f"* **Initial Finding:** held at `{from_v}` confidence before the "
+            "self-check below.\n"
+            f"* **Verification Action:** {verification} (trigger "
+            f"`tool_call_id`: `{trigger}`).\n"
+            f"* **What It Revealed:** {reason}\n"
+            f"* **Correction Applied:** confidence revised `{from_v}` -> `{to_v}` "
+            f"via `{md_cell(str(mechanism))}`.\n"
+        )
+    omitted_rev = ""
+    if len(revisions) > 20:
+        omitted_rev = (
+            f"\n*{len(revisions) - 20} additional self-correction(s) are "
+            "recorded in `verdict.json`.*\n"
+        )
+    return (
+        "\n## Self-Correction\n\n"
+        "Each entry is a committed conclusion flip: a Finding whose confidence "
+        "tier the run lowered as its own verification machinery reasoned about it. "
+        "These revisions ride the hash-chained audit log (each cites the trigger "
+        "`tool_call_id`) and are offline-verifiable via `manifest_verify` chain "
+        "replay — they are the audited record of VERDICT correcting itself, not a "
+        "narrative claim.\n\n" + "\n".join(blocks) + omitted_rev + "\n"
+    )
+
+
 def write_markdown(
     case_dir: Path,
     manifest: dict[str, Any],
@@ -1515,6 +1693,8 @@ def write_markdown(
     rejected_finding_leads: list[dict[str, Any]] | None = None,
     verdict_revisions: list[dict[str, Any]] | None = None,
     host_groups: list[dict[str, Any]] | None = None,
+    score_basis: str = "",
+    reason_codes: list[str] | None = None,
 ) -> Path:
     md = case_dir / "REPORT.md"
     fa = manifest["audit_log_final_hash"]
@@ -1657,9 +1837,14 @@ def write_markdown(
         )
         findings_md_lines.append("")
         findings_md_lines.append(md_cell(f.get("description", "")) + "\n")
+        # Surface the value the verifier RE-EXTRACTED from the evidence (the sealed
+        # entailment slice), not just the model's description, so a tolerant match
+        # cannot let the model's spelling reach the reader as the fact.
+        findings_md_lines.extend(entailment_evidence_lines(f))
         findings_md_lines.append(
             f"- `tool_call_id`: `{md_cell(f.get('tool_call_id', 'n/a'))}`"
         )
+        findings_md_lines.extend(confirmed_reverify_affordance(f))
         findings_md_lines.append(
             f"- artifact: `{md_cell(display_artifact_path(f.get('artifact_path')))}`"
         )
@@ -1745,53 +1930,7 @@ def write_markdown(
             "succeeds in a later run.\n\n" + "\n".join(rows) + omitted + "\n\n"
         )
 
-    revisions = [rev for rev in (verdict_revisions or []) if isinstance(rev, dict)]
-    self_correction_section = ""
-    if revisions:
-        mechanism_label = {
-            "verify_hash_drift": "verifier replayed the cited tool call and its "
-            "output hash drifted",
-            "correlation_downgrade": "the SOUL.md >=2-artifact-class rule was applied "
-            "during correlation",
-            "tool_failure_resequence": "a tool failure forced a re-sequence of the "
-            "Finding",
-        }
-        blocks: list[str] = []
-        for rev in revisions[:20]:
-            from_v = md_cell(rev.get("from_verdict", "?"))
-            to_v = md_cell(rev.get("to_verdict", "?"))
-            trigger = md_cell(rev.get("trigger_tool_call_id", "n/a"))
-            mechanism = rev.get("mechanism", "")
-            verification = mechanism_label.get(
-                mechanism, md_cell(str(mechanism) or "an audited self-check")
-            )
-            reason = md_cell(rev.get("reason", "")) or "no per-flip reason recorded"
-            finding = md_cell(rev.get("finding_id", "n/a"))
-            blocks.append(
-                f"### Self-Correction — Finding `{finding}`\n\n"
-                f"* **Initial Finding:** held at `{from_v}` confidence before the "
-                "self-check below.\n"
-                f"* **Verification Action:** {verification} (trigger "
-                f"`tool_call_id`: `{trigger}`).\n"
-                f"* **What It Revealed:** {reason}\n"
-                f"* **Correction Applied:** confidence revised `{from_v}` -> `{to_v}` "
-                f"via `{md_cell(str(mechanism))}`.\n"
-            )
-        omitted_rev = ""
-        if len(revisions) > 20:
-            omitted_rev = (
-                f"\n*{len(revisions) - 20} additional self-correction(s) are "
-                "recorded in `verdict.json`.*\n"
-            )
-        self_correction_section = (
-            "\n## Self-Correction\n\n"
-            "Each entry is a committed conclusion flip: a Finding whose confidence "
-            "tier the run lowered as its own verification machinery reasoned about it. "
-            "These revisions ride the hash-chained audit log (each cites the trigger "
-            "`tool_call_id`) and are offline-verifiable via `manifest_verify` chain "
-            "replay — they are the audited record of VERDICT correcting itself, not a "
-            "narrative claim.\n\n" + "\n".join(blocks) + omitted_rev + "\n"
-        )
+    self_correction_section = render_self_correction_section(verdict_revisions)
 
     psscan_fig_block = ""
     if has_psscan:
@@ -1984,7 +2123,9 @@ def write_markdown(
             + "\n\n"
         )
 
-    bluf_section = build_bluf_section(attack_story, verdict, merged, host_groups)
+    bluf_section = build_bluf_section(
+        attack_story, verdict, merged, host_groups, score_basis, reason_codes
+    )
     timeline_of_events_section = build_timeline_of_events_section(
         normalized_timeline,
         event_narratives,
@@ -2316,6 +2457,50 @@ def _inject_figures(html_text: str, figures: dict[str, str]) -> str:
     return html_text
 
 
+def build_offline_audit_embed(audit_text: str) -> str:
+    """Self-contained HTML block embedding the case's hash-chained ``audit.jsonl``.
+
+    The complete ``audit.jsonl`` is embedded base64 so a reader can re-verify each
+    cited ``tool_call_id`` fully offline (no server): a base64 ``data:`` download
+    link plus the same payload inside a non-executing
+    ``<script type="application/x-ndjson">`` element for programmatic recovery. The
+    embed is a verbatim byte-for-byte copy of audit.jsonl; it is presentation-only
+    and never changes the findings, the verdict, or the custody chain.
+    """
+    raw = (audit_text or "").encode("utf-8")
+    b64 = base64.b64encode(raw).decode("ascii")
+    sha = hashlib.sha256(raw).hexdigest()
+    href = f"data:application/x-ndjson;base64,{b64}"
+    # The base64 alphabet has no '<'/'>'/'&', so it is safe verbatim inside both the
+    # attribute and the <script> text node (which _colorize_html skips).
+    return (
+        '<section id="verdict-offline-audit" class="offline-audit">'
+        "<h2>Offline Re-Verification</h2>"
+        "<p>The complete hash-chained <code>audit.jsonl</code> for this case is "
+        "embedded below so every cited <code>tool_call_id</code> can be re-verified "
+        "fully offline, with no server. Download it, then for any CONFIRMED finding "
+        "run the listed <code>grep &lt;tool_call_id&gt; audit.jsonl</code>.</p>"
+        f"<p>Embedded <code>audit.jsonl</code> &mdash; {len(raw)} bytes, SHA-256 "
+        f"<code>{escape(sha)}</code>.</p>"
+        f'<p><a download="audit.jsonl" href="{href}">Download embedded '
+        "audit.jsonl</a></p>"
+        '<script type="application/x-ndjson" id="verdict-embedded-audit-jsonl" '
+        f'data-sha256="{escape(sha)}">{b64}</script>'
+        "</section>"
+    )
+
+
+def inject_offline_audit_embed(html_text: str, audit_text: str) -> str:
+    """Insert the embedded-audit block just before ``</body>`` (presentation-only)."""
+    if not (audit_text or "").strip():
+        return html_text
+    block = build_offline_audit_embed(audit_text)
+    idx = html_text.lower().rfind("</body>")
+    if idx == -1:
+        return html_text + block
+    return html_text[:idx] + block + html_text[idx:]
+
+
 def render_html_pdf(
     md_path: Path, figures: dict[str, str] | None = None
 ) -> tuple[Path, Path | None]:
@@ -2356,6 +2541,13 @@ def render_html_pdf(
         text = html.read_text(encoding="utf-8")
         if figures:
             text = _inject_figures(text, figures)
+        # Embed the hash-chained audit.jsonl (base64) so the report self-verifies
+        # offline; presentation-only, never alters findings/verdict/custody.
+        audit_path = case_dir / "audit.jsonl"
+        if audit_path.exists():
+            text = inject_offline_audit_embed(
+                text, audit_path.read_text(encoding="utf-8")
+            )
         html.write_text(_colorize_html(text), encoding="utf-8")
     except Exception:
         pass
@@ -2401,21 +2593,23 @@ def render_html_pdf(
 
 
 _DEFAULT_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
-:root { --paper:#101426; --surface:#12131a; --inset:#0c1020; --ink:#f5f1e8;
-  --muted:#b8a8ff; --faint:#7f789c; --hairline:#27304a; --accent:#4d5dff;
-  --accent-light:#b8a8ff; --alert:#ff6257; --confirmed:#73d9c2; --inferred:#ffd76a;
-  --hypothesis:#4d5dff; --mono:"JetBrains Mono","Courier New",monospace;
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=Archivo+Narrow:wght@600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+:root { --paper:#f5f1e8; --surface:#fdfcf8; --inset:#ece6da; --ink:#12131a;
+  --muted:#6b6459; --faint:#9a9384; --hairline:#d8d2c6; --accent:#4d5dff;
+  --accent-light:#4453d6; --alert:#ff6257; --alert-text:#cf3b26; --confirmed:#73d9c2; --confirmed-text:#268a72;
+  --inferred:#ffd76a; --inferred-text:#9a7414; --hypothesis:#4d5dff; --hypothesis-text:#3f43c4;
+  --mono:"JetBrains Mono","Courier New",monospace;
+  --body:"Inter",system-ui,-apple-system,sans-serif; --condensed:"Archivo Narrow","Arial Narrow",system-ui,sans-serif;
   --serif:"Archivo",Impact,system-ui,sans-serif; --grotesk:"Archivo",system-ui,sans-serif; }
 @page { margin: 0; }
 html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-body { background:#101426; color:var(--ink); font-family:var(--mono); font-size:13px;
+body { background:var(--paper); color:var(--ink); font-family:var(--body); font-size:13px;
   line-height:1.7; max-width:1040px; margin:0 auto; padding:1.5cm 1.6cm 2cm;
   -webkit-print-color-adjust:exact; print-color-adjust:exact;
-  background-image:linear-gradient(rgba(245,241,232,0.026) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(245,241,232,0.026) 1px,transparent 1px);
+  background-image:linear-gradient(rgba(18,19,26,0.028) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(18,19,26,0.028) 1px,transparent 1px);
   background-size:56px 56px; }
-h1 { font-family:var(--serif); font-weight:900; color:var(--ink); font-size:2.5em;
+h1 { font-family:var(--condensed); font-weight:700; color:var(--ink); font-size:2.5em;
   letter-spacing:-0.5px; line-height:1.05; margin:0 0 0.35em; border:none; }
 h1.tier-break { page-break-before:always; font-family:var(--grotesk);
   text-transform:uppercase; letter-spacing:4px; font-size:1.15em; font-weight:700;
@@ -2450,15 +2644,21 @@ th { background:rgba(77,93,255,0.16); color:var(--accent-light); font-family:var
   padding:0.55em 0.8em; border:1px solid var(--hairline); text-align:left; }
 td { padding:0.5em 0.8em; border:1px solid var(--hairline); color:var(--ink); vertical-align:top; }
 th, td { overflow-wrap:anywhere; word-break:break-word; }
-tr:nth-child(even) td { background:rgba(245,241,232,0.025); }
+tr:nth-child(even) td { background:rgba(18,19,26,0.028); }
 hr { border:none; border-top:1px solid var(--hairline); margin:2.4em 0; }
 .kicker { font-family:var(--grotesk); text-transform:uppercase; letter-spacing:5px;
   font-size:0.72em; font-weight:600; color:var(--accent); }
-.tagline { font-family:var(--mono); color:var(--muted); letter-spacing:1px; font-size:0.86em; }
-.conf-confirmed, .verdict-confirmed { color:var(--confirmed); font-weight:700; }
-.conf-inferred, .verdict-inferred { color:var(--inferred); font-weight:700; }
-.conf-hypothesis { color:var(--accent-light); font-weight:700; }
-.verdict-alert { color:var(--alert); font-weight:700; }
+.tagline { font-family:var(--body); color:var(--muted); letter-spacing:0.5px; font-size:0.86em; }
+.conf-confirmed, .verdict-confirmed { color:var(--confirmed-text); font-weight:700; }
+.conf-inferred, .verdict-inferred { color:var(--inferred-text); font-weight:700; }
+.conf-hypothesis { color:var(--hypothesis-text); font-weight:700; }
+.verdict-alert { color:var(--alert-text); font-weight:700; }
+.offline-audit { background:var(--surface); border:1px solid var(--hairline);
+  border-left:3px solid var(--confirmed); border-radius:0 8px 8px 0;
+  padding:1em 1.3em; margin:2.2em 0; page-break-inside:avoid; }
+.offline-audit h2 { margin-top:0; border-bottom:none; color:var(--confirmed); }
+.offline-audit a { font-family:var(--grotesk); letter-spacing:0.5px; }
+.offline-audit script { display:none; }
 """
 
 
@@ -2512,6 +2712,16 @@ def render_report(
             verdict_obj = json.loads(verdict_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             verdict_obj = {}
+
+    # Rendered Self-Correction block: read the committed verdict_revision
+    # records read-only (default-ON env gate, custody chain untouched). Prefer
+    # the verdict.json mirror when present, otherwise recover the flips straight
+    # from the hash-chained audit log.
+    report_verdict_revisions: list[dict[str, Any]] = []
+    if self_correction_enabled():
+        report_verdict_revisions = list(
+            verdict_obj.get("verdict_revisions") or []
+        ) or verdict_revisions_from_audit(audit)
 
     final_release_gate = {}
     final_gate_path = case_dir / "customer_release_gate.final.json"
@@ -2625,8 +2835,10 @@ def render_report(
         has_process_view_fig=has_process_view_fig,
         has_entity_timeline_fig=has_entity_timeline_fig,
         rejected_finding_leads=verdict_obj.get("rejected_finding_leads", []),
-        verdict_revisions=verdict_obj.get("verdict_revisions", []),
+        verdict_revisions=report_verdict_revisions,
         host_groups=verdict_obj.get("host_groups", []),
+        score_basis=str(verdict_obj.get("score_basis", "")),
+        reason_codes=verdict_obj.get("reason_codes", []),
     )
     html, pdf = render_html_pdf(md, figures=figures_html)
     # Render the companion internal QA/signoff packet (no figure placeholders).

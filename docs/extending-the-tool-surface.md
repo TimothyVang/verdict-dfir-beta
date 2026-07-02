@@ -125,7 +125,7 @@ A reviewer will check these with a grep, not your word:
 
 ## Adding a Python tool (`findevil-agent-mcp`)
 
-The 13 Python tools are protocol shims, not DFIR primitives — crypto, ACH, memory,
+The 14 Python tools are protocol shims, not DFIR primitives — crypto, ACH, memory,
 expert-feedback. Domain logic lives in `services/agent/` (`findevil_agent`); the tool is
 a typed Pydantic wrapper that calls it. Reference implementation:
 [`services/agent_mcp/findevil_agent_mcp/tools/audit_append.py`](../services/agent_mcp/findevil_agent_mcp/tools/audit_append.py).

@@ -16,6 +16,8 @@ from findevil_agent.agentloop.factory import (
     DEFAULT_MODEL,
     EvidenceEgressError,
     build_provider,
+    provider_requires_egress_ack,
+    resolve_provider,
 )
 from findevil_agent.agentloop.openai_provider import OpenAIProvider
 
@@ -109,3 +111,31 @@ def test_injected_transport_needs_no_credential() -> None:
         transport=fake_transport,
     )
     assert isinstance(provider, AnthropicProvider)
+
+
+def test_provider_requires_egress_ack_flags_cloud_but_not_on_prem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The CLI uses this to fail fast before case_open instead of raising mid-run.
+    monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
+    for cloud in ("anthropic", "claude_cli", "openai", "openrouter"):
+        assert provider_requires_egress_ack(cloud) is True
+    for on_prem in ("local", "dgx"):
+        assert provider_requires_egress_ack(on_prem) is False
+
+
+def test_provider_requires_egress_ack_defaults_to_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bare --agent (no provider) resolves to the anthropic default, which is cloud.
+    monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
+    assert provider_requires_egress_ack(None) is True
+
+
+def test_resolve_provider_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    # explicit arg > env > default, always lowercased.
+    monkeypatch.setenv("FINDEVIL_AGENT_PROVIDER", "openrouter")
+    assert resolve_provider("LOCAL") == "local"  # explicit wins, lowercased
+    assert resolve_provider(None) == "openrouter"  # env
+    monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
+    assert resolve_provider(None) == "anthropic"  # default

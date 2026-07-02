@@ -116,6 +116,27 @@ The honest one-line claim this earns:
 
 Not more than that.
 
+## Tier A vs Tier B — never assert recall without an external key
+
+The same "verifiability is not truth" discipline governs the accuracy report itself.
+The two axes are tier-labelled so one can never be read as the other:
+
+- **Tier A — `deterministic_grounding`** (`tier: "A"`): citation coverage, replay,
+  custody. Goldens-FREE, so it is computable *now* with no answer key — "provably
+  consistent, not proven correct."
+- **Tier B — `investigative_recall`** (`tier: "B"`): recall / precision / F1. Valid
+  ONLY against an external ground-truth answer key; `corpus_identity` names whether
+  that key is `synthetic` or `public` so a seed number is never read as field accuracy.
+
+When no golden resolves, Tier B is **not fabricated**: `recall_percent` /
+`precision_percent` / `f1` are emitted as `{"value": null, "reason":
+"no_external_answer_key"}`, `pass` is `null`, and the case is **disclosed** under
+`disclosed_no_external_key_cases` (with Tier A still populated) rather than silently
+dropped. `scripts/generate-accuracy-report.py` **fails closed** — and
+`scripts/accuracy-report-smoke.py` independently re-checks the committed artifact —
+so a Tier B number can never appear without the key it requires. Enforced by
+`services/agent/tests/test_accuracy_tiers.py`.
+
 ## Prove it yourself
 
 A reproducible "break it on purpose" hook corrupts a finding's asserted value
@@ -139,6 +160,39 @@ python3 scripts/entailment-demo.py --render clip.mp4   # render a clip
 Tests: `services/agent/tests/test_entailment.py` (the path/match spec),
 `test_verifier.py::TestEntailmentCheck` (reject-on-misread), and
 `test_fault_injection.py` (the misread mutation on the real emitter path).
+
+## Adversarial held-out validation (blind red-team set)
+
+The detector is not just asserted to work — it is **scored** against a committed,
+frozen fixture set of synthetic adversarial findings, split into two arms that
+are reported **separately**:
+
+| arm | what it is |
+|---|---|
+| `calibration` | the in-design seed set the detector was built against |
+| `held_out` | a **blind** red-team set of unseen adversarial cases (near-miss hashes/IPs, cross-row launders, hex/timestamp conflicts, count over-claims) |
+
+```bash
+python3 scripts/fact-fidelity-rate.py           # per-arm precision/recall
+python3 scripts/fact-fidelity-rate.py --json     # machine-readable
+```
+
+`scripts/fact-fidelity-rate.py` runs this held-out arm **alongside** the
+seeded-rejection-rate calibration arm; the gate passes only if BOTH do. The
+harness records the **detector source SHA-256** (`entailment.py`) in its report,
+and `test_entailment.py::TestHeldOutAdversarialValidation` pins that hash to the
+live module — so editing the detector forces the validation to be re-run rather
+than silently drifting. It is **custody-neutral**: it only scores the existing
+detector, never calls `verify_finding`, and changes no scoring math.
+
+Honest scope: every fixture is **in scope** — a structured-value claim with a
+parser oracle. The set deliberately does **not** measure interpretive
+hallucination, which the entailment layer does not claim to catch. A 100%
+held-out recall therefore means *no in-scope absent-value finding reached
+GROUNDED, and no genuine finding was falsely rejected* — not "hallucination
+solved". Fixtures live at `goldens/fact-fidelity/held-out-findings.json`; the
+absent-IOC negative control (a synthetic hash/IP in no cited span cannot reach
+GROUNDED) is `test_entailment.py::TestAbsentIocNegativeControl`.
 
 ## Where it lives
 

@@ -56,6 +56,8 @@ def finding_to_pool_dict(finding: Finding) -> dict[str, Any]:
         out["derived_from"] = list(finding.derived_from)
     if finding.asserted_values:
         out["asserted_values"] = [_asserted_value_to_dict(av) for av in finding.asserted_values]
+    if finding.counter_hypothesis:
+        out["counter_hypothesis"] = finding.counter_hypothesis
     return out
 
 
@@ -115,6 +117,7 @@ class AgentToolBridge:
                 pool_origin=self.pool_origin,
                 asserted_values=asserted,
                 derived_from=args.get("derived_from"),
+                counter_hypothesis=args.get("counter_hypothesis"),
             )
         except (KeyError, ValueError) as exc:
             return f"ERROR: finding rejected: {exc}"

@@ -13,7 +13,7 @@ VERDICT combines **two** architectural patterns:
 1. **Direct Agent Extension** — Claude Code IS the agent. The operator runs `scripts/verdict <evidence>` for the one-shot path, or `claude` / `scripts/find-evil` at the repo root for interactive exploration; `.mcp.json` auto-spawns both MCP servers; Claude Code drives the investigation as supervisor + Pool A/B subagents (native Task mechanism — not `CLAUDE_CODE_FORK_SUBAGENT`, which is a build-time internal and is not used in this product).
 2. **Custom MCP Server** — two purpose-built MCP servers expose the typed tool surface:
    - `findevil-mcp` (Rust) — 32 DFIR primitives (core Windows memory/disk/log/network verbs plus allow-listed long-tail wrappers such as `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, and `cloud_audit`). Read-only on evidence; SHA-256 every output. **NO `execute_shell`.**
-   - `findevil-agent-mcp` (Python) — 13 crypto + ACH + memory + ACP + expert-feedback tools (audit_append/verify, manifest_finalize/verify, verify_finding, detect_contradictions, judge_findings, correlate_findings, memory_remember/recall, pool_handoff, expert_miss_capture, accuracy_compare). The pre-A5 `ots_stamp`/`ots_verify` pair was removed.
+   - `findevil-agent-mcp` (Python) — 14 crypto + ACH + memory + ACP + expert-feedback tools (audit_append/verify, manifest_finalize/verify, verify_finding, detect_contradictions, judge_findings, correlate_findings, memory_remember/recall, pool_handoff, expert_miss_capture, accuracy_compare). The pre-A5 `ots_stamp`/`ots_verify` pair was removed.
 
 The combination is the architectural claim: Claude Code's agent loop never touches a raw shell because the only verbs it has are MCP-typed function calls into one of the two servers.
 
@@ -37,14 +37,14 @@ VERDICT runs on the same SANS SIFT VM (`sift-2026.03.24.ova`) that Protocol SIFT
 | Aspect | VERDICT | Protocol SIFT gateway |
 |---|---|---|
 | Product MCP servers | 2 typed, audit-chained servers (`findevil-mcp`, `findevil-agent-mcp`); `.mcp.json` registers 6 servers total including 4 non-product operator conveniences | 1 gateway (200+ shell-backed tools) |
-| Tool count | 45 (32 Rust DFIR + 13 Python crypto/ACH/memory/ACP/expert) | 200+ (dynamic, shell coverage) |
+| Tool count | 46 (32 Rust DFIR + 14 Python crypto/ACH/memory/ACP/expert) | 200+ (dynamic, shell coverage) |
 | Shell surface | None — NO `execute_shell` | Broad — gateway is a shell pass-through |
 | Use case | Repeatable DFIR mechanics for evidence investigation | General-purpose bot connectivity |
 | Installation | No conflicts — separate MCP registrations | `protocol-sift install` installs the gateway independently |
 
 After `protocol-sift install` on a SIFT VM, both VERDICT's narrow typed surface and Protocol SIFT's broad shell-backed gateway coexist. Operators choose which agent interface to use per investigation; neither requires nor conflicts with the other.
 
-The narrow surface is intentional: it reduces the attack surface from "full shell access" to 32 named Rust DFIR operations and 13 Python cryptographic/ACH/memory/ACP/expert operations, enabling an architectural argument that the agent loop never touches shell primitives directly — all actions flow through typed JSON-RPC schema validation.
+The narrow surface is intentional: it reduces the attack surface from "full shell access" to 32 named Rust DFIR operations and 14 Python cryptographic/ACH/memory/ACP/expert operations, enabling an architectural argument that the agent loop never touches shell primitives directly — all actions flow through typed JSON-RPC schema validation.
 
 ---
 
@@ -66,7 +66,7 @@ flowchart TB
 
     subgraph Trust2["**TRUST BOUNDARY 2** — Two MCP Servers (typed tool surface)"]
         RustMcp["**findevil-mcp** (Rust, hand-rolled MCP 2024-11-05)<br/>32 typed DFIR tools<br/>NO execute_shell<br/>---<br/>core Windows memory/disk/log/network verbs<br/>+ allow-listed long-tail wrappers"]
-        AgentMcp["**findevil-agent-mcp** (Python, mcp SDK 1.x)<br/>13 typed crypto/ACH/memory/ACP/expert-feedback tools<br/>---<br/>audit_append/verify,<br/>manifest_finalize/verify,<br/>verify_finding,<br/>detect_contradictions,<br/>judge_findings,<br/>correlate_findings,<br/>memory_remember/recall,<br/>pool_handoff,<br/>expert_miss_capture,<br/>accuracy_compare"]
+        AgentMcp["**findevil-agent-mcp** (Python, mcp SDK 1.x)<br/>14 typed crypto/ACH/memory/ACP/expert-feedback tools<br/>---<br/>audit_append/verify,<br/>manifest_finalize/verify,<br/>verify_finding,<br/>detect_contradictions,<br/>judge_findings,<br/>correlate_findings,<br/>memory_remember/recall,<br/>pool_handoff,<br/>expert_miss_capture,<br/>accuracy_compare"]
         EvtxCrate["evtx crate<br/>MIT, in-process<br/>~1600× python-evtx (upstream)"]
         Merkle["hand-rolled Merkle<br/>(rs_merkle-compatible semantics)<br/>append-only tree"]
         DuckDB["DuckDB L1 case store<br/>(path reserved, not yet initialized)"]
@@ -267,7 +267,7 @@ All three modes are **fully supported**. Operators pick whichever they already h
 
 | Dimension | Valhuntir (reference) | Us |
 |---|---|---|
-| MCP server | Python, 8 servers via sift-gateway, 100+ tools | **Two audit-chained product MCP servers** — Rust `findevil-mcp` (32 DFIR tools, including the deliberately-redundant `vol_pslist` + `vol_psscan` pair plus `vol_psxview` for DKOM cross-validation, disk mount/extract helpers, network/log triage, and allow-listed long-tail wrappers) + Python `findevil-agent-mcp` (13 crypto/ACH/memory/ACP/expert-feedback tools); `.mcp.json` has 6 registered servers total, but the 4 non-product helpers emit no Findings; no execute_shell |
+| MCP server | Python, 8 servers via sift-gateway, 100+ tools | **Two audit-chained product MCP servers** — Rust `findevil-mcp` (32 DFIR tools, including the deliberately-redundant `vol_pslist` + `vol_psscan` pair plus `vol_psxview` for DKOM cross-validation, disk mount/extract helpers, network/log triage, and allow-listed long-tail wrappers) + Python `findevil-agent-mcp` (14 crypto/ACH/memory/ACP/expert-feedback tools); `.mcp.json` has 6 registered servers total, but the 4 non-product helpers emit no Findings; no execute_shell |
 | Agent runtime | Custom Python harness | **Claude Code** itself ("Direct Agent Extension" pattern) — no custom orchestrator to maintain |
 | Chain-of-custody | Password-gated HMAC (PBKDF2 2M iter) | Ed25519/Sigstore signer tier + Merkle + audit hash chain (FRE 902(14) self-authenticating, with the A5 timestamp trade-off documented) |
 | Agent pattern | Single agent + human approval | ACH dual-agent (persistence vs exfil) via Claude Code forked subagents + judge + contradiction surface |

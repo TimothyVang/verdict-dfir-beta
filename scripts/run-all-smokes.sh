@@ -85,10 +85,32 @@ run_smoke \
     "uv run --directory services/agent_mcp python ../../scripts/agent-mcp-smoke.py" \
     "[ -d services/agent_mcp ]"
 
+# 2b. Finding evidence-anchor firewall (P0-4): a CONFIRMED/INFERRED finding can't
+# be constructed blank-cited; HYPOTHESIS leads are exempt.
+run_smoke \
+    "finding-schema-smoke (tool_call_id evidence-anchor firewall)" \
+    "uv run --directory services/agent python ../../scripts/finding-schema-smoke.py" \
+    "[ -d services/agent ]"
+
+# 2c. Benign-explanation gate (P0-5a, opt-in): doctrine taught + schema/correlator
+# downgrade an execution/intent claim lacking counter_hypothesis when the flag is on.
+run_smoke \
+    "benign-gate-smoke (counter_hypothesis presumption-of-benignity gate)" \
+    "uv run --directory services/agent python ../../scripts/benign-gate-smoke.py" \
+    "[ -d services/agent ]"
+
 # 3. compute_verdict + detect_evidence_type policy lock.
 run_smoke \
     "verdict-policy-smoke (compute_verdict + detect_evidence_type)" \
     "python3 scripts/verdict-policy-smoke.py"
+
+# 3b. Mechanical verifier-discipline lock. Asserts every shipped Finding cites an
+#     executed tool_call_output, every shipped CONFIRMED/INFERRED Finding has a
+#     verifier_action and none ship rejected, counts reconcile, and recovery
+#     records cite real executed tool calls. LLM-free, custody-neutral.
+run_smoke \
+    "verifier-discipline-smoke (audit.jsonl: anchors executed, verifier exercised, counts reconcile)" \
+    "python3 scripts/verifier-discipline-smoke.py"
 
 # 4. fleet_correlate pure-function lock.
 run_smoke \
@@ -102,10 +124,21 @@ run_smoke \
     "report-policy-smoke (report QA + expert signoff + visual evidence policy)" \
     "python3 scripts/report-policy-smoke.py"
 
-# 4b2. Evidence-agnostic lock. Production code must work for ANY evidence in
-# /evidence, never hard-code one image's values (CLAUDE.md hard rule).
+# 4b1. Restricted-conclusions report linter. A deterministic HARD gate over
+# rendered output: a banned escalation term ("compromised", "exfiltration
+# confirmed", "attacker", "proves", ...) may only appear when the Finding is
+# backed by >=2 artifact classes, and should carry a hedge verb. Custody-neutral
+# (no chain/manifest interaction); complements report-policy-smoke's QA gate.
 run_smoke \
-    "evidence-agnostic-smoke (no image-specific hard-coding in production code)" \
+    "report-escalation-linter (banned escalation terms gated on >=2 artifact classes)" \
+    "python3 scripts/report-escalation-linter.py"
+
+# 4b2. Evidence-agnostic lock. Production code must work for ANY evidence in
+# /evidence, never hard-code one image's values (CLAUDE.md hard rule). Also
+# enforces the anti-enumeration / anti-fabrication finding policy (no tool-absence
+# claims, no uncited CVEs, no asserted attribution/intent).
+run_smoke \
+    "evidence-agnostic-smoke (no image-specific hard-coding + anti-enumeration/anti-fabrication finding policy)" \
     "python3 scripts/evidence-agnostic-smoke.py"
 
 # 4c. Windows readiness packet smoke. It uses PacketOnly synthetic evidence
@@ -160,6 +193,13 @@ run_smoke \
     "sample-run-trace-smoke (committed fixture traces, verifies, no /home leak)" \
     "python3 scripts/sample-run-trace-smoke.py"
 
+# 8b-0. Evidence traceability index — the deterministic, read-only finding ->
+#       tool_call_id -> audit line + output_sha256 join must resolve a clean run
+#       and surface a tampered audit line as UNRESOLVED.
+run_smoke \
+    "evidence-traceability-index-smoke (deterministic join; tamper -> UNRESOLVED)" \
+    "python3 scripts/evidence-traceability-index-smoke.py"
+
 # 8b-2. Committed-trace integrity — the offline verify-release entrypoint re-checks
 #       every docs/release-evidence/*-trace*.jsonl against its sealed summary; this
 #       smoke pins that a clean trace verifies and any record edit is rejected.
@@ -195,6 +235,21 @@ run_smoke \
     "golden-answer-key-smoke (all committed expected-findings schemas valid)" \
     "python3 scripts/golden-answer-key-smoke.py"
 
+# P0-3: the run engine must never read the answer key — only the post-run scorer may.
+run_smoke \
+    "goldens-keyblind-smoke (run engine never reads the answer key)" \
+    "python3 scripts/goldens-keyblind-smoke.py"
+
+# P0-1/2: the committed accuracy report keeps recall and grounding as two labeled
+# axes (never one blended number) and names each caught false-positive.
+run_smoke \
+    "accuracy-report-smoke (two-axis accuracy report well-formed)" \
+    "python3 scripts/accuracy-report-smoke.py"
+
+run_smoke \
+    "toolless-negative-control-smoke (tool-less run scores recall=0; hallucination posture disclosed separately)" \
+    "python3 scripts/toolless-negative-control-smoke.py"
+
 run_smoke \
     "windows-goldens-smoke (Windows log/memory/disk golden inventory)" \
     "python3 scripts/windows-goldens-smoke.py"
@@ -202,6 +257,10 @@ run_smoke \
 run_smoke \
     "verdict-smoke (the one command, --dry-run)" \
     "python3 scripts/verdict-smoke.py"
+
+run_smoke \
+    "regenerate-sample-run-smoke (provenance scrub + custody-bound verbatim boundary)" \
+    "python3 scripts/regenerate-sample-run-smoke.py"
 
 run_smoke \
     "make-demo-video-smoke (TTS+ffmpeg video builder, --dry-run)" \
@@ -218,6 +277,15 @@ run_smoke \
     "grounding-smoke (claim extraction + boundary + anti-hallucination contract)" \
     "python3 scripts/grounding-smoke.py" \
     "[ -f scripts/ground_verdict.py ]"
+
+# 11b. Fact-fidelity rejection rate. Measures the deterministic entailment check
+#      against seeded false values across every match mode (target: 100% rejected,
+#      100% of true values still accepted). Runs under the services/agent uv env
+#      because it imports findevil_agent; SKIPs cleanly without uv.
+run_smoke \
+    "fact-fidelity-rate (seeded-fabrication rejection rate == 1.0 across all match modes)" \
+    "uv run --directory services/agent python ../../scripts/fact-fidelity-rate.py" \
+    "command -v uv && [ -d services/agent ]"
 
 # Lint / format gates. L0 GHA workflow runs these too; mirror them locally
 # so a contributor running this script before commit catches a missing
@@ -250,6 +318,27 @@ if [ "${SKIP_SLOW_RUST:-0}" != "1" ]; then
         "cargo test --workspace --locked" \
         "command -v cargo && [ -f Cargo.toml ]"
 fi
+
+# 12. Verifier-regression catch-rate guard. Runs a committed known-bad findings
+#     corpus (attribution overclaim, phantom PID, single-citation CONFIRMED
+#     execution, exfil-without-staging) through the real verifier + correlator
+#     stages and asserts a minimum catch-rate, so a gate cannot silently weaken.
+#     Runs under the services/agent uv env (imports findevil_agent); SKIPs cleanly
+#     without uv.
+run_smoke \
+    "verifier-regression-smoke (known-bad findings corpus catch-rate floor)" \
+    "uv run --directory services/agent pytest tests/test_verifier_regression.py -q" \
+    "command -v uv && [ -d services/agent ]"
+
+# 13. Zero-dependency offline manifest verifier. A standalone, stdlib-only
+#     re-derivation of the run.manifest custody (per-line hash chain + Merkle root
+#     + vendored pure-Python Ed25519 signature) that imports ZERO production code,
+#     run with --check against the committed /home-free public sample-run so it
+#     must agree with the committed product manifest_verify.json. Plain python3 —
+#     no uv/venv/cryptography wheel.
+run_smoke \
+    "manifest-verify-offline-smoke (stdlib-only re-derivation agrees with committed sample-run)" \
+    "python3 scripts/manifest-verify-offline.py docs/release-evidence/sample-run/run.manifest.json --check"
 
 total=$((passed + failed + skipped))
 echo

@@ -415,6 +415,20 @@ def main() -> int:
     print(f"checked {total_paths} backtick-quoted paths across {len(docs)} docs")
     print()
 
+    # Content gate: the validation-scope doc must exist and name all three
+    # validation classes, so the training-data-contamination caveat the
+    # accuracy report links to can never silently lose a class.
+    limitations = REPO / "docs" / "LIMITATIONS.md"
+    if not limitations.is_file():
+        missing.append(("docs/LIMITATIONS.md", "file does not exist"))
+    else:
+        ltext = limitations.read_text(encoding="utf-8")
+        for cls in ("synthetic", "public-documented", "held-out"):
+            if cls not in ltext:
+                missing.append(
+                    ("docs/LIMITATIONS.md", f"missing validation_class '{cls}'")
+                )
+
     if missing:
         for src, target in missing:
             print(f"{FAIL} {src}: {target!r}")

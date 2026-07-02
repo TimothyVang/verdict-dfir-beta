@@ -84,6 +84,7 @@ const GROUPS: ToolGroup[] = [
       "pool_handoff",
       "expert_miss_capture",
       "accuracy_compare",
+      "find_ai_signatures",
     ],
   },
 ];

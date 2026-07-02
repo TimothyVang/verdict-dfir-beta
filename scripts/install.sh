@@ -310,7 +310,13 @@ else
     info "Building findevil-mcp (Rust, release mode — first build can take 5-10 min)..."
     # `-p findevil-mcp` selects the single package to build; we don't need
     # `--workspace` (cargo silently ignores it when -p is also passed).
-    cargo build --release --locked -p findevil-mcp -q
+    # Stream cargo's per-crate `Compiling …` progress on an interactive run so the
+    # 5-10 min first build does not look hung; stay quiet (-q) only under CI/non-TTY.
+    if [ -n "${CI:-}" ]; then
+        cargo build --release --locked -p findevil-mcp -q
+    else
+        cargo build --release --locked -p findevil-mcp
+    fi
 fi
 if [ ! -x "target/release/findevil-mcp" ] && [ ! -x "target/release/findevil-mcp.exe" ]; then
     fail "target/release/findevil-mcp not found after cargo build."

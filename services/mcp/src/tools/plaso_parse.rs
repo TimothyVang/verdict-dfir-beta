@@ -22,12 +22,24 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+
+/// Env var that overrides the per-stage plaso wall-clock budget (seconds).
+const TIMEOUT_ENV: &str = "FINDEVIL_PLASO_TIMEOUT_SECS";
+
+/// Default wall-clock budget applied to *each* plaso stage (log2timeline, psort).
+/// Generous — plaso parses can legitimately run long — but bounded so a wedged
+/// stage can no longer block the MCP server indefinitely. Override with
+/// [`TIMEOUT_ENV`].
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Allow-listed plaso parser names. Curated from the parser-coverage roadmap's
 /// log section — the cross-OS text/binary logs plaso normalizes well. These are
@@ -114,6 +126,12 @@ pub enum PlasoParseError {
         exit_code: i32,
         stderr: String,
     },
+
+    #[error(
+        "{stage} exceeded its {seconds} s time budget and was killed \
+         (raise $FINDEVIL_PLASO_TIMEOUT_SECS for legitimately long parses)"
+    )]
+    Timeout { stage: String, seconds: u64 },
 
     #[error("could not read plaso output: {0}")]
     OutputRead(String),
@@ -338,19 +356,48 @@ fn collect_path_strings(runs: &[String], paths: &mut BTreeSet<String>) {
 
 /// Run one plaso stage with fixed argv; return its stderr tail or a typed error.
 fn run_stage(binary: &Path, args: &[OsString], stage: &str) -> Result<String, PlasoParseError> {
-    let proc = Command::new(binary).args(args).output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            PlasoParseError::BinaryNotFound {
-                binary: stage.to_string(),
-            }
-        } else {
-            PlasoParseError::SubprocessFailed {
-                stage: stage.to_string(),
-                exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
-            }
+    // Defense-in-depth pre-spawn gate: refuse a poisoned $PLASO_DIR that resolves
+    // to a denied binary, and reject NUL bytes in the artifact/storage paths.
+    crate::tools::argsafe::guard_spawn(binary, args).map_err(|e| {
+        PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: e.to_string(),
         }
     })?;
+    let mut cmd = Command::new(binary);
+    cmd.args(args);
+    // Run in its own process group under a per-stage wall-clock budget so a hung
+    // log2timeline/psort is force-killed and reaped instead of blocking forever.
+    let proc =
+        run_with_timeout(cmd, timeout_from_env(TIMEOUT_ENV, DEFAULT_TIMEOUT)).map_err(|err| {
+            match err {
+                RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    PlasoParseError::BinaryNotFound {
+                        binary: stage.to_string(),
+                    }
+                }
+                RunError::Spawn(e) => PlasoParseError::SubprocessFailed {
+                    stage: stage.to_string(),
+                    exit_code: -1,
+                    stderr: format!("spawn failed: {e}"),
+                },
+                RunError::Io(e) => PlasoParseError::SubprocessFailed {
+                    stage: stage.to_string(),
+                    exit_code: -1,
+                    stderr: format!("io error: {e}"),
+                },
+                RunError::Timeout(d) => PlasoParseError::Timeout {
+                    stage: stage.to_string(),
+                    seconds: d.as_secs(),
+                },
+                RunError::ReaderPanicked => PlasoParseError::SubprocessFailed {
+                    stage: stage.to_string(),
+                    exit_code: -1,
+                    stderr: "plaso output reader thread panicked".to_string(),
+                },
+            }
+        })?;
     // Normalize plaso's run-varying log tokens (timestamp + PID) at the point of
     // capture so BOTH the success `stderr_tail` and the `SubprocessFailed` error
     // are reproducible — a `verify_finding` replay must recompute the same
