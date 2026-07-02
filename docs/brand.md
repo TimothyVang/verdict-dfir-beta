@@ -54,7 +54,8 @@ Rules:
   badge/chip assets), not hollow outlines.
 - Fonts are self-hosted — no `fonts.gstatic.com` at build/render time: web via
   `next/font`, report via `@import`, video via local woff2 + the `FontFace` API
-  (`scripts/make-demo-video/public/fonts/` loaded in `src/fonts.ts`).
+  (`scripts/make-demo-video/public/fonts/` loaded in
+  `scripts/make-demo-video/src/fonts.ts`).
 
 ## Voice
 

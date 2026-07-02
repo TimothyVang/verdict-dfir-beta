@@ -133,6 +133,10 @@ ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
     # in CLAUDE.md "Commands" section + apps/web/README.md for
     # `pnpm --filter` invocations.
     re.compile(r"^@[a-z0-9_-]+/[a-z0-9_-]+$"),
+    # First-party framework subpath package imports (e.g. `next/font`,
+    # `next/image`) — Next.js module specifiers quoted in docs/brand.md's type
+    # roles, not repo files. Same rationale as the @scoped-package allow above.
+    re.compile(r"^next/[a-z-]+$"),
     # Deferred-per-Amendment-A2 widget paths. apps/web is live now,
     # so broken apps/web references should fail this smoke.
     re.compile(r"^apps/mcp-widgets(/|$)"),
@@ -213,6 +217,12 @@ ALLOW_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Runtime output dir (`./out/`, `./out`): gitignored and created at run time,
     # so it exists only after a run, never in the CI checkout.
     re.compile(r"^\./out(/|$)"),
+    # The containment runtime dir: `.project-local/` holds TMPDIR, the
+    # FINDEVIL_HOME case store, XDG_*, and the npm/Rust/uv/pnpm toolchain caches
+    # (documented in docs/repo-layout.md + docs/agent-containment.md). It is
+    # gitignored and created by scripts/setup, so it exists only after setup —
+    # never in a fresh clone (where this smoke would otherwise false-fail).
+    re.compile(r"^\.project-local(/|$)"),
     # Generated demo video: built by scripts/make-demo-video.sh and hosted on the
     # GitHub Release (not committed, to keep the clone small). CHANGELOG/docs cite
     # its generator output path; README links the hosted copy.
