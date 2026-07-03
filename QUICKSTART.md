@@ -7,7 +7,7 @@ For the project pitch + claims, see [README.md](README.md). For the full doc map
 ## Quickstart in 3 steps
 
 ```bash
-git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-community.git verdict && cd verdict
+git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-beta.git verdict && cd verdict
 bash scripts/setup                    # installs the product toolchain, common DFIR tools, browser helpers, and both MCP servers, then runs doctor
 scripts/verdict <path-to-evidence>    # investigate -> live dashboard -> signed verdict + report
 ```

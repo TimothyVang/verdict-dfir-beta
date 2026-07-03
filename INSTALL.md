@@ -50,7 +50,7 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 ## Step 1 — Clone
 
 ```bash
-git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-community.git verdict   # --depth 1 keeps the clone small + fast
+git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-beta.git verdict   # --depth 1 keeps the clone small + fast
 cd verdict
 ```
 

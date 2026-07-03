@@ -2,7 +2,7 @@
 # install.sh — one-line bootstrap for VERDICT DFIR.
 #
 # Usage (from a bare machine):
-#   curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-community/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/install.sh | bash
 #
 # This is a CLONE-AND-DELEGATE bootstrap, NOT a self-contained binary
 # installer. VERDICT runs inside Claude Code and drives a real forensics
@@ -36,7 +36,7 @@
 
 set -euo pipefail
 
-REPO_URL="${VERDICT_REPO:-https://github.com/TimothyVang/verdict-dfir-community.git}"
+REPO_URL="${VERDICT_REPO:-https://github.com/TimothyVang/verdict-dfir-beta.git}"
 CLONE_DIR="verdict"
 CLONE_REF="main"
 SETUP_ARGS=()
@@ -51,7 +51,7 @@ usage() {
   cat <<'USAGE'
 install.sh — one-line bootstrap for VERDICT DFIR.
 
-  curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-community/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/install.sh | bash
 
 Clones the repo and hands off to `bash scripts/setup`. This is a convenience
 wrapper, not a standalone binary: it still needs `git` and a Claude Code

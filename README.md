@@ -80,7 +80,7 @@ operation; it does not validate the interpretation.
 **One-liner** — clones the repo and runs setup:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-community/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/install.sh | bash
 ```
 
 This is a convenience wrapper around the steps below, **not** a standalone binary
@@ -91,7 +91,7 @@ will not run a Case by itself — it gets you to a green `scripts/setup`. Prefer
 every step? Run them yourself:
 
 ```bash
-git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-community.git verdict
+git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-beta.git verdict
 cd verdict
 bash scripts/setup            # toolchain + DFIR binaries + both MCP servers + preflight doctor
 scripts/verdict <path-to-evidence>
@@ -557,7 +557,7 @@ Help is welcome — especially from people who know DFIR, memory forensics, or L
 Start with [docs/help-wanted.md](docs/help-wanted.md) for the open problems (including the hard one:
 keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/submit mechanics.
 
-- **Found a bug or have an idea?** [Open an issue](https://github.com/TimothyVang/verdict-dfir-community/issues).
+- **Found a bug or have an idea?** [Open an issue](https://github.com/TimothyVang/verdict-dfir-beta/issues).
 - **Sending code?** Fork this repo and open a pull request against the **`develop`** branch. The gates
   are the local checks in [CONTRIBUTING.md](CONTRIBUTING.md) (`bash scripts/run-all-smokes.sh` plus the
   per-language suites) — no GitHub Actions runners required. A maintainer runs them on your branch and
@@ -565,8 +565,8 @@ keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/sub
   maintainer with `git ship`.
 
 <p align="center">
-  <a href="https://github.com/TimothyVang/verdict-dfir-community/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=TimothyVang/verdict-dfir-community" alt="VERDICT contributors">
+  <a href="https://github.com/TimothyVang/verdict-dfir-beta/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TimothyVang/verdict-dfir-beta" alt="VERDICT contributors">
   </a>
 </p>
 
@@ -575,8 +575,8 @@ keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/sub
 If VERDICT is useful to you, a &#11088; helps other DFIR practitioners find it — and motivates the roadmap.
 
 <p align="center">
-  <a href="https://www.star-history.com/#TimothyVang/verdict-dfir-community&Date">
-    <img src="https://api.star-history.com/svg?repos=TimothyVang/verdict-dfir-community&type=Date" alt="VERDICT star history chart" width="640">
+  <a href="https://www.star-history.com/#TimothyVang/verdict-dfir-beta&Date">
+    <img src="https://api.star-history.com/svg?repos=TimothyVang/verdict-dfir-beta&type=Date" alt="VERDICT star history chart" width="640">
   </a>
 </p>
 
