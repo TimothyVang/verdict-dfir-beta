@@ -5,7 +5,7 @@ repository does not drift into an unbounded development dump.
 
 ## Canonical Release Channel
 
-- Canonical public repo (clone, run, contribute): `https://github.com/TimothyVang/verdict-dfir-community`
+- Canonical public repo (clone, run, contribute): `https://github.com/TimothyVang/verdict-dfir-beta`
 - Release assets (prebuilt MCP binaries, demo videos) and the published docs are
   hosted on the original release repo `https://github.com/TimothyVang/verdict-dfir`:
   `https://timothyvang.github.io/verdict-dfir/`

@@ -4,7 +4,7 @@ How VERDICT is developed in the open: the branch model, how changes are gated **
 GitHub Actions runners**, and how releases are cut. It is deliberately portable — nothing here assumes
 a particular machine, account, or clone path. Use your own fork and the standard `origin` remote.
 
-For the build/test commands themselves, see [CONTRIBUTING.md](https://github.com/TimothyVang/verdict-dfir-community/blob/main/CONTRIBUTING.md).
+For the build/test commands themselves, see [CONTRIBUTING.md](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/CONTRIBUTING.md).
 For where to plug in, see [Help Wanted](help-wanted.md).
 
 ## Branches
@@ -54,7 +54,7 @@ the authority — review backed by a locally-run gate is.
 
 Branch protection on `develop` requires:
 
-- **Two approving reviews, including a maintainer / code owner** (see [`.github/CODEOWNERS`](https://github.com/TimothyVang/verdict-dfir-community/blob/main/.github/CODEOWNERS)).
+- **Two approving reviews, including a maintainer / code owner** (see [`.github/CODEOWNERS`](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/.github/CODEOWNERS)).
   Requiring a code owner means at least one reviewer who has actually run the gate on your branch —
   this is what stands in for an automated status check.
 - A branch up to date with `develop`.

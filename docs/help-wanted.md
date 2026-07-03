@@ -4,7 +4,7 @@ VERDICT shipped at a SANS AI hackathon. It works, the core idea holds up, and I 
 genuinely useful — but it can be a lot better, and I'd rather build it in the open with people who
 know DFIR and AI than grind it solo. If that's you: welcome, and thank you.
 
-> **Heads-up on where to contribute.** [Open issues here](https://github.com/TimothyVang/verdict-dfir-community/issues),
+> **Heads-up on where to contribute.** [Open issues here](https://github.com/TimothyVang/verdict-dfir-beta/issues),
 > and send code as a pull request against the **`develop`** branch of this repo. The gates are local
 > (`bash scripts/run-all-smokes.sh` plus the per-language suites) — no GitHub Actions runners
 > required; a maintainer runs them on your branch and reviews, and two approvals merge it. The
