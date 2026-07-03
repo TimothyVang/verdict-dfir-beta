@@ -10,7 +10,13 @@
   <img src="https://img.shields.io/badge/rust-1.88-orange.svg" alt="Rust 1.88">
   <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
   <img src="https://img.shields.io/badge/node-20-green.svg" alt="Node 20">
+  <img src="https://img.shields.io/badge/status-BETA-FFB000.svg" alt="Beta">
 </p>
+
+> [!IMPORTANT]
+> **This is the BETA repository.** It is a snapshot that does not yet include the new UI design
+> and updated images. For the stable release, see
+> [verdict-dfir](https://github.com/TimothyVang/verdict-dfir).
 
 <p align="center"><b>Show Me the Evidence — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
 
