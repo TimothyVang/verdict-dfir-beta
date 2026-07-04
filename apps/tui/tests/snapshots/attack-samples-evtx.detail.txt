@@ -1,0 +1,40 @@
+┌ VERDICT — read-only case viewer ─────────────────────────────────────────────────────────────────┐
+│Case    attack-samples-evtx    case_id dir-65e16198ac581860                                       │
+│Verdict SUSPICIOUS    Findings 3                                                                  │
+│Tally   CONFIRMED 1  ·  INFERRED 0  ·  HYPOTHESIS 2                                               │
+│Custody overall yes    signature ed25519  present yes  verified yes                               │
+│Cover   coverage manifest not produced by this run                                                │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Finding detail — custody strip ──────────────────────────────────────────────────────────────────┐
+│Finding   f-A-evtx-audit-log-cleared                                                              │
+│Tier      CONFIRMED    MITRE T1070.001                                                            │
+│EVTX contains Security EID 1102 audit-log clear event (record 1); this is confirmed event-log     │
+│evidence of log clearing and requires analyst review.                                             │
+│                                                                                                  │
+│Custody                                                                                           │
+│tool_call_id   tc-002                                                                             │
+│replay expected sha256   3d3dd69400552c92c939f1635b9ba781c1ed6847109e293e368c57afc52dd800         │
+│replay actual sha256   3d3dd69400552c92c939f1635b9ba781c1ed6847109e293e368c57afc52dd800           │
+│replay matched   yes                                                                              │
+│                                                                                                  │
+│Asserted values                                                                                   │
+│absent                                                                                            │
+│                                                                                                  │
+│Counter-hypothesis                                                                                │
+│absent                                                                                            │
+│                                                                                                  │
+│Derived from                                                                                      │
+│absent                                                                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit  |  Up/Down or j/k move  |  Enter open  |  Esc back  |  ? help

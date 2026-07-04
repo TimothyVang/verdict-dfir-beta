@@ -34,7 +34,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Mirrors docker/l2-siftlite.Dockerfile's proven set, plus the gaps the SIFT VM
 # was missing: tshark (pcap_triage — THE tool that was absent), suricata,
 # nfdump, auditd(ausearch); plus the Rust C-build deps (libclang/pkg-config/
-# libssl) so findevil-mcp compiles inside the container.
+# libssl) so findevil-mcp compiles inside the container. libicu70 is the ICU
+# globalization runtime the .NET-based Eric Zimmerman tools (ez_parse) need.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -62,6 +63,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     suricata \
     nfdump \
     auditd \
+    libicu70 \
  && rm -rf /var/lib/apt/lists/* \
  && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
  && ln -sf /usr/bin/python3.11 /usr/bin/python
@@ -125,6 +127,84 @@ RUN curl -fsSL \
  && ln -sf "/opt/pandoc-${PANDOC_VERSION}/bin/pandoc" /usr/local/bin/pandoc \
  && rm -f /tmp/pandoc.tar.gz
 
+# .NET runtime (Eric Zimmerman tools = ez_parse). Eric publishes the tools as
+# cross-platform, framework-dependent .NET 9 builds: a managed `<Tool>.dll` plus
+# a Windows apphost — no Linux apphost — so on Linux each runs as
+# `dotnet <Tool>.dll`. We install the .NET 10 LTS runtime (currently the active
+# LTS; .NET 9 is the shorter-support STS the tools target) and let the net9
+# builds roll forward onto it via DOTNET_ROLL_FORWARD=Major. dotnet-install.sh
+# pins the exact runtime patch; the `dotnet` symlink lands on PATH via
+# /usr/local/bin. This is a hint tool — ez_parse degrades to a typed
+# BinaryNotFound when EZTOOLS_DIR is empty — so it is NOT added to HEALTHCHECK.
+ARG DOTNET_VERSION=10.0.9
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+ && chmod +x /tmp/dotnet-install.sh \
+ && /tmp/dotnet-install.sh --runtime dotnet --version "${DOTNET_VERSION}" \
+      --install-dir /opt/dotnet --no-path \
+ && ln -sf /opt/dotnet/dotnet /usr/local/bin/dotnet \
+ && rm -f /tmp/dotnet-install.sh \
+ && dotnet --list-runtimes
+
+ENV DOTNET_ROOT=/opt/dotnet \
+    DOTNET_ROLL_FORWARD=Major \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1
+
+# Eric Zimmerman tools (ez_parse): the .NET decoders for the Windows execution /
+# persistence / anti-forensic artifacts (LNK, jump-lists, Amcache, ShimCache,
+# Recycle Bin, shellbags, Win10 Timeline). We fetch only the seven binaries the
+# ez_parse allow-list uses, then write a thin exec-wrapper per tool named
+# EXACTLY as the tool resolves it ($EZTOOLS_DIR/<Tool>) — ez_parse invokes the
+# bare name, not `dotnet <dll>`, so the wrapper bridges the two. The published
+# URLs serve the current build (Eric does not version the download path), so the
+# EZ tool build itself is not pinnable here; the .NET runtime is.
+RUN mkdir -p /opt/eztools /opt/eztools-net9 \
+ && for tool in LECmd JLECmd AmcacheParser AppCompatCacheParser RBCmd SBECmd WxTCmd; do \
+      curl -fsSL "https://download.ericzimmermanstools.com/net9/${tool}.zip" \
+        -o "/tmp/${tool}.zip" ; \
+      unzip -q -o "/tmp/${tool}.zip" -d "/opt/eztools-net9/${tool}" ; \
+      test -f "/opt/eztools-net9/${tool}/${tool}.dll" ; \
+      printf '#!/bin/sh\nexec /opt/dotnet/dotnet "/opt/eztools-net9/%s/%s.dll" "$@"\n' \
+        "${tool}" "${tool}" > "/opt/eztools/${tool}" ; \
+      chmod +x "/opt/eztools/${tool}" ; \
+      rm -f "/tmp/${tool}.zip" ; \
+    done \
+ && /opt/eztools/LECmd --help >/dev/null \
+ && /opt/eztools/AmcacheParser --help >/dev/null
+
+# plaso / log2timeline (plaso_parse): the super-timeline builder + long-tail log
+# normalizer (syslog, utmp, dpkg, selinux, legacy winevt/msiecf/winjob, recycle
+# bin, macOS asl). The GIFT stable PPA ships prebuilt plaso-tools with the heavy
+# libyal native deps already compiled, so it is the clean container path (vs pip
+# building libyal from source). Added the lean way — armored key into a keyring
+# + a signed-by source, no software-properties-common. log2timeline.py/psort.py
+# land in /usr/bin; plaso_parse finds them on PATH ($PLASO_DIR then PATH).
+# Optional lane — NOT added to HEALTHCHECK; degrades to BinaryNotFound.
+#
+# Interpreter pin: plaso's C-extensions (pytsk3, libbde, ...) are compiled for
+# jammy's distro python3.10, but the base layer repoints /usr/bin/python3 at
+# 3.11 (VERDICT's runtime). plaso's `#!/usr/bin/python3` shebang would then load
+# under 3.11 and fail (`ModuleNotFoundError: pytsk3`). So we shadow the two CLIs
+# with PATH-preceding wrappers in /usr/local/bin that force python3.10 (present
+# as a plaso dependency) — leaving python3 -> 3.11 intact for everything else.
+ARG GIFT_PPA_FPR=3ED1EAECE81894B171D7DA5B5E80511B10C598B8
+# hadolint ignore=DL3008
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${GIFT_PPA_FPR}" \
+      -o /etc/apt/keyrings/gift.asc \
+ && echo "deb [signed-by=/etc/apt/keyrings/gift.asc] https://ppa.launchpadcontent.net/gift/stable/ubuntu jammy main" \
+      > /etc/apt/sources.list.d/gift-stable.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends plaso-tools \
+ && rm -rf /var/lib/apt/lists/* \
+ && for s in log2timeline.py psort.py; do \
+      printf '#!/bin/sh\nexec /usr/bin/python3.10 "/usr/bin/%s" "$@"\n' "${s}" \
+        > "/usr/local/bin/${s}" ; \
+      chmod +x "/usr/local/bin/${s}" ; \
+    done \
+ && log2timeline.py --version \
+ && psort.py --version
+
 # Rust toolchain (pinned to rust-toolchain.toml) + uv — the build environment
 # findevil-mcp (Rust) and findevil-agent-mcp (Python) are compiled with at
 # container bring-up. Installed system-wide so the non-root user can build.
@@ -149,6 +229,7 @@ ENV HAYABUSA_BIN=/usr/local/bin/hayabusa \
     NFDUMP_BIN=/usr/bin/nfdump \
     AUSEARCH_BIN=/sbin/ausearch \
     VOLATILITY_BIN=/usr/local/bin/vol \
+    EZTOOLS_DIR=/opt/eztools \
     FINDEVIL_FLS_BIN=/usr/bin/fls \
     FINDEVIL_ICAT_BIN=/usr/bin/icat \
     EWF_MOUNT_BIN=/usr/bin/ewfmount \
@@ -156,12 +237,26 @@ ENV HAYABUSA_BIN=/usr/local/bin/hayabusa \
     FINDEVIL_UMOUNT_BIN=/bin/umount
 
 # Non-root user; evidence mounts read-only at /evidence, repo at /workspace.
+# disk_mount loop-mounts the image read-only, which needs root: the DFIR tools
+# invoke ewfmount / mount / umount / mmls via `sudo -n` (services/mcp/src/tools/
+# disk.rs::run_sudo_fixed), exactly as the SIFT VM does. Grant the non-root
+# analyst passwordless sudo so disk_mount -> disk_extract_artifacts works in the
+# container; without it every raw disk stays custody-only. This is scoped to a
+# single-purpose, ephemeral forensic container that already runs with SYS_ADMIN
+# + unconfined apparmor for disk mounting and read-only evidence, mirroring the
+# SIFT sansforensics passwordless-sudo setup.
 ARG DEV_UID=1000
 ARG DEV_GID=1000
 RUN groupadd --gid "${DEV_GID}" analyst \
  && useradd --uid "${DEV_UID}" --gid "${DEV_GID}" --create-home --shell /bin/bash analyst \
  && mkdir -p /evidence /workspace \
- && chown -R analyst:analyst /workspace
+ && chown -R analyst:analyst /workspace \
+ && DEBIAN_FRONTEND=noninteractive apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo \
+ && rm -rf /var/lib/apt/lists/* \
+ && printf 'analyst ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/analyst-dfir \
+ && chmod 0440 /etc/sudoers.d/analyst-dfir \
+ && visudo -cf /etc/sudoers.d/analyst-dfir
 
 # Prove the toolchain is invocable — the failure mode this image exists to kill.
 HEALTHCHECK --interval=30s --timeout=15s --retries=3 \
@@ -178,4 +273,4 @@ WORKDIR /workspace
 # Long-lived by default so `docker exec -i` can drive the MCP servers (the
 # container analog of `ssh -T` into the SIFT VM). run-dfir-container.sh starts
 # it detached; a bare `docker run` just prints a readiness banner.
-CMD ["bash", "-lc", "echo 'VERDICT DFIR container ready.'; tshark --version | head -1; fls -V; hayabusa --version | head -1; vol --version 2>&1 | head -1"]
+CMD ["bash", "-lc", "echo 'VERDICT DFIR container ready.'; tshark --version | head -1; fls -V; hayabusa --version | head -1; vol --version 2>&1 | head -1; dotnet --list-runtimes 2>/dev/null | head -1; /opt/eztools/LECmd --help 2>/dev/null | grep -m1 -i 'LECmd version' || true; log2timeline.py --version 2>&1 | head -1 || true"]

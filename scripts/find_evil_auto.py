@@ -369,10 +369,22 @@ def mem_store_path() -> str:
 # Configuration (env-overridable)
 # ---------------------------------------------------------------------------
 
+# Docker-container backend (the container analog of SIFT). Toggled by
+# FIND_EVIL_DOCKER=1 (set by scripts/verdict --docker). Selects the docker-exec
+# MCP transport + container paths exactly the way FIND_EVIL_LOCAL selects the
+# host-stdio transport. The repo is bind-mounted read-write at /workspace and
+# evidence read-only at /evidence, so the guest repo defaults to /workspace and
+# the case dir the container writes to IS a host path via the bind mount.
+DOCKER_MODE = os.environ.get("FIND_EVIL_DOCKER") == "1"
+DOCKER_CONTAINER = os.environ.get("FIND_EVIL_DOCKER_CONTAINER", "findevil-dfir")
+
 GUEST_IP = os.environ.get("FIND_EVIL_GUEST_IP", "192.168.197.143")
 GUEST_USER = os.environ.get("FIND_EVIL_GUEST_USER", "sansforensics")
 SSH_KEY = os.environ.get("FIND_EVIL_SSH_KEY", str(Path.home() / ".ssh" / "sift_key"))
-GUEST_REPO = os.environ.get("FIND_EVIL_GUEST_REPO", "/home/sansforensics/find-evil")
+GUEST_REPO = os.environ.get(
+    "FIND_EVIL_GUEST_REPO",
+    "/workspace" if DOCKER_MODE else "/home/sansforensics/find-evil",
+)
 # Fail fast on an UNREACHABLE SIFT VM instead of hanging forever. Without
 # ConnectTimeout, ssh to a dead GUEST_IP blocks on connect() with no upper bound
 # (no route / firewalled host can hang for minutes), deadlocking the whole
@@ -655,6 +667,29 @@ PY_MCP_LAUNCHER = (
 )
 
 # ---------------------------------------------------------------------------
+# Docker-container backend argv (the container analog of the SIFT ssh args).
+# Both servers run INSIDE the container over `docker exec -i` (stdio JSON-RPC —
+# the same pipe `ssh -T` gives SIFT). Mirrors .mcp.json.docker verbatim: the
+# Rust binary is launched directly (tool env — HAYABUSA_BIN, TSHARK_BIN, … — is
+# baked into the image, so no host/guest tool-path prefix), and the Python MCP
+# runs with its working dir set to services/agent_mcp under uv.
+# ---------------------------------------------------------------------------
+DOCKER_RUST_ARGV = ["docker", "exec", "-i", DOCKER_CONTAINER, RUST_BIN]
+DOCKER_PY_ARGV = [
+    "docker",
+    "exec",
+    "-i",
+    "-w",
+    f"{GUEST_REPO}/services/agent_mcp",
+    DOCKER_CONTAINER,
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "findevil_agent_mcp.server",
+]
+
+# ---------------------------------------------------------------------------
 # Local mode (no SIFT VM): run both MCP servers on the host over stdio.
 # Toggled by --local / FIND_EVIL_LOCAL=1. The host is Linux and every remote
 # command this orchestrator issues is plain POSIX, so ssh_run() runs it
@@ -708,6 +743,15 @@ def rust_replay_command() -> list[str]:
             *(f"{k}={v}" for k, v in _local_rust_env().items()),
             LOCAL_RUST_BIN,
         ]
+    if DOCKER_MODE:
+        # Runs INSIDE the container (the Python MCP is in the container), so the
+        # replay argv is just the container binary. Tool env (HAYABUSA_BIN,
+        # TSHARK_BIN, ewfexport, …) is baked into the image and inherited by the
+        # re-spawned process — no host/guest sansforensics tool-path prefix,
+        # which would point at paths that do not exist in the container. A
+        # verify_finding replay re-runs this argv and must reproduce the same
+        # output_sha256, so it has to resolve the SAME tools as the live run.
+        return [RUST_BIN]
     return RUST_REPLAY_COMMAND
 
 
@@ -934,6 +978,55 @@ class StdioMcpClient(SshMcpClient):
             bufsize=1,
         )
         self._wire()
+
+
+class DockerMcpClient(SshMcpClient):
+    """Docker-mode MCP client: runs the server INSIDE the findevil-dfir
+    container over ``docker exec -i <argv>`` instead of tunnelling through ssh.
+    The container analog of ``SshMcpClient`` — same stdio JSON-RPC pipe, same
+    reader thread / framing verbatim; only the spawn argv differs (``docker
+    exec -i`` in place of ``ssh -i key GUEST``). Takes the full docker argv
+    (see DOCKER_RUST_ARGV / DOCKER_PY_ARGV) so it mirrors .mcp.json.docker."""
+
+    def __init__(self, docker_argv: list[str], label: str) -> None:
+        self.label = label
+        try:
+            self.proc = subprocess.Popen(
+                docker_argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            # No docker client on this host — behave as an already-closed server
+            # so callers get the same fast tool-error degrade as an unreachable
+            # SIFT VM, not an engine crash.
+            self.proc = None
+            self._spawn_error = f"{label}: cannot spawn docker exec: {exc}"
+        self._wire()
+
+
+def make_rust_client() -> SshMcpClient:
+    """Spawn a findevil-mcp (Rust DFIR) client for the active transport:
+    host stdio (local), docker exec (container), or ssh (SIFT VM)."""
+    if LOCAL_MODE:
+        return StdioMcpClient(_local_rust_command(), "rust-mcp")
+    if DOCKER_MODE:
+        return DockerMcpClient(DOCKER_RUST_ARGV, "rust-mcp")
+    return SshMcpClient(PY_LAUNCHER, "rust-mcp")
+
+
+def make_py_client() -> SshMcpClient:
+    """Spawn a findevil-agent-mcp (Python custody/crypto) client for the active
+    transport: host stdio (local), docker exec (container), or ssh (SIFT VM)."""
+    if LOCAL_MODE:
+        return StdioMcpClient(_local_py_command(), "py-mcp")
+    if DOCKER_MODE:
+        return DockerMcpClient(DOCKER_PY_ARGV, "py-mcp")
+    return SshMcpClient(PY_MCP_LAUNCHER, "py-mcp")
 
 
 # ---------------------------------------------------------------------------
@@ -1821,6 +1914,18 @@ def ssh_run(remote_command: str, timeout: int = 600) -> tuple[int, str, str]:
         # orchestrator issues is plain POSIX, so run it locally.
         r = subprocess.run(
             ["bash", "-lc", remote_command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return r.returncode, r.stdout, r.stderr
+    if DOCKER_MODE:
+        # Docker mode: the container IS the analysis box. Run the same POSIX
+        # guest command inside it — `docker exec -i <ctr> bash -lc <cmd>` is the
+        # container analog of `ssh GUEST <cmd>`. Case-dir mkdir/test/cat land on
+        # /workspace, which is the host repo via the read-write bind mount.
+        r = subprocess.run(
+            ["docker", "exec", "-i", DOCKER_CONTAINER, "bash", "-lc", remote_command],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -8841,7 +8946,70 @@ _SUSPICIOUS_SVC_PATH_TOKENS = (
     "%temp%",
     "rundll32",
     "mshta",
+    "\\users\\",
+    "\\programdata\\",
+    "\\appdata\\",
+    "\\.\\pipe\\",
+    "regsvr32",
+    "wscript",
+    "cscript",
 )
+
+# Curated Windows Security/System event-ID -> MITRE ATT&CK technique table.
+# GENERAL DFIR signature map keyed ONLY on event IDs (plus, for logon events, the
+# logon type) -- never on any evidence-specific username, host, IP, service, or
+# image name. It is the single source of truth for the technique an EVTX-derived
+# finding attributes to, so the same signal maps to the same technique regardless
+# of which disk/EVTX image produced it (the evidence-agnostic contract).
+WINDOWS_EVENT_TECHNIQUES: dict[int, str] = {
+    1102: "T1070.001",  # Security audit log cleared (indicator removal)
+    104: "T1070.001",  # a Windows event log was cleared (indicator removal)
+    4625: "T1110.001",  # failed-logon burst -> password guessing / brute force
+    4624: "T1021.001",  # remote-interactive (RDP, Logon Type 10) logon
+    7045: "T1543.003",  # new Windows service installed (service persistence)
+    4697: "T1543.003",  # service installed (Security-channel variant of 7045)
+    4698: "T1053.005",  # scheduled task created
+    4104: "T1059.001",  # PowerShell script-block (encoded / download cradle)
+    4720: "T1136.001",  # a local user account was created
+    4732: "T1098",  # a member was added to a security-enabled (admin) group
+    4688: "T1059",  # process creation lead (refined to T1047 for WmiPrvSE parent)
+}
+
+# The Security/System event IDs an EVTX finding can be built from. When a large
+# log truncates the default row sample, investigate_evtx re-queries with exactly
+# this EventID filter so these attack signatures are never buried under benign
+# volume (e.g. a domain controller's thousands of 4624/4634 auth records). It is
+# a superset of every EID evtx_rows_to_findings keys on, so a finding built from
+# the targeted rows always cites a tool call whose deterministic replay
+# reproduces it.
+SECURITY_FINDING_EIDS: tuple[int, ...] = (
+    104,
+    1102,
+    4104,
+    4624,
+    4625,
+    4688,
+    4697,
+    4698,
+    4720,
+    4732,
+    7045,
+)
+
+
+def _evtx_source_ip(entities: dict[str, Any]) -> str | None:
+    """Return a routable/remote source IP from EVTX entities, else None.
+
+    Loopback / blank / link-local values are dropped so a benign local unlock
+    (127.0.0.1) never masquerades as a remote attacker source. A private-range
+    address (lateral movement) is kept -- only non-remote noise is filtered.
+    """
+    src = str(entities.get("source_ip") or "").strip()
+    if not src or src in ("-", "127.0.0.1", "::1"):
+        return None
+    if src.startswith(("fe80", "::", "0.0.0.0")):
+        return None
+    return src
 
 
 def _win_basename(path: Any) -> str:
@@ -8871,6 +9039,13 @@ def evtx_rows_to_findings(
     seen_kinds: set[str] = set()
     failed_logons = 0
     failed_logon_ctx: dict[str, Any] = {}
+    # Aggregate the multi-instance attack signatures across ALL rows and pick the
+    # attack-relevant instance AFTER the pass, rather than firing on the first
+    # occurrence. On a real host the first 7045 is a benign driver install and the
+    # first 4624 Type 10 (if any) can be a console session -- first-match would
+    # surface the noise and bury the malicious install / the remote foothold.
+    rdp_type10_events: list[dict[str, Any]] = []
+    service_installs: list[dict[str, Any]] = []
     # Pre-pass: map each spawned process PID -> its image basename so a child's
     # parent PID can be resolved to a name. Samples without command-line auditing
     # carry only ProcessId (parent PID), not ParentProcessName.
@@ -8922,6 +9097,41 @@ def evtx_rows_to_findings(
                             "path": "rows[*]",
                             "expected": json.dumps(
                                 {"event_id": "1102", "channel": "Security"}
+                            ),
+                            "match": "record",
+                        },
+                    ],
+                }
+            )
+        elif (
+            event_id == 104
+            and "system_log_cleared" not in seen_kinds
+            and "system" in channel.lower()
+        ):
+            # EID 104 on the System channel is the EventLog "log file was cleared"
+            # record -- the System-log analog of the Security-channel 1102. Same
+            # indicator-removal technique; keyed on the general EID+channel
+            # signature, not on any evidence-specific value.
+            seen_kinds.add("system_log_cleared")
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-A-evtx-system-log-cleared",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        f"EVTX contains {channel} EID 104 event-log clear event "
+                        f"(record {record_id}); this is confirmed event-log "
+                        f"evidence of log clearing and requires analyst review."
+                    ),
+                    "confidence": "CONFIRMED",
+                    "pool_origin": "A",
+                    "mitre_technique": WINDOWS_EVENT_TECHNIQUES[104],
+                    "asserted_values": [
+                        {
+                            "path": "rows[*]",
+                            "expected": json.dumps(
+                                {"event_id": "104", "channel": channel}
                             ),
                             "match": "record",
                         },
@@ -8992,34 +9202,11 @@ def evtx_rows_to_findings(
                     "domain": ent.get("domain") or ent.get("subject_domain"),
                     "source_ip": ent.get("source_ip"),
                 }
-        elif event_id == 4624 and "rdp_logon" not in seen_kinds:
+        elif event_id == 4624:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
             if str(ent.get("logon_type") or "") == "10":
-                seen_kinds.add("rdp_logon")
-                who = (
-                    _format_account(ent.get("account"), ent.get("domain"))
-                    or "an account"
-                )
-                src = ent.get("source_ip")
-                findings.append(
-                    {
-                        "case_id": case_id,
-                        "finding_id": "f-B-evtx-rdp-logon",
-                        "tool_call_id": tool_call_id,
-                        "artifact_path": artifact_path,
-                        "description": (
-                            f"EVTX Security EID 4624 records a Remote Desktop (Type 10) "
-                            f"logon for {who}"
-                            + (f" from {src}" if src else "")
-                            + f" (record {record_id}); treat as a lateral-movement / "
-                            "remote-access lead until corroborated with the source host "
-                            "and in-session activity."
-                        ),
-                        "confidence": "HYPOTHESIS",
-                        "pool_origin": "B",
-                        "mitre_technique": "T1021.001",
-                    }
-                )
+                ent["_record_id"] = record_id
+                rdp_type10_events.append(ent)
         elif event_id == 4688 and "process_creation_lead" not in seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
             proc = _win_basename(ent.get("process"))
@@ -9067,55 +9254,140 @@ def evtx_rows_to_findings(
                         "mitre_technique": "T1059",
                     }
                 )
-        elif event_id in (7045, 4697) and "service_install" not in seen_kinds:
+        elif event_id in (7045, 4697):
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
-            seen_kinds.add("service_install")
-            svc = ent.get("service_name") or "a service"
-            path = ent.get("service_path")
-            suspicious = any(
-                t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS
-            )
-            findings.append(
-                {
-                    "case_id": case_id,
-                    "finding_id": "f-B-evtx-service-install",
-                    "tool_call_id": tool_call_id,
-                    "artifact_path": artifact_path,
-                    "description": (
-                        f"EVTX EID {event_id} records installation of service '{svc}'"
-                        + (f" (image {path})" if path else "")
-                        + f" (record {record_id}); service installation is a durable "
-                        "persistence and lateral-movement mechanism — "
-                        + ("the image path looks suspicious; " if suspicious else "")
-                        + "corroborate the binary and origin before response."
-                    ),
-                    "confidence": "HYPOTHESIS",
-                    "pool_origin": "B",
-                    "mitre_technique": "T1543.003",
-                }
-            )
+            ent["_event_id"] = event_id
+            ent["_record_id"] = record_id
+            service_installs.append(ent)
+
+    # --- After the pass: emit the aggregate-signature findings -----------------
+    # Pick the attack-relevant instance rather than the first occurrence, and
+    # enrich the description with the actual parsed entities (account, remote
+    # source, service image) so the finding carries the distinctive evidence.
+
+    # Remote-interactive (RDP) foothold: prefer a Type 10 logon whose source is a
+    # remote IP (a public attacker host outranks a private/lateral one); a purely
+    # local (127.0.0.1) session is not a remote foothold and is skipped.
+    rdp_choice: dict[str, Any] | None = None
+    for ent in rdp_type10_events:
+        if _evtx_source_ip(ent) is None:
+            continue
+        if rdp_choice is None:
+            rdp_choice = ent
+        elif _is_external_ip(_evtx_source_ip(ent)) and not _is_external_ip(
+            _evtx_source_ip(rdp_choice)
+        ):
+            rdp_choice = ent
+    if rdp_choice is not None:
+        who = _format_account(rdp_choice.get("account"), rdp_choice.get("domain")) or (
+            "an account"
+        )
+        src = _evtx_source_ip(rdp_choice)
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": "f-B-evtx-rdp-logon",
+                "tool_call_id": tool_call_id,
+                "artifact_path": artifact_path,
+                "description": (
+                    f"EVTX Security EID 4624 records an interactive Remote Desktop "
+                    f"Protocol (RDP, Logon Type 10 / RemoteInteractive) logon for {who}"
+                    + (f" from {src}" if src else "")
+                    + f" (record {rdp_choice.get('_record_id')}); treat as a "
+                    "lateral-movement / remote-access foothold lead until corroborated "
+                    "with the source host and in-session activity."
+                ),
+                "confidence": "HYPOTHESIS",
+                "pool_origin": "B",
+                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[4624],
+            }
+        )
+
+    # Service persistence: prefer a service whose image path matches a suspicious
+    # signature (LOLBIN, user-writable / temp / pipe path) over the benign driver
+    # installs that dominate a normal host; fall back to the first install.
+    svc_choice: dict[str, Any] | None = None
+    for ent in service_installs:
+        path_l = str(ent.get("service_path") or "").lower()
+        if any(t in path_l for t in _SUSPICIOUS_SVC_PATH_TOKENS):
+            svc_choice = ent
+            break
+    if svc_choice is None and service_installs:
+        svc_choice = service_installs[0]
+    if svc_choice is not None:
+        svc = svc_choice.get("service_name") or "a service"
+        path = svc_choice.get("service_path")
+        suspicious = any(
+            t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS
+        )
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": "f-B-evtx-service-install",
+                "tool_call_id": tool_call_id,
+                "artifact_path": artifact_path,
+                "description": (
+                    f"EVTX EID {svc_choice.get('_event_id')} records installation of "
+                    f"a new Windows service '{svc}'"
+                    + (f" (image {path})" if path else "")
+                    + f" (record {svc_choice.get('_record_id')}); a service install is "
+                    "a durable persistence and lateral-movement mechanism — "
+                    + (
+                        "the service image path matches a suspicious/LOLBIN "
+                        "signature; "
+                        if suspicious
+                        else ""
+                    )
+                    + "corroborate the binary and origin before response."
+                ),
+                "confidence": "HYPOTHESIS",
+                "pool_origin": "B",
+                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[
+                    int(svc_choice.get("_event_id") or 7045)
+                ],
+            }
+        )
+
+    # Failed-logon burst (credential access / brute force). Enrich with the
+    # follow-on remote logon when one exists: a 4625 burst that culminates in a
+    # successful RDP (Type 10) logon is the RDP brute-force -> foothold sequence,
+    # and the attacker source lives on the successful 4624 (the 4625 records
+    # frequently carry no IpAddress). Derived only from parsed entities.
     if failed_logons >= 5 and "failed_logon_burst" not in seen_kinds:
         seen_kinds.add("failed_logon_burst")
         who = _format_account(
             failed_logon_ctx.get("account"), failed_logon_ctx.get("domain")
         )
-        src = failed_logon_ctx.get("source_ip")
+        desc = f"EVTX Security EID 4625 shows {failed_logons} failed logons" + (
+            f" for {who}" if who else ""
+        )
+        desc += "; consistent with password-spray / brute-force"
+        if rdp_choice is not None:
+            rdp_who = (
+                _format_account(rdp_choice.get("account"), rdp_choice.get("domain"))
+                or "an account"
+            )
+            rdp_src = _evtx_source_ip(rdp_choice)
+            desc += (
+                ", and the failed-logon burst culminated in a successful remote "
+                f"interactive (RDP, Type 10) logon as {rdp_who}"
+                + (f" from {rdp_src}" if rdp_src else "")
+                + " (EID 4624)"
+            )
+        desc += (
+            "; treat as a credential-access / RDP brute-force lead and corroborate "
+            "the source host and any successful follow-on logon."
+        )
         findings.append(
             {
                 "case_id": case_id,
                 "finding_id": "f-B-evtx-failed-logon-burst",
                 "tool_call_id": tool_call_id,
                 "artifact_path": artifact_path,
-                "description": (
-                    f"EVTX Security EID 4625 shows {failed_logons} failed logons"
-                    + (f" for {who}" if who else "")
-                    + (f" from {src}" if src else "")
-                    + "; consistent with password-spray / brute-force. Treat as a "
-                    "credential-access lead and check for a subsequent successful logon."
-                ),
+                "description": desc,
                 "confidence": "HYPOTHESIS",
                 "pool_origin": "B",
-                "mitre_technique": "T1110",
+                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[4625],
             }
         )
     return findings
@@ -9328,11 +9600,17 @@ class Investigation:
         self.case_id = case_id or f"auto-{uuid.uuid4()}"
         self.run_id = f"auto-{int(time.time())}"
         self.started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.case_dir = (
-            str(LOCAL_RUNS_DIR / self.case_id)
-            if LOCAL_MODE
-            else f"{GUEST_REPO}/tmp/{self.case_id}"
-        )
+        if LOCAL_MODE:
+            self.case_dir = str(LOCAL_RUNS_DIR / self.case_id)
+        elif DOCKER_MODE:
+            # /workspace is the repo bind-mounted read-write, so the container's
+            # case dir IS the host dir REPO_ROOT/tmp/auto-runs/<case> — the exact
+            # path fetch_artifacts_to_host resolves on the host. The in-container
+            # MCP servers write audit.jsonl / run.manifest.json straight there,
+            # so the host reads them with no copy step.
+            self.case_dir = f"{GUEST_REPO}/tmp/auto-runs/{self.case_id}"
+        else:
+            self.case_dir = f"{GUEST_REPO}/tmp/{self.case_id}"
         self.audit_path = f"{self.case_dir}/audit.jsonl"
         self.manifest_path = f"{self.case_dir}/run.manifest.json"
         self.verdict_path = f"{self.case_dir}/verdict.json"
@@ -10986,8 +11264,52 @@ class Investigation:
             ]
         )
         self.disk_artifact_summary = _finalize_disk_artifact_summary(disk_summary)
+        finding_rows = rows
+        finding_tcid = tcid
+        # A large Security/System log truncates the default row sample, burying
+        # the sparse attack signatures (e.g. a handful of RDP Type 10 logons among
+        # thousands of benign 4624/4634 auth records, or one malicious 7045 among
+        # dozens of driver installs). Re-query with the security-relevant EventID
+        # filter so those records surface, and build the findings from THAT call
+        # whose deterministic replay reproduces them for verify_finding. Only the
+        # truncated case pays for the second parse; small logs are unchanged.
+        #
+        # The truncation signal is "the sample hit its row cap" (len(rows) >=
+        # limit): the Rust parser stops AT the limit, so records_seen equals the
+        # limit on a truncated log rather than the true total -- a seen > len(rows)
+        # test would never fire.
+        sample_limit = int(evtx_args.get("limit") or 0)
+        if sample_limit and len(rows) >= sample_limit:
+            targeted_args = {
+                "case_id": self.handle["id"],
+                "evtx_path": evidence_path,
+                "eids": list(SECURITY_FINDING_EIDS),
+                "limit": 20000,
+            }
+            targeted = rust.call_tool("evtx_query", targeted_args)
+            if "_error" not in targeted:
+                trows = targeted.get("rows", [])
+                if trows:
+                    finding_tcid = self._record_tool(
+                        py,
+                        "evtx_query",
+                        self._output_hash(targeted),
+                        {
+                            "artifact_path": evidence_path,
+                            "row_count": len(trows),
+                            "records_seen": targeted.get("records_seen", 0),
+                            "parse_errors": targeted.get("parse_errors", 0),
+                            "eids_filter": list(SECURITY_FINDING_EIDS),
+                        },
+                        arguments=targeted_args,
+                    )
+                    finding_rows = trows
+                    print(
+                        f"  evtx_query (targeted EIDs): {len(trows)} security-relevant "
+                        f"rows recovered past the {sample_limit}-row sample cap"
+                    )
         evtx_findings = evtx_rows_to_findings(
-            rows, tcid, self.handle["id"], evidence_path
+            finding_rows, finding_tcid, self.handle["id"], evidence_path
         )
         for finding in evtx_findings:
             if finding.get("pool_origin") == "B":
@@ -15271,6 +15593,15 @@ class Investigation:
         for warning in inference_provenance_warnings(merged):
             self.analysis_limitations.append(warning)
 
+        # Corroboration promotion (SOUL.md >=2 rule): a tagged Windows attack
+        # signature from EVTX is a lead on its own, but in a case that examined a
+        # second artifact class it is an INFERRED part of the narrative. Applied
+        # here on the final merged list -- after verify/judge/correlate have made
+        # their keep/drop/downgrade decisions on the lead tier -- so it never
+        # changes what survives, only the tier the survivors carry. Never
+        # auto-CONFIRMS (execution/exfil >=2-class gates stay intact).
+        merged = self._promote_corroborated_evtx_findings(merged)
+
         # SOUL.md HYPOTHESIS-prefix normalization — catches confidence
         # downgrades (verifier/correlator) that happen after Finding validation.
         merged = normalize_hypothesis_prefix(merged)
@@ -15304,6 +15635,62 @@ class Investigation:
         )
         print(f"  correlator: {kept} kept, {downgraded} downgraded")
         return merged, kept, downgraded
+
+    # EVTX attack-signature findings (keyed on general event-ID signatures, never
+    # on evidence-specific values) eligible for a HYPOTHESIS -> INFERRED promotion
+    # once the case examined a second artifact class. The 1102/104 log-clear
+    # findings are already CONFIRMED and are intentionally excluded.
+    _EVTX_PROMOTABLE_FINDING_IDS = frozenset(
+        {
+            "f-B-evtx-failed-logon-burst",
+            "f-B-evtx-rdp-logon",
+            "f-B-evtx-service-install",
+            "f-B-evtx-scheduled-task-lead",
+        }
+    )
+
+    def _consulted_artifact_classes(self) -> set[str]:
+        """Distinct non-custody artifact classes the case actually parsed."""
+        classes: set[str] = set()
+        for tc in self.tool_calls:
+            if tc.get("error"):
+                continue
+            cls = TOOL_ARTIFACT_CLASSES.get(str(tc.get("tool")))
+            if cls and cls not in ("custody", "unknown_tool_output"):
+                classes.add(cls)
+        return classes
+
+    def _promote_corroborated_evtx_findings(
+        self, merged: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Promote tagged EVTX attack findings HYPOTHESIS -> INFERRED when the
+        case examined >= 2 distinct artifact classes.
+
+        This is corroboration context, not a per-finding execution claim: it never
+        auto-CONFIRMS and never touches the execution/exfiltration >=2-class gates
+        (those techniques are still bound by discipline/ablation upstream). A
+        single-class EVTX run -- every standalone EVTX benchmark case -- has < 2
+        classes, so its leads stay HYPOTHESIS and the verdict word is unchanged.
+        """
+        classes = self._consulted_artifact_classes()
+        if len(classes) < 2:
+            return merged
+        corroboration = "case examined >= 2 artifact classes: " + ", ".join(
+            sorted(classes)
+        )
+        rationale = (
+            "single EVTX lane on its own; a finding-specific second artifact class "
+            "is still required before CONFIRMED"
+        )
+        for f in merged:
+            if (
+                f.get("finding_id") in self._EVTX_PROMOTABLE_FINDING_IDS
+                and f.get("confidence") == "HYPOTHESIS"
+            ):
+                f["confidence"] = "INFERRED"
+                f.setdefault("why_not_higher", rationale)
+                f.setdefault("corroboration", corroboration)
+        return merged
 
     def _build_report_metadata(
         self, merged: list[dict[str, Any]], verdict: str
@@ -16094,6 +16481,28 @@ class Investigation:
             verdict_file = Path(self.verdict_path)
             verdict_file.parent.mkdir(parents=True, exist_ok=True)
             verdict_file.write_bytes(verdict_bytes)
+        elif DOCKER_MODE:
+            # Docker mode: pipe into the container via `docker exec -i cat` — the
+            # container analog of SIFT's ssh cat. The path is /workspace/…, so it
+            # lands on the host case dir via the read-write bind mount (no quoting
+            # hell, and no separate host-path mapping needed).
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-i",
+                    DOCKER_CONTAINER,
+                    "bash",
+                    "-lc",
+                    f"cat > {shlex.quote(self.verdict_path)}",
+                ],
+                input=verdict_bytes,
+                capture_output=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", errors="replace")
+                print(f"  WARN: failed to write verdict.json: {stderr}")
         else:
             # SIFT mode: pipe into the VM via SSH cat to avoid quoting hell.
             proc = subprocess.run(
@@ -16125,6 +16534,21 @@ class Investigation:
             # Local mode: the case dir IS a host path; the local MCP servers
             # already wrote audit/manifest/verdict there. No SCP needed.
             local_dir = Path(self.case_dir)
+            local_dir.mkdir(parents=True, exist_ok=True)
+            self.local_run_dir = local_dir
+        elif DOCKER_MODE:
+            # Docker mode: the container case dir /workspace/tmp/auto-runs/<case>
+            # IS this host dir (REPO_ROOT/tmp/auto-runs/<case>) via the read-write
+            # bind mount. The in-container MCP wrote audit.jsonl / run.manifest.json
+            # here, and verdict.json was piped here via `docker exec cat`, so every
+            # custody file is already present — no copy step (a docker cp would be a
+            # bind-mount self-copy). Point local_dir at it directly, like LOCAL_MODE.
+            local_dir = (
+                Path(__file__).resolve().parent.parent
+                / "tmp"
+                / "auto-runs"
+                / self.case_id
+            )
             local_dir.mkdir(parents=True, exist_ok=True)
             self.local_run_dir = local_dir
         else:
@@ -16390,20 +16814,12 @@ class Investigation:
                 file=sys.stderr,
             )
 
-        if LOCAL_MODE:
-            rust = StdioMcpClient(_local_rust_command(), "rust-mcp")
-            py = StdioMcpClient(_local_py_command(), "py-mcp")
-        else:
-            rust = SshMcpClient(PY_LAUNCHER, "rust-mcp")
-            py = SshMcpClient(PY_MCP_LAUNCHER, "py-mcp")
+        rust = make_rust_client()
+        py = make_py_client()
 
         def _spawn_rust() -> SshMcpClient:
             # A fresh, initialized findevil-mcp connection for a parallel lane.
-            client = (
-                StdioMcpClient(_local_rust_command(), "rust-mcp")
-                if LOCAL_MODE
-                else SshMcpClient(PY_LAUNCHER, "rust-mcp")
-            )
+            client = make_rust_client()
             client.call(
                 "initialize",
                 {
@@ -16621,7 +17037,8 @@ class Investigation:
                 for blocker in final_release_gate.get("release_blockers", [])[:5]:
                     print(f"    - {blocker}")
             if not LOCAL_MODE:
-                print(f"  Inside VM      : {self.case_dir}/")
+                where = "container" if DOCKER_MODE else "VM"
+                print(f"  Inside {where:<8}: {self.case_dir}/")
             print(f"  On host (local): {local_dir}")
             self._heartbeat(
                 "complete",
@@ -16667,6 +17084,48 @@ def preflight_check() -> None:
         if missing:
             print(
                 "ERROR: local-mode pre-flight failed:\n  - " + "\n  - ".join(missing),
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return
+    if DOCKER_MODE:
+        # Docker mode: verify the container is up and both MCP prerequisites are
+        # runnable inside it (Rust binary + agent_mcp dir + uv). One docker exec
+        # round-trip, the container analog of the SIFT ssh probe. scripts/verdict
+        # --docker brings the container up first, so a failure here means the
+        # container is down or was not built.
+        if not shutil.which("docker"):
+            print(
+                "ERROR: docker-mode pre-flight failed: docker not on PATH.\n"
+                "  fix: install docker, then re-run scripts/verdict --docker.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        probe = (
+            f"test -x {RUST_BIN_Q} && "
+            f"test -d {AGENT_MCP_DIR_Q} && "
+            f"command -v uv >/dev/null && "
+            f"echo ok"
+        )
+        try:
+            code, _, stderr = ssh_run(probe, timeout=30)
+        except subprocess.TimeoutExpired:
+            code, stderr = 124, "docker exec timed out after 30s"
+        if code != 0:
+            print(
+                f"ERROR: cannot reach the '{DOCKER_CONTAINER}' container or one of "
+                f"the MCP server prerequisites is missing.\n\n"
+                f"Pre-flight tried: docker exec -i {DOCKER_CONTAINER} bash -lc '<probe>'\n"
+                f"  exit code: {code}\n"
+                f"  stderr   : {stderr.strip()[:200]}\n\n"
+                f"Required inside the container (any one missing -> this error):\n"
+                f"  1. {RUST_BIN}                 (Rust MCP binary)\n"
+                f"  2. {GUEST_REPO}/services/agent_mcp/   (Python MCP dir)\n"
+                f"  3. uv on PATH                          (uv binary)\n\n"
+                "Fix:\n"
+                "  - bring the container up: scripts/run-dfir-container.sh <evidence>\n"
+                "  - or run the one-shot     : scripts/verdict --docker <evidence>\n"
+                "  - alt container name      : set FIND_EVIL_DOCKER_CONTAINER.",
                 file=sys.stderr,
             )
             sys.exit(2)

@@ -8,6 +8,7 @@
 resolver = "2"
 members = [
     "services/mcp",
+    "apps/tui",
 ]
 
 # Pinned toolchain is Rust 1.88 (see rust-toolchain.toml + docker/l1-devbase.Dockerfile).

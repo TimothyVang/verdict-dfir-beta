@@ -26,7 +26,10 @@ The container fixes each of these by construction:
 
 The image pins Volatility 3, Hayabusa (**with its Sigma rules baked in**, so
 scans are never silently empty), Chainsaw, Velociraptor, Sleuth Kit, libewf,
-`tshark`, Suricata, `nfdump`, plus the Rust 1.88 + `uv` build environment.
+`tshark`, Suricata, `nfdump`, the Eric Zimmerman tools (`ez_parse`, via a pinned
+.NET 10 LTS runtime the .NET 9 builds roll forward onto) and plaso /
+`log2timeline` (`plaso_parse`, from the GIFT stable PPA), plus the Rust 1.88 +
+`uv` build environment.
 
 ## Download (recommended) or build
 
@@ -66,17 +69,57 @@ Disk-image mounting needs FUSE, so the container runs with
 `--cap-add SYS_ADMIN --device /dev/fuse`; every other lane (memory, pcap, evtx,
 registry, artifact parsing) runs unprivileged.
 
-## Point VERDICT at the container
+## One command: `scripts/verdict --docker`
 
-Activate the Docker MCP transport (the container analog of `.mcp.json.sift`):
+`scripts/verdict --docker <evidence>` folds the bring-up and the transport swap
+into one step — the container analog of `--sift`:
 
 ```bash
-cp .mcp.json.docker .mcp.json     # route the MCP over `docker exec -i`
+scripts/verdict --docker <path-to-evidence>
 ```
 
-Both product MCP servers now run **inside** the container. Evidence paths are the
-in-container mount, e.g. `/evidence/<case>`. Revert with `git checkout .mcp.json`
-(or `cp .mcp.json` from your local backend variant) to return to local/`--sift`.
+It:
+
+- brings the container up via `scripts/run-dfir-container.sh` (build/pull the
+  image, mount the evidence read-only at `/evidence`, build the MCP in-container);
+- skips the host `cargo build` — the MCP is built in the container;
+- swaps in the docker MCP transport (`.mcp.json.docker` over `.mcp.json`, backed
+  up and restored on exit, exactly as `--sift` swaps `.mcp.json.sift`) — this is
+  what the **interactive** Claude Code path reads;
+- selects the **deterministic engine's** own `docker exec` transport
+  (`FIND_EVIL_DOCKER=1`): `scripts/find_evil_auto.py` drives `findevil-mcp` /
+  `findevil-agent-mcp` over `docker exec -i <container>`, the container analog of
+  its SSH (`--sift`) transport. The case dir is written under `/workspace`
+  (the repo bind mount), so it lands on the host with no copy step, and
+  `manifest_verify` reproduces `output_sha256` from inside the container;
+- hands the run the in-container evidence path (`/evidence`, where the evidence
+  is bind-mounted read-only), since the tools run in the container and see it
+  there;
+- leaves the container running for reuse.
+
+`--sift` and `--docker` are mutually exclusive (each picks where the DFIR tools
+run), and `--docker` is single-host — a multi-host case folder is refused. Tear
+the container down when finished:
+
+```bash
+scripts/run-dfir-container.sh --down
+```
+
+## Point VERDICT at the container (manual equivalent)
+
+`scripts/verdict --docker` performs the two steps below for you; run them by hand
+when driving the container from an interactive Claude Code session. Activate the
+Docker MCP transport (the container analog of `.mcp.json.sift`):
+
+```bash
+scripts/run-dfir-container.sh <path-to-evidence>   # bring the container up
+cp .mcp.json.docker .mcp.json                       # route the MCP over `docker exec -i`
+```
+
+Both product MCP servers now run **inside** the container. The evidence is
+bind-mounted read-only at `/evidence`, so that is the in-container evidence path
+(`case_open /evidence`). Revert with `git checkout .mcp.json` (or `cp .mcp.json`
+from your local backend variant) to return to local/`--sift`.
 
 Tear down when finished:
 
@@ -93,15 +136,26 @@ this image.
 
 ## Known limitations (honest scope)
 
-- **`--docker` flag on `scripts/verdict` is not wired yet.** Today you bring the
-  container up and swap `.mcp.json.docker` manually (above). A first-class
-  `scripts/verdict --docker <evidence>` branch — mirroring `--sift` (start
-  container, bind-mount evidence, swap transport, hand off) — is the next step.
+- **Long-tail DFIR tools degrade, never crash.** Every subprocess tool the image
+  omits returns a typed `BinaryNotFound` the engine pivots on, rather than
+  crashing. The Eric Zimmerman tools (`ez_parse`: `AmcacheParser`, `JLECmd`,
+  `RBCmd`, `LECmd`, `AppCompatCacheParser`, `SBECmd`, `WxTCmd`) and plaso
+  (`plaso_parse`: `log2timeline.py` / `psort.py`) are now **baked into the
+  image** — the EZ .NET 9 builds run on a pinned .NET 10 LTS runtime via
+  `DOTNET_ROLL_FORWARD=Major`, and plaso comes from the GIFT stable PPA — so a
+  disk case runs `case_open` → `disk_mount` → `disk_extract_artifacts` →
+  `evtx_query` / `registry_query` / `mft_timeline` / `usnjrnl_query` /
+  `hayabusa_scan` **and** `ez_parse` (Amcache/ShimCache/LNK/JumpList/RecycleBin/
+  shellbags) and `plaso_parse` (super timeline). `ez_parse` still depends on
+  `disk_extract_artifacts` having carved the target artifact. Remaining SIFT-only
+  long-tail lanes (e.g. `mac_triage` / mac_apt) are not in the image and still
+  degrade to `BinaryNotFound`. Prefer `--sift` when you need one of those lanes.
 - **Multi-segment E01.** The image ships Ubuntu 22.04's `libewf` (`ewfmount
-  20140807`), the same era as the SIFT VM. A truncated multi-segment E01 read
-  seen on the VM may persist. Workaround until a newer `libewf` is pinned:
-  `ewfexport` the segmented `.E01`/`.E02` to a single raw `.dd` first, then point
-  VERDICT at the `.dd`.
+  20140807`). A real multi-segment E01 (`.E01` + `.E02`) live run (Szechuan DC)
+  mounted and read the full ~11 GB C: volume (114,999 filesystem entries, 107
+  EVTX, 4 registry hives via `fls`), so no truncation was observed there. If a
+  truncated read does surface on a larger segmented image, `ewfexport` the
+  `.E01`/`.E02` to a single raw `.dd` first and point VERDICT at the `.dd`.
 - **The MCP server is built at bring-up, not baked into the image**, so the image
   stays decoupled from any single repo snapshot. First bring-up compiles
   `findevil-mcp` inside the container; subsequent starts reuse it.

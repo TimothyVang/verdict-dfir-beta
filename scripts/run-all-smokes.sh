@@ -188,6 +188,16 @@ run_smoke \
     "containment-smoke (runtime + toolchain stay in .project-local/)" \
     "python3 scripts/containment-smoke.py"
 
+# 7c1. verdict-tui read-only viewer — builds the TUI crate and drives it
+#      headlessly (--print) against the committed sample-run fixtures, asserting
+#      it renders without panic, keeps a read-only-by-construction source (no
+#      evidence_path read / subprocess / network), and writes nothing under
+#      evidence/. Needs cargo; SKIPs cleanly without it.
+run_smoke \
+    "tui-smoke (verdict-tui builds, renders headlessly, stays read-only)" \
+    "python3 scripts/tui-smoke.py" \
+    "command -v cargo && [ -f Cargo.toml ]"
+
 # 8b. Trace-finding tamper detection — verdict and manifest edits after finalize
 #     must break offline tracing.
 run_smoke \

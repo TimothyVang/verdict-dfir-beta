@@ -18,6 +18,15 @@
 #   --sift            run the DFIR tools inside the SANS SIFT VM over SSH
 #                     (default: tools on the local host). Requires the VM to be
 #                     bootstrapped once: bash scripts/sift-vm-bootstrap.sh
+#   --docker          run the DFIR tools inside the findevil-dfir container (the
+#                     container analog of --sift; mutually exclusive with it).
+#                     Brings the container up via scripts/run-dfir-container.sh
+#                     (build/pull the image, mount evidence read-only at
+#                     /evidence, build the MCP in-container), swaps in the docker
+#                     MCP transport (.mcp.json.docker), and hands the engine the
+#                     in-container evidence path. The container is left running
+#                     for reuse; tear it down with
+#                     scripts/run-dfir-container.sh --down.
 #   --fleet           whole multi-host case in ONE command: per-host
 #                     investigations -> cross-host correlation -> FLEET_REPORT.
 #                     Auto-detected when <evidence> is a folder with hosts/ or
@@ -66,6 +75,7 @@ source "${REPO_ROOT}/scripts/lib/project-env.sh"
 DASH="http://localhost:3000"
 EVIDENCE_DIR="${REPO_ROOT}/evidence"
 SIFT=0
+DOCKER=0
 FLEET=0
 NO_DASHBOARD=0
 SKIP_BUILD=0
@@ -95,6 +105,7 @@ RESTORE_MCP=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sift)          SIFT=1; shift ;;
+    --docker)        DOCKER=1; shift ;;
     --fleet)         FLEET=1; shift ;;
     --no-dashboard)  NO_DASHBOARD=1; shift ;;
     --skip-build)    SKIP_BUILD=1; shift ;;
@@ -126,6 +137,12 @@ ok()   { printf '   \033[32m✓\033[0m %s\n' "$*" >&2; }
 warn() { printf '   \033[33m!\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[31m[verdict] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 url_up() { [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null)" != "000" ]]; }
+
+# --sift and --docker both choose "where the DFIR tools run" (VM vs container);
+# they are mutually exclusive backends. Local mode is the default when neither.
+if [[ "${SIFT}" == "1" && "${DOCKER}" == "1" ]]; then
+  fail "--sift and --docker are mutually exclusive — pick one DFIR tool backend"
+fi
 
 case_root_abs() {
   if [[ "${CASE_ROOT}" == /* ]]; then
@@ -1444,7 +1461,10 @@ for passthrough_arg in "${PASSTHROUGH[@]}"; do
 done
 [[ -n "${CASE_ID_OVERRIDE:-}" ]] && CASE_ID_OVERRIDE="$(safe_case_id "${CASE_ID_OVERRIDE}")"
 [[ -n "${RUN_SUMMARY:-}" ]] && RUN_SUMMARY="$(prepare_requested_run_summary_path "${RUN_SUMMARY}" 0)"
-if [[ "${SIFT}" == "1" ]]; then
+# SIFT and Docker both run the tools off-host, so (like each other) they reserve
+# the case dir up front and resolve the dashboard after the run. Local mode pins
+# its case dir just before the engine so the dashboard can open LIVE.
+if [[ "${SIFT}" == "1" || "${DOCKER}" == "1" ]]; then
   CASE_ID="${CASE_ID_OVERRIDE:-auto-$(python3 -c 'import uuid;print(uuid.uuid4())')}"
   CASE_DIR="$(case_root_abs)/${CASE_ID}"
   create_owned_case_dir "${CASE_DIR}" "$(case_root_abs)"
@@ -1606,6 +1626,8 @@ run_fleet() {
   printf '   verdicts + correlation: fleet.json · fleet_correlation.{json,md} · FLEET_REPORT.md\n' >&2
   exit 0
 }
+[[ "${FLEET}" == "1" && "${DOCKER}" == "1" ]] \
+  && fail "--docker is a single-host backend and does not support fleet runs — run per host, or use local/--sift fleet mode"
 [[ "${FLEET}" == "1" ]] && run_fleet
 
 # 1. preflight ---------------------------------------------------------------
@@ -1624,6 +1646,8 @@ if [[ "${DRY}" == "1" ]]; then
   ok "DRY-RUN: cargo build --workspace --release --locked"
 elif [[ "${SIFT}" == "1" ]]; then
   ok "--sift: the MCP server is built inside the VM by sift-vm-bootstrap; skipping host build"
+elif [[ "${DOCKER}" == "1" ]]; then
+  ok "--docker: the MCP server is built inside the findevil-dfir container by run-dfir-container.sh; skipping host build"
 elif [[ "${SKIP_BUILD}" == "1" || -f target/release/findevil-mcp ]]; then
   ok "findevil-mcp present (or --skip-build); skipping build"
 else
@@ -1639,6 +1663,13 @@ if [[ "${SIFT}" == "1" ]]; then
   RESTORE_MCP=1
   trap cleanup_on_exit EXIT INT TERM
   ok "--sift: MCP routed to the SANS SIFT VM over SSH"
+elif [[ "${DOCKER}" == "1" ]]; then
+  [[ -f .mcp.json.docker ]] || fail "--docker needs .mcp.json.docker (the docker MCP transport variant)"
+  cp -f .mcp.json .mcp.json.local.bak
+  cp -f .mcp.json.docker .mcp.json
+  RESTORE_MCP=1
+  trap cleanup_on_exit EXIT INT TERM
+  ok "--docker: MCP routed to the findevil-dfir container over 'docker exec -i'"
 fi
 
 # 3b. SIFT evidence staging (automation: ONE command for ANY host path) -------
@@ -2102,6 +2133,36 @@ fi" 2>/dev/null || fail "--sift: could not promote staged directory into place (
   fi
 fi
 
+# 3c. Docker backend bring-up (the container analog of SIFT staging) ----------
+# In --docker mode the typed tools run INSIDE the findevil-dfir container, so
+# case_open needs a path the container can see. run-dfir-container.sh builds/pulls
+# the image, starts the long-lived container with this repo bind-mounted at
+# /workspace and the evidence bind-mounted READ-ONLY at /evidence, then builds the
+# MCP servers in-container. The evidence path itself is mounted at /evidence, so
+# that IS the in-container evidence path — rewrite EVIDENCE to it for the engine.
+# A whole multi-host case folder is refused here (docker is single-host; use the
+# fleet pipeline). Unlike --sift there is no per-run copy staging to clean up
+# (evidence is a read-only bind mount), and the container is left running for
+# reuse (tear down with: scripts/run-dfir-container.sh --down).
+if [[ "${DOCKER}" == "1" ]]; then
+  if [[ -d "${EVIDENCE}" && ( -d "${EVIDENCE}/hosts" || -d "${EVIDENCE}/disks" ) ]]; then
+    fail "--docker: '${EVIDENCE}' is a multi-host case folder — run each host separately, or use local/--sift fleet mode."
+  fi
+  if [[ "${DRY}" == "1" ]]; then
+    ok "DRY-RUN: bash scripts/run-dfir-container.sh ${ORIGINAL_EVIDENCE}   # build/pull image, start findevil-dfir, mount evidence :ro at /evidence, build MCP in-container"
+  else
+    [[ -e "${ORIGINAL_EVIDENCE}" || -L "${ORIGINAL_EVIDENCE}" ]] \
+      || fail "--docker: evidence path not found on this host: ${ORIGINAL_EVIDENCE}"
+    log "--docker: bringing up the findevil-dfir container (build/pull image, mount evidence :ro at /evidence, build MCP in-container)…"
+    bash "${REPO_ROOT}/scripts/run-dfir-container.sh" "${ORIGINAL_EVIDENCE}" \
+      || fail "--docker: container bring-up failed (see output above)"
+    ok "--docker: container ready; evidence mounted read-only at /evidence"
+  fi
+  # Evidence is bind-mounted AT /evidence (the path itself, not under it), so the
+  # in-container evidence path the engine hands to case_open is exactly /evidence.
+  EVIDENCE="/evidence"
+fi
+
 # 4. investigate -------------------------------------------------------------
 log "3/4 investigate — ${EVIDENCE}"
 if [[ -z "${CASE_DIR:-}" ]]; then
@@ -2120,7 +2181,7 @@ if [[ "${AGENT_MODE}" == "1" ]]; then
 else
   ENGINE=(python3 scripts/find_evil_auto.py "${EVIDENCE}" --run-summary "${SUMMARY}")
 fi
-if [[ "${SIFT}" == "0" ]]; then
+if [[ "${SIFT}" == "0" && "${DOCKER}" == "0" ]]; then
   # Default = local host. Pin the case id so the dashboard can open LIVE —
   # before the run — and tail the audit chain as each stage lands. The engine
   # writes straight to this host dir (no SCP), so the stream is real-time.
@@ -2135,6 +2196,18 @@ if [[ "${SIFT}" == "0" ]]; then
   export PYTHONPATH="${REPO_ROOT}/services/agent${PYTHONPATH:+:${PYTHONPATH}}"
   ENGINE+=(--local --case-id "${CASE_ID}")
 else
+  # --sift and --docker run the tools off-host, so the engine is NOT in --local
+  # mode; it just pins the reserved case id (dashboard resolves after the run).
+  if [[ "${DOCKER}" == "1" ]]; then
+    # Select the deterministic engine's docker-exec MCP transport (the parallel
+    # of FIND_EVIL_LOCAL/FIND_EVIL_SIFT): the engine drives findevil-mcp /
+    # findevil-agent-mcp over `docker exec -i <container>`, writes the case dir
+    # to /workspace (the repo bind mount, so it lands on the host), and hands
+    # case_open the in-container /evidence path. Container name is kept in sync
+    # with run-dfir-container.sh's default (FINDEVIL_DFIR_CONTAINER).
+    export FIND_EVIL_DOCKER=1
+    export FIND_EVIL_DOCKER_CONTAINER="${FINDEVIL_DFIR_CONTAINER:-findevil-dfir}"
+  fi
   ENGINE+=(--case-id "${CASE_ID}")
 fi
 [[ ${#PASSTHROUGH[@]} -gt 0 ]] && ENGINE+=("${PASSTHROUGH[@]}")
@@ -2147,7 +2220,7 @@ if [[ "${DRY}" == "1" ]]; then
 fi
 
 # Local mode: open the dashboard LIVE before the engine runs.
-if [[ "${SIFT}" == "0" ]]; then
+if [[ "${SIFT}" == "0" && "${DOCKER}" == "0" ]]; then
   log "4/4 dashboard (live)"
   open_dashboard "${CASE_DIR}"
 fi
@@ -2166,9 +2239,9 @@ fi
 # 5. Resolve + open the case dir, THEN fire automation (below). SIFT resolves the
 #    case dir here after the post-run sync; local pinned it up front. Automation
 #    runs after this block so it fires in BOTH local and --sift mode. ----------
-if [[ "${SIFT}" == "1" ]]; then
+if [[ "${SIFT}" == "1" || "${DOCKER}" == "1" ]]; then
   log "4/4 dashboard"
-  [[ -n "${CASE_DIR:-}" ]] || fail "missing reserved SIFT case directory"
+  [[ -n "${CASE_DIR:-}" ]] || fail "missing reserved case directory (--sift/--docker reserve it up front)"
   initialize_case_layout "${CASE_DIR}"
   sync_case_summary "${SUMMARY}"
   open_dashboard "${CASE_DIR}"

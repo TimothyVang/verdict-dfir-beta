@@ -302,7 +302,7 @@ pub fn disk_extract_artifacts(
     create_dir(&output_dir)?;
     let wanted = wanted_kinds(&input.artifact_kinds);
 
-    let sector_offset = first_partition_sector_offset(&image_path);
+    let sector_offset = primary_partition_sector_offset(&image_path);
 
     // Enumerate every file once and keep the wanted classes. Selection then
     // allocates the `limit` *fairly across classes* (round-robin) so a
@@ -522,11 +522,12 @@ fn auto_mount_ewf(
 
 /// Loop-mount an NTFS volume read-only with the kernel `ntfs3` driver, under
 /// sudo (the EWF device is root-owned). Tries offset 0 (bare volume image) then
-/// the first filesystem-partition offset from `mmls` (full disk image).
+/// the primary (largest) filesystem-partition offset from `mmls` (full disk
+/// image).
 fn mount_ntfs_ro(device: &Path, mount_point: &Path) -> Result<(Vec<String>, String), DiskError> {
     let mount_bin = std::env::var("FINDEVIL_MOUNT_BIN").unwrap_or_else(|_| "mount".to_string());
     let mut offsets = vec![0u64];
-    if let Some(offset) = first_partition_byte_offset_sudo(device) {
+    if let Some(offset) = primary_partition_byte_offset_sudo(device) {
         offsets.push(offset);
     }
     let mut last_status = String::new();
@@ -562,9 +563,10 @@ fn mount_ntfs_ro(device: &Path, mount_point: &Path) -> Result<(Vec<String>, Stri
     })
 }
 
-/// `mmls` first-filesystem-partition byte offset, run under sudo because the
-/// EWF device is root-owned. None when the image is a bare volume (no table).
-fn first_partition_byte_offset_sudo(image_path: &Path) -> Option<u64> {
+/// `mmls` primary- (largest-) filesystem-partition byte offset, run under sudo
+/// because the EWF device is root-owned. None when the image is a bare volume
+/// (no table).
+fn primary_partition_byte_offset_sudo(image_path: &Path) -> Option<u64> {
     let output = Command::new("sudo")
         .args(["-n", "mmls"])
         .arg(image_path)
@@ -573,7 +575,7 @@ fn first_partition_byte_offset_sudo(image_path: &Path) -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    parse_mmls_first_partition_offset(&String::from_utf8_lossy(&output.stdout))
+    parse_mmls_primary_partition_offset(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn auto_mount_raw(
@@ -600,7 +602,7 @@ fn auto_mount_raw(
 
     let direct_status = result.1;
     let direct_stderr = result.2;
-    if let Some(offset) = first_partition_byte_offset(image_path) {
+    if let Some(offset) = primary_partition_byte_offset(image_path) {
         let offset_args = vec![
             "-o".to_string(),
             format!("ro,loop,offset={offset}"),
@@ -614,7 +616,7 @@ fn auto_mount_raw(
                 mount_point.to_path_buf(),
                 std::iter::once(bin).chain(offset_args).collect(),
                 offset_result.2,
-                format!("mounted first filesystem partition read-only with loop offset {offset}"),
+                format!("mounted primary filesystem partition read-only with loop offset {offset}"),
             ));
         }
         if bin == "mount" {
@@ -630,7 +632,7 @@ fn auto_mount_raw(
                         .collect(),
                     sudo_result.2,
                     format!(
-                        "mounted first filesystem partition read-only with sudo loop offset {offset}"
+                        "mounted primary filesystem partition read-only with sudo loop offset {offset}"
                     ),
                 ));
             }
@@ -676,15 +678,29 @@ fn auto_mount_raw(
     })
 }
 
-fn first_partition_byte_offset(image_path: &Path) -> Option<u64> {
+fn primary_partition_byte_offset(image_path: &Path) -> Option<u64> {
     let output = Command::new("mmls").arg(image_path).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_mmls_first_partition_offset(&String::from_utf8_lossy(&output.stdout))
+    parse_mmls_primary_partition_offset(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_mmls_first_partition_offset(output: &str) -> Option<u64> {
+/// Byte offset of the **primary** filesystem partition — the largest-by-length
+/// filesystem partition `mmls` reports, not merely the first one.
+///
+/// On a full Windows disk image the *first* filesystem partition is the small
+/// "System Reserved" boot volume (a few hundred MB, ~a hundred files). The OS
+/// volume that actually holds `Windows/System32/winevt/Logs`, the registry
+/// hives, and user data is a separate, much larger partition further down the
+/// table. Selecting the first partition therefore points `fls`/`icat` and the
+/// loop mount at the boot stub and extracts almost nothing. Selecting by size
+/// keys on a general disk-layout property (fully evidence-agnostic) and lands
+/// on the OS/data volume instead. Returns `None` for a bare volume image (no
+/// partition table), where TSK and the loop mount read at offset 0.
+fn parse_mmls_primary_partition_offset(output: &str) -> Option<u64> {
+    // Best seen so far, as (length_in_sectors, start_sector).
+    let mut best: Option<(u64, u64)> = None;
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
         if lower.contains("meta")
@@ -693,14 +709,27 @@ fn parse_mmls_first_partition_offset(output: &str) -> Option<u64> {
         {
             continue;
         }
-        let start_sector = line
+        // The columns after the slot labels are Start, End, Length (decimal
+        // sector counts), then the free-text description. Collect the decimal
+        // fields in order; the index ("002:") and CHS-style slot ("000:000")
+        // carry colons, so they never parse as all-digit.
+        let mut nums = line
             .split_whitespace()
-            .find(|field| field.chars().all(|c| c.is_ascii_digit()))?
-            .parse::<u64>()
-            .ok()?;
-        return start_sector.checked_mul(512);
+            .filter(|field| !field.is_empty() && field.chars().all(|c| c.is_ascii_digit()))
+            .filter_map(|field| field.parse::<u64>().ok());
+        let (Some(start), Some(_end), Some(length)) = (nums.next(), nums.next(), nums.next())
+        else {
+            continue;
+        };
+        let is_better = match best {
+            Some((best_len, _)) => length > best_len,
+            None => true,
+        };
+        if is_better {
+            best = Some((length, start));
+        }
     }
-    None
+    best.and_then(|(_, start)| start.checked_mul(512))
 }
 
 fn matches_filesystem_description(line: &str) -> bool {
@@ -817,11 +846,12 @@ fn run_fixed(bin: &str, args: &[String]) -> Result<(bool, String, String), DiskE
     ))
 }
 
-/// Sector offset of the first filesystem partition for `fls`/`icat -o`, or None
-/// for a bare volume image (TSK reads it at offset 0). mmls reports the start
+/// Sector offset of the primary (largest) filesystem partition for
+/// `fls`/`icat -o`, or None for a bare volume image (TSK reads it at offset 0).
+/// mmls reports the start
 /// sector; the byte helper multiplies by 512, so divide it back to sectors.
-fn first_partition_sector_offset(image_path: &Path) -> Option<u64> {
-    first_partition_byte_offset(image_path).map(|bytes| bytes / 512)
+fn primary_partition_sector_offset(image_path: &Path) -> Option<u64> {
+    primary_partition_byte_offset(image_path).map(|bytes| bytes / 512)
 }
 
 /// One `fls -r -p` listing entry. `deleted` marks an unallocated directory
@@ -1555,7 +1585,7 @@ fn tail_utf8_lossy(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         artifact_subrank, class_priority, classify_artifact_path, mock_list, parse_fls_line,
-        parse_mmls_first_partition_offset, safe_join, select_artifacts, unmount_steps,
+        parse_mmls_primary_partition_offset, safe_join, select_artifacts, unmount_steps,
         wanted_kinds, Candidate, FlsEntry,
     };
     use std::path::Path;
@@ -2072,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn mmls_parser_returns_first_filesystem_partition_offset() {
+    fn mmls_parser_returns_sole_filesystem_partition_offset() {
         let output = r"DOS Partition Table
 Offset Sector: 0
 Units are in 512-byte sectors
@@ -2083,7 +2113,7 @@ Units are in 512-byte sectors
 002:  000:000   0000000063   0009510479   0009510417   NTFS / exFAT (0x07)
 ";
 
-        assert_eq!(parse_mmls_first_partition_offset(output), Some(63 * 512));
+        assert_eq!(parse_mmls_primary_partition_offset(output), Some(63 * 512));
     }
 
     #[test]
@@ -2093,6 +2123,47 @@ Units are in 512-byte sectors
 001:  -------   0000000000   0000002047   0000002048   Unallocated
 ";
 
-        assert_eq!(parse_mmls_first_partition_offset(output), None);
+        assert_eq!(parse_mmls_primary_partition_offset(output), None);
+    }
+
+    /// Regression: on a full Windows disk image the first filesystem partition
+    /// is the tiny "System Reserved" boot volume; the OS/C: volume that holds
+    /// the event logs and registry is a separate, much larger partition. The
+    /// parser must select the largest (offset 718848), not the first (2048) —
+    /// selecting the first walked only ~166 files and extracted zero EVTX.
+    #[test]
+    fn mmls_parser_selects_largest_partition_not_the_system_reserved_stub() {
+        let output = r"DOS Partition Table
+Offset Sector: 0
+Units are in 512-byte sectors
+
+      Slot      Start        End          Length       Description
+000:  Meta      0000000000   0000000000   0000000001   Primary Table (#0)
+001:  -------   0000000000   0000002047   0000002048   Unallocated
+002:  000:000   0000002048   0000718847   0000716800   NTFS / exFAT (0x07)
+003:  000:001   0000718848   0023590911   0022872064   NTFS / exFAT (0x07)
+004:  -------   0023590912   0023592959   0000002048   Unallocated
+";
+
+        assert_eq!(
+            parse_mmls_primary_partition_offset(output),
+            Some(718_848 * 512)
+        );
+    }
+
+    /// The largest filesystem partition wins even when it is listed before the
+    /// smaller ones, so ordering never masks the size comparison.
+    #[test]
+    fn mmls_parser_selects_largest_partition_regardless_of_order() {
+        let output = r"      Slot      Start        End          Length       Description
+000:  Meta      0000000000   0000000000   0000000001   Primary Table (#0)
+002:  000:000   0000002048   0020000000   0019997953   NTFS / exFAT (0x07)
+003:  000:001   0020002048   0020718847   0000716800   NTFS / exFAT (0x07)
+";
+
+        assert_eq!(
+            parse_mmls_primary_partition_offset(output),
+            Some(2048 * 512)
+        );
     }
 }
