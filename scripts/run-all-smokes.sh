@@ -141,6 +141,31 @@ run_smoke \
     "evidence-agnostic-smoke (no image-specific hard-coding + anti-enumeration/anti-fabrication finding policy)" \
     "python3 scripts/evidence-agnostic-smoke.py"
 
+# 4b3. Attack-flow visualizer (offline STIX/Mermaid/DOT/D2/Navigator emit). The
+# presentation-only attack-flow package must produce all documented artifacts
+# from a fixture case and the two JSON artifacts must parse — no API calls, no
+# Findings created.
+run_smoke \
+    "attack-flow visualizer (offline STIX/Mermaid/summary/timeline/process-tree/Navigator emit)" \
+    "python3 scripts/attackflow-smoke.py"
+
+# 4b'. The report hook must work under the ENGINE's host python (may be 3.10), not
+# just the 3.11 agent venv. Guards the regression where the visualization was
+# silently dead in the live pipeline because the hook imported through the 3.11-only
+# findevil_agent package. Drives the real render_report._emit_attack_flow.
+run_smoke \
+    "attack-flow report hook under host python (live-pipeline parity)" \
+    "python3 scripts/attackflow-hostpy-smoke.py"
+
+# 4b''. Render/INTERACTION smoke: drives the emitted HTML in headless Chrome and
+# asserts on computed layout + behavior (histogram bars have real height, a facet
+# chip hides rows, the brush filters the timeline, the tree renders + expands).
+# The structure-only tests can't catch invisible renders or dead interactions;
+# this can. SKIPs cleanly when no Chrome/Chromium is installed.
+run_smoke \
+    "attack-flow render/interaction (headless Chrome, skips w/o a browser)" \
+    "python3 scripts/attackflow-render-smoke.py"
+
 # 4c. Windows readiness packet smoke. It uses PacketOnly synthetic evidence
 # and skips cleanly outside environments that can launch PowerShell.
 run_smoke \
