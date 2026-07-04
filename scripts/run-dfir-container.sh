@@ -17,6 +17,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${FINDEVIL_DFIR_IMAGE:-findevil/dfir:local}"
 CTR="${FINDEVIL_DFIR_CONTAINER:-findevil-dfir}"
 DOCKERFILE="${REPO_ROOT}/docker/dfir.Dockerfile"
+# Published image to pull before building locally (set FINDEVIL_DFIR_GHCR="" to
+# always build). Owner is derived from the origin remote.
+default_ghcr_owner() {
+  local url slug; url="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  slug="$(printf '%s' "$url" | sed -E 's#^[a-z]+://[^/]+/##; s#^[^:]+:##; s#\.git$##')"
+  printf '%s' "${slug%%/*}" | tr '[:upper:]' '[:lower:]'
+}
+GHCR_IMAGE="${FINDEVIL_DFIR_GHCR-ghcr.io/$(default_ghcr_owner)/verdict-dfir-toolkit:latest}"
 
 log() { printf '[dfir-container] %s\n' "$*"; }
 
@@ -29,12 +37,16 @@ EVIDENCE="${1:-}"
 
 command -v docker >/dev/null || { log "docker not found on PATH"; exit 1; }
 
-# 1. Build the image if absent.
-if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-  log "building ${IMAGE} (first run; installs the DFIR toolchain)..."
-  docker build -f "${DOCKERFILE}" -t "${IMAGE}" "${REPO_ROOT}"
-else
+# 1. Get the image: use local if present, else try pulling the published one
+#    (fast), else build it (slow, first run installs the whole toolchain).
+if docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   log "image ${IMAGE} present"
+elif [[ -n "${GHCR_IMAGE}" ]] && docker pull "${GHCR_IMAGE}" 2>/dev/null; then
+  log "pulled published image ${GHCR_IMAGE}"
+  docker tag "${GHCR_IMAGE}" "${IMAGE}"
+else
+  log "no local or published image — building ${IMAGE} (installs the DFIR toolchain)..."
+  docker build -f "${DOCKERFILE}" -t "${IMAGE}" "${REPO_ROOT}"
 fi
 
 # 2. (Re)start the container. Evidence is mounted read-only when supplied.

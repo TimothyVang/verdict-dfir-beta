@@ -67,8 +67,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && ln -sf /usr/bin/python3.11 /usr/bin/python
 
 # Volatility 3 — pinned to SIFT Workstation parity (requirements.txt).
+# Make the symbols dirs writable: vol downloads Windows PDB symbols on first use
+# and must cache them, but the non-root user cannot write the root-owned package
+# dir otherwise (windows.info et al. fail with an unsatisfied-symbol error).
 # hadolint ignore=DL3013
-RUN pip install --no-cache-dir 'volatility3==2.27.0'
+RUN pip install --no-cache-dir 'volatility3==2.27.0' \
+ && vol_dir="$(python3 -c 'import volatility3,os;print(os.path.dirname(volatility3.__file__))')" \
+ && mkdir -p "${vol_dir}/symbols" "${vol_dir}/framework/symbols" \
+ && chmod -R a+rwX "${vol_dir}/symbols" "${vol_dir}/framework/symbols"
 
 # INDXParse ($I30/INDX slack — the indx_parse lane). Not on PyPI, so install
 # from source, best-effort: it is an optional lane (BinaryNotFound-graceful), so
@@ -129,7 +135,8 @@ ENV RUSTUP_HOME=/opt/rust/rustup \
 RUN curl -fsSL https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" --component clippy,rustfmt \
  && curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
- && chmod -R a+rX /opt/rust
+ && chmod -R a+rX /opt/rust \
+ && chmod -R a+rwX /opt/rust/cargo
 
 # Point VERDICT's MCP tools at the toolchain. Every subprocess tool degrades to
 # a typed BinaryNotFound when absent, so these are hints, not hard requirements.

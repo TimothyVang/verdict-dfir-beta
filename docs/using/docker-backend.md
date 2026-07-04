@@ -28,17 +28,36 @@ The image pins Volatility 3, Hayabusa (**with its Sigma rules baked in**, so
 scans are never silently empty), Chainsaw, Velociraptor, Sleuth Kit, libewf,
 `tshark`, Suricata, `nfdump`, plus the Rust 1.88 + `uv` build environment.
 
-## Build and bring up
+## Download (recommended) or build
+
+The image is published to GHCR, so most users can just pull it (~2.3 GB) instead
+of building the toolchain locally:
 
 ```bash
-# Build the image (first run installs the toolchain, ~2.3 GB):
-docker build -f docker/dfir.Dockerfile -t findevil/dfir:local .
+docker pull ghcr.io/<owner>/verdict-dfir-toolkit:latest
+```
 
-# Bring it up as the tool backend, with evidence bind-mounted read-only:
+`scripts/run-dfir-container.sh` does this automatically — it uses a local image if
+present, else **pulls the published one**, else builds from the Dockerfile. So the
+common path is simply:
+
+```bash
 scripts/run-dfir-container.sh <path-to-evidence>
 ```
 
-`run-dfir-container.sh` builds the image if absent, starts a long-lived
+To build locally instead (offline, or to modify the toolchain):
+
+```bash
+docker build -f docker/dfir.Dockerfile -t findevil/dfir:local .
+```
+
+**Maintainers** publish a new image with `scripts/publish-dfir-image.sh <tag>`
+(needs a `write:packages` token in `GHCR_TOKEN`); CI also builds + pushes it on
+release. The pull target is overridable with `FINDEVIL_DFIR_GHCR`.
+
+## Bring up
+
+`run-dfir-container.sh` gets the image (per above), starts a long-lived
 `findevil-dfir` container with the repo bind-mounted read-write at `/workspace`
 and evidence read-only at `/evidence`, builds the MCP server inside it (mirroring
 how `sift-vm-bootstrap` builds it in the VM), and prints a toolchain check.
