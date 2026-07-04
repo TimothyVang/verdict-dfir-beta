@@ -11,7 +11,7 @@ Source-of-truth driven, not a hardcoded duplicate list:
 
 * Python (``findevil-agent-mcp``, 14 tools) — imported from the live
   registry via :func:`findevil_agent_mcp.tools.all_specs`.
-* Rust (``findevil-mcp``, 32 tools) — parsed out of the registration
+* Rust (``findevil-mcp``, 34 tools) — parsed out of the registration
   site ``services/mcp/src/server.rs`` (``build_registry()``), which is
   the single place the wire-level tool names are declared.
 
@@ -149,9 +149,9 @@ def python_tool_names() -> set[str]:
 
 class TestNoForbiddenVerbs:
     def test_rust_registry_enumerates_expected_count(self) -> None:
-        # Sanity: the Rust product surface is 31 audit-chained tools.
+        # Sanity: the Rust product surface is 34 audit-chained tools.
         names = rust_tool_names()
-        assert len(names) == 32, f"expected 32 Rust tools, parsed {len(names)}: {sorted(names)}"
+        assert len(names) == 34, f"expected 34 Rust tools, parsed {len(names)}: {sorted(names)}"
 
     def test_python_registry_enumerates_expected_count(self) -> None:
         # Sanity: the Python product surface is 14 audit-chained tools.

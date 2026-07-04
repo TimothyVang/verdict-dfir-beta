@@ -4,7 +4,7 @@ The agent has access to two MCP servers, both auto-spawned by Claude Code via `.
 
 | Server | Lang | Tools |
 |---|---|---|
-| `findevil-mcp` | Rust (`services/mcp/`) | 32 typed DFIR tools |
+| `findevil-mcp` | Rust (`services/mcp/`) | 34 typed DFIR tools |
 | `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 14 crypto + ACH + memory + ACP + expert-feedback + accuracy + AI-signature tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
 
 Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the canonical JSON output). Findings cite tool calls by `tool_call_id`. The verifier vetoes any finding that doesn't.
@@ -25,9 +25,9 @@ Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the can
 
 **Maturity note.** The long-tail verbs `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`,
 `cloud_audit`, `journalctl_query`, `login_accounting`, `ausearch`, `nfdump_query`,
-`suricata_eve`, and `indx_parse` are implemented as typed, allow-listed, shell-free tools and
-unit-tested against synthetic fixtures, but they have not yet been exercised on real evidence in a
-committed case run. The committed sample runs prove the core disk/registry/EVTX/MFT/Prefetch/YARA/
+`suricata_eve`, `indx_parse`, `thumbcache_parse`, and `hashset_lookup` are implemented as typed,
+allow-listed, shell-free tools and unit-tested against synthetic fixtures, but they have not yet
+been exercised on real evidence in a committed case run. The committed sample runs prove the core disk/registry/EVTX/MFT/Prefetch/YARA/
 USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` paths.
 
 > **Long-tail tool availability.** `scripts/setup` installs `volatility3`, `hayabusa` (+ Sigma
@@ -185,6 +185,16 @@ Use when: a carved NTFS `$I30`/INDX stream may hold slack entries for deleted fi
 Args: `{case_id, artifact_path}`
 Returns: `{is_oe_dbx, is_message_store, message_subject_count, subjects[], senders[], newsgroups[], hacking_newsgroups[]}`
 Use when: a carved Outlook Express `.dbx` mail/news store is in scope. **Pure Rust, in-process — no subprocess, no external binary** (no other parser reads DBX). Validates the OE file signature (`CF AD 12 FE`) before walking the store and extracts RFC822 `Subject`/`From`/`Newsgroups` headers. HONEST SCOPE: header-level only — no message bodies and no deleted-message recovery — so a recovered subject or newsgroup CONFIRMS store *content* (a mail/news-artifact fact at header granularity), never execution; intent stays a separate `hypothesis:` layer.
+
+### thumbcache_parse
+Args: `{case_id, thumbcache_path, limit?}`
+Returns: `{format: "olecfb_xp"|"cmmm", entries[]: {index?, cache_entry_hash?, original_filename?, modified_iso?, data_size_bytes, content_sha256?}, entries_seen, parse_errors[]}`
+Use when: a carved XP `Thumbs.db` or Vista+ `thumbcache_*.db` / `iconcache_*.db` (Explorer thumbnail cache) is in scope. **Pure Rust, in-process** (`cfb` crate for the XP OLE container; hand-rolled CMMM records for Vista+). Format detected by magic bytes, never filename. HONEST SCOPE: a cache entry CONFIRMS an image *existed and was rendered by Explorer* (surviving file deletion) — it is viewing/presence evidence at cache granularity, never execution and never proof the user opened the file at a specific time; XP catalog `modified_iso` is the cache's own timestamp. Fixture-tested only until exercised on a real image.
+
+### hashset_lookup
+Args: `{case_id, hashes[] (hex MD5/SHA1/SHA256, ≤10k), hashset_paths?[]: {path, disposition: known_good|known_bad, name?}}`
+Returns: `{results[]: {hash, disposition: known_good|known_bad|unknown, matched_sets[]}, sets_loaded[], hashes_checked}`
+Use when: triaging extracted/recovered file hashes against NSRL known-good or operator known-bad sets. **Pure Rust, in-process** — text sets stream (never loaded whole), SQLite sets (NSRL RDS v3 `FILE` schema or generic `hashes(hash)`) open read-only-immutable, parameterized queries only. Defaults to `$FINDEVIL_HASHSET_DIR/known_good/**` + `known_bad/**`; no sets configured degrades to all-`unknown`, never an error. HONEST SCOPE: `known_good` supports demotion/suppression, `known_bad` is a lead requiring corroboration — a hash match alone is never execution evidence. Fixture-tested only; not yet run against a full NSRL RDS download.
 
 ---
 

@@ -639,9 +639,17 @@ def synthetic_flow(client: StdioClient) -> int:
         )
         if not (mf["leaf_count"] >= 4 and len(mf["merkle_root_hex"]) == 64):
             fatal(f"manifest finalize unexpected: {mf}")
+        # Transparency anchoring is opt-in and absent by default: without
+        # anchor_transparency the manifest carries NO transparency_log block.
+        if (
+            mf.get("transparency_anchored") is not False
+            or mf.get("transparency_kind") is not None
+        ):
+            fatal(f"transparency anchor must be absent by default, got: {mf}")
         log(
             f"  -> {mf['leaf_count']} Merkle leaves, root={mf['merkle_root_hex'][:12]}..., "
-            f"sig sha256={mf['signature_payload_sha256'][:12]}..."
+            f"sig sha256={mf['signature_payload_sha256'][:12]}... "
+            "(transparency anchor absent by default)"
         )
 
         # ---- 9. manifest_verify (offline) ------------------------------
@@ -649,11 +657,16 @@ def synthetic_flow(client: StdioClient) -> int:
         mv = client.call_tool("manifest_verify", {"manifest_path": str(manifest_path)})
         if not mv["overall"]:
             fatal(f"manifest verification failed: {mv}")
+        # No anchor present -> transparency_ok is vacuously True and never gates.
+        if mv.get("transparency_ok") is not True:
+            fatal(f"transparency_ok must be vacuously True with no anchor, got: {mv}")
         log(
-            "  -> overall=True, audit_chain_ok={a}, merkle_root_ok={m}, sig_present={s}".format(
+            "  -> overall=True, audit_chain_ok={a}, merkle_root_ok={m}, sig_present={s}, "
+            "transparency_ok={t}".format(
                 a=mv["audit_chain_ok"],
                 m=mv["merkle_root_ok"],
                 s=mv["signature_present"],
+                t=mv["transparency_ok"],
             )
         )
 

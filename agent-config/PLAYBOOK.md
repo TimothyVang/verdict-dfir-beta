@@ -61,7 +61,7 @@ the at-a-glance map of *what exists* and *when it runs*.
 |---|---|---|
 | `case_open` | SHA-256 the evidence, open the Case, derive `case_id` | **every** run (first call) |
 | `disk_mount` | Loop/EWF-mount a disk image read-only (`ewfmount`+inner volume via TSK) | disk |
-| `disk_extract_artifacts` | Carve MFT/USN/Prefetch/Registry/yara-targets from the mount | disk |
+| `disk_extract_artifacts` | Carve MFT/USN/Prefetch/Registry/yara-targets from the mount; recovers deleted-but-metadata-intact files (`__deleted__/<inode>/`, realloc'd inodes skipped) | disk |
 | `disk_unmount` | Release the mount (finally-block) | disk |
 | `mft_timeline` | `$MFT` timeline, `$SI` vs `$FN` timestomp detection | disk |
 | `usnjrnl_query` | `$UsnJrnl` change log — corroborates MFT, surfaces deletes | disk |
@@ -117,7 +117,7 @@ Note: `scripts/find-evil-auto` intentionally deviates today for raw disk images:
 |---|---|---|---|
 | 1 | `case_open` | SHA-256 + case_id | both |
 | 2 | `disk_mount` | Mount read-only — EWF container via `ewfmount`, then the inner volume via TSK. **Local mode mounts the container only; the inner-volume mount needs the SIFT VM (`--sift`).** | both |
-| 3 | `disk_extract_artifacts` | Carve MFT/USN/Prefetch/Registry (and yara-targets, if any) to the work dir | both |
+| 3 | `disk_extract_artifacts` | Carve MFT/USN/Prefetch/Registry (and yara-targets, if any) to the work dir; deleted-but-metadata-intact files recover under `__deleted__/<inode>/` | both |
 | 4 | `mft_timeline` | Master File Table — what existed when, timestomp detection (`$SI` vs `$FN`) | both |
 | 5 | `prefetch_parse` | Per-binary execution evidence (run_count, last 8 run times) | A |
 | 6 | `usnjrnl_query` | Filesystem mutation log — corroborates MFT, surfaces deletes | both |

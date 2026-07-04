@@ -256,12 +256,11 @@ its facts (registry Run-key, EVTX EID 1102, the prefetch execution lead) and
 every INFERRED finding declares `asserted_values` or cites `derived_from`.
 
 The full-coverage run that gates this flip is committed: `SCHARDT.dd` with the
-gate on, `manifest_verify` **overall: true**. Committed recall for this case is
-run-dependent and below the 71% bar — **7/14 = 50%** on the richer runs
-(`docs/release-evidence/l3-local-sift.json`) and **5/14 = 36%** on leaner runs
-(`docs/sample-run/nist-hacking-case-sift/recall-score.json`). The gate governs
-fact-fidelity — which structured values a CONFIRMED finding may assert — not
-recall, so enabling it did not drop any legitimate finding. The reject path still has teeth
+gate on, `manifest_verify` **overall: true**. Recall for this case is **10/14 =
+71%**, at its floor (measured 2026-07-01, `docs/benchmark/RESULTS.md`; reproduces
+at 10/14 across repeat runs). The gate governs fact-fidelity — which structured
+values a CONFIRMED finding may assert — not recall, so enabling it did not drop
+any legitimate finding. The reject path still has teeth
 (`test_entailment.py`, `test_verifier.py::TestEntailmentCheck`,
 `test_fault_injection.py` pass), and `services/agent/tests/test_gate_coverage.py`
 re-checks that run's emitted CONFIRMED/INFERRED findings against the gate.

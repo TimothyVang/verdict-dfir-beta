@@ -84,6 +84,11 @@ from findevil_agent.correlator_gates import (
     apply_confidence_ceiling,
     strip_quoted_spans,
 )
+from findevil_agent.correlator_pid_check import (
+    MemoryProcess,
+    build_cross_artifact_findings,
+    cross_artifact_pid_check,
+)
 from findevil_agent.correlator_suppressors import (
     FpSuppressionDecision,
     evaluate_fp_suppressors,
@@ -361,12 +366,15 @@ __all__ = [
     "CrossHostCorrelation",
     "CrossHostOutcome",
     "FpSuppressionDecision",
+    "MemoryProcess",
     "SharedArtifact",
     "TemporalCouplingDecision",
     "apply_confidence_ceiling",
+    "build_cross_artifact_findings",
     "classify_evidence_type",
     "correlate",
     "correlate_cross_host",
+    "cross_artifact_pid_check",
     "evaluate_benign_clearance",
     "evaluate_fp_suppressors",
     "evaluate_temporal_coupling",

@@ -76,16 +76,28 @@ def _print_report(result: dict[str, Any]) -> None:
     print(f"=== VERDICT recall score — {result['case_id']} ===")
     print(f"  case_dir : {result['case_dir']}")
     print(f"  golden   : {result['golden']}")
+    rci = result.get("recall_ci_95")
+    rci_s = f"  95% CI [{rci[0]}, {rci[1]}%]" if rci else ""
     print(
         f"  recall   : {result['recalled_n']}/{result['expected_n']} "
-        f"= {result['recall_percent']}%  (min {result['min_recall_percent']}%)"
+        f"= {result['recall_percent']}%{rci_s}  (min {result['min_recall_percent']}%)"
     )
     scored = "scored" if result["precision_scored"] else "open-world (not scored)"
+    pci = result.get("precision_ci_95")
+    pci_s = f"  95% CI [{pci[0]}, {pci[1]}%]" if pci else ""
     print(
-        f"  precision: {result['precision_percent']}%  "
+        f"  precision: {result['precision_percent']}%{pci_s}  "
         f"(F1 {result['f1']}; {result['false_positives_n']} FP / "
         f"{result['extra_n']} extra of {result['run_finding_n']} findings; {scored})"
     )
+    missed = result.get("missed_by_name") or {}
+    if missed.get("count"):
+        names = "; ".join(
+            (m.get("description") or m.get("finding_id") or "?")[:48]
+            for m in missed["items"][:3]
+        )
+        more = f" (+{missed['count'] - 3} more)" if missed["count"] > 3 else ""
+        print(f"  missed   : {missed['count']} false negative(s) — {names}{more}")
     print(f"  halluc.  : {result['hallucination_rate']}")
     print(
         f"  fp_planted: {result['fp_planted']} (planted bait the run must not assert)"

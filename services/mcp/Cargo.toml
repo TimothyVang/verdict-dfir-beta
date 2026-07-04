@@ -81,6 +81,14 @@ usnjrnl-forensic = "=0.7.3"
 # libsqlite3-dev (fully reproducible). Already resolved at 0.32.1 in the lock.
 rusqlite = { version = "=0.32.1", features = ["bundled"] }
 
+# cfb — MIT, pure-Rust Compound File Binary (OLE2/CFB) reader.
+# Used by `thumbcache_parse` to read XP-era `Thumbs.db` thumbnail caches
+# (the `Catalog` stream + per-index thumbnail streams). Runtime use is
+# read-only; the crate's write face is used only by tests to synthesize
+# fixtures. Pinned exact per the spec's library pin discipline; MSRV 1.74
+# (toolchain is pinned at 1.88).
+cfb = "=0.14.0"
+
 # UUID v4 for deterministic case_id generation.
 uuid = { version = "1", features = ["v4", "serde"] }
 

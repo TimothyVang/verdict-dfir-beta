@@ -2501,8 +2501,36 @@ def inject_offline_audit_embed(html_text: str, audit_text: str) -> str:
     return html_text[:idx] + block + html_text[idx:]
 
 
+def _emit_attack_flow(case_dir: "Path") -> str:
+    """Render attack-flow + process-tree panels. Presentation only.
+
+    Never raises: a visualization failure must not break the custody report.
+    Returns an HTML snippet to embed, or "" on any failure.
+    """
+    try:
+        # Import attackflow as a TOP-LEVEL package (its parent dir on sys.path), NOT
+        # as findevil_agent.attackflow — the deterministic engine runs under host
+        # python3 (may be 3.10), where findevil_agent/__init__.py -> config.py pulls
+        # 3.11-only names (StrEnum, datetime.UTC) and would fail. attackflow itself is
+        # pure stdlib + relative imports, so it loads cleanly on 3.10 this way.
+        attackflow_parent = (
+            Path(__file__).resolve().parents[1] / "services" / "agent" / "findevil_agent"
+        )
+        if str(attackflow_parent) not in sys.path:
+            sys.path.insert(0, str(attackflow_parent))
+        from attackflow import emit as _emit
+
+        return _emit(Path(case_dir)).html_snippet
+    except Exception as exc:  # noqa: BLE001 - viz must never break the report
+        try:
+            print(f"[attack-flow] skipped: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+        return ""
+
+
 def render_html_pdf(
-    md_path: Path, figures: dict[str, str] | None = None
+    md_path: Path, figures: dict[str, str] | None = None, extra_html: str = ""
 ) -> tuple[Path, Path | None]:
     case_dir = md_path.parent
     html = case_dir / f"{md_path.stem}.html"
@@ -2548,6 +2576,22 @@ def render_html_pdf(
             text = inject_offline_audit_embed(
                 text, audit_path.read_text(encoding="utf-8")
             )
+        if extra_html:
+            # Lead with it: insert right after the report title (first </h1>) so the
+            # at-a-glance attack-flow summary opens the report instead of trailing it.
+            # Fall back to just-inside <body>, else prepend. (pandoc runs with
+            # -raw_html, so this must be spliced into the rendered HTML, not the md.)
+            h1 = text.find("</h1>")
+            if h1 != -1:
+                pos = h1 + len("</h1>")
+                text = text[:pos] + "\n" + extra_html + "\n" + text[pos:]
+            else:
+                body = text.find("<body")
+                if body != -1:
+                    bend = text.find(">", body) + 1
+                    text = text[:bend] + "\n" + extra_html + "\n" + text[bend:]
+                else:
+                    text = extra_html + "\n" + text
         html.write_text(_colorize_html(text), encoding="utf-8")
     except Exception:
         pass
@@ -2713,6 +2757,8 @@ def render_report(
         except json.JSONDecodeError:
             verdict_obj = {}
 
+    attack_flow_html = _emit_attack_flow(case_dir)
+
     # Rendered Self-Correction block: read the committed verdict_revision
     # records read-only (default-ON env gate, custody chain untouched). Prefer
     # the verdict.json mirror when present, otherwise recover the flips straight
@@ -2840,7 +2886,7 @@ def render_report(
         score_basis=str(verdict_obj.get("score_basis", "")),
         reason_codes=verdict_obj.get("reason_codes", []),
     )
-    html, pdf = render_html_pdf(md, figures=figures_html)
+    html, pdf = render_html_pdf(md, figures=figures_html, extra_html=attack_flow_html)
     # Render the companion internal QA/signoff packet (no figure placeholders).
     internal_md = case_dir / "REPORT-internal.md"
     if internal_md.is_file():

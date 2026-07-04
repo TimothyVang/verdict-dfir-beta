@@ -303,11 +303,15 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "evidence_type": "extracted_disk",
             "parser_tool": "plaso_parse",
         }
-    if name == "thumbs.db" or name.endswith(".thumbcache"):
+    if (
+        name == "thumbs.db"
+        or name.endswith(".thumbcache")
+        or (name.startswith(("thumbcache_", "iconcache_")) and name.endswith(".db"))
+    ):
         return {
             "artifact_class": "thumbnail",
             "evidence_type": "extracted_disk",
-            "parser_tool": None,
+            "parser_tool": "thumbcache_parse",
         }
     if name in {
         "history",

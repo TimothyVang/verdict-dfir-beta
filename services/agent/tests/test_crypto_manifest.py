@@ -2,18 +2,55 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
+from findevil_agent.crypto import anchor
 from findevil_agent.crypto.audit_log import AuditLog
 from findevil_agent.crypto.manifest import (
     MANIFEST_VERSION,
     ManifestLeaf,
+    _to_json_safe,
     build_manifest,
     verify_manifest,
     write_manifest,
 )
 from findevil_agent.crypto.signer import StubSigner
+
+
+def _good_transparency_block(merkle_root_hex: str) -> dict:
+    """A valid Rekor ``transparency_log`` block whose single-leaf RFC-6962
+    inclusion proof genuinely verifies offline (no network)."""
+    body = anchor._build_statement(merkle_root_hex)._contents
+    body_b64 = base64.b64encode(body).decode("ascii")
+    root_hex = hashlib.sha256(b"\x00" + body).hexdigest()
+    return {
+        "kind": "rekor",
+        "anchored": True,
+        "subject": {"merkle_root_sha256": merkle_root_hex},
+        "statement_type": "https://in-toto.io/Statement/v1",
+        "predicate_type": "https://verdict.dev/attestations/audit-merkle-root/v1",
+        "rekor": {
+            "url": "https://rekor.sigstore.dev",
+            "log_id": "c0ffee",
+            "log_index": 0,
+            "integrated_time": 1_700_000_000,
+            "entry_uuid": "deadbeef",
+            "body": body_b64,
+            "inclusion_proof": {
+                "checkpoint": "rekor - 000\n1\n<root>\n",
+                "hashes": [],
+                "log_index": 0,
+                "root_hash": root_hex,
+                "tree_size": 1,
+            },
+        },
+        "tsa": None,
+        "fallback_reason": None,
+    }
 
 
 def _seed_log(path: Path) -> AuditLog:
@@ -632,4 +669,86 @@ class TestEntailmentReVerification:
         assert result.entailment_ok is not True
         assert "entailment re-check failed" in str(result.entailment_ok)
         # entailment_ok is a separate signal; chain/merkle/signature still pass.
+        assert result.overall is True
+
+
+class TestTransparencyAnchor:
+    """The optional Rekor/RFC-3161 anchor is a NON-GATING side-signal attached
+    AFTER signing. These prove the absent-by-default custody invariant: adding
+    the block never invalidates the signature and never flips ``overall``."""
+
+    def _ed25519_manifest(self, tmp_path: Path):
+        from findevil_agent.crypto.signer import LocalEd25519Signer
+
+        log = _seed_log(tmp_path / "audit.jsonl")
+        return build_manifest(
+            case_id="case-anchor",
+            run_id="anchor-1",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=LocalEd25519Signer(key_path=tmp_path / "signing.key"),
+        )
+
+    def test_block_excluded_from_signed_body(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path)
+        anchored = replace(
+            manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
+        )
+        # The signed body (exclude_signature=True) must drop BOTH signature and
+        # transparency_log — otherwise the after-signing anchor would be in the
+        # bytes the signature covers.
+        signed_body = _to_json_safe(anchored, exclude_signature=True)
+        assert "transparency_log" not in signed_body
+        assert "signature" not in signed_body
+        # The on-disk form (exclude_signature=False) keeps both.
+        on_disk = _to_json_safe(anchored)
+        assert "transparency_log" in on_disk
+        assert "signature" in on_disk
+
+    def test_ed25519_still_verifies_offline_with_anchor_present(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path)
+        anchored = replace(
+            manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
+        )
+        path = write_manifest(anchored, tmp_path / "run.manifest.json")
+
+        result = verify_manifest(path)
+        # The core claim: attaching + re-writing the anchor does NOT break the
+        # already-computed Ed25519 signature.
+        assert result.signature_kind == "ed25519"
+        assert result.signature_verified is True, result.signature_verified
+        assert result.overall is True
+        # And the anchor itself verifies offline (real RFC-6962 inclusion proof).
+        assert result.transparency_ok is True, result.transparency_ok
+
+    def test_overall_unchanged_by_anchor_presence(self, tmp_path: Path) -> None:
+        # Build once, verify without the anchor, then verify WITH it — overall
+        # must be identical (True) both ways.
+        manifest = self._ed25519_manifest(tmp_path)
+        bare = write_manifest(manifest, tmp_path / "bare.manifest.json")
+        bare_result = verify_manifest(bare)
+
+        anchored = replace(
+            manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
+        )
+        anchored_path = write_manifest(anchored, tmp_path / "anchored.manifest.json")
+        # Point the anchored manifest's verification at the same audit log.
+        anchored_result = verify_manifest(anchored_path, audit_log_path=tmp_path / "audit.jsonl")
+        assert bare_result.overall is True
+        assert anchored_result.overall == bare_result.overall
+
+    def test_corrupted_anchor_flagged_but_does_not_gate_overall(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path)
+        block = _good_transparency_block(manifest.merkle_root_hex)
+        # Corrupt the inclusion proof's declared root so it no longer chains.
+        block["rekor"]["inclusion_proof"]["root_hash"] = "ff" * 32
+        anchored = replace(manifest, transparency_log=block)
+        path = write_manifest(anchored, tmp_path / "run.manifest.json")
+
+        result = verify_manifest(path)
+        # The corruption is surfaced honestly as a reason string ...
+        assert result.transparency_ok is not True
+        assert "inclusion proof" in str(result.transparency_ok)
+        # ... but the signature is intact and overall stays True (non-gating).
+        assert result.signature_verified is True
         assert result.overall is True

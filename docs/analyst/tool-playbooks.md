@@ -1,6 +1,6 @@
 > **Status: ACTIVE.** Operator-facing per-tool guidance for the under-documented corners of the typed MCP surface — the args, hive locations, scope caps, and failure modes that the per-tool entries in `agent-config/TOOLS.md` summarize but don't expand. Read this before driving these tools on a Case; read `agent-config/MEMORY.md` for the Tier-1 artifact caveats it builds on.
 
-Scope: the 45 product tools (32 Rust `findevil-mcp` + 13 Python `findevil-agent-mcp`) are the only audit-chained surface; `.mcp.json` registers 6 servers total (4 non-product, incl. `qmd` dev-memory). Canonical inventory and pins:
+Scope: the 48 product tools (34 Rust `findevil-mcp` + 14 Python `findevil-agent-mcp`) are the only audit-chained surface; `.mcp.json` registers 6 servers total (4 non-product, incl. `qmd` dev-memory). Canonical inventory and pins:
 
 - Tool inventory & server map → [`docs/reference/mcp-and-tools.md`](../reference/mcp-and-tools.md)
 - Crate/binary versions → [`docs/reference/dependencies.md`](../reference/dependencies.md)

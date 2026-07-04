@@ -194,7 +194,7 @@ Reaching Ship means the DoD was verified **this cycle**, not earlier. Re-run the
 more if any edit happened since the last green.
 
 This repo's remotes (verify with `git remote -v`): `origin` = `TimothyVang/dev-verdict-github` is
-**dev**; `release` = `TimothyVang/verdict-dfir` and `beta` = `verdict-dfir-community` are
+**dev**; `release` = `TimothyVang/verdict-dfir` and `beta` = `verdict-dfir-beta` are
 public/protected. The loop ships to **dev only**.
 
 1. **Confirm the branch** — you're on the worktree's `<type>/<short-topic>` branch, never the

@@ -2,6 +2,20 @@
 
 Agent instructions for **VERDICT DFIR**. This file is for Codex, OpenCode, and other coding agents that follow the `AGENTS.md` convention. Claude Code also reads `CLAUDE.md`; for Claude-specific runtime behavior, `CLAUDE.md` is authoritative.
 
+## VERDICT ecosystem — what is what
+
+VERDICT is a local-first DFIR (digital forensics & incident response) agent platform, split into three repos:
+
+| Repo | Role | It is… |
+|---|---|---|
+| [`caseforge-core`](https://github.com/TimothyVang/caseforge-core) | Headless **controller**: privacy routing, model selection, structured findings, custody validation, the `caseforge` CLI. | the **driver** |
+| [`verdict-opencode`](https://github.com/TimothyVang/verdict-opencode) | The agent **runtime** — a branded fork of [opencode](https://github.com/sst/opencode); the `verdict` binary is built from it. | the **engine** |
+| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 32 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
+
+**Runtime flow:** `caseforge` (controls + guards) → `verdict` binary (runs the agent) → **this repo's `findevil` MCP tools (do the forensics)** → hash-chained custody → `caseforge verify`.
+
+**Two rules everything obeys:** the LLM is not the forensic source of truth (findings must cite a `tool_call_id` + `output_sha256` + verified manifest); real evidence stays local by default.
+
 ## Start Here
 
 - Work from the repository root.

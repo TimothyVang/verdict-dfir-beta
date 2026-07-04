@@ -88,7 +88,7 @@ Fixtures live in `fixtures/`; to investigate one, point `verdict` at it directly
 ## 3. Supported evidence types and their PLAYBOOK path
 
 `case_open` inspects the path's extension and size, then the supervisor picks one of the
-[`agent-config/PLAYBOOK.md`](https://github.com/TimothyVang/verdict-dfir-community/blob/main/agent-config/PLAYBOOK.md) sequences below. The tool
+[`agent-config/PLAYBOOK.md`](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/agent-config/PLAYBOOK.md) sequences below. The tool
 names map to the typed product surface documented in
 [`docs/reference/mcp-and-tools.md`](../reference/mcp-and-tools.md).
 
@@ -161,7 +161,7 @@ Every Case starts with `case_open`, and that step is the chain-of-custody anchor
   Adding a write path or an `execute_shell` verb is a non-negotiable invariant violation.
 - **Mid-run tamper is fatal.** If the evidence is modified out-of-band during a run, the
   chain of custody is compromised and the supervisor refuses to sign the manifest.
-- **The 46 product tools are the only audit-chained surface** (32 Rust + 14 Python).
+- **The 48 product tools are the only audit-chained surface** (34 Rust + 14 Python).
   `.mcp.json` registers 6 servers total; the other 4 are non-product conveniences and
   are not part of the signed chain. See
   [`docs/reference/mcp-and-tools.md`](../reference/mcp-and-tools.md) for the full map and

@@ -47,6 +47,7 @@ use crate::tools::{
     disk::{disk_extract_artifacts, disk_mount, disk_unmount},
     evtx_query::evtx_query,
     ez_parse::ez_parse,
+    hashset_lookup::hashset_lookup,
     hayabusa_scan::hayabusa_scan,
     indx_parse::indx_parse,
     journalctl_query::journalctl_query,
@@ -61,6 +62,7 @@ use crate::tools::{
     registry_query::registry_query,
     suricata_eve::suricata_eve,
     sysmon_network_query::sysmon_network_query,
+    thumbcache_parse::thumbcache_parse,
     usnjrnl_query::usnjrnl_query,
     vel_collect::vel_collect,
     vol_malfind::vol_malfind,
@@ -71,11 +73,12 @@ use crate::tools::{
     yara_scan::yara_scan,
     zeek_summary::zeek_summary,
     AusearchInput, BrowserHistoryInput, CaseOpenInput, CloudAuditInput, DiskExtractArtifactsInput,
-    DiskMountInput, DiskUnmountInput, EvtxQueryInput, EzParseInput, HayabusaInput, IndxParseInput,
-    JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput, NfdumpQueryInput,
-    OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, RegistryInput,
-    SuricataEveInput, SysmonNetworkInput, UsnJrnlInput, VelCollectInput, VolMalfindInput,
-    VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, YaraInput, ZeekSummaryInput,
+    DiskMountInput, DiskUnmountInput, EvtxQueryInput, EzParseInput, HashsetLookupInput,
+    HayabusaInput, IndxParseInput, JournalctlQueryInput, LoginAccountingInput, MacTriageInput,
+    MftInput, NfdumpQueryInput, OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput,
+    RegistryInput, SuricataEveInput, SysmonNetworkInput, ThumbcacheParseInput, UsnJrnlInput,
+    VelCollectInput, VolMalfindInput, VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput,
+    YaraInput, ZeekSummaryInput,
 };
 use crate::CRATE_VERSION;
 
@@ -796,6 +799,39 @@ fn build_registry() -> Vec<ToolEntry> {
             handler: |args| dispatch_oe_dbx_parse(args),
         },
         ToolEntry {
+            name: "thumbcache_parse",
+            description: "Parse a Windows thumbnail cache: an XP-era Thumbs.db (OLE/CFB compound \
+                 file — Catalog stream + per-index thumbnail streams) or a Vista+ \
+                 thumbcache_*.db / iconcache_*.db (flat CMMM records; Vista/Win7/Win8+ layouts). \
+                 The thumbnail cache is the canonical 'an image file existed / was viewed here' \
+                 artifact: a catalog row plus a cached thumbnail survives after the original \
+                 image is deleted. Format is detected by magic bytes (D0CF11E0 OLE vs CMMM), \
+                 never by filename. \
+                 XP entries carry index + original_filename + modified_iso (the original file's \
+                 FILETIME as ISO-8601Z) + data size + SHA-256 of the embedded thumbnail bytes; \
+                 Vista+ entries carry the 64-bit cache_entry_hash (16-char lowercase hex) + data \
+                 size + SHA-256 (the Vista+ format stores no filename or timestamp — the mapping \
+                 lives in Windows.edb). Raw image bytes are NEVER returned — only sizes and \
+                 digests, so a recovered thumbnail can be corroborated byte-for-byte. Output is \
+                 sorted by (index, cache_entry_hash) and carries no wall-clock values — \
+                 deterministic for verify_finding replay. Truncated/corrupt tails stop cleanly \
+                 and are recorded in parse_errors. \
+                 Use AFTER case_open / disk_mount / disk_extract_artifacts; thumbcache_path is \
+                 one cache file. Default limit 500 entries. \
+                 ERRORS: NotFound / NotRegular (verify the path), TooLarge (files over 512 MiB \
+                 are refused), NotThumbcache (magic is neither OLE/CFB nor CMMM, or an OLE file \
+                 with no Catalog stream — e.g. an Office document), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse Windows Thumbnail Cache (Thumbs.db / thumbcache_*.db)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<ThumbcacheParseInput>(),
+            handler: |args| dispatch_thumbcache_parse(args),
+        },
+        ToolEntry {
             name: "mac_triage",
             description: "Run ONE allow-listed mac_apt module against a mounted macOS image and \
                  return the decoded rows. mac_apt is the macOS supertool — its modules parse \
@@ -1128,6 +1164,45 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<BrowserHistoryInput>(),
             handler: |args| dispatch_browser_history(args),
+        },
+        ToolEntry {
+            name: "hashset_lookup",
+            description: "Look up file hashes against operator-provisioned known-good and \
+                 known-bad hash sets — Autopsy-class NSRL hash flagging behind a typed \
+                 read-only tool. Use AFTER case_open. hashes[] takes 1-10000 hex MD5(32)/\
+                 SHA-1(40)/SHA-256(64) digests (validated, lowercased, deduplicated). \
+                 hashset_paths[] optionally names explicit set files \
+                 {path, disposition: known_good|known_bad, name?}; when empty, the tool \
+                 enumerates $FINDEVIL_HASHSET_DIR/known_good/** and known_bad/** \
+                 (.txt/.hashes text sets, .db/.sqlite/.sqlite3 SQLite sets; disposition \
+                 from the subdirectory, name = file stem). A missing env var/dir degrades \
+                 honestly: empty sets_loaded, every hash unknown — never an error. \
+                 Text sets (one hex hash per line, '#' comments) are STREAMED so multi-GB \
+                 NSRL exports never load into memory. SQLite sets open READ-ONLY+immutable \
+                 (never writes -wal/-journal next to the set) and support NSRL RDS v3 \
+                 (FILE table, md5/sha1/sha256 columns) and generic hashes(hash) schemas \
+                 via parameterized lookups only; an unrecognized schema records an error \
+                 on that set's sets_loaded entry and is skipped. \
+                 Returns results[] {hash, disposition: known_good|known_bad|unknown, \
+                 matched_sets[]} sorted by hash — known_bad takes precedence over \
+                 known_good when both match — plus sets_loaded[] {name, kind: \
+                 text|sqlite_rds|sqlite_generic, disposition, path, error?} sorted by \
+                 name, and hashes_checked (unique count). Deterministic: no wall-clock. \
+                 HONEST SCOPE: a known_bad match is a LEAD until corroborated (hash sets \
+                 can be stale or mislabeled); known_good means only 'present in a \
+                 reference set' — NEVER proof a file is benign; unknown means only that \
+                 the loaded sets did not contain the hash. \
+                 ERRORS: BadHashCount / InvalidHash (fix the hashes array — set-level \
+                 failures never error, they degrade into sets_loaded[].error).",
+            annotations: ToolAnnotations {
+                title: "Look Up Hash Sets (NSRL / Known-Bad)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<HashsetLookupInput>(),
+            handler: |args| dispatch_hashset_lookup(args),
         },
     ]
 }
@@ -1628,6 +1703,25 @@ fn dispatch_oe_dbx_parse(args: Value) -> Result<Value, ToolError> {
     }
 }
 
+fn dispatch_thumbcache_parse(args: Value) -> Result<Value, ToolError> {
+    let input: ThumbcacheParseInput = parse_args(args)?;
+    // NotFound / NotRegular / TooLarge / NotThumbcache are user-input errors
+    // (wrong path, or the file is not a thumbnail cache); surface as -32602
+    // so the agent corrects the call. Read is a system IO issue → -32603.
+    match thumbcache_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::ThumbcacheParseError::NotFound(_)
+            | crate::tools::ThumbcacheParseError::NotRegular(_)
+            | crate::tools::ThumbcacheParseError::TooLarge { .. }
+            | crate::tools::ThumbcacheParseError::NotThumbcache(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("thumbcache_parse: {e}"))),
+    }
+}
+
 fn dispatch_mac_triage(args: Value) -> Result<Value, ToolError> {
     let input: MacTriageInput = parse_args(args)?;
     // ModuleNotAllowed / ImageNotFound are user-input errors; surface as -32602.
@@ -1782,6 +1876,21 @@ fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
             | crate::tools::BrowserHistoryError::UnknownSchema(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("browser_history: {e}"))),
+    }
+}
+
+fn dispatch_hashset_lookup(args: Value) -> Result<Value, ToolError> {
+    let input: HashsetLookupInput = parse_args(args)?;
+    // Every HashsetLookupError variant is a user-input problem (bad hash
+    // count / non-hex hash) → -32602 so the agent fixes the hashes array.
+    // Set-level failures (missing file, unsupported schema, corrupt DB)
+    // are NOT errors — they degrade into sets_loaded[].error so a partial
+    // hash-set inventory still yields an honest result.
+    match hashset_lookup(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e) => Err(ToolError::InvalidParams(format!("{e}"))),
     }
 }
 
@@ -1969,6 +2078,8 @@ mod tests {
             "vel_collect",
             "browser_history",
             "oe_dbx_parse",
+            "hashset_lookup",
+            "thumbcache_parse",
         ];
         assert_eq!(names.len(), expected.len());
         for want in expected {

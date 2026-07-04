@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -637,6 +638,27 @@ def _per_tactic_recall(
     return out
 
 
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> list[float] | None:
+    """Wilson score 95% confidence interval for a k/n rate, as ``[low%, high%]``.
+
+    Returns ``None`` when ``n == 0`` (no trials, no interval). The Wilson interval
+    is used rather than the naive normal approximation because it stays inside
+    [0, 100] and is well-behaved at the small n and extreme rates a golden corpus
+    produces — e.g. a 7/7 recall must not report a symmetric band that runs past
+    100%, and a rate should carry the honest uncertainty of its sample size
+    (recall 7/14 on one image is 50% with a wide band, not a settled number).
+    """
+    if n <= 0:
+        return None
+    p = k / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    low = max(0.0, center - margin)
+    high = min(1.0, center + margin)
+    return [round(low * 100, 1), round(high * 100, 1)]
+
+
 def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     """Grade a finished Case directory against a ground-truth golden.
 
@@ -777,6 +799,9 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
         "expected_n": expected_n,
         "recalled_n": recalled_n,
         "recall_percent": recall_percent,
+        # Wilson 95% CI on the recall rate (recalled_n of expected_n): the honest
+        # sample-size uncertainty behind the point estimate, not a settled number.
+        "recall_ci_95": _wilson_ci(recalled_n, expected_n),
         "per_tactic_recall": _per_tactic_recall(expected, assignment),
         "min_recall_percent": min_recall,
         "run_finding_n": total_run,
@@ -786,6 +811,8 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
         "candidate_fp_n": len(candidate_fp_for_human_review),
         "fp_planted": fp_planted,
         "precision_percent": precision_percent,
+        # Wilson 95% CI on the precision rate (recalled_n of recalled_n + fp_n).
+        "precision_ci_95": _wilson_ci(recalled_n, precision_denom),
         "precision_scored": precision_scored,
         "exhaustive": exhaustive,
         "f1": f1,

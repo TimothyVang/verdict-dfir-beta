@@ -43,13 +43,24 @@ coverage was too limited to scope a clearance, and **`NO_EVIL`** means no report
 artifacts actually examined. `NO_EVIL` is never a whole-environment clean bill of health: coverage is
 bounded, and what was not examined is not the same as absent.
 
-The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT also
-ships its **reference agent**: running `scripts/verdict <evidence>` (or `claude`) in this repo turns
-that [Claude Code](https://claude.com/claude-code) session into the analyst — it opens the Case,
-drives the tools, runs the verifier, and signs the verdict, with no separate application server. It is
-not an autonomous responder: the analyst approves the plan, and before any Finding reaches the report
-the verifier re-runs every cited tool to confirm its output reproduces. Replay reproduces the
-operation; it does not validate the interpretation.
+The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT runs
+in three modes, and it matters which one you're in:
+
+1. **Default — deterministic engine.** `scripts/verdict <evidence>` runs a headless detection
+   engine (curated DFIR signature logic + ACH scoring) over the same typed tools and custody spine —
+   **zero LLM calls** (`token_usage: llm_api_calls 0` in the committed trace). This is the proven,
+   benchmarked path.
+2. **Interactive analyst.** Run [`claude`](https://claude.com/claude-code) in this repo and type
+   `/verdict <evidence>`: that Claude Code session becomes the analyst — it opens the Case, drives
+   the tools, runs the verifier, and signs the verdict, with no separate application server.
+3. **Agent mode (opt-in, experimental).** `scripts/verdict --agent` swaps the pools for a
+   provider-agnostic LLM tool-use loop (Claude, OpenAI-compatible, or local endpoints). Currently
+   live-verified on single-artifact evidence (e.g. one EVTX); not yet proven at disk/memory scale.
+
+None of these is an autonomous responder: the verdict, custody, and verification guarantees are
+enforced by deterministic code either way — before any Finding reaches the report the verifier
+re-runs every cited tool to confirm its output reproduces. Replay reproduces the operation; it does
+not validate the interpretation.
 
 > **The tools give any agent a read-only forensic surface; the verdict, custody, and verification
 > guarantees come from VERDICT's orchestration layer** (the verifier, the ≥2-artifact-class gate, the
@@ -58,9 +69,23 @@ operation; it does not validate the interpretation.
 
 <p align="center"><sub><b>Drives:</b> memory images · EVTX · disk images (<code>.E01</code>/<code>.dd</code>) · packet captures · registry · MFT · Prefetch · Velociraptor · whole multi-host case folders</sub></p>
 
-- **Plug it into your agent** — two standard MCP stdio servers (32 Rust + 14 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
+- **Plug it into your agent** — two standard MCP stdio servers (34 Rust + 14 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
 - **Stay read-only by design** — no `execute_shell`; every tool is a narrow, schema-validated read-only verb, and evidence is hashed first and never mutated.
 - **Verify it offline** — runs seal into a hash-chained audit log → Merkle root → signed manifest; `manifest_verify` confirms the whole chain offline.
+
+## VERDICT ecosystem — what is what
+
+VERDICT is a local-first DFIR (digital forensics & incident response) agent platform, split into three repos:
+
+| Repo | Role | It is… |
+|---|---|---|
+| [`caseforge-core`](https://github.com/TimothyVang/caseforge-core) | Headless **controller**: privacy routing, model selection, structured findings, custody validation, the `caseforge` CLI. | the **driver** |
+| [`verdict-opencode`](https://github.com/TimothyVang/verdict-opencode) | The agent **runtime** — a branded fork of [opencode](https://github.com/sst/opencode); the `verdict` binary is built from it. | the **engine** |
+| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 34 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
+
+**Runtime flow:** `caseforge` (controls + guards) → `verdict` binary (runs the agent) → **this repo's `findevil` MCP tools (do the forensics)** → hash-chained custody → `caseforge verify`.
+
+**Two rules everything obeys:** the LLM is not the forensic source of truth (findings must cite a `tool_call_id` + `output_sha256` + verified manifest); real evidence stays local by default.
 
 ## Install and run
 
@@ -74,26 +99,30 @@ operation; it does not validate the interpretation.
 **One-liner** — clones the repo and runs setup:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-community/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/install.sh | bash
 ```
 
 This is a convenience wrapper around the steps below, **not** a standalone binary
-download. VERDICT is a Claude Code agent over a real forensics toolchain, so the
-wrapper still needs `git` and a Claude Code credential present; on a bare machine it
+download. VERDICT is a real forensics toolchain, so the wrapper still needs `git`
+and a Claude Code credential present (the preflight requires one; see below); on a
+bare machine it
 relies on the official Rust/uv/Node installers (driven by setup's `--bootstrap`). It
 will not run a Case by itself — it gets you to a green `scripts/setup`. Prefer to see
 every step? Run them yourself:
 
 ```bash
-git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-community.git verdict
+git clone --depth 1 https://github.com/TimothyVang/verdict-dfir-beta.git verdict
 cd verdict
 bash scripts/setup            # toolchain + DFIR binaries + both MCP servers + preflight doctor
 scripts/verdict <path-to-evidence>
 ```
 
 Before your first Case you also need a **Claude Code credential**: a logged-in `claude`,
-`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. VERDICT drives the tools as a Claude Code agent, so
-`scripts/verdict` needs one to run. `scripts/setup` will go green without it; a Case will not.
+`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. The preflight doctor checks for one before any
+run, so `scripts/verdict` will not start a Case without it — even though the default deterministic
+engine itself makes zero LLM calls (the credential is exercised only by the interactive analyst
+path and agent mode's default `claude_cli` backend). `scripts/setup` will go green without it; a
+Case will not.
 
 Point it at supported evidence — a memory image, EVTX log, disk image (`.E01` / `.dd`), packet
 capture, Velociraptor collection, or a whole multi-host case folder. Output lands in
@@ -304,7 +333,7 @@ custody** → the **presentation** layer, with trust boundaries marked.
 
 The same pipeline mapped to the repository — entrypoints (`scripts/`), the agent loop governed by
 `agent-config/`, the `.mcp.json` surface (product servers `findevil-mcp` + `findevil-agent-mcp` =
-45 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
+48 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
 emit findings), the SIFT DFIR tools, the read-only evidence vault, the custody chain
 (`audit.jsonl` → `manifest_finalize` → `manifest_verify`), and the outputs:
 
@@ -384,14 +413,14 @@ reproducible with `scripts/score-recall.py`; full method and caveats are in
 | Case | Evidence | Recall (bar) | Run verdict | What it shows |
 |---|---|---|---|---|
 | **Nitroba** | network (PCAP) | **5/5 = 100%** (80%) | `INDETERMINATE` | Full network-evidence recall with no over-attribution. All five golden facts surfaced; attribution stays `INFERRED` / `HYPOTHESIS`, so the verdict scopes down. The strongest single result. |
-| **NIST Hacking Case** | disk (Windows XP) | **5/14 = 36%** committed run (up to 7/14 = 50% on richer 27-finding runs; bar 71%) | `SUSPICIOUS` | 8 CONFIRMED tool-artifact findings — Prefetch-backed tool-use, on-disk tool files (MFT), shellbag staging, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU; richer runs also surface LNK + Recycle-Bin traces (7/14). Below the bar, up from 1/14. Misses (search / USB / email / browser history, XP `.evt`, thumbcache, named-pipe) **published, not hidden**. |
+| **NIST Hacking Case** | disk (Windows XP) | **10/14 = 71%** (bar 71%) | `SUSPICIOUS` | Recalls ten of fourteen golden claims — Prefetch-backed tool-use, on-disk tool files (MFT), IE internet history, shellbag + removable-media LNK staging, Recycle-Bin staging, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU, ACMru search history, and service/named-pipe recon. Passes at its floor. Four misses (USB history, deleted email, XP logon `.evt` — unsatisfiable, empty on this image — and thumbcache) **published, not hidden**. Caveat: SCHARDT is in the golden set, so read a strong score as regression signal, not blind generalization. |
 
-Of 11 scoreable goldens, **3 are fully scored and passing** (Nitroba 100%; the `synthetic-benign`
-and `synthetic-decoy` controls 100% — 0 findings / 0 planted-bait asserted, custody-verified) and
-**1 is scored and failing-but-improving** (NIST); the other 7 are fixture-staged and **not yet run,
-with no number fabricated**. A staged control is `alihadi-09-encrypt` (dual-use crypto should not
-become an overconfident `SUSPICIOUS`). NIST recall is run-dependent (**5/14 = 36% committed**, 7/14 =
-50% best).
+On the local-runnable corpus, **9 of 9 cases pass** (aggregate recall 23/27 = 85%; measured
+2026-07-01, [`docs/benchmark/RESULTS.md`](docs/benchmark/RESULTS.md); `manifest_verify` overall:true
+on every run) — Nitroba, NIST, and seven EVTX / control cases. NIST now passes at its 71% floor. The
+larger gated disk/memory goldens (19 cases) are fixture-staged and **not yet run, with no number
+fabricated**. A staged control is `alihadi-09-encrypt` (dual-use crypto should not become an
+overconfident `SUSPICIOUS`).
 
 ### Artifact classes proven on committed runs
 
@@ -531,7 +560,7 @@ carries a real verdict and `manifest_verify.json` reports `overall: true`.
 ```
 .
 ├── agent-config/        — runtime agent identity (SOUL / AGENTS / PLAYBOOK / TOOLS / MEMORY)
-├── services/mcp/        — Rust MCP server (32 typed DFIR tools)
+├── services/mcp/        — Rust MCP server (34 typed DFIR tools)
 ├── services/agent_mcp/  — Python MCP server (13 crypto / ACH / memory tools)
 ├── services/agent/      — findevil_agent package (crypto chain + ACH primitives)
 ├── apps/web/            — Next.js dashboard (live audit-stream viewer + design system)
@@ -566,7 +595,7 @@ Help is welcome — especially from people who know DFIR, memory forensics, or L
 Start with [docs/help-wanted.md](docs/help-wanted.md) for the open problems (including the hard one:
 keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/submit mechanics.
 
-- **Found a bug or have an idea?** [Open an issue](https://github.com/TimothyVang/verdict-dfir-community/issues).
+- **Found a bug or have an idea?** [Open an issue](https://github.com/TimothyVang/verdict-dfir-beta/issues).
 - **Sending code?** Fork this repo and open a pull request against the **`develop`** branch. The gates
   are the local checks in [CONTRIBUTING.md](CONTRIBUTING.md) (`bash scripts/run-all-smokes.sh` plus the
   per-language suites) — no GitHub Actions runners required. A maintainer runs them on your branch and
@@ -574,8 +603,8 @@ keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/sub
   maintainer with `git ship`.
 
 <p align="center">
-  <a href="https://github.com/TimothyVang/verdict-dfir-community/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=TimothyVang/verdict-dfir-community" alt="VERDICT contributors">
+  <a href="https://github.com/TimothyVang/verdict-dfir-beta/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TimothyVang/verdict-dfir-beta" alt="VERDICT contributors">
   </a>
 </p>
 
@@ -584,8 +613,8 @@ keeping the AI honest) and [CONTRIBUTING.md](CONTRIBUTING.md) for build/test/sub
 If VERDICT is useful to you, a &#11088; helps other DFIR practitioners find it — and motivates the roadmap.
 
 <p align="center">
-  <a href="https://www.star-history.com/#TimothyVang/verdict-dfir-community&Date">
-    <img src="https://api.star-history.com/svg?repos=TimothyVang/verdict-dfir-community&type=Date" alt="VERDICT star history chart" width="640">
+  <a href="https://www.star-history.com/#TimothyVang/verdict-dfir-beta&Date">
+    <img src="https://api.star-history.com/svg?repos=TimothyVang/verdict-dfir-beta&type=Date" alt="VERDICT star history chart" width="640">
   </a>
 </p>
 

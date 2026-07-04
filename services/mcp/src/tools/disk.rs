@@ -87,6 +87,13 @@ pub struct DiskExtractArtifactsInput {
     pub limit: usize,
     #[serde(default = "default_max_artifact_bytes")]
     pub max_artifact_bytes: u64,
+    /// Also recover deleted-but-metadata-intact files (unallocated dirents
+    /// whose inode still resolves). Entries whose inode was reallocated to a
+    /// live file are always skipped — extracting them would return the reusing
+    /// file's bytes. Recovered files stage under `<class>/__deleted__/<inode>/`
+    /// and never crowd allocated files out of the class budget.
+    #[serde(default = "default_true")]
+    pub recover_deleted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -118,6 +125,11 @@ pub struct ExtractedDiskArtifact {
     pub source_path: PathBuf,
     pub extracted_path: PathBuf,
     pub size_bytes: u64,
+    /// True when this artifact was recovered from a deleted (unallocated)
+    /// directory entry rather than a live file. Default keeps pre-existing
+    /// ledgers deserializing.
+    #[serde(default)]
+    pub recovered_deleted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -130,6 +142,21 @@ pub struct DiskExtractArtifactsOutput {
     pub artifacts_seen: usize,
     pub artifacts_skipped_oversize: usize,
     pub max_artifact_bytes: u64,
+    /// Deleted entries observed in the filesystem listing (including ones
+    /// skipped as reallocated). Defaults keep pre-existing recorded outputs
+    /// deserializing.
+    #[serde(default)]
+    pub deleted_entries_seen: usize,
+    /// Deleted entries whose content was recovered and staged.
+    #[serde(default)]
+    pub deleted_recovered: usize,
+    /// Deleted entries skipped because their inode was reused by a live file.
+    #[serde(default)]
+    pub deleted_skipped_realloc: usize,
+    /// Deleted entries selected for recovery whose content was unreadable or
+    /// empty.
+    #[serde(default)]
+    pub deleted_recovery_failed: usize,
     pub ledger_path: PathBuf,
 }
 
@@ -302,42 +329,31 @@ pub fn disk_extract_artifacts(
             None => (tsk_result?, false),
         },
     };
-    let candidates: Vec<(&'static str, String, String)> = listed
-        .into_iter()
-        .filter_map(|(inode, path)| {
-            let class = classify_artifact_path(&path)?;
-            wanted
-                .get(class)
-                .copied()
-                .unwrap_or(false)
-                .then_some((class, inode, path))
-        })
-        .collect();
+    let (candidates, deleted_entries_seen, deleted_skipped_realloc) =
+        build_candidates(listed, &wanted, input.recover_deleted);
     let selected = select_artifacts(candidates, input.limit);
 
     let mut artifacts = Vec::new();
-    let mut artifacts_skipped_oversize = 0;
-    for (class, inode, path) in selected {
+    let mut stats = ExtractStats::default();
+    for candidate in &selected {
         match (via_walk, &mock_root) {
             (true, Some(root)) => mock_extract(
                 root,
-                &path,
-                class,
+                &candidate.path,
+                candidate.class,
                 &output_dir,
                 input.max_artifact_bytes,
                 &mut artifacts,
-                &mut artifacts_skipped_oversize,
+                &mut stats,
             )?,
             _ => tsk_extract(
                 &image_path,
                 sector_offset,
-                &inode,
-                &path,
-                class,
+                candidate,
                 &output_dir,
                 input.max_artifact_bytes,
                 &mut artifacts,
-                &mut artifacts_skipped_oversize,
+                &mut stats,
             )?,
         }
     }
@@ -366,8 +382,12 @@ pub fn disk_extract_artifacts(
         extract_id,
         output_dir,
         artifacts_seen: artifacts.len(),
-        artifacts_skipped_oversize,
+        artifacts_skipped_oversize: stats.skipped_oversize,
         max_artifact_bytes: input.max_artifact_bytes,
+        deleted_entries_seen,
+        deleted_recovered: stats.deleted_recovered,
+        deleted_skipped_realloc,
+        deleted_recovery_failed: stats.deleted_recovery_failed,
         artifacts,
         ledger_path,
     })
@@ -804,12 +824,31 @@ fn first_partition_sector_offset(image_path: &Path) -> Option<u64> {
     first_partition_byte_offset(image_path).map(|bytes| bytes / 512)
 }
 
-/// Enumerate every live regular file in the image via `fls -r -p`, returning
-/// `(inode, relative_path)` pairs. Reads the image directly (no mount).
-fn tsk_list(
-    image_path: &Path,
-    sector_offset: Option<u64>,
-) -> Result<Vec<(String, String)>, DiskError> {
+/// One `fls -r -p` listing entry. `deleted` marks an unallocated directory
+/// entry whose metadata address is still readable — recoverable via the same
+/// `icat`-by-inode path as live files. `realloc` marks a deleted entry whose
+/// inode has been reused by a live file; extracting it would return the
+/// reusing file's content, so extraction must skip it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlsEntry {
+    inode: String,
+    path: String,
+    deleted: bool,
+    realloc: bool,
+}
+
+/// One classified extraction candidate flowing from listing to selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Candidate {
+    class: &'static str,
+    inode: String,
+    path: String,
+    deleted: bool,
+}
+
+/// Enumerate every regular file in the image via `fls -r -p` — live files and
+/// deleted-but-addressable entries alike. Reads the image directly (no mount).
+fn tsk_list(image_path: &Path, sector_offset: Option<u64>) -> Result<Vec<FlsEntry>, DiskError> {
     let bin = std::env::var("FINDEVIL_FLS_BIN").unwrap_or_else(|_| "fls".to_string());
     let mut command = Command::new(&bin);
     command.args(["-r", "-p"]);
@@ -834,16 +873,17 @@ fn tsk_list(
 }
 
 /// Recursively list regular files under a mock mount's `fs_root`, returning
-/// `(placeholder_inode, relative_path)` pairs shaped exactly like [`tsk_list`]
-/// so they flow through the same classifier + fair-share selector. The inode
-/// slot is a placeholder — mock extraction copies by relative path, not inode.
-fn mock_list(fs_root: &Path) -> Result<Vec<(String, String)>, DiskError> {
+/// entries shaped exactly like [`tsk_list`] so they flow through the same
+/// classifier + fair-share selector. The inode slot is a placeholder — mock
+/// extraction copies by relative path, not inode — and a directory walk has no
+/// deleted-file concept, so `deleted` is always false.
+fn mock_list(fs_root: &Path) -> Result<Vec<FlsEntry>, DiskError> {
     let mut out = Vec::new();
     mock_walk(fs_root, fs_root, &mut out)?;
     Ok(out)
 }
 
-fn mock_walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<(), DiskError> {
+fn mock_walk(root: &Path, dir: &Path, out: &mut Vec<FlsEntry>) -> Result<(), DiskError> {
     for entry in fs::read_dir(dir).map_err(|source| DiskError::Io {
         path: dir.to_path_buf(),
         source,
@@ -861,7 +901,12 @@ fn mock_walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result
             mock_walk(root, &path, out)?;
         } else if ft.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
-                out.push(("-".to_string(), rel.to_string_lossy().replace('\\', "/")));
+                out.push(FlsEntry {
+                    inode: "-".to_string(),
+                    path: rel.to_string_lossy().replace('\\', "/"),
+                    deleted: false,
+                    realloc: false,
+                });
             }
         }
     }
@@ -878,7 +923,7 @@ fn mock_extract(
     output_dir: &Path,
     max_artifact_bytes: u64,
     out: &mut Vec<ExtractedDiskArtifact>,
-    skipped_oversize: &mut usize,
+    stats: &mut ExtractStats,
 ) -> Result<(), DiskError> {
     let src = safe_join(fs_root, rel_path);
     let size = fs::metadata(&src)
@@ -888,7 +933,7 @@ fn mock_extract(
         })?
         .len();
     if size > max_artifact_bytes {
-        *skipped_oversize += 1;
+        stats.skipped_oversize += 1;
         return Ok(());
     }
     let dest = safe_join(&output_dir.join(class), rel_path);
@@ -904,30 +949,53 @@ fn mock_extract(
         source_path: PathBuf::from(rel_path),
         extracted_path: dest,
         size_bytes: size,
+        recovered_deleted: false,
     });
     Ok(())
 }
 
-/// Parse one `fls -p` line into `(inode, relative_path)` for a live regular
-/// file. Lines look like `r/r 380861-128-4:\tWindows/System32/config/SYSTEM`.
-/// Returns None for directories, deleted entries (marked `*`), and non-files.
-fn parse_fls_line(line: &str) -> Option<(String, String)> {
+/// Parse one `fls -p` line into an [`FlsEntry`]. Live files look like
+/// `r/r 380861-128-4:\tWindows/System32/config/SYSTEM`; deleted entries carry
+/// a `*` marker (`r/r * 999-128-1:\t...`) and often lose their name-type
+/// (`-/r * 999:\t...`). Returns None for directories, non-files, and deleted
+/// entries whose name-type is unknown while still allocated.
+fn parse_fls_line(line: &str) -> Option<FlsEntry> {
     let (kind, rest) = line.split_once(char::is_whitespace)?;
-    if !kind.starts_with("r/r") {
-        return None;
-    }
-    let rest = rest.trim_start();
-    if rest.starts_with('*') {
-        // deleted entry — not reliably recoverable, skip.
+    let mut rest = rest.trim_start();
+    let deleted = rest.strip_prefix('*').is_some_and(|stripped| {
+        rest = stripped.trim_start();
+        true
+    });
+    // Deleted dirents frequently list as `-/r` (name-type lost, meta-type
+    // still a regular file); accept that shape only for deleted entries so
+    // live unknowns stay excluded.
+    if !(kind.starts_with("r/r") || (deleted && kind.starts_with("-/r"))) {
         return None;
     }
     let (inode, path) = rest.split_once(':')?;
-    let inode = inode.trim();
+    let mut inode = inode.trim();
+    // fls appends `(realloc)` when the deleted entry's inode was reused by a
+    // live file — icat on it would return the *new* file's bytes.
+    let realloc = inode.strip_suffix("(realloc)").is_some_and(|stripped| {
+        inode = stripped.trim_end();
+        true
+    });
     let path = path.trim();
     if inode.is_empty() || path.is_empty() {
         return None;
     }
-    Some((inode.to_string(), path.to_string()))
+    // The inode is handed to `icat` argv and used as an output path component;
+    // TSK prints only digits and dashes (`380861-128-4`), so reject anything
+    // else a hostile listing line could smuggle in.
+    if !inode.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return None;
+    }
+    Some(FlsEntry {
+        inode: inode.to_string(),
+        path: path.to_string(),
+        deleted,
+        realloc,
+    })
 }
 
 /// Extract order: forensically critical classes first, broad yara targets last,
@@ -1007,31 +1075,65 @@ fn artifact_subrank(class: &str, rel_path: &str) -> u8 {
     }
 }
 
+/// Classify listing entries into wanted-class extraction candidates, dropping
+/// reallocated deleted entries (extraction would return the reusing live
+/// file's bytes) and — when recovery is opted out — deleted entries entirely.
+/// Returns `(candidates, deleted_entries_seen, deleted_skipped_realloc)` so
+/// the output counters stay honest even when nothing is recovered.
+fn build_candidates(
+    listed: Vec<FlsEntry>,
+    wanted: &BTreeMap<&'static str, bool>,
+    recover_deleted: bool,
+) -> (Vec<Candidate>, usize, usize) {
+    let deleted_entries_seen = listed.iter().filter(|entry| entry.deleted).count();
+    let deleted_skipped_realloc = listed
+        .iter()
+        .filter(|entry| entry.deleted && entry.realloc)
+        .count();
+    let candidates = listed
+        .into_iter()
+        .filter(|entry| !entry.realloc && (recover_deleted || !entry.deleted))
+        .filter_map(|entry| {
+            let class = classify_artifact_path(&entry.path)?;
+            wanted
+                .get(class)
+                .copied()
+                .unwrap_or(false)
+                .then_some(Candidate {
+                    class,
+                    inode: entry.inode,
+                    path: entry.path,
+                    deleted: entry.deleted,
+                })
+        })
+        .collect();
+    (candidates, deleted_entries_seen, deleted_skipped_realloc)
+}
+
 /// Choose up to `limit` artifacts to extract, allocating the budget *fairly
 /// across classes* so no single voluminous class starves the rest. Classes are
 /// visited in [`class_priority`] order and drawn round-robin: every class with
 /// candidates gets a turn each pass, and a class that drains early hands its
-/// unused budget to the others. Within a class, [`artifact_subrank`] then path
-/// order decides which artifacts win the class's share. Pure (no I/O) so the
-/// allocation is unit-testable.
-fn select_artifacts(
-    candidates: Vec<(&'static str, String, String)>,
-    limit: usize,
-) -> Vec<(&'static str, String, String)> {
-    let mut buckets: BTreeMap<u8, Vec<(&'static str, String, String)>> = BTreeMap::new();
+/// unused budget to the others. Within a class, [`artifact_subrank`], then
+/// allocated-before-deleted, then path order decides which artifacts win the
+/// class's share — recovered-deleted entries never crowd out live ones. Pure
+/// (no I/O) so the allocation is unit-testable.
+fn select_artifacts(candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+    let mut buckets: BTreeMap<u8, Vec<Candidate>> = BTreeMap::new();
     for candidate in candidates {
         buckets
-            .entry(class_priority(candidate.0))
+            .entry(class_priority(candidate.class))
             .or_default()
             .push(candidate);
     }
-    let mut queues: Vec<VecDeque<(&'static str, String, String)>> = buckets
+    let mut queues: Vec<VecDeque<Candidate>> = buckets
         .into_values()
         .map(|mut bucket| {
             bucket.sort_by(|a, b| {
-                artifact_subrank(a.0, &a.2)
-                    .cmp(&artifact_subrank(b.0, &b.2))
-                    .then_with(|| a.2.cmp(&b.2))
+                artifact_subrank(a.class, &a.path)
+                    .cmp(&artifact_subrank(b.class, &b.path))
+                    .then_with(|| a.deleted.cmp(&b.deleted))
+                    .then_with(|| a.path.cmp(&b.path))
             });
             VecDeque::from(bucket)
         })
@@ -1051,22 +1153,38 @@ fn select_artifacts(
     selected
 }
 
-/// `icat` one inode out of the image into `output_dir/<class>/<rel_path>`,
-/// streaming to disk (no in-memory buffering) and enforcing the size cap.
-/// A failed `icat` (unreadable inode) is skipped, not fatal.
+/// Per-extract counters shared by [`tsk_extract`] and [`mock_extract`].
+#[derive(Debug, Default)]
+struct ExtractStats {
+    skipped_oversize: usize,
+    deleted_recovered: usize,
+    deleted_recovery_failed: usize,
+}
+
+/// `icat` one inode out of the image, streaming to disk (no in-memory
+/// buffering) and enforcing the size cap. Live files land under
+/// `output_dir/<class>/<rel_path>`; recovered-deleted entries under
+/// `output_dir/<class>/__deleted__/<inode>/<rel_path>` so recovered content is
+/// unmistakable in the ledger and report, and same-path collisions cannot
+/// overwrite a live artifact. A failed `icat` (unreadable inode) is skipped,
+/// not fatal; a zero-byte recovered-deleted file counts as a failed recovery.
 #[allow(clippy::too_many_arguments)]
 fn tsk_extract(
     image_path: &Path,
     sector_offset: Option<u64>,
-    inode: &str,
-    rel_path: &str,
-    class: &str,
+    candidate: &Candidate,
     output_dir: &Path,
     max_artifact_bytes: u64,
     out: &mut Vec<ExtractedDiskArtifact>,
-    skipped_oversize: &mut usize,
+    stats: &mut ExtractStats,
 ) -> Result<(), DiskError> {
-    let dest = safe_join(&output_dir.join(class), rel_path);
+    let class_dir = output_dir.join(candidate.class);
+    let base = if candidate.deleted {
+        safe_join(&class_dir.join("__deleted__"), &candidate.inode)
+    } else {
+        class_dir
+    };
+    let dest = safe_join(&base, &candidate.path);
     if let Some(parent) = dest.parent() {
         create_dir(parent)?;
     }
@@ -1075,20 +1193,23 @@ fn tsk_extract(
     if let Some(offset) = sector_offset {
         command.arg("-o").arg(offset.to_string());
     }
-    command.arg(image_path).arg(inode);
+    command.arg(image_path).arg(&candidate.inode);
     let file = fs::File::create(&dest).map_err(|source| DiskError::Io {
         path: dest.clone(),
         source,
     })?;
-    let status = command
+    let icat_status = command
         .stdout(file)
         .status()
         .map_err(|source| DiskError::Io {
             path: PathBuf::from(&bin),
             source,
         })?;
-    if !status.success() {
+    if !icat_status.success() {
         let _ = fs::remove_file(&dest);
+        if candidate.deleted {
+            stats.deleted_recovery_failed += 1;
+        }
         return Ok(());
     }
     let size = fs::metadata(&dest)
@@ -1097,16 +1218,26 @@ fn tsk_extract(
             source,
         })?
         .len();
-    if size > max_artifact_bytes {
+    if candidate.deleted && size == 0 {
+        // The dirent parsed but the content run is gone — nothing recovered.
         let _ = fs::remove_file(&dest);
-        *skipped_oversize += 1;
+        stats.deleted_recovery_failed += 1;
         return Ok(());
     }
+    if size > max_artifact_bytes {
+        let _ = fs::remove_file(&dest);
+        stats.skipped_oversize += 1;
+        return Ok(());
+    }
+    if candidate.deleted {
+        stats.deleted_recovered += 1;
+    }
     out.push(ExtractedDiskArtifact {
-        artifact_class: class.to_string(),
-        source_path: PathBuf::from(rel_path),
+        artifact_class: candidate.class.to_string(),
+        source_path: PathBuf::from(&candidate.path),
         extracted_path: dest,
         size_bytes: size,
+        recovered_deleted: candidate.deleted,
     });
     Ok(())
 }
@@ -1176,7 +1307,14 @@ fn classify_windows_specific(name: &str, rel: &str) -> Option<&'static str> {
         && (rel.contains("/history.ie5/") || rel.contains("/temporary internet files/"))
     {
         Some("ie_history")
-    } else if name == "thumbs.db" || name.ends_with(".thumbcache") {
+    } else if name == "thumbs.db"
+        || name.ends_with(".thumbcache")
+        || ((name.starts_with("thumbcache_") || name.starts_with("iconcache_"))
+            && has_extension(name, "db"))
+    {
+        // XP Thumbs.db plus the Vista+ Explorer caches (thumbcache_####.db /
+        // iconcache_####.db); the bare `.thumbcache` extension is kept for
+        // pre-existing fixtures.
         Some("thumbnail")
     } else if rel.contains("/system32/tasks/") || rel.starts_with("windows/system32/tasks/") {
         Some("scheduled_task")
@@ -1234,10 +1372,16 @@ fn classify_macos(name: &str, rel: &str) -> Option<&'static str> {
 }
 
 /// Generic Windows content sweep — the yara catch-all. Kept last so specific
-/// OS classes always win over the `users/`/`programdata/` directory match.
+/// OS classes always win over the profile/`programdata` directory match.
+/// `documents and settings/` is the pre-Vista (XP/2003) equivalent of
+/// `users/`; without it the whole user-profile tree on an XP-era image is
+/// invisible to the content sweep, so both live and recovered-deleted profile
+/// files go unclassified.
 fn classify_windows_generic(rel: &str) -> Option<&'static str> {
     if rel.starts_with("users/")
         || rel.contains("/users/")
+        || rel.starts_with("documents and settings/")
+        || rel.contains("/documents and settings/")
         || rel.starts_with("programdata/")
         || rel.contains("/programdata/")
         || rel.starts_with("windows/temp/")
@@ -1392,6 +1536,10 @@ const fn default_max_artifact_bytes() -> u64 {
     DEFAULT_MAX_ARTIFACT_BYTES
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 fn has_extension(name: &str, ext: &str) -> bool {
     Path::new(name)
         .extension()
@@ -1408,7 +1556,7 @@ mod tests {
     use super::{
         artifact_subrank, class_priority, classify_artifact_path, mock_list, parse_fls_line,
         parse_mmls_first_partition_offset, safe_join, select_artifacts, unmount_steps,
-        wanted_kinds,
+        wanted_kinds, Candidate, FlsEntry,
     };
     use std::path::Path;
 
@@ -1457,8 +1605,12 @@ mod tests {
         std::fs::write(root.join("Windows/System32/config/SOFTWARE"), b"hive").unwrap();
 
         let mut listed = mock_list(root).expect("walk");
-        listed.sort();
-        let paths: Vec<&str> = listed.iter().map(|(_, p)| p.as_str()).collect();
+        listed.sort_by(|a, b| a.path.cmp(&b.path));
+        assert!(
+            listed.iter().all(|entry| !entry.deleted && !entry.realloc),
+            "a directory walk has no deleted-file concept"
+        );
+        let paths: Vec<&str> = listed.iter().map(|entry| entry.path.as_str()).collect();
         assert!(paths.contains(&"$MFT"), "{paths:?}");
         assert!(
             paths.contains(&"Windows/Prefetch/CMD.EXE-1.pf"),
@@ -1472,7 +1624,7 @@ mod tests {
         // classifier the TSK path uses.
         let classes: std::collections::BTreeSet<_> = listed
             .iter()
-            .filter_map(|(_, p)| classify_artifact_path(p))
+            .filter_map(|entry| classify_artifact_path(&entry.path))
             .collect();
         assert!(classes.contains("mft"));
         assert!(classes.contains("prefetch"));
@@ -1480,24 +1632,95 @@ mod tests {
     }
 
     #[test]
-    fn parse_fls_line_extracts_inode_and_path_for_live_files() {
+    fn classify_artifact_path_matches_thumbnail_caches() {
         assert_eq!(
-            parse_fls_line("r/r 380861-128-4:\tWindows/System32/config/SYSTEM"),
-            Some((
-                "380861-128-4".to_string(),
-                "Windows/System32/config/SYSTEM".to_string(),
-            ))
+            classify_artifact_path("Documents and Settings/Suspect User/My Documents/Thumbs.db"),
+            Some("thumbnail")
+        );
+        assert_eq!(
+            classify_artifact_path(
+                "Users/bob/AppData/Local/Microsoft/Windows/Explorer/thumbcache_256.thumbcache"
+            ),
+            Some("thumbnail")
+        );
+        // Real Vista+ Explorer caches are thumbcache_####.db / iconcache_*.db —
+        // the shapes that actually exist on disk.
+        assert_eq!(
+            classify_artifact_path(
+                "Users/bob/AppData/Local/Microsoft/Windows/Explorer/thumbcache_1024.db"
+            ),
+            Some("thumbnail")
+        );
+        assert_eq!(
+            classify_artifact_path(
+                "Users/bob/AppData/Local/Microsoft/Windows/Explorer/iconcache_32.db"
+            ),
+            Some("thumbnail")
         );
     }
 
     #[test]
-    fn parse_fls_line_skips_dirs_deleted_and_blanks() {
+    fn parse_fls_line_extracts_inode_and_path_for_live_files() {
+        assert_eq!(
+            parse_fls_line("r/r 380861-128-4:\tWindows/System32/config/SYSTEM"),
+            Some(FlsEntry {
+                inode: "380861-128-4".to_string(),
+                path: "Windows/System32/config/SYSTEM".to_string(),
+                deleted: false,
+                realloc: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_fls_line_skips_dirs_and_blanks() {
         assert_eq!(parse_fls_line("d/d 282867-144-5:\tUsers"), None);
+        assert_eq!(parse_fls_line(""), None);
+        // Live entries with unknown name-type stay excluded — only deleted
+        // entries are allowed the `-/r` shape.
+        assert_eq!(parse_fls_line("-/r 555-128-1:\tWindows/x.pf"), None);
+    }
+
+    #[test]
+    fn parse_fls_line_keeps_deleted_entries_with_markers() {
         assert_eq!(
             parse_fls_line("r/r * 999-128-1:\tWindows/Prefetch/x.pf"),
-            None
+            Some(FlsEntry {
+                inode: "999-128-1".to_string(),
+                path: "Windows/Prefetch/x.pf".to_string(),
+                deleted: true,
+                realloc: false,
+            })
         );
-        assert_eq!(parse_fls_line(""), None);
+        // Deleted entries that lost their name-type still parse.
+        assert_eq!(
+            parse_fls_line("-/r * 555-128-1:\tDocuments and Settings/user/evil.doc"),
+            Some(FlsEntry {
+                inode: "555-128-1".to_string(),
+                path: "Documents and Settings/user/evil.doc".to_string(),
+                deleted: true,
+                realloc: false,
+            })
+        );
+        // A reallocated inode is flagged so extraction can skip it — icat
+        // would return the reusing live file's content.
+        assert_eq!(
+            parse_fls_line("r/r * 2036-128-3(realloc):\tWINDOWS/system32/mal.dll"),
+            Some(FlsEntry {
+                inode: "2036-128-3".to_string(),
+                path: "WINDOWS/system32/mal.dll".to_string(),
+                deleted: true,
+                realloc: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_fls_line_rejects_non_tsk_inode_tokens() {
+        // The inode is passed to icat argv and used as an output path
+        // component; anything but digits/dashes is hostile-listing noise.
+        assert_eq!(parse_fls_line("r/r ../escape:\tWindows/x.pf"), None);
+        assert_eq!(parse_fls_line("r/r abc-def:\tWindows/x.pf"), None);
     }
 
     #[test]
@@ -1517,6 +1740,12 @@ mod tests {
         );
         assert_eq!(
             classify_artifact_path("Users/bob/Desktop/evil.txt"),
+            Some("yara_target")
+        );
+        // XP/2003 profile path (the pre-Vista `Users/` equivalent) must also
+        // reach the content sweep — live and recovered-deleted alike.
+        assert_eq!(
+            classify_artifact_path("Documents and Settings/analyst/Local Settings/Temp/x.exe"),
             Some("yara_target")
         );
         assert_eq!(
@@ -1556,16 +1785,6 @@ mod tests {
                 "Documents and Settings/Suspect User/Local Settings/History/History.IE5/index.dat"
             ),
             Some("ie_history")
-        );
-        assert_eq!(
-            classify_artifact_path("Documents and Settings/Suspect User/My Documents/Thumbs.db"),
-            Some("thumbnail")
-        );
-        assert_eq!(
-            classify_artifact_path(
-                "Users/bob/AppData/Local/Microsoft/Windows/Explorer/thumbcache_256.thumbcache"
-            ),
-            Some("thumbnail")
         );
         assert_eq!(
             classify_artifact_path(
@@ -1711,39 +1930,78 @@ mod tests {
         // three classes represented (the old global-priority sort extracted
         // zero evtx), and the canonical Security.evtx wins evtx's share over
         // the operational tail.
-        let mut candidates: Vec<(&'static str, String, String)> = Vec::new();
+        fn live(class: &'static str, inode: &str, path: String) -> Candidate {
+            Candidate {
+                class,
+                inode: inode.to_string(),
+                path,
+                deleted: false,
+            }
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
         for i in 0..400 {
-            candidates.push((
-                "prefetch",
-                format!("{i}"),
-                format!("Windows/Prefetch/A{i:04}.pf"),
-            ));
+            candidates.push(live("prefetch", &format!("{i}"), {
+                format!("Windows/Prefetch/A{i:04}.pf")
+            }));
         }
         for i in 0..600 {
-            candidates.push((
+            candidates.push(live(
                 "evtx",
-                format!("e{i}"),
+                &format!("e{i}"),
                 format!(
                     "Windows/System32/winevt/Logs/Microsoft-Windows-Zzz{i:04}%4Operational.evtx"
                 ),
             ));
         }
-        candidates.push((
+        candidates.push(live(
             "evtx",
-            "sec".to_string(),
+            "sec",
             "Windows/System32/winevt/Logs/Security.evtx".to_string(),
         ));
-        candidates.push(("mft", "mft".to_string(), "$MFT".to_string()));
+        candidates.push(live("mft", "mft", "$MFT".to_string()));
 
         let selected = select_artifacts(candidates, 50);
         assert_eq!(selected.len(), 50);
-        let classes: std::collections::HashSet<&str> = selected.iter().map(|c| c.0).collect();
+        let classes: std::collections::HashSet<&str> = selected.iter().map(|c| c.class).collect();
         assert!(classes.contains("prefetch"), "prefetch starved");
         assert!(classes.contains("evtx"), "evtx starved (the original bug)");
         assert!(classes.contains("mft"), "mft missing");
         assert!(
-            selected.iter().any(|c| c.2.ends_with("/Security.evtx")),
+            selected.iter().any(|c| c.path.ends_with("/Security.evtx")),
             "canonical Security.evtx must win evtx's fair share"
+        );
+    }
+
+    #[test]
+    fn select_artifacts_draws_allocated_before_deleted_within_a_class() {
+        // With a class budget of 2, the two live prefetch files must win over
+        // the alphabetically-earlier deleted one: recovered-deleted entries
+        // never crowd allocated evidence out of the budget.
+        let candidates = vec![
+            Candidate {
+                class: "prefetch",
+                inode: "9".to_string(),
+                path: "Windows/Prefetch/AAA-DELETED.pf".to_string(),
+                deleted: true,
+            },
+            Candidate {
+                class: "prefetch",
+                inode: "1".to_string(),
+                path: "Windows/Prefetch/LIVE1.pf".to_string(),
+                deleted: false,
+            },
+            Candidate {
+                class: "prefetch",
+                inode: "2".to_string(),
+                path: "Windows/Prefetch/LIVE2.pf".to_string(),
+                deleted: false,
+            },
+        ];
+        let selected = select_artifacts(candidates, 2);
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected.iter().all(|c| !c.deleted),
+            "deleted entry crowded out a live file: {selected:?}"
         );
     }
 
@@ -1751,12 +2009,18 @@ mod tests {
     fn select_artifacts_caps_at_limit_and_handles_empty() {
         assert!(select_artifacts(Vec::new(), 10).is_empty());
         let candidates = vec![
-            ("mft", "1".to_string(), "$MFT".to_string()),
-            (
-                "prefetch",
-                "2".to_string(),
-                "Windows/Prefetch/X.pf".to_string(),
-            ),
+            Candidate {
+                class: "mft",
+                inode: "1".to_string(),
+                path: "$MFT".to_string(),
+                deleted: false,
+            },
+            Candidate {
+                class: "prefetch",
+                inode: "2".to_string(),
+                path: "Windows/Prefetch/X.pf".to_string(),
+                deleted: false,
+            },
         ];
         assert_eq!(select_artifacts(candidates.clone(), 1).len(), 1);
         assert_eq!(select_artifacts(candidates, 5).len(), 2); // limit above supply

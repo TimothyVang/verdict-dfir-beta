@@ -28,6 +28,20 @@ Verdict words are strictly scoped:
 - `INDETERMINATE` means leads or limited coverage prevent a scoped clearance.
 - `NO_EVIL` means no reportable Finding in the artifacts actually examined. It is never a whole-environment clean bill of health.
 
+## VERDICT ecosystem — what is what
+
+VERDICT is a local-first DFIR (digital forensics & incident response) agent platform, split into three repos:
+
+| Repo | Role | It is… |
+|---|---|---|
+| [`caseforge-core`](https://github.com/TimothyVang/caseforge-core) | Headless **controller**: privacy routing, model selection, structured findings, custody validation, the `caseforge` CLI. | the **driver** |
+| [`verdict-opencode`](https://github.com/TimothyVang/verdict-opencode) | The agent **runtime** — a branded fork of [opencode](https://github.com/sst/opencode); the `verdict` binary is built from it. | the **engine** |
+| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 34 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
+
+**Runtime flow:** `caseforge` (controls + guards) → `verdict` binary (runs the agent) → **this repo's `findevil` MCP tools (do the forensics)** → hash-chained custody → `caseforge verify`.
+
+**Two rules everything obeys:** the LLM is not the forensic source of truth (findings must cite a `tool_call_id` + `output_sha256` + verified manifest); real evidence stays local by default.
+
 ## Required Setup
 
 Run setup from the repository root before the first Case:
@@ -98,7 +112,7 @@ These rules are part of the product safety boundary.
 - Product/audit-chain servers: `findevil-mcp` and `findevil-agent-mcp`.
 - Operator convenience servers: `n8n-mcp`, `playwright`, `puppeteer`, and `qmd`.
 
-Only the two product servers can emit audit-chain tool calls for Findings. The product surface is 46 audit-chained product tools: 32 Rust DFIR tools in `findevil-mcp` plus 14 Python crypto/ACH/memory/ACP/expert-feedback/accuracy/ai-tradecraft tools in `findevil-agent-mcp`. The operator convenience servers must never emit Findings, satisfy Finding citations, or mutate evidence.
+Only the two product servers can emit audit-chain tool calls for Findings. The product surface is 48 audit-chained product tools: 34 Rust DFIR tools in `findevil-mcp` plus 14 Python crypto/ACH/memory/ACP/expert-feedback/accuracy/ai-tradecraft tools in `findevil-agent-mcp`. The operator convenience servers must never emit Findings, satisfy Finding citations, or mutate evidence.
 
 Do not add a broad filesystem, shell, Docker, Kubernetes, browser, GitHub, fetch, or raw-command MCP to the product surface. Do not add an `execute_shell` tool. Long-tail DFIR execution belongs behind allow-listed typed tools such as `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, and `cloud_audit`.
 

@@ -233,6 +233,8 @@ def main() -> int:
                 "nfdump_query",
                 "suricata_eve",
                 "indx_parse",
+                "thumbcache_parse",
+                "hashset_lookup",
                 "vel_collect",
                 "browser_history",
             ]

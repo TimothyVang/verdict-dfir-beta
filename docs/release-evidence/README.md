@@ -29,12 +29,13 @@ This is intentionally narrow:
 
 Strict check:
 
-This check is expected to fail the recall threshold while the historical packet
-records 7/14 NIST recall (50%) against the 71% bar. (That 7/14 reproduces under the
-current hardened matcher on the richer 27-finding runs; leaner 19-finding runs score
-**5/14** — run-to-run variance, see `docs/accuracy-report.md`. Either way the packet
-is below the bar.) That failure is the point of the packet: the release evidence
-remains honest about the L3 gap.
+Current runs pass this check: NIST recall is **10/14 = 71%**, at its 71% floor
+(measured 2026-07-01, `docs/benchmark/RESULTS.md`; reproduces at 10/14 from
+`evidence/SCHARDT.dd`). The historical `l3-local-sift.json` packet recorded a lower
+7/14 before the disk-artifact emitters and native-fallback triage landed; it is
+retained as a point-in-time receipt, not the current number. The four remaining
+misses (USB history, deleted email, empty-XP-logon, thumbcache) are published in
+`docs/accuracy-report.md`, so the release evidence stays honest about the gap.
 
 ```bash
 python3 scripts/validate-l3-evidence.py docs/release-evidence/l3-local-sift.json

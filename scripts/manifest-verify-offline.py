@@ -296,6 +296,114 @@ def _merkle_root_hex(leaf_digests_hex: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Transparency anchor (optional Sigstore Rekor / RFC-3161) — stdlib-only,
+# independent re-implementation of the RFC-6962 inclusion check. Mirrors
+# sigstore._internal.merkle so agreement with the product's transparency_ok is
+# a real cross-check, not a shared-code tautology. Non-gating either way.
+# ---------------------------------------------------------------------------
+
+_RFC6962_LEAF_PREFIX = b"\x00"
+_RFC6962_NODE_PREFIX = b"\x01"
+
+
+def _rfc6962_leaf(body: bytes) -> bytes:
+    return hashlib.sha256(_RFC6962_LEAF_PREFIX + body).digest()
+
+
+def _rfc6962_children(lhs: bytes, rhs: bytes) -> bytes:
+    return hashlib.sha256(_RFC6962_NODE_PREFIX + lhs + rhs).digest()
+
+
+def _decomp_inclusion_proof(index: int, size: int) -> tuple[int, int]:
+    inner = (index ^ (size - 1)).bit_length()
+    border = bin(index >> inner).count("1")
+    return inner, border
+
+
+def _chain_inner(seed: bytes, hashes: list[str], log_index: int) -> bytes:
+    for i, hex_hash in enumerate(hashes):
+        node = bytes.fromhex(hex_hash)
+        if (log_index >> i) & 1 == 0:
+            seed = _rfc6962_children(seed, node)
+        else:
+            seed = _rfc6962_children(node, seed)
+    return seed
+
+
+def _chain_border_right(seed: bytes, hashes: list[str]) -> bytes:
+    for hex_hash in hashes:
+        seed = _rfc6962_children(bytes.fromhex(hex_hash), seed)
+    return seed
+
+
+def _verify_rekor_inclusion(rekor: dict[str, Any]) -> bool | str:
+    """Re-derive the Rekor entry's RFC-6962 leaf hash from its stored body and
+    chain the inclusion-proof hashes to the declared root — pure stdlib."""
+    proof = rekor.get("inclusion_proof") or {}
+    body_b64 = rekor.get("body")
+    if not body_b64:
+        return "rekor block missing entry body; cannot verify inclusion proof offline"
+    try:
+        body = base64.b64decode(str(body_b64))
+        hashes = [str(h) for h in (proof.get("hashes") or [])]
+        log_index = int(proof.get("log_index") or 0)
+        tree_size = int(proof.get("tree_size") or 0)
+        declared_root = str(proof.get("root_hash") or "")
+    except (ValueError, TypeError) as exc:
+        return f"rekor inclusion proof malformed: {exc}"
+    if tree_size <= 0 or log_index < 0 or log_index >= tree_size:
+        return f"rekor inclusion proof has invalid index/size ({log_index}/{tree_size})"
+    inner, border = _decomp_inclusion_proof(log_index, tree_size)
+    if len(hashes) != inner + border:
+        return (
+            f"rekor inclusion proof has wrong size: expected {inner + border}, "
+            f"got {len(hashes)}"
+        )
+    seed = _chain_inner(_rfc6962_leaf(body), hashes[:inner], log_index)
+    calc_root = _chain_border_right(seed, hashes[inner:]).hex()
+    if calc_root != declared_root:
+        return (
+            f"rekor inclusion proof root mismatch: declared {declared_root} != "
+            f"recomputed {calc_root}"
+        )
+    return True
+
+
+def _verify_transparency_offline(
+    anchor: dict[str, Any], merkle_root_hex: str
+) -> bool | str:
+    """Non-gating offline check of the optional transparency anchor.
+
+    Absent anchor -> vacuously True. A Rekor anchor is re-derived here in pure
+    stdlib. An RFC-3161 anchor needs ``openssl`` + the TSA CA chain to verify,
+    which is out of this zero-dependency verifier's scope, so it is reported
+    honestly (still non-gating)."""
+    if not isinstance(anchor, dict) or not anchor:
+        return True
+    subject = anchor.get("subject")
+    subject_digest = (
+        subject.get("merkle_root_sha256") if isinstance(subject, dict) else None
+    )
+    if str(subject_digest) != merkle_root_hex:
+        return (
+            f"transparency subject digest {subject_digest!r} != manifest merkle "
+            f"root {merkle_root_hex!r}"
+        )
+    kind = anchor.get("kind")
+    if kind == "none":
+        return str(anchor.get("fallback_reason") or "root was not anchored")
+    if kind == "rekor":
+        return _verify_rekor_inclusion(anchor.get("rekor") or {})
+    if kind == "rfc3161":
+        return (
+            "rfc3161 timestamp present; offline verification of the TSA token is "
+            "out of this zero-dependency verifier's scope (needs openssl + the "
+            "issuing CA chain)"
+        )
+    return f"unknown transparency kind {kind!r}"
+
+
+# ---------------------------------------------------------------------------
 # Result shape + signature verification.
 # ---------------------------------------------------------------------------
 
@@ -311,6 +419,7 @@ class OfflineVerification:
     signature_present: bool
     signature_kind: str
     signature_verified: bool | str
+    transparency_ok: bool | str
     overall: bool
 
 
@@ -339,7 +448,15 @@ def _verify_signature(sig: dict[str, Any], manifest_obj: dict[str, Any]) -> bool
         signature = base64.b64decode(bundle["signature_b64"])
     except (KeyError, ValueError, TypeError) as exc:
         return f"ed25519 bundle malformed: {exc}"
-    body = {k: v for k, v in manifest_obj.items() if k != "signature"}
+    # The signed body excludes BOTH ``signature`` and the after-signing
+    # ``transparency_log`` anchor (mirror of the product's
+    # ``_to_json_safe(exclude_signature=True)``), so exclude both here or a
+    # manifest carrying a transparency anchor would fail ed25519 verification.
+    body = {
+        k: v
+        for k, v in manifest_obj.items()
+        if k not in ("signature", "transparency_log")
+    }
     body_bytes = canonicalize_json(body)
     if not ed25519_verify(signature, body_bytes, public_key):
         return "ed25519 signature verification FAILED: manifest body does not match the signature"
@@ -408,6 +525,13 @@ def verify_manifest_offline(
     sig_kind = str(sig.get("kind") or "stub")
     sig_verified = _verify_signature(sig, obj)
 
+    # 5. Optional transparency anchor — a non-gating side-signal, absent by
+    # default (a run that didn't opt into anchoring carries no block, so this is
+    # vacuously True and the manifest verifies exactly as before).
+    transparency_status = _verify_transparency_offline(
+        obj.get("transparency_log") or {}, declared_root
+    )
+
     sig_failed = (
         sig_present and sig_kind not in _ADVISORY_SIG_KINDS and sig_verified is not True
     )
@@ -425,6 +549,7 @@ def verify_manifest_offline(
         signature_present=sig_present,
         signature_kind=sig_kind,
         signature_verified=sig_verified,
+        transparency_ok=transparency_status,
         overall=overall,
     )
 
@@ -471,6 +596,7 @@ _SIDECAR_FIELD_MAP: dict[str, str] = {
     "signature_present": "signature_present",
     "signature_kind": "signature_kind",
     "signature_verified": "signature_verified",
+    "transparency_ok": "transparency_ok",
     "overall": "overall",
 }
 
@@ -588,6 +714,11 @@ def main(argv: list[str]) -> int:
             _format_field(
                 f"signature verified ({result.signature_kind})",
                 result.signature_verified,
+            )
+        )
+        print(
+            _format_field(
+                "transparency anchor (non-gating side-signal)", result.transparency_ok
             )
         )
         print(f"  overall: {'PASS' if result.overall else 'FAIL'}")

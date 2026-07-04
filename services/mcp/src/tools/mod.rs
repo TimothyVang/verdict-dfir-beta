@@ -24,6 +24,7 @@ pub mod cloud_audit;
 pub mod disk;
 pub mod evtx_query;
 pub mod ez_parse;
+pub mod hashset_lookup;
 pub mod hayabusa_scan;
 pub mod indx_parse;
 pub mod journalctl_query;
@@ -40,6 +41,7 @@ pub mod regf;
 pub mod registry_query;
 pub mod suricata_eve;
 pub mod sysmon_network_query;
+pub mod thumbcache_parse;
 pub mod usnjrnl_query;
 pub mod vel_collect;
 pub mod vol_malfind;
@@ -72,6 +74,10 @@ pub use evtx_query::{
     evtx_query, path_looks_like_evtx, EvtxError, EvtxQueryInput, EvtxQueryOutput, EvtxRow,
 };
 pub use ez_parse::{ez_parse, is_allowed_ez_tool, EzParseError, EzParseInput, EzParseOutput};
+pub use hashset_lookup::{
+    hashset_lookup, HashLookupRow, HashsetKind, HashsetLoaded, HashsetLookupError,
+    HashsetLookupInput, HashsetLookupOutput, HashsetRef, LookupDisposition, SetDisposition,
+};
 pub use hayabusa_scan::{
     hayabusa_scan, HayabusaAlert, HayabusaError, HayabusaInput, HayabusaOutput,
 };
@@ -109,6 +115,10 @@ pub use suricata_eve::{suricata_eve, SuricataEveError, SuricataEveInput, Suricat
 pub use sysmon_network_query::{
     path_looks_like_sysmon_evtx, sysmon_network_query, SysmonNetworkError, SysmonNetworkInput,
     SysmonNetworkOutput, SysmonNetworkRow,
+};
+pub use thumbcache_parse::{
+    path_looks_like_thumbcache, thumbcache_parse, ThumbcacheEntry, ThumbcacheParseError,
+    ThumbcacheParseInput, ThumbcacheParseOutput,
 };
 pub use usnjrnl_query::{
     path_looks_like_usnjrnl, usnjrnl_query, UsnJrnlEntry, UsnJrnlError, UsnJrnlInput, UsnJrnlOutput,

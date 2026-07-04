@@ -75,7 +75,7 @@ echo "=========================================="
 
 # 1. Rust MCP server end-to-end.
 run_smoke \
-    "rust-mcp-smoke (32-tool catalog + core error paths)" \
+    "rust-mcp-smoke (34-tool catalog + core error paths)" \
     "python3 scripts/rust-mcp-smoke.py --release" \
     '[ -x "${CARGO_TARGET_DIR:-target}/release/findevil-mcp" ] || [ -x "${CARGO_TARGET_DIR:-target}/release/findevil-mcp.exe" ]'
 
@@ -141,6 +141,31 @@ run_smoke \
     "evidence-agnostic-smoke (no image-specific hard-coding + anti-enumeration/anti-fabrication finding policy)" \
     "python3 scripts/evidence-agnostic-smoke.py"
 
+# 4b3. Attack-flow visualizer (offline STIX/Mermaid/DOT/D2/Navigator emit). The
+# presentation-only attack-flow package must produce all documented artifacts
+# from a fixture case and the two JSON artifacts must parse — no API calls, no
+# Findings created.
+run_smoke \
+    "attack-flow visualizer (offline STIX/Mermaid/summary/timeline/process-tree/Navigator emit)" \
+    "python3 scripts/attackflow-smoke.py"
+
+# 4b'. The report hook must work under the ENGINE's host python (may be 3.10), not
+# just the 3.11 agent venv. Guards the regression where the visualization was
+# silently dead in the live pipeline because the hook imported through the 3.11-only
+# findevil_agent package. Drives the real render_report._emit_attack_flow.
+run_smoke \
+    "attack-flow report hook under host python (live-pipeline parity)" \
+    "python3 scripts/attackflow-hostpy-smoke.py"
+
+# 4b''. Render/INTERACTION smoke: drives the emitted HTML in headless Chrome and
+# asserts on computed layout + behavior (histogram bars have real height, a facet
+# chip hides rows, the brush filters the timeline, the tree renders + expands).
+# The structure-only tests can't catch invisible renders or dead interactions;
+# this can. SKIPs cleanly when no Chrome/Chromium is installed.
+run_smoke \
+    "attack-flow render/interaction (headless Chrome, skips w/o a browser)" \
+    "python3 scripts/attackflow-render-smoke.py"
+
 # 4c. Windows readiness packet smoke. It uses PacketOnly synthetic evidence
 # and skips cleanly outside environments that can launch PowerShell.
 run_smoke \
@@ -172,6 +197,14 @@ run_smoke \
 run_smoke \
     "repo-layout-smoke (no un-sanctioned tracked/un-ignored entries at repo root)" \
     "python3 scripts/repo-layout-smoke.py"
+
+# 7b1. Benchmark corpus manifest lock — goldens/CORPUS.json must stay well-formed
+#      and every scoreable case must point at a real golden, so a broken corpus
+#      entry is caught before an operator kicks off a long scripts/benchmark run.
+#      (The runner itself needs staged evidence, so it stays OUT of this gate.)
+run_smoke \
+    "benchmark-smoke (CORPUS.json schema + golden wiring + runner syntax)" \
+    "python3 scripts/benchmark-smoke.py"
 
 # 7c. Containment regression lock — every MCP launcher + scripts/verdict must keep
 #     sourcing scripts/lib/project-env.sh and .mcp.json must launch through the

@@ -44,6 +44,8 @@ class ManifestVerifyOutput(BaseModel):
     signature_verified_detail: str | None
     entailment_ok: bool
     entailment_ok_detail: str | None
+    transparency_ok: bool
+    transparency_ok_detail: str | None
 
 
 async def _handle(inp: BaseModel) -> ManifestVerifyOutput:
@@ -63,6 +65,7 @@ async def _handle(inp: BaseModel) -> ManifestVerifyOutput:
     count_ok, count_detail = _split(result.leaf_count_ok)
     sig_verified, sig_verified_detail = _split(result.signature_verified)
     entail_ok, entail_detail = _split(result.entailment_ok)
+    transparency_ok, transparency_detail = _split(result.transparency_ok)
     return ManifestVerifyOutput(
         overall=result.overall,
         audit_chain_ok=audit_ok,
@@ -77,6 +80,8 @@ async def _handle(inp: BaseModel) -> ManifestVerifyOutput:
         signature_verified_detail=sig_verified_detail,
         entailment_ok=entail_ok,
         entailment_ok_detail=entail_detail,
+        transparency_ok=transparency_ok,
+        transparency_ok_detail=transparency_detail,
     )
 
 
@@ -93,7 +98,10 @@ SPEC = ToolSpec(
         "only when the manifest carries an offline-verified Ed25519 signature. "
         "Sigstore bundles are recorded for identity-policy-aware verification, while "
         "stub bundles are dev placeholders. overall=True only if the chain, Merkle, "
-        "leaf-count, and signature-presence checks pass. "
+        "leaf-count, and signature-presence checks pass. transparency_ok is a "
+        "separate non-gating side-signal: True when the optional Sigstore Rekor / "
+        "RFC-3161 anchor of the Merkle root verifies offline, and vacuously True "
+        "when a run carries no anchor (absent by default) — it never gates overall. "
         "If the manifest was moved/renamed, pass audit_log_path explicitly to override "
         "the path embedded in the manifest. "
         "On verify failure: the per-field detail string identifies which check failed "

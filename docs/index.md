@@ -15,8 +15,8 @@ what an agent did.
 
 | Need | Read |
 |---|---|
-| Install from a cold clone | [Install Guide](https://github.com/TimothyVang/verdict-dfir-community/blob/main/INSTALL.md) |
-| Run in three commands | [Quickstart](https://github.com/TimothyVang/verdict-dfir-community/blob/main/QUICKSTART.md) |
+| Install from a cold clone | [Install Guide](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/INSTALL.md) |
+| Run in three commands | [Quickstart](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/QUICKSTART.md) |
 | Run every mode and flag | [Running VERDICT](using/running-verdict.md) |
 | Understand trust boundaries | [Architecture](architecture.md) |
 | Verify custody claims | [Cryptographic Attestation](cryptographic-attestation.md) |

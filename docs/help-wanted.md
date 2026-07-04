@@ -4,7 +4,7 @@ VERDICT shipped at a SANS AI hackathon. It works, the core idea holds up, and I 
 genuinely useful — but it can be a lot better, and I'd rather build it in the open with people who
 know DFIR and AI than grind it solo. If that's you: welcome, and thank you.
 
-> **Heads-up on where to contribute.** [Open issues here](https://github.com/TimothyVang/verdict-dfir-community/issues),
+> **Heads-up on where to contribute.** [Open issues here](https://github.com/TimothyVang/verdict-dfir-beta/issues),
 > and send code as a pull request against the **`develop`** branch of this repo. The gates are local
 > (`bash scripts/run-all-smokes.sh` plus the per-language suites) — no GitHub Actions runners
 > required; a maintainer runs them on your branch and reviews, and two approvals merge it. The
@@ -21,7 +21,7 @@ session *is* the engine. You point it at evidence (a memory image, Windows Event
 a packet capture, or a whole multi-host case folder) and it:
 
 1. opens a read-only **Case** and SHA-256s the evidence,
-2. drives a **narrow, typed, read-only** tool surface (46 product tools — 32 Rust DFIR tools + 14
+2. drives a **narrow, typed, read-only** tool surface (48 product tools — 34 Rust DFIR tools + 14
    Python crypto/memory tools; **no `execute_shell`, ever**),
 3. **verifies every Finding** (re-runs the cited tool and compares output hashes),
 4. and writes a **scoped verdict** — `SUSPICIOUS` / `INDETERMINATE` / `NO_EVIL` — plus an analyst

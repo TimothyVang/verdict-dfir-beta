@@ -1417,8 +1417,8 @@ def classify_artifact_path(path):
         return {"artifact_class": "recyclebin", "evidence_type": "extracted_disk", "parser_tool": "ez_parse"}
     if lower_name == "index.dat" and "history.ie5" in lower_path:
         return {"artifact_class": "ie_history", "evidence_type": "extracted_disk", "parser_tool": "plaso_parse"}
-    if lower_name == "thumbs.db" or lower_name.endswith(".thumbcache"):
-        return {"artifact_class": "thumbnail", "evidence_type": "extracted_disk", "parser_tool": None}
+    if lower_name == "thumbs.db" or lower_name.endswith(".thumbcache") or (lower_name.startswith(("thumbcache_", "iconcache_")) and lower_name.endswith(".db")):
+        return {"artifact_class": "thumbnail", "evidence_type": "extracted_disk", "parser_tool": "thumbcache_parse"}
     if lower_name in {"history", "places.sqlite", "web data", "cookies", "login data"} or lower_name.endswith(".sqlite"):
         return {"artifact_class": "browser_db", "evidence_type": "extracted_disk", "parser_tool": "browser_history"}
     if lower_name.endswith(YARA_TARGET_EXTS):
@@ -3674,6 +3674,7 @@ TOOL_ARTIFACT_CLASSES = {
     "cloud_audit": "cloud",
     "evtx_query": "evtx",
     "ez_parse": "disk/filesystem",
+    "hashset_lookup": "disk/filesystem",
     "hayabusa_scan": "evtx",
     "indx_parse": "disk/filesystem",
     "journalctl_query": "linux",
@@ -3687,6 +3688,7 @@ TOOL_ARTIFACT_CLASSES = {
     "registry_query": "registry",
     "suricata_eve": "network",
     "sysmon_network_query": "network",
+    "thumbcache_parse": "disk/filesystem",
     "usnjrnl_query": "usnjrnl",
     "vel_collect": "velociraptor",
     "vol_malfind": "memory",
@@ -3719,6 +3721,7 @@ APPLICABLE_TOOLS_BY_CLASS: dict[str, frozenset[str]] = {
             "prefetch_parse",
             "registry_query",
             "indx_parse",
+            "thumbcache_parse",
             "yara_scan",
         }
     ),
@@ -9344,6 +9347,10 @@ class Investigation:
         # (exe basename lower, finding dict) for prefetch suspicious-tool findings,
         # used to corroborate execution against UserAssist after registry parsing.
         self._prefetch_exec_findings: list[tuple[str, dict[str, Any]]] = []
+        # Opt-in cross-artifact PID discrepancy check (FIND_EVIL_CROSS_ARTIFACT_PID):
+        # memory process/injection/hidden rows captured in investigate_memory,
+        # assembled + run against on-disk execution records at the start of reason().
+        self._pidcheck_memory: dict[str, Any] | None = None
         self.evtx_summary: dict[str, Any] | None = None
         # EVTX summary is accumulated across every evtx_query call (one per
         # file). A trailing empty log used to reset records_seen to 0 because
@@ -10549,6 +10556,18 @@ class Investigation:
                 "no cross-view divergence to disambiguate.",
             )
 
+        # Capture memory rows for the opt-in cross-artifact PID discrepancy check
+        # (correlator_pid_check): assembled + run against on-disk execution records
+        # in reason(). injs = vol_malfind injections; psxview may be [] when the
+        # process views agree. Last memory image wins if this runs more than once.
+        self._pidcheck_memory = {
+            "psscan_rows": list(psscan),
+            "malfind_rows": list(injs),
+            "psxview_rows": list(psxview),
+            "tool_call_id": tcid_psscan,
+            "memory_artifact_path": evidence_path,
+        }
+
         # Synthesize findings
         # Finding 1 — pslist=0 + psscan>0. This split has TWO opposite causes
         # that look identical at the tool level, so disambiguate before asserting:
@@ -10793,6 +10812,68 @@ class Investigation:
                 },
             )
         print(f"  hayabusa_scan: {len(alerts)} high+ alerts")
+        if not error and alerts:
+            self._emit_hayabusa_lead_finding(alerts, evtx_dir, tcid)
+
+    def _emit_hayabusa_lead_finding(
+        self, alerts: list[dict[str, Any]], evtx_dir: str, tcid: str
+    ) -> None:
+        """Emit ONE aggregate Pool-B HYPOTHESIS lead when the Hayabusa Sigma
+        sweep returns high/critical alerts.
+
+        Doctrine: Sigma output is a LEAD until corroborated (CLAUDE.md), so this
+        never ships CONFIRMED/INFERRED and never asserts a specific technique —
+        ``mitre_technique`` stays ``None`` and the wording is scoped to
+        "detection lead, corroborate before treating as established". But the
+        lead MUST be visible: before this, high+ alerts landed only in the
+        timeline, so a single-artifact EVTX run with real Sigma hits reported
+        NO_EVIL / 0 findings / 0 disclosed leads. Surfacing one HYPOTHESIS lead
+        makes ``compute_verdict`` return INDETERMINATE (leads present, not
+        corroborated) instead of a false scoped-clean — a HYPOTHESIS-only tier
+        can never flip the verdict to SUSPICIOUS, so there is no overclaim risk.
+        Aggregate (one finding, top rules listed) to avoid one-finding-per-alert
+        spam, mirroring the RecentDocs / service-recon emitters.
+        """
+        rules = list(
+            dict.fromkeys(
+                str(a.get("rule") or a.get("title") or "").strip()
+                for a in alerts
+                if isinstance(a, dict) and (a.get("rule") or a.get("title"))
+            )
+        )
+        crit = sum(
+            1
+            for a in alerts
+            if isinstance(a, dict)
+            and str(a.get("level") or "").lower().startswith("crit")
+        )
+        top = "; ".join(rules[:6]) or "unnamed Sigma rules"
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for(
+                "f-B-hayabusa-sigma", evtx_dir, force_suffix=True
+            ),
+            "tool_call_id": tcid,
+            "artifact_path": evtx_dir,
+            "description": (
+                f"hypothesis: the Hayabusa Sigma sweep matched {len(alerts)} "
+                f"high/critical detection alert(s) ({crit} critical) across the "
+                f"EVTX evidence (hayabusa_scan, top rules: {top}). Per doctrine "
+                "these signature-engine matches are DETECTION LEADS, not confirmed "
+                "findings: they are treated as uncorroborated until a second "
+                "current-case artifact class independently confirms them. This "
+                "single EVTX lane carries no corroborating class, so it remains a "
+                "HYPOTHESIS lead — corroborate with execution (Prefetch/UserAssist), "
+                "registry, or network artifacts before treating any matched "
+                "technique as established."
+            ),
+            "confidence": "HYPOTHESIS",
+            "pool_origin": "B",
+            "mitre_technique": None,
+            "derived_from": [tcid],
+        }
+        self.findings_pool_b.append(finding)
+        print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
 
     def investigate_evtx(
         self, rust: SshMcpClient, py: SshMcpClient, evidence_path: str | None = None
@@ -11064,6 +11145,14 @@ class Investigation:
                         "artifacts_skipped_oversize", 0
                     ),
                     "max_artifact_bytes": extracted.get("max_artifact_bytes"),
+                    "deleted_entries_seen": extracted.get("deleted_entries_seen", 0),
+                    "deleted_recovered": extracted.get("deleted_recovered", 0),
+                    "deleted_skipped_realloc": extracted.get(
+                        "deleted_skipped_realloc", 0
+                    ),
+                    "deleted_recovery_failed": extracted.get(
+                        "deleted_recovery_failed", 0
+                    ),
                     **({"error": extract_error} if extract_error else {}),
                 },
                 arguments=extract_args,
@@ -11079,6 +11168,18 @@ class Investigation:
                 self.analysis_limitations.append(
                     f"disk_extract_artifacts skipped {skipped_oversize} oversized artifact(s); rerun with a targeted extraction plan if those paths are needed."
                 )
+            deleted_seen = int(extracted.get("deleted_entries_seen") or 0)
+            deleted_recovered = int(extracted.get("deleted_recovered") or 0)
+            deleted_realloc = int(extracted.get("deleted_skipped_realloc") or 0)
+            deleted_failed = int(extracted.get("deleted_recovery_failed") or 0)
+            if deleted_realloc or deleted_failed:
+                # Recovery coverage is partial by nature; disclose what could
+                # not be recovered so NO_EVIL scoping stays honest.
+                self.analysis_limitations.append(
+                    f"deleted-file recovery: {deleted_seen} deleted entries listed, "
+                    f"{deleted_recovered} recovered, {deleted_realloc} skipped "
+                    f"(inode reallocated by a live file), {deleted_failed} unreadable/empty."
+                )
 
             evtx_entries: list[dict[str, Any]] = []
             for artifact in artifacts:
@@ -11093,6 +11194,9 @@ class Investigation:
                             "artifact_class": artifact_class,
                             "evidence_type": "extracted_disk",
                             "size_bytes": artifact.get("size_bytes", 0),
+                            "recovered_deleted": bool(
+                                artifact.get("recovered_deleted", False)
+                            ),
                         }
                     )
                 elif artifact_class == "evtx":
@@ -11106,11 +11210,15 @@ class Investigation:
                             "artifact_class": "evtx",
                             "evidence_type": "evtx",
                             "size_bytes": artifact.get("size_bytes", 0),
+                            "recovered_deleted": bool(
+                                artifact.get("recovered_deleted", False)
+                            ),
                         }
                     )
             print(
                 f"  disk_extract_artifacts: {len(extracted_entries)} typed artifacts"
                 f" + {len(evtx_entries)} event logs"
+                f" (deleted recovered: {deleted_recovered})"
             )
             if extracted_entries:
                 self.investigate_extracted_disk_artifacts(rust, py, extracted_entries)
@@ -13314,6 +13422,89 @@ class Investigation:
                 "YARA-target disk artifacts were identified but FIND_EVIL_DISK_YARA_RULES is not set; files were summarized for follow-up only."
             )
 
+        # Thumbnail caches (XP Thumbs.db / Vista+ thumbcache_*.db): parse for
+        # image-presence/viewing evidence that survives file deletion. Parsed
+        # entries are recorded and timelined as correlatable material only —
+        # thumbnails are ubiquitous and benign on any Windows host, so no
+        # finding is emitted here; promotion requires case-specific
+        # corroboration downstream (leads-until-corroborated rule).
+        thumb_entries = by_class["thumbnail"][:20]
+        thumb_specs: list[tuple[str, dict[str, Any]]] = [
+            (
+                "thumbcache_parse",
+                {
+                    "case_id": self.handle["id"],
+                    "thumbcache_path": str(e["path"]),
+                    "limit": 500,
+                },
+            )
+            for e in thumb_entries
+        ]
+        thumb_outs = self._parallel_tool_calls(rust, thumb_specs, timeout=600.0)
+        for entry, (_name, args), out in zip(
+            thumb_entries, thumb_specs, thumb_outs, strict=True
+        ):
+            path = str(entry["path"])
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"thumbcache_parse failed for {path}: {error}"
+                )
+            rows = out.get("entries", []) if not error else []
+            named = [
+                row
+                for row in rows
+                if isinstance(row, dict) and row.get("original_filename")
+            ]
+            tcid = self._record_tool(
+                py,
+                "thumbcache_parse",
+                self._output_hash(out),
+                {
+                    "thumbcache_path": path,
+                    "format": out.get("format"),
+                    "entries_seen": out.get("entries_seen", 0),
+                    "entries_returned": len(rows),
+                    "named_entries": len(named),
+                    "parse_errors": len(out.get("parse_errors") or []),
+                    "recovered_deleted_source": bool(entry.get("recovered_deleted")),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            for row in named[:10]:
+                modified = str(row.get("modified_iso") or "")
+                if not modified:
+                    continue
+                self._timeline_add(
+                    modified,
+                    "thumbcache_parse",
+                    "thumbnail",
+                    f"thumbnail cache entry for {row.get('original_filename')} "
+                    f"(cache-side timestamp; presence/rendering evidence, not execution)",
+                    tcid,
+                    {"thumbcache_path": path},
+                )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "thumbcache_parse",
+                tcid,
+                {
+                    "thumbcache_path": path,
+                    "format": out.get("format"),
+                    "entries_seen": out.get("entries_seen", 0),
+                    "named_entries": len(named),
+                    "sample_filenames": [
+                        str(row.get("original_filename")) for row in named[:10]
+                    ],
+                    "recovered_deleted_source": bool(entry.get("recovered_deleted")),
+                    **({"error": error} if error else {}),
+                },
+            )
+            print(
+                f"  thumbcache_parse: {path} entries={out.get('entries_seen', 0)} named={len(named)}"
+            )
+
         disk_summary["timeline_event_count"] = len(
             [
                 event
@@ -13334,6 +13525,7 @@ class Investigation:
                     "legacy_evt",
                     "ie_history",
                     "scheduled_task",
+                    "thumbnail",
                 }
             ]
         )
@@ -14917,8 +15109,58 @@ class Investigation:
             {"findings": len(pool_b_verified)},
         )
 
+    def _emit_cross_artifact_pid_findings(self) -> None:
+        """Opt-in (FIND_EVIL_CROSS_ARTIFACT_PID): flag memory-resident processes
+        that are independently suspicious (malfind-injected or psxview-hidden) AND
+        have no matching on-disk execution record (Prefetch/Amcache). Appended to
+        Pool A here — before verify/judge/correlate — so each cross-artifact lead is
+        replayed and gated like any other finding. HYPOTHESIS-only; a no-op unless
+        the case carries BOTH memory and on-disk execution evidence.
+        """
+        if not os.environ.get("FIND_EVIL_CROSS_ARTIFACT_PID"):
+            return
+        mem = self._pidcheck_memory
+        if not mem or not self._prefetch_exec_findings:
+            return
+        from findevil_agent.correlator import build_cross_artifact_findings
+
+        disk_execs = {base for base, _ in self._prefetch_exec_findings}
+        findings = build_cross_artifact_findings(
+            mem["psscan_rows"],
+            mem["malfind_rows"],
+            mem["psxview_rows"],
+            disk_execs,
+            memory_tool_call_id=mem["tool_call_id"],
+            memory_artifact_path=mem["memory_artifact_path"],
+            case_id=self.handle["id"],
+        )
+        for f in findings:
+            self.findings_pool_a.append(
+                {
+                    "case_id": f.case_id,
+                    "finding_id": self._finding_id_for(
+                        f.finding_id, mem["memory_artifact_path"]
+                    ),
+                    "tool_call_id": f.tool_call_id,
+                    "artifact_path": f.artifact_path,
+                    "description": f.description,
+                    "confidence": f.confidence,
+                    "pool_origin": "A",
+                    "mitre_technique": f.mitre_technique,
+                    "derived_from": [f.tool_call_id],
+                }
+            )
+        if findings:
+            print(
+                f"  cross-artifact PID discrepancy: {len(findings)} HYPOTHESIS lead(s)"
+            )
+
     def reason(self, py: SshMcpClient) -> tuple[list[dict[str, Any]], int, int, int]:
         print("\n=== reasoning phase ===")
+
+        # Opt-in cross-artifact PID discrepancy leads (memory-vs-disk), appended to
+        # Pool A before verify/judge/correlate so they are replayed and gated.
+        self._emit_cross_artifact_pid_findings()
 
         # Recall prior-case context onto each drafted finding BEFORE the
         # verifier/judge see them (Hermes memory_recall). Non-evidentiary
