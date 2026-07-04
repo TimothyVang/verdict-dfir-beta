@@ -2,22 +2,29 @@
 """tui-smoke - build verdict-tui and drive it non-interactively.
 
 The VERDICT TUI (apps/tui, the `verdict-tui` binary) is a read-only case
-viewer: it renders a finished case directory's JSON and, by construction,
-never opens evidence, never calls an MCP/forensic tool, and never emits a
-Finding. This smoke locks that contract without a terminal:
+viewer and live monitor: it renders a case directory's JSON and, in drive
+mode, launches the repo's own `scripts/verdict` launcher and tails the run.
+By construction it never opens evidence itself, never calls an MCP/forensic
+tool, and never emits a Finding. This smoke locks that contract without a
+terminal:
 
   1. Build the crate (`cargo build -p verdict-tui --locked`). If the build
      cannot run (no cargo) or fails offline but a binary already exists,
      fall back to the existing binary; otherwise fail.
-  2. Static doctrine check over apps/tui/src: the source must not reference
-     `evidence_path`, spawn a subprocess (`Command::new`), or pull a network
-     client crate - the structural guarantee behind "read-only by
-     construction".
-  3. Run `verdict-tui --print` (headless TestBackend render to stdout)
+  2. Static doctrine check over apps/tui/src: the source must not read the
+     evidence-path field, or pull a network client crate - the structural
+     guarantee behind "read-only by construction".
+  3. Launcher isolation: the ONLY subprocess the crate spawns is
+     `scripts/verdict`, spawned solely from case/runner.rs. No other source
+     file may call `Command::new`; runner.rs must spawn exactly once, pin the
+     program to the `scripts/verdict` launcher constant, and open no shell or
+     forensic-tool escape hatch.
+  4. Run `verdict-tui --print` (headless TestBackend render to stdout)
      against the committed sample-run fixtures AND with no argument
      (newest-case discovery). Assert exit 0, non-empty output, the VERDICT
-     header, and no Rust panic on stderr.
-  4. Assert the run wrote nothing under `evidence/`.
+     header, and no Rust panic on stderr. Also assert `--print --drive` is
+     rejected (the live path never runs headless) without spawning anything.
+  5. Assert the run wrote nothing under `evidence/`.
 
 Evidence-agnostic: the fixtures are discovered under docs/sample-run and
 the checks key on structural markers ("VERDICT", the scoped verdict word),
@@ -48,12 +55,32 @@ VERDICT_WORDS = ("SUSPICIOUS", "INDETERMINATE", "NO_EVIL")
 # the TUI source. Each maps to why it is forbidden. `evidence_path` is
 # matched in its JSON-key form ("evidence_path") so a real read of the field
 # trips it while prose in doc comments that merely names it does not.
+#
+# `Command::new` is NOT here: Phase 2 drive mode must spawn the scripts/verdict
+# launcher. That single, pinned spawn is enforced structurally by
+# check_launcher_isolation() below instead of blanket-banned here.
 FORBIDDEN_SOURCE = {
     '"evidence_path"': "the viewer must never read/resolve the evidence path field",
-    "Command::new": "the viewer must never spawn a subprocess / forensic tool",
     "reqwest": "the viewer must never make a network/MCP call",
     "TcpStream": "the viewer must never open a network connection",
 }
+
+# The one module allowed to spawn a subprocess, and the launcher it must pin.
+LAUNCHER_MODULE = SRC / "case" / "runner.rs"
+LAUNCHER_MARKER = 'VERDICT_LAUNCHER: &str = "scripts/verdict"'
+
+# Shell / raw-exec escape hatches that must never appear in the launcher: the
+# only program it may start is the scripts/verdict launcher, never a shell or a
+# forensic tool. Quoted forms avoid matching flag substrings like --no-dashboard.
+LAUNCHER_ESCAPES = (
+    '"/bin/sh"',
+    '"/bin/bash"',
+    '"sh"',
+    '"bash"',
+    '"-c"',
+    "execute_shell",
+    "shell_exec",
+)
 
 
 def fail(message: str) -> None:
@@ -121,6 +148,44 @@ def check_source_doctrine() -> None:
     print(f"  source doctrine OK ({len(FORBIDDEN_SOURCE)} forbidden patterns absent)")
 
 
+def check_launcher_isolation() -> None:
+    """The only subprocess is scripts/verdict, spawned solely from runner.rs."""
+    if not LAUNCHER_MODULE.is_file():
+        fail(f"expected the launcher module at {LAUNCHER_MODULE.relative_to(REPO)}")
+
+    # 1. `Command::new` may appear ONLY in the launcher module.
+    offenders: list[str] = []
+    for path in SRC.rglob("*.rs"):
+        if path == LAUNCHER_MODULE:
+            continue
+        count = path.read_text(encoding="utf-8", errors="replace").count("Command::new")
+        if count:
+            offenders.append(
+                f"{path.relative_to(REPO)}: {count} Command::new "
+                "(only case/runner.rs may spawn a subprocess)"
+            )
+    if offenders:
+        fail("subprocess spawn outside the launcher module:\n    " + "\n    ".join(offenders))
+
+    runner = LAUNCHER_MODULE.read_text(encoding="utf-8", errors="replace")
+
+    # 2. Exactly one spawn.
+    spawns = runner.count("Command::new(")
+    if spawns != 1:
+        fail(f"launcher must spawn exactly one subprocess; runner.rs has {spawns} Command::new(")
+
+    # 3. That spawn is pinned to the scripts/verdict launcher constant.
+    if LAUNCHER_MARKER not in runner:
+        fail(f"launcher must pin the program via `{LAUNCHER_MARKER}`")
+
+    # 4. No shell / raw-exec escape hatch.
+    hits = [needle for needle in LAUNCHER_ESCAPES if needle in runner]
+    if hits:
+        fail(f"launcher must not open a shell/raw-exec escape hatch: {sorted(hits)}")
+
+    print("  launcher isolation OK (one scripts/verdict spawn in case/runner.rs, no shell escape)")
+
+
 def snapshot_tree(root: Path) -> set[tuple[str, int]]:
     """Set of (relpath, size) for every file under root (empty if absent)."""
     if not root.exists():
@@ -153,6 +218,23 @@ def run_print(binary: Path, args: list[str], label: str) -> str:
     return result.stdout
 
 
+def check_drive_print_rejected(binary: Path) -> None:
+    """`--print --drive` must be refused (live path never runs headless)."""
+    result = subprocess.run(
+        [str(binary), "--print", "--drive", "/nonexistent/evidence"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    stderr = result.stderr or ""
+    if "panicked" in stderr:
+        fail(f"--print --drive panicked:\n{stderr[-1500:]}")
+    if result.returncode == 0:
+        fail("--print --drive was accepted; the live path must not run headless")
+    print("  --print --drive rejected (no subprocess, no headless drive)")
+
+
 def main() -> int:
     print("tui-smoke: verdict-tui read-only viewer")
 
@@ -161,6 +243,7 @@ def main() -> int:
 
     binary = build()
     check_source_doctrine()
+    check_launcher_isolation()
 
     before = snapshot_tree(EVIDENCE)
 
@@ -179,7 +262,10 @@ def main() -> int:
     # 3. No-argument newest-case discovery under the allow-listed roots.
     run_print(binary, [], "newest-case-discovery")
 
-    # 4. The viewer wrote nothing under evidence/.
+    # 4. The interactive drive path refuses to run headless (and spawns nothing).
+    check_drive_print_rejected(binary)
+
+    # 5. The viewer wrote nothing under evidence/.
     after = snapshot_tree(EVIDENCE)
     if after != before:
         added = after - before

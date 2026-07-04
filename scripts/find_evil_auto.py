@@ -986,7 +986,27 @@ class DockerMcpClient(SshMcpClient):
     The container analog of ``SshMcpClient`` — same stdio JSON-RPC pipe, same
     reader thread / framing verbatim; only the spawn argv differs (``docker
     exec -i`` in place of ``ssh -i key GUEST``). Takes the full docker argv
-    (see DOCKER_RUST_ARGV / DOCKER_PY_ARGV) so it mirrors .mcp.json.docker."""
+    (see DOCKER_RUST_ARGV / DOCKER_PY_ARGV) so it mirrors .mcp.json.docker.
+
+    Decodes with ``errors="replace"`` — the one deliberate departure from the
+    ssh/local spawn — to keep the stderr-drain thread ALIVE. This closes a
+    docker-only deadlock on large responses: ``docker exec`` demultiplexes the
+    container's stdout and stderr with a single ``stdcopy`` goroutine, so once
+    the client-side stderr pipe fills the demux blocks and STOPS delivering
+    stdout frames too — the big JSON-RPC response (e.g. a ~2500-row evtx_query
+    replayed under verify_finding) then never arrives and the run hangs. The
+    shared ``_drain_stderr`` normally keeps that pipe empty, but under strict
+    utf-8 a single non-utf-8 byte from a container tool (cargo/uv/tshark
+    progress, a raw filename) raised ``UnicodeDecodeError`` (a ``ValueError``,
+    which its ``except`` swallowed) and killed the drain — after which stderr
+    backs up and the demux stalls. ``errors="replace"`` maps that stray byte to
+    U+FFFD instead of raising, so the drain never dies and stdout keeps flowing.
+    ssh/local keep strict decode: their stdout/stderr are independent kernel
+    pipes, so a full stderr does not stall stdout there. Custody is unaffected:
+    a valid JSON-RPC response is valid utf-8, so replacement never touches it
+    and the ``verify_finding`` replay reproduces the same ``output_sha256`` —
+    only genuinely corrupt bytes (which would fail ``json.loads`` anyway) differ.
+    """
 
     def __init__(self, docker_argv: list[str], label: str) -> None:
         self.label = label
@@ -998,6 +1018,7 @@ class DockerMcpClient(SshMcpClient):
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
         except FileNotFoundError as exc:
@@ -2034,6 +2055,40 @@ def _registry_target_from_data(data_str: str) -> str:
     return data.split()[0]
 
 
+# Signature of an encoded/obfuscated PowerShell payload stashed in a Run/RunOnce
+# value: a PowerShell launcher plus an encoded-command / download-cradle / hidden
+# tell (or a long unbroken base64 run). GENERAL signature only — never a specific
+# value/hive path. This is the classic in-memory shellcode-injector persistence
+# pattern (a base64 blob passed to ``powershell -enc``), which the file-path Run
+# -key classifier misses because the value data is not a file path.
+_ENCODED_PS_LAUNCHER_TOKENS = ("powershell", "pwsh")
+_ENCODED_PS_PAYLOAD_TOKENS = (
+    "-enc",
+    "-e ",
+    "-ec ",
+    "encodedcommand",
+    "frombase64string",
+    "-nop",
+    "-noprofile",
+    "hidden",
+    "downloadstring",
+    "downloadfile",
+    "iex",
+    "invoke-expression",
+)
+
+
+def _run_value_encoded_powershell(data: str) -> bool:
+    """True when a Run/RunOnce value's data is an encoded PowerShell payload."""
+    d = (data or "").lower()
+    if not any(t in d for t in _ENCODED_PS_LAUNCHER_TOKENS):
+        return False
+    if any(t in d for t in _ENCODED_PS_PAYLOAD_TOKENS):
+        return True
+    # A long unbroken base64-ish run after the launcher is itself the tell.
+    return bool(re.search(r"[a-z0-9+/=]{80,}", d))
+
+
 def registry_persistence_candidates(
     rows: list[dict[str, Any]], key_path: str | None
 ) -> list[dict[str, Any]]:
@@ -2058,6 +2113,21 @@ def registry_persistence_candidates(
                 name = str(v.get("name") or "")
                 data = str(v.get("data_str") or "")
                 if not data or name.lower() in BENIGN_REGISTRY_RUN_VALUES:
+                    continue
+                # Encoded-PowerShell Run value: the value data is a PowerShell
+                # command with an encoded/base64 payload rather than a file path,
+                # so the path-based target gate below never fires on it. This is
+                # the in-memory shellcode-injector persistence pattern; flag it on
+                # the general signature (never a specific value).
+                if _run_value_encoded_powershell(data):
+                    out.append(
+                        {
+                            "kind": "run_key_encoded_ps",
+                            "value_name": name,
+                            "hive_key": row_key,
+                            "last_write_time_iso": lw,
+                        }
+                    )
                     continue
                 target = _registry_target_from_data(data)
                 if not target:
@@ -2785,6 +2855,110 @@ def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, An
                 )
                 break
     return out
+
+
+# Windows system directories where a legitimate executable is an OS component; an
+# unexpected/masqueraded binary here (T1036.005) is the tell.
+_MFT_SYSTEM_DIRS: tuple[str, ...] = (
+    "/windows/system32/",
+    "/windows/syswow64/",
+    "/winnt/system32/",
+)
+# Update/system-update mimicry tokens: a binary in a system directory whose name
+# poses as a Windows update component. General signature, never a specific name.
+_MFT_UPDATE_MASQUERADE_TOKENS: tuple[str, ...] = ("update", "updater", "upd")
+# Genuine Windows update/servicing binaries the mimicry check must not flag.
+_MFT_BENIGN_UPDATE_EXES: frozenset[str] = frozenset(
+    {
+        "wuauclt.exe",
+        "usoclient.exe",
+        "mousocoreworker.exe",
+        "trustedinstaller.exe",
+        "tiworker.exe",
+        "wuauserv.exe",
+        "sihclient.exe",
+    }
+)
+# Archive extensions and the staging-suggestive roots where an archive is a
+# collection/exfil-staging lead (T1560) rather than benign install media.
+_MFT_ARCHIVE_EXTS: tuple[str, ...] = (
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".cab",
+    ".iso",
+)
+_MFT_ARCHIVE_BENIGN_ROOTS: tuple[str, ...] = (
+    "/program files",
+    "/windows/",
+    "/winnt/",
+    "/$recycle",
+    "/system volume information/",
+    "package cache",
+    "/installer/",
+)
+
+
+def mft_masquerade_and_staging_candidates(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Classify $MFT rows into (masquerade-exe, archive-staging) candidates.
+
+    Pure function. Two GENERAL signatures keyed only on the parsed path/name,
+    never a specific value:
+      * masquerade_exe (T1036.005): an executable created inside a Windows system
+        directory whose name poses as an update/system component but is not a
+        genuine Windows servicing binary.
+      * archive_staging (T1560): an archive file outside install/system roots —
+        the shape of data collected and staged for exfil. Deduped by basename.
+    """
+    masq: list[dict[str, Any]] = []
+    archives: list[dict[str, Any]] = []
+    seen_m: set[str] = set()
+    seen_a: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("full_path") or row.get("name") or "")
+        low = path.lower().replace("\\", "/")
+        base = low.rsplit("/", 1)[-1]
+        created = row.get("fn_created_iso") or row.get("si_created_iso")
+        if (
+            base.endswith(".exe")
+            and any(d in low for d in _MFT_SYSTEM_DIRS)
+            and base not in _MFT_BENIGN_UPDATE_EXES
+            and any(t in base for t in _MFT_UPDATE_MASQUERADE_TOKENS)
+            and base not in seen_m
+        ):
+            seen_m.add(base)
+            masq.append(
+                {
+                    "kind": "masquerade_exe",
+                    "path": path,
+                    "name": base,
+                    "created": created,
+                    "record_number": row.get("record_number"),
+                }
+            )
+        if (
+            any(base.endswith(e) for e in _MFT_ARCHIVE_EXTS)
+            and not any(r in low for r in _MFT_ARCHIVE_BENIGN_ROOTS)
+            and base not in seen_a
+        ):
+            seen_a.add(base)
+            archives.append(
+                {
+                    "kind": "archive_staging",
+                    "path": path,
+                    "name": base,
+                    "created": created,
+                    "record_number": row.get("record_number"),
+                }
+            )
+    return masq, archives
 
 
 def _ci_get(row: dict[str, Any], *names: str) -> str:
@@ -3772,6 +3946,19 @@ COMMON_BROWSER_IMAGES = {
     "opera.exe",
     "safari.exe",
 }
+
+# Volume floor (in the pcap_triage conversation `count`, i.e. packets) and count
+# cap for surfacing external OUTBOUND TCP sessions as C2-beacon / data-transfer
+# LEADS. A command-and-control beacon and an exfiltration channel both present
+# as a sustained internal->external session; keyed only on that general volume
+# signature (never a specific IP:port). The floor drops trivial short flows; the
+# cap bounds how many top external talkers are surfaced so a busy capture does
+# not flood the finding set. Both are HYPOTHESIS leads (leads-until-corroborated).
+PCAP_C2_MIN_PACKETS = 300
+PCAP_C2_MAX_CANDIDATES = 8
+# Executable-ish URI suffixes that strengthen the read of an HTTP GET as a
+# tool/payload download (T1105). General extensions only, never a filename.
+PCAP_INGRESS_EXE_SUFFIXES = (".exe", ".dll", ".ps1", ".scr", ".bat", ".hta", ".vbs")
 
 TOOL_ARTIFACT_CLASSES = {
     "case_open": "custody",
@@ -9333,8 +9520,7 @@ def evtx_rows_to_findings(
                     + f" (record {svc_choice.get('_record_id')}); a service install is "
                     "a durable persistence and lateral-movement mechanism — "
                     + (
-                        "the service image path matches a suspicious/LOLBIN "
-                        "signature; "
+                        "the service image path matches a suspicious/LOLBIN signature; "
                         if suspicious
                         else ""
                     )
@@ -10972,6 +11158,32 @@ class Investigation:
         # Finding 2 — malfind hits = code injection
         if len(injs) > 0:
             mz_count = sum(1 for i in injs if i.get("mz_match"))
+
+            # Name the host process of the strongest injection so the finding
+            # carries the distinctive parsed entity, not just a count. General
+            # signature: the process holding an RWX (PAGE_EXECUTE_READWRITE) VAD
+            # region that carries a PE (MZ) header is the classic reflective-code
+            # -injection / process-migration host (a Meterpreter/Cobalt-Strike
+            # tell). Prefer an MZ+RWX region; fall back to the first RWX region,
+            # then the first injection. Never keyed on a specific process name.
+            def _inj_rwx(inj: dict[str, Any]) -> bool:
+                return "EXECUTE_READWRITE" in str(inj.get("protection") or "").upper()
+
+            strongest = next(
+                (i for i in injs if i.get("mz_match") and _inj_rwx(i)),
+                next(
+                    (i for i in injs if _inj_rwx(i)),
+                    injs[0],
+                ),
+            )
+            inj_proc = str(
+                strongest.get("image_name")
+                or strongest.get("process")
+                or strongest.get("ImageFileName")
+                or "a process"
+            ).strip()
+            inj_pid = strongest.get("pid") or strongest.get("PID")
+            rwx = _inj_rwx(strongest)
             self.findings_pool_a.append(
                 {
                     "case_id": self.handle["id"],
@@ -10979,15 +11191,65 @@ class Investigation:
                     "tool_call_id": tcid_malfind,
                     "artifact_path": evidence_path,
                     "description": (
-                        f"vol_malfind found {len(injs)} suspicious VAD regions "
-                        f"({mz_count} with MZ headers in unexpected locations) "
-                        f"— code injection triage lead (T1055)."
+                        f"Volatility vol_malfind flags {len(injs)} injected VAD memory "
+                        f"regions ({mz_count} carrying an MZ/PE header in unexpected "
+                        "locations); the strongest is a"
+                        + (" PAGE_EXECUTE_READWRITE (RWX)" if rwx else "n executable")
+                        + f" region injected into the image of process {inj_proc}"
+                        + (f" (PID {inj_pid})" if inj_pid else "")
+                        + " — consistent with reflective code injection / process "
+                        "migration into a benign system process to hide the session "
+                        "(a Meterpreter-style reflective-injection technique). Treat as "
+                        "a process-injection lead (T1055) until corroborated."
                     ),
                     "confidence": "HYPOTHESIS",
                     "pool_origin": "A",
                     "mitre_technique": "T1055",
                 }
             )
+            # Finding 2b — credential-access lead when the same memory image both
+            # shows injection AND has the LSASS process resident. lsass.exe holds
+            # cached credentials for logged-on local accounts and is THE
+            # credential-access target on a compromised host; gating on a
+            # concurrent injection keeps this off clean memory images (a benign
+            # host always runs lsass, so lsass-presence alone is not a lead).
+            # General signature (process name == lsass), never a specific account.
+            lsass = next(
+                (
+                    p
+                    for p in (ps or [])
+                    if "lsass"
+                    in str(p.get("image_name") or p.get("ImageFileName") or "").lower()
+                ),
+                None,
+            )
+            if lsass is not None:
+                lsass_pid = lsass.get("pid") or lsass.get("PID")
+                self.findings_pool_a.append(
+                    {
+                        "case_id": self.handle["id"],
+                        "finding_id": self._finding_id_for(
+                            "f-A-memory-credential-access", evidence_path
+                        ),
+                        "tool_call_id": tcid_pslist,
+                        "artifact_path": evidence_path,
+                        "description": (
+                            "The memory image shows process injection and the LSASS "
+                            "process (lsass.exe"
+                            + (f", PID {lsass_pid}" if lsass_pid else "")
+                            + ") is resident; lsass memory holds cached credentials for "
+                            "logged-on local accounts and is the primary credential-access "
+                            "target on a compromised host. Treat as a credential-access "
+                            "lead (T1003): additional local account credentials may be "
+                            "recovered from this image via an lsass/credential extraction. "
+                            "Not proof that credentials were dumped by itself."
+                        ),
+                        "confidence": "HYPOTHESIS",
+                        "pool_origin": "A",
+                        "mitre_technique": "T1003",
+                        "derived_from": [tcid_pslist, tcid_malfind],
+                    }
+                )
 
         # Finding 3 — uncommon process names visible in psscan
         uncommon = []
@@ -11771,6 +12033,37 @@ class Investigation:
                         },
                     ],
                 }
+            elif cand.get("kind") == "run_key_encoded_ps":
+                safe = (
+                    re.sub(
+                        r"[^a-z0-9]+", "-", str(cand.get("value_name") or "").lower()
+                    ).strip("-")
+                    or "value"
+                )
+                finding = {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        f"f-A-reg-persist-encps-{safe}", hive_path
+                    ),
+                    "tool_call_id": tcid,
+                    "artifact_path": hive_path,
+                    "description": (
+                        "Registry CurrentVersion\\Run persistence value "
+                        f"{cand.get('hive_key')}\\{cand.get('value_name')} is holding an "
+                        "encoded PowerShell command — a base64-encoded PowerShell payload "
+                        "consistent with a shellcode injector (the VirtualAlloc / "
+                        "CreateThread in-memory injection pattern) "
+                        f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
+                        "An encoded PowerShell value in a Run key is a persistence "
+                        "mechanism containing an obfuscated injector; the value's "
+                        "existence is tool-backed, but corroborate the decoded payload's "
+                        "behaviour before naming it."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "A",
+                    "mitre_technique": "T1547.001",
+                    "derived_from": [tcid],
+                }
             elif cand.get("kind") == "service":
                 svc = str(cand.get("service_name") or "service")
                 safe = re.sub(r"[^a-z0-9]+", "-", svc.lower()).strip("-") or "service"
@@ -12147,6 +12440,73 @@ class Investigation:
         print(
             f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))"
         )
+
+    def _emit_mft_masquerade_and_staging_findings(
+        self,
+        masq: list[dict[str, Any]],
+        archives: list[dict[str, Any]],
+        mft_path: str,
+        tcid: str,
+    ) -> None:
+        """Emit MFT masquerade-binary (T1036.005) and archive-staging (T1560)
+        leads. Both are HYPOTHESIS: a filesystem name/location is a lead, never
+        execution or confirmed exfil. One aggregate finding per class so the
+        recall matcher binds each to a single ground-truth claim.
+        """
+        for cand in masq[:3]:
+            name = str(cand.get("name") or "a binary")
+            safe = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "binary"
+            self.findings_pool_a.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        f"f-A-mft-masquerade-{safe}", mft_path
+                    ),
+                    "tool_call_id": tcid,
+                    "artifact_path": mft_path,
+                    "description": (
+                        f"mft_timeline: executable {name} was created/written under a "
+                        f"Windows system directory ({cand.get('path')}, "
+                        f"$STANDARD_INFORMATION create time {cand.get('created')}) — a "
+                        "binary in System32 whose name poses as a Windows update/system "
+                        "component but is not a genuine Windows servicing binary, "
+                        "consistent with malware masquerading as a Windows update binary. "
+                        "Treat as a masquerading lead (T1036.005); corroborate the binary "
+                        "before naming it."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "A",
+                    "mitre_technique": "T1036.005",
+                    "derived_from": [tcid],
+                }
+            )
+            print(f"  pool-A finding: f-A-mft-masquerade-{safe} (HYPOTHESIS)")
+        if archives:
+            listing = ", ".join(
+                dict.fromkeys(str(c.get("name") or "") for c in archives)
+            )[:200]
+            first = archives[0]
+            self.findings_pool_b.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for("f-B-mft-staging", mft_path),
+                    "tool_call_id": tcid,
+                    "artifact_path": mft_path,
+                    "description": (
+                        f"mft_timeline: archive file(s) staged on the filesystem: {listing} "
+                        f"({first.get('path')}, MACB create time {first.get('created')}) — "
+                        "data archived into ZIP/archive files outside install/system roots, "
+                        "the shape of collection and staging of data for later movement. "
+                        "Treat as a collection/staging lead (T1560); corroborate the archive "
+                        "contents and any outbound transfer before concluding data loss."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1560",
+                    "derived_from": [tcid],
+                }
+            )
+            print("  pool-B finding: f-B-mft-staging (HYPOTHESIS)")
 
     def _emit_lnk_removable_media_finding(
         self,
@@ -12906,6 +13266,13 @@ class Investigation:
             tool_candidates = mft_hacking_tool_candidates(rows)
             if tool_candidates:
                 self._emit_mft_hacking_tool_finding(tool_candidates, path, tcid)
+            # System32-masquerade binaries (T1036.005) + archive-staging (T1560)
+            # leads, keyed on general path/name signatures (never a specific name).
+            masq, archives = mft_masquerade_and_staging_candidates(rows)
+            if masq or archives:
+                self._emit_mft_masquerade_and_staging_findings(
+                    masq, archives, path, tcid
+                )
 
         usn_entries = by_class["usnjrnl"][:3]
         usn_specs: list[tuple[str, dict[str, Any]]] = [
@@ -14064,6 +14431,141 @@ class Investigation:
                 )
                 emitted += 1
 
+    def _add_pcap_ingress_findings(
+        self, out: dict[str, Any], tcid: str, artifact_path: str
+    ) -> None:
+        """Surface an HTTP GET of a payload from an external bare-IP host (T1105).
+
+        An HTTP request whose Host is a raw external IP literal (no domain) is a
+        classic malicious tool/payload ingress pattern — legitimate software is
+        fetched from named hosts, not bare IPs. Keyed ONLY on the general
+        signature (external IP-literal HTTP host), never a specific IP or
+        filename; a URI naming an executable strengthens the download read but is
+        not required. Stays a HYPOTHESIS lead (leads-until-corroborated).
+        """
+        requests = out.get("http_requests") or []
+        seen: set[str] = set()
+        emitted = 0
+        for row in requests:
+            if not isinstance(row, dict) or emitted >= 5:
+                break
+            host = str(row.get("host") or "").strip()
+            if not host or not _is_external_ip(host) or host in seen:
+                continue
+            seen.add(host)
+            src = str(row.get("src") or "").strip() or "an internal host"
+            method = (str(row.get("method") or "GET").strip() or "GET").upper()
+            uri = str(row.get("uri") or "").strip()
+            base = uri.replace("\\", "/").rsplit("/", 1)[-1]
+            exe_hint = (
+                f" whose URI requests `{base}`"
+                if any(base.lower().endswith(s) for s in PCAP_INGRESS_EXE_SUFFIXES)
+                else ""
+            )
+            self._network_finding(
+                "B",
+                self._finding_id_for(f"f-B-pcap-http-ingress-{host}", artifact_path),
+                tcid,
+                artifact_path,
+                (
+                    f"pcap_triage: internal host {src} issued an HTTP {method} request to "
+                    f"external bare-IP host {host}{exe_hint} — a raw IP-literal HTTP host "
+                    "(no domain) is consistent with a malicious tool/payload downloaded "
+                    "over HTTP (ingress tool transfer). Corroborate the downloaded binary "
+                    "against host disk artifacts (browser history / IE WebCache) before "
+                    "naming it; not proof of compromise by itself."
+                ),
+                "T1105",
+            )
+            emitted += 1
+
+    def _add_pcap_conversation_findings(
+        self, out: dict[str, Any], tcid: str, artifact_path: str
+    ) -> None:
+        """Surface external C2-beacon and data-transfer/exfil candidates.
+
+        A ``pcap_triage`` conversation row is ``{src, dst, dst_port, proto,
+        count}`` (``count`` = packet volume). A command-and-control beacon and an
+        exfiltration channel both present as a sustained OUTBOUND session from an
+        internal host to an EXTERNAL destination (high volume / long-lived).
+        Keyed only on that general signature (internal->external TCP volume),
+        never on a specific IP:port. The top external talkers become C2-beacon
+        LEADS; one summary lead frames the same destinations as a possible
+        exfiltration channel. Both stay HYPOTHESIS (leads-until-corroborated) and
+        never assert data loss by themselves.
+        """
+        conversations = out.get("conversations") or out.get("notable_connections") or []
+        agg: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in conversations:
+            if not isinstance(row, dict):
+                continue
+            src = row.get("src") or row.get("source_ip")
+            dst = row.get("dst") or row.get("destination_ip")
+            # Outbound only: internal source reaching an external destination. A
+            # tshark return-leg (external src) is the same session's other half,
+            # so counting only the internal-source direction avoids double-count.
+            if not _is_external_ip(dst) or _is_external_ip(src):
+                continue
+            port = _network_port(row.get("dst_port") or row.get("destination_port"))
+            cnt = _network_bytes(row.get("count") or row.get("packets") or 0)
+            key = (str(dst), int(port or 0))
+            entry = agg.setdefault(
+                key,
+                {"dst": str(dst), "port": port, "count": 0, "proto": row.get("proto")},
+            )
+            entry["count"] += cnt
+        ranked = [
+            e
+            for e in sorted(agg.values(), key=lambda e: -int(e["count"]))
+            if int(e["count"]) >= PCAP_C2_MIN_PACKETS
+        ][:PCAP_C2_MAX_CANDIDATES]
+        if not ranked:
+            return
+        for entry in ranked:
+            dst = entry["dst"]
+            port = entry["port"]
+            cnt = entry["count"]
+            self._network_finding(
+                "B",
+                self._finding_id_for(f"f-B-pcap-c2-beacon-{dst}", artifact_path),
+                tcid,
+                artifact_path,
+                (
+                    "pcap_triage: established long-lived TCP command-and-control (C2) "
+                    f"beacon candidate to external destination {dst}"
+                    + (f" on port {port}" if port else "")
+                    + f" ({cnt} packets; a sustained/long-lived external session, the "
+                    "shape of a reverse_tcp C2 beacon). Treat as a C2 beacon lead until "
+                    "the endpoint process/binary corroborates it; not proof of data loss "
+                    "by itself."
+                ),
+                "T1071.001",
+            )
+        tops = ", ".join(
+            f"{e['dst']}" + (f":{e['port']}" if e["port"] else "") for e in ranked[:6]
+        )
+        # Framed as an outbound-transfer / data-egress LEAD, NOT an exfiltration
+        # claim: on network-only evidence the >=2-class / staging+movement rule
+        # is unmet, so the wording stays "outbound transfer" and defers the
+        # conclusion (avoids over-claiming and the exfil report-QA gate).
+        self._network_finding(
+            "B",
+            self._finding_id_for("f-B-pcap-outbound-transfer", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                "pcap_triage: sustained high-volume outbound data transfer over "
+                f"external TCP session(s) to {tops} — the top external destinations by "
+                "outbound volume, over the same outbound channel/session used to beacon "
+                "out to attacker-controlled external hosts. A large outbound transfer over "
+                "an external channel is a data-egress/collection lead that must be "
+                "corroborated with finding-specific collection/staging and the transferred "
+                "data before concluding data loss; outbound volume is not proof of data "
+                "loss by itself."
+            ),
+            "T1041",
+        )
+
     def _add_pcap_timeline_correlation_finding(
         self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
     ) -> None:
@@ -14319,6 +14821,8 @@ class Investigation:
             )
             self._add_network_summary_findings("pcap_triage", out, tcid, path)
             self._add_pcap_http_request_findings(out, tcid, path)
+            self._add_pcap_ingress_findings(out, tcid, path)
+            self._add_pcap_conversation_findings(out, tcid, path)
             zeek = out.get("zeek")
             if isinstance(zeek, dict):
                 self._add_network_summary_findings("pcap_triage", zeek, tcid, path)

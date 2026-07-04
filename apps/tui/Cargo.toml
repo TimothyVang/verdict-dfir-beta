@@ -36,6 +36,13 @@ serde_json = "1"
 # workspace so no new lock entry is introduced.
 thiserror = "2"
 
+# Filesystem watch for the Phase 2 live audit tail. notify only lowers the
+# latency of a streamed append — correctness comes from the poll-on-tick
+# follower in case::audit_tail, so a missed/absent notify event never drops a
+# record. Kept out of the read-only-core so it is only touched by the
+# interactive driver.
+notify = "8"
+
 [dev-dependencies]
 # Per-test scratch directories for the discovery tests. Same pin as the
 # rest of the workspace, so no new lock entry is introduced.

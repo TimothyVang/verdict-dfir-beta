@@ -1,14 +1,22 @@
-//! `verdict-tui` — a read-only terminal viewer for a finished VERDICT case
-//! directory.
+//! `verdict-tui` — a read-only terminal viewer and live monitor for a VERDICT
+//! case directory.
 //!
 //! # Read-only by construction
 //!
-//! The viewer reads only the JSON a completed run wrote into a case
-//! directory (`verdict.json` plus optional custody/coverage siblings). It
-//! is **not** an MCP client: it never opens evidence, never resolves
-//! `evidence_path`, never calls a forensic tool, and never emits or
-//! upgrades a Finding. It is presentation only — it renders the scoped
-//! verdict, Findings, and custody state the run already committed to.
+//! The viewer reads only the JSON a run writes into a case directory
+//! (`verdict.json` plus optional custody/coverage siblings; a streamed
+//! `audit.jsonl` + `status.json` while a run is live). It is **not** an MCP
+//! client: it never opens evidence, never resolves the evidence-path field,
+//! never calls a forensic tool, and never emits or upgrades a Finding. It is
+//! presentation only — it renders the scoped verdict, Findings, and custody
+//! state the run committed to.
+//!
+//! Phase 2 adds a **live monitor** and a **drive** launcher. Drive mode spawns
+//! the repo's own `scripts/verdict` launcher (the single subprocess this crate
+//! ever starts — see [`case::runner`]) and tails the case directory it writes;
+//! it re-implements none of the investigation and still opens no evidence. When
+//! a run seals its `verdict.json`, the live monitor hands off to the finalized
+//! viewer above.
 //!
 //! The crate exposes a library face so the snapshot tests can build the
 //! [`case`] model and render frames headlessly, without a TTY.
@@ -23,6 +31,7 @@ pub mod case;
 pub mod cli;
 pub mod discovery;
 pub mod keymap;
+pub mod live;
 pub mod runtime;
 pub mod ui;
 
@@ -50,6 +59,30 @@ pub fn run(args: &Args, cwd: &Path, out: &mut impl Write) -> Result<(), Box<dyn 
     }
     if args.version {
         writeln!(out, "{}", cli::version_text())?;
+        return Ok(());
+    }
+
+    // Phase 2 live paths are interactive and drive a real run/tail, so they
+    // are incompatible with the headless `--print` render.
+    if args.print && (args.drive.is_some() || args.follow) {
+        return Err("--print cannot be combined with --drive or --follow (both are live)".into());
+    }
+
+    // Drive mode: launch scripts/verdict for the evidence and live-tail it.
+    if let Some(evidence) = &args.drive {
+        let repo = discovery::repo_root(cwd)
+            .ok_or("could not locate the VERDICT repo root to launch scripts/verdict")?;
+        live::driver::drive(evidence, &repo)?;
+        return Ok(());
+    }
+
+    // Follow mode: live-tail an in-progress (or finished) case directory.
+    if args.follow {
+        let dir = args
+            .case_dir
+            .clone()
+            .ok_or("--follow needs a CASE_DIR to tail")?;
+        live::driver::follow(&dir)?;
         return Ok(());
     }
 

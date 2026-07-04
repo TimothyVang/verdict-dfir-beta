@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -137,3 +139,78 @@ def test_missing_docker_binary_degrades_not_crashes(monkeypatch) -> None:
         assert "docker" in result["_error"]["message"]
     finally:
         client.close()
+
+
+# Responder for the large-response deadlock repro below. It reproduces the
+# ROOT-CAUSE trigger deterministically without needing a real container:
+#   1. emit one non-utf-8 byte on stderr — under strict decode this raised
+#      UnicodeDecodeError (a ValueError) inside _drain_stderr, whose ``except``
+#      swallowed it and KILLED the drain thread;
+#   2. with the drain dead, flood stderr past the 64 KB pipe buffer;
+#   3. only THEN read the JSON-RPC request and answer on stdout.
+# With the drain dead (pre-fix) the flood fills the stderr pipe and the producer
+# blocks on write(stderr) forever, so the response in step 3 never ships and the
+# ``call`` times out — the same stall that, over ``docker exec``, is aggravated
+# by stdcopy's single-goroutine stdout/stderr demux. With errors="replace" the
+# drain survives step 1, keeps stderr drained, and the response ships promptly.
+_DEADLOCK_RESPONDER = textwrap.dedent(
+    """
+    import sys, os, time, json
+    os.write(2, b"\\xff\\n")          # non-utf-8 byte: kills a strict-decode drain
+    time.sleep(0.3)                    # let the drain thread hit it
+    os.write(2, b"E" * (1024 * 1024))  # flood the (now undrained) stderr pipe
+    line = sys.stdin.readline()        # only reached if the drain kept up
+    req = json.loads(line)
+    resp = {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True, "rows": 2500}}
+    os.write(1, (json.dumps(resp, separators=(",", ":")) + "\\n").encode())
+    sys.stdout.flush()
+    time.sleep(0.5)
+    """
+)
+
+
+def test_docker_large_response_survives_stderr_backpressure() -> None:
+    """A large response must ship even when the container floods stderr with a
+    stray non-utf-8 byte in it. Pre-fix (strict decode) the drain thread died on
+    that byte, stderr backed up, and the response never arrived — the run hung.
+    errors="replace" keeps the drain alive so the response ships.
+
+    Docker-free by design: DockerMcpClient just spawns whatever argv it is given,
+    so a plain ``python3 -c`` producer exercises the exact reader/drain code the
+    fix touches, deterministically and without a running container.
+    """
+    argv = [sys.executable, "-c", _DEADLOCK_RESPONDER]
+    client = fea.DockerMcpClient(argv, "py-mcp")
+    try:
+        t0 = time.time()
+        # Pre-fix this call blocks until the timeout; post-fix it returns in ~1s.
+        result = client.call("tools/call", {"name": "x", "arguments": {}}, timeout=20.0)
+        elapsed = time.time() - t0
+        assert result == {"ok": True, "rows": 2500}
+        # Comfortably under the timeout: proves the response shipped rather than
+        # the caller being woken by a closing pipe near the deadline.
+        assert elapsed < 15.0
+    finally:
+        client.close()
+
+
+def test_ssh_client_keeps_strict_decode() -> None:
+    """The fix is scoped to the docker path: the ssh/local clients keep strict
+    utf-8 decode (errors defaults to None/"strict"), so their behavior is
+    unchanged. Guards against the fix silently leaking onto the other spawns."""
+    # DockerMcpClient opts into replacement …
+    docker = fea.DockerMcpClient([sys.executable, "-c", "pass"], "probe")
+    try:
+        assert docker.proc is not None
+        assert docker.proc.stdout.errors == "replace"
+        assert docker.proc.stderr.errors == "replace"
+    finally:
+        docker.close()
+    # … the local stdio client (same reader/drain, different spawn) does not.
+    local = fea.StdioMcpClient("true", "probe")
+    try:
+        assert local.proc is not None
+        assert local.proc.stdout.errors == "strict"
+        assert local.proc.stderr.errors == "strict"
+    finally:
+        local.close()

@@ -17,7 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use verdict_tui::app::{App, View};
-use verdict_tui::case::{CaseBundle, Finding};
+use verdict_tui::case::{AuditRecord, CaseBundle, Finding, RunStatus};
+use verdict_tui::live::state::LiveState;
+use verdict_tui::live::ui as live_ui;
 use verdict_tui::ui;
 
 const WIDTH: u16 = 100;
@@ -89,6 +91,47 @@ fn attack_samples_detail_view_confirmed() {
     app.view = View::Detail;
     let frame = ui::render_to_string(&mut app, WIDTH, HEIGHT);
     check("attack-samples-evtx.detail.txt", &frame);
+}
+
+/// The Live monitor renders a streaming case: a `status.json` heartbeat plus a
+/// handful of audit records, mid-run. Built from a synthetic [`LiveState`] so
+/// the frame is deterministic (no clock, no filesystem, no subprocess).
+#[test]
+fn live_tailing_view() {
+    fn record(seq: i64, kind: &str, tool: Option<&str>, tcid: Option<&str>) -> AuditRecord {
+        AuditRecord {
+            seq: Some(seq),
+            kind: kind.to_string(),
+            ts: None,
+            tool: tool.map(ToString::to_string),
+            tool_call_id: tcid.map(ToString::to_string),
+            confidence: None,
+            metric: None,
+        }
+    }
+
+    let mut state = LiveState::new("/cases/tmp/auto-runs/tui-fixture");
+    state.set_status(Some(RunStatus {
+        case_id: Some("tui-fixture".into()),
+        stage: Some("pool_a".into()),
+        tool_calls: Some(3),
+        findings_so_far: Some(1),
+        updated_at: Some("2026-07-04T00:01:00Z".into()),
+    }));
+    state.ingest(vec![
+        record(1, "case_open", None, None),
+        record(2, "tool_call_start", Some("evtx_query"), Some("tc-001")),
+        record(3, "tool_call_output", None, Some("tc-001")),
+        AuditRecord {
+            seq: Some(4),
+            kind: "finding_approved".into(),
+            confidence: Some("CONFIRMED".into()),
+            ..AuditRecord::default()
+        },
+    ]);
+
+    let frame = live_ui::render_to_string(&state, WIDTH, HEIGHT);
+    check("live-tailing.txt", &frame);
 }
 
 /// No committed fixture carries a replay SHA-256 mismatch, so exercise that

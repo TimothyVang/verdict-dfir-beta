@@ -58,6 +58,25 @@ pub fn replay_color(expected: Option<&str>, actual: Option<&str>) -> Color {
     }
 }
 
+/// Categorical colour for a live audit record's `kind`.
+///
+/// Informational, not a severity: it groups the stream (tool activity,
+/// findings/verdict, recovery, failure) so the eye can scan it. It never
+/// re-ranks a Finding or a verdict — the record's own confidence tier is
+/// coloured separately by [`confidence_color`].
+#[must_use]
+pub fn audit_kind_color(kind: &str) -> Color {
+    match kind {
+        "tool_call_start" | "tool_call_output" | "replay" | "verifier_action" => Color::Cyan,
+        "finding_approved" | "finding_rejected" | "verdict_packet" | "verdict_artifact" => {
+            Color::Blue
+        }
+        "course_correction" | "verdict_revision" => Color::Yellow,
+        "heartbeat_failure" | "heartbeat_terminated" | "fault_injection" => Color::Red,
+        _ => Color::Gray,
+    }
+}
+
 /// Colour for a coverage artifact-class status.
 #[must_use]
 pub fn coverage_status_color(status: &str) -> Color {

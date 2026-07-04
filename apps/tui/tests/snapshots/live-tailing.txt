@@ -1,0 +1,40 @@
+┌ VERDICT — live run monitor ──────────────────────────────────────────────────────────────────────┐
+│Case    tui-fixture    LIVE                                                                       │
+│Stage   pool_a    tool_calls 3    findings_so_far 1    updated 2026-07-04T00:01:00Z               │
+│Stream  4 records    tool_call_start 1  ·  tool_call_output 1  ·  finding_approved 1              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Audit stream (4 records) ────────────────────────────────────────────────────────────────────────┐
+│   1  case_open                                                                                   │
+│   2  tool_call_start   evtx_query      tc-001                                                    │
+│   3  tool_call_output  tc-001                                                                    │
+│   4  finding_approved  CONFIRMED                                                                 │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit  |  live tail — auto-follows the run  |  hands off to the viewer on verdict.json

@@ -23,6 +23,10 @@ pub struct Args {
     pub print: bool,
     /// Start on the Finding detail pane (first Finding) rather than the list.
     pub detail: bool,
+    /// Drive mode: launch `scripts/verdict <EVIDENCE>` and live-tail its run.
+    pub drive: Option<PathBuf>,
+    /// Follow mode: live-tail the positional `CASE_DIR` as an in-progress run.
+    pub follow: bool,
     /// Headless render width for `--print`.
     pub width: u16,
     /// Headless render height for `--print`.
@@ -37,6 +41,8 @@ impl Default for Args {
             case_dir: None,
             print: false,
             detail: false,
+            drive: None,
+            follow: false,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             help: false,
@@ -59,6 +65,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
             "-V" | "--version" => parsed.version = true,
             "--print" => parsed.print = true,
             "--detail" => parsed.detail = true,
+            "--follow" => parsed.follow = true,
+            "--drive" => parsed.drive = Some(take_value(&mut iter, "--drive")?),
             "--width" => parsed.width = take_dim(&mut iter, "--width")?,
             "--height" => parsed.height = take_dim(&mut iter, "--height")?,
             other if other.starts_with('-') && other != "-" => {
@@ -81,31 +89,42 @@ fn take_dim<I: Iterator<Item = String>>(iter: &mut I, flag: &str) -> Result<u16,
         .map_err(|_| format!("{flag} value must be a positive integer, got {raw}"))
 }
 
+fn take_value<I: Iterator<Item = String>>(iter: &mut I, flag: &str) -> Result<PathBuf, String> {
+    iter.next()
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{flag} needs a value"))
+}
+
 /// Usage text for `--help`.
 #[must_use]
 pub fn help_text() -> String {
     format!(
-        "verdict-tui {version} — read-only VERDICT case viewer\n\
+        "verdict-tui {version} — read-only VERDICT case viewer + live monitor\n\
          \n\
          USAGE:\n\
          \x20   verdict-tui [OPTIONS] [CASE_DIR]\n\
          \n\
          ARGS:\n\
-         \x20   CASE_DIR   Finished case directory (holds verdict.json).\n\
+         \x20   CASE_DIR   Case directory (holds verdict.json when finished).\n\
          \x20              Omit to open the newest case under the\n\
          \x20              allow-listed roots.\n\
          \n\
          OPTIONS:\n\
-         \x20   --print           Render one frame to stdout and exit\n\
-         \x20   --detail          Open on the Finding detail pane\n\
-         \x20   --width <N>       Headless render width for --print (default {w})\n\
-         \x20   --height <N>      Headless render height for --print (default {h})\n\
-         \x20   -h, --help        Show this help\n\
-         \x20   -V, --version     Show the version\n\
+         \x20   --drive <EVIDENCE>  Launch scripts/verdict on EVIDENCE and\n\
+         \x20                       live-tail the run, then open the viewer\n\
+         \x20   --follow            Live-tail CASE_DIR as an in-progress run\n\
+         \x20   --print             Render one frame to stdout and exit\n\
+         \x20   --detail            Open on the Finding detail pane\n\
+         \x20   --width <N>         Headless render width for --print (default {w})\n\
+         \x20   --height <N>        Headless render height for --print (default {h})\n\
+         \x20   -h, --help          Show this help\n\
+         \x20   -V, --version       Show the version\n\
          \n\
-         This viewer is read-only by construction: it reads a case\n\
-         directory's JSON only. It never opens evidence, never calls a\n\
-         tool, and never emits a Finding.\n",
+         Read-only by construction: it reads a case directory's JSON and,\n\
+         in drive mode, launches the scripts/verdict launcher. It never\n\
+         opens evidence itself, never calls a forensic tool, and never\n\
+         emits a Finding.\n",
         version = env!("CARGO_PKG_VERSION"),
         w = DEFAULT_WIDTH,
         h = DEFAULT_HEIGHT,
@@ -149,6 +168,22 @@ mod tests {
         let args = parse_ok(&["--width", "80", "--height", "24"]);
         assert_eq!(args.width, 80);
         assert_eq!(args.height, 24);
+    }
+
+    #[test]
+    fn parses_drive_and_follow() {
+        let drive = parse_ok(&["--drive", "/evidence/case.evtx"]);
+        assert_eq!(drive.drive, Some(PathBuf::from("/evidence/case.evtx")));
+        assert!(!drive.follow);
+
+        let follow = parse_ok(&["--follow", "/cases/tui-1"]);
+        assert!(follow.follow);
+        assert_eq!(follow.case_dir, Some(PathBuf::from("/cases/tui-1")));
+    }
+
+    #[test]
+    fn drive_requires_a_value() {
+        assert!(parse(["--drive".to_string()]).is_err());
     }
 
     #[test]
