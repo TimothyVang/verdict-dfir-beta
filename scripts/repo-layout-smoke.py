@@ -57,6 +57,7 @@ ROOT_ALLOWLIST: frozenset[str] = frozenset(
         ".dockerignore",
         ".mcp.json",
         ".mcp.json.sift",
+        ".mcp.json.docker",
         ".gitignore",
         ".gitattributes",
         ".yamllint",

@@ -131,6 +131,12 @@ while IFS=$'\t' read -r name type local evidence golden needs_golden; do
     continue
   fi
 
+  # Clear any prior benchmark output for this deterministic case-id. scripts/verdict
+  # refuses to clobber an existing case dir (an anti-clobber safety), so a re-run
+  # would fail without this. Confined to tmp/auto-runs/<corpus-name> (the name is a
+  # validated CORPUS entry), never a foreign path.
+  [ -n "${name}" ] && rm -rf "tmp/auto-runs/${name}"
+
   echo "  run: ${verdict_args[*]}"
   if ! "${verdict_args[@]}" > "${BENCH_TMP}/${name}.run.log" 2>&1; then
     echo "  FAIL: engine run errored (see ${BENCH_TMP}/${name}.run.log)"

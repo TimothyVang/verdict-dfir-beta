@@ -6,7 +6,7 @@ Engine commit: (current master). Cases runnable with LOCAL evidence only. **9/9 
 |------|-------:|------:|--------|-------------|
 | nist-hacking-case | 10/14 (71%) | 71 | PASS | SUSPICIOUS |
 | nitroba | 5/5 (100%) | 80 | PASS | INDETERMINATE |
-| evtx-attack-samples | 3/3 (100%) | 100 | PASS | SUSPICIOUS |
+| evtx-attack-samples | 3/3 (100%) | 100 | PASS | INDETERMINATE |
 | synthetic-benign | 0/0 (100%) | 100 | PASS | INDETERMINATE |
 | synthetic-decoy | 0/0 (100%) | 100 | PASS | INDETERMINATE |
 | security-log-cleared | 1/1 (100%) | 100 | PASS | INDETERMINATE |
@@ -18,6 +18,7 @@ Engine commit: (current master). Cases runnable with LOCAL evidence only. **9/9 
 alihadi-01/07/09, dfrws-2008-linux, dfrws-2011-android, digitalcorpora-lonewolf, m57-jean, memlabs-lab1/2/3, nist-data-leakage, otrf-apt3-mordor, sans-starter, synthetic-toolless, volatility-cridex. Drop the image in `evidence/` (or via SIFT fixtures) and re-run to add it to the measured set.
 
 ## Honest notes
+- evtx-attack-samples now issues INDETERMINATE (was SUSPICIOUS): the Hayabusa lead-visibility change surfaces high/critical Sigma matches as HYPOTHESIS leads and the log-cleared finding is INFERRED (not CONFIRMED), so the multi-finding EVTX set scopes down. Recall is unaffected (3/3).
 - Several single-finding EVTX cases score recall 100% but issue an INDETERMINATE verdict — the engine correctly stays cautious on single-artifact-class evidence (recall matched; verdict conservative).
 - NIST (71%) is the only case at its floor; the 4 remaining misses are real DFIR depth (USB registry / deleted-email carve / thumbcache) — see benchmark-coverage-matrix.md.
 - nist-sift + the 2 self-correction demo runs remain stale (SIFT VM / narrative-preserving regen).

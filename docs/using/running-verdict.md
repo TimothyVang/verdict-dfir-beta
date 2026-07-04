@@ -42,6 +42,13 @@ It is a turnkey wrapper around `scripts/verdict` (documented below); anything it
 do by hand with the flags in §1. The SIFT VM provides the broad forensic workstation baseline when
 available; host-local mode remains useful but has narrower disk-content coverage.
 
+> **DFIR container backend (recommended replacement for the SIFT VM).** A reproducible Docker image
+> carries the full toolchain (`docker/dfir.Dockerfile`); `tshark`, Sleuth Kit, libewf, Volatility,
+> Hayabusa-with-rules, and the rest are pinned and verified by the image `HEALTHCHECK`, so nothing is
+> silently missing, and evidence bind-mounts at native disk speed instead of over the VM's hgfs share.
+> Bring it up with `scripts/run-dfir-container.sh <evidence>` and activate it with
+> `cp .mcp.json.docker .mcp.json`. See [docker-backend.md](docker-backend.md).
+
 > The skill is loaded at session start. If you just pulled it (e.g. after a merge), start a fresh
 > `claude` session so `/verdict` is registered. To force serial or local, the skill honors the same
 > flags — tell it "run `/verdict <evidence>` locally" or "with `--no-parallel`".
@@ -212,38 +219,6 @@ written wherever you point it; if you omit the flag the launcher still writes on
 A run is a **live test**: confirm `verdict.json` carries a real Verdict whose Findings cite
 `tool_call_id`s, and `manifest_verify.json` reports `overall: true`. An honest
 `INDETERMINATE` on a custody-only disk is a PASS — see [`../verdict-semantics.md`](../verdict-semantics.md).
-
-### Attack-flow visualizer (`tmp/auto-runs/<case-id>/attack-flow/`)
-
-When the report renders, it now embeds the technique-grouped **attack summary** directly —
-Confirmed findings first, repeated findings per technique collapsed into one card — instead of
-a graphviz/mermaid panel pair. The summary is followed by a short pointer block naming the
-richer artifacts an analyst can open separately: `timeline.html` for the full forensic timeline
-and `process-tree.html` for process lineage (the timeline is not inlined — it is roughly 580 KB
-with embedded fonts). The emitter writes exactly seven canonical artifacts (STIX 2.1 bundle,
-Mermaid flow, an interactive collapsible `process-tree.html`, the technique-grouped
-`attack-summary.html`, the interactive `timeline.html`, an ATT&CK Navigator layer, and an index
-`attack-flow.md`) to `tmp/auto-runs/<case-id>/attack-flow/`. Run it standalone against any
-completed Case with `scripts/attack-flow <case-dir>` (a thin wrapper over
-`python -m findevil_agent.attackflow`). It is **presentation-only** — it derives its graph from
-the Case's own `verdict.json` and process artifacts, makes no network or model calls, and never
-creates or modifies a Finding. The process-tree artifact appears only when the Case has a
-process artifact (for example a memory image); otherwise it is omitted from the output with a
-stated reason rather than fabricated.
-
-Findings are colored by confidence tier (Signal Coral = Confirmed, Butter = Inferred, Cobalt =
-Hypothesis) and processes linked to a Finding are called out. Best-viewed paths:
-
-- **`attack-summary.html`** — the recommended first view; embedded directly in the analyst
-  report.
-- **`process-tree.html`** — open in a browser for a searchable, collapsible tree (the flagged
-  process's lineage is expanded on load); a static image of a large process table is unreadable.
-- **`timeline.html`** — the full interactive forensic timeline, referenced by filename from the
-  report rather than inlined.
-- **`incident.attack-flow.json`** — drag into the MITRE
-  [Attack Flow Builder](https://center-for-threat-informed-defense.github.io/attack-flow/builder/)
-  for the polished, purpose-built interactive canvas.
-- **`attack-flow.mmd`** — renders inline in a GitHub Markdown file or PR.
 
 ---
 

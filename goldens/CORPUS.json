@@ -193,7 +193,6 @@
       "evidence": "fixtures/szechuan",
       "golden": "goldens/szechuan",
       "runnable_local": false,
-      "needs_golden": true,
       "url": "https://dfirmadness.com/the-stolen-szechuan-sauce/",
       "answer_key": "https://dfirmadness.com/answers-to-szechuan-case-001/",
       "env_url": "SZECHUAN_URL",

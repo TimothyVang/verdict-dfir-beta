@@ -43,24 +43,13 @@ coverage was too limited to scope a clearance, and **`NO_EVIL`** means no report
 artifacts actually examined. `NO_EVIL` is never a whole-environment clean bill of health: coverage is
 bounded, and what was not examined is not the same as absent.
 
-The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT runs
-in three modes, and it matters which one you're in:
-
-1. **Default — deterministic engine.** `scripts/verdict <evidence>` runs a headless detection
-   engine (curated DFIR signature logic + ACH scoring) over the same typed tools and custody spine —
-   **zero LLM calls** (`token_usage: llm_api_calls 0` in the committed trace). This is the proven,
-   benchmarked path.
-2. **Interactive analyst.** Run [`claude`](https://claude.com/claude-code) in this repo and type
-   `/verdict <evidence>`: that Claude Code session becomes the analyst — it opens the Case, drives
-   the tools, runs the verifier, and signs the verdict, with no separate application server.
-3. **Agent mode (opt-in, experimental).** `scripts/verdict --agent` swaps the pools for a
-   provider-agnostic LLM tool-use loop (Claude, OpenAI-compatible, or local endpoints). Currently
-   live-verified on single-artifact evidence (e.g. one EVTX); not yet proven at disk/memory scale.
-
-None of these is an autonomous responder: the verdict, custody, and verification guarantees are
-enforced by deterministic code either way — before any Finding reaches the report the verifier
-re-runs every cited tool to confirm its output reproduces. Replay reproduces the operation; it does
-not validate the interpretation.
+The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT also
+ships its **reference agent**: running `scripts/verdict <evidence>` (or `claude`) in this repo turns
+that [Claude Code](https://claude.com/claude-code) session into the analyst — it opens the Case,
+drives the tools, runs the verifier, and signs the verdict, with no separate application server. It is
+not an autonomous responder: the analyst approves the plan, and before any Finding reaches the report
+the verifier re-runs every cited tool to confirm its output reproduces. Replay reproduces the
+operation; it does not validate the interpretation.
 
 > **The tools give any agent a read-only forensic surface; the verdict, custody, and verification
 > guarantees come from VERDICT's orchestration layer** (the verifier, the ≥2-artifact-class gate, the
@@ -94,6 +83,7 @@ VERDICT is a local-first DFIR (digital forensics & incident response) agent plat
 | Cold-clone install | [`INSTALL.md`](INSTALL.md) |
 | Three-command quickstart | [`QUICKSTART.md`](QUICKSTART.md) |
 | Every run mode, flag, and output file | [`docs/using/running-verdict.md`](docs/using/running-verdict.md) |
+| DFIR container backend (SIFT-VM replacement) | [`docs/using/docker-backend.md`](docs/using/docker-backend.md) |
 | Failure-mode fixes | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
 
 **One-liner** — clones the repo and runs setup:
@@ -103,9 +93,8 @@ curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/
 ```
 
 This is a convenience wrapper around the steps below, **not** a standalone binary
-download. VERDICT is a real forensics toolchain, so the wrapper still needs `git`
-and a Claude Code credential present (the preflight requires one; see below); on a
-bare machine it
+download. VERDICT is a Claude Code agent over a real forensics toolchain, so the
+wrapper still needs `git` and a Claude Code credential present; on a bare machine it
 relies on the official Rust/uv/Node installers (driven by setup's `--bootstrap`). It
 will not run a Case by itself — it gets you to a green `scripts/setup`. Prefer to see
 every step? Run them yourself:
@@ -118,11 +107,8 @@ scripts/verdict <path-to-evidence>
 ```
 
 Before your first Case you also need a **Claude Code credential**: a logged-in `claude`,
-`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. The preflight doctor checks for one before any
-run, so `scripts/verdict` will not start a Case without it — even though the default deterministic
-engine itself makes zero LLM calls (the credential is exercised only by the interactive analyst
-path and agent mode's default `claude_cli` backend). `scripts/setup` will go green without it; a
-Case will not.
+`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. VERDICT drives the tools as a Claude Code agent, so
+`scripts/verdict` needs one to run. `scripts/setup` will go green without it; a Case will not.
 
 Point it at supported evidence — a memory image, EVTX log, disk image (`.E01` / `.dd`), packet
 capture, Velociraptor collection, or a whole multi-host case folder. Output lands in
