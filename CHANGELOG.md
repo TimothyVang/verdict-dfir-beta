@@ -12,6 +12,25 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.8] - 2026-07-09
+
+Local-LLM seal fragility follow-up. **Still toolkit-only** (no CaseForge /
+opencode embed). CaseForge prompt-side companions live in caseforge-core PR #9.
+
+### Fixed
+
+- **`manifest_verify` accepts `path` as an alias for `manifest_path`** — local
+  tool-calling models routinely emit `{"path": ...}`; under `extra="forbid"` that
+  hard-failed mid-seal. A before-validator maps the alias, rejects ambiguous
+  both-keys-differ calls, and keeps every other unexpected key forbidden.
+  (PR #173)
+
+### Notes
+
+- Crypto default was already `ed25519` for `manifest_finalize`; no signer default
+  change in this release. Stub-signed seals remain a prompt-side failure mode
+  fixed in caseforge-core, not here.
+
 ## [v0.5.0-beta.7] - 2026-07-09
 
 Security hardening follow-up to beta.6. **Still toolkit-only** (no CaseForge /

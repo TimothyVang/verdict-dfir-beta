@@ -8,9 +8,10 @@ sanity check, and the signature presence check. Stays offline.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from findevil_agent.crypto.manifest import verify_manifest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
 
@@ -26,6 +27,26 @@ class ManifestVerifyInput(BaseModel):
             "verifying a manifest copied to a different directory."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_path_alias(cls, data: Any) -> Any:
+        # Local models routinely call this tool with {"path": ...} instead of
+        # the canonical {"manifest_path": ...}. Under extra="forbid" that hard-
+        # fails and derails the seal sequence, forcing the deterministic
+        # fallback. Accept `path` as an alias so one arg slip does not cost a
+        # tool call — while still rejecting an ambiguous both-keys-differ call
+        # and every other unexpected key.
+        if not isinstance(data, dict) or "path" not in data:
+            return data
+        alias = data["path"]
+        canonical = data.get("manifest_path")
+        if canonical is not None and canonical != alias:
+            raise ValueError(
+                "pass either manifest_path or path (they are aliases), "
+                "not both with different values"
+            )
+        return {**{k: v for k, v in data.items() if k != "path"}, "manifest_path": alias}
 
 
 class ManifestVerifyOutput(BaseModel):
