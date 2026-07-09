@@ -13,9 +13,9 @@
 //!     `InvalidRegex`, missing keyword file) that must be rejected BEFORE
 //!     any subprocess spawn.
 //!
-//! A real end-to-end run (and the free-space recall benchmark) needs BOTH
-//! the `bulk_extractor` binary AND a carving fixture — neither is
-//! committed here, so no recall delta is asserted.
+//! A synthetic carve fixture is covered when `bulk_extractor` is on PATH
+//! (`bulk_extract_recovers_synthetic_marker_when_binary_present`). That proves
+//! mechanism recovery only — NOT SCHARDT/nhc-003 recall.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -390,4 +390,83 @@ fn bulk_extract_input_rejects_unknown_scanner() {
         "scanners": ["definitely_not_a_scanner"]
     }"#;
     assert!(serde_json::from_str::<BulkExtractInput>(body).is_err());
+}
+
+// --- synthetic free-space carve (real bulk_extractor when present) ---------
+
+/// Known marker planted at a fixed offset in a synthetic raw image.
+/// Not SCHARDT / nhc-003 content — proves recovery mechanism only.
+const SYNTH_CARVE_MARKER: &str = "VERDICT_SYNTH_CARVE_MARKER_nhc003_v1";
+
+/// Build a small raw image (256 KiB of zeros) with [`SYNTH_CARVE_MARKER`] at
+/// offset 100_000 so free-space / whole-image scanners can recover it.
+fn write_synthetic_carve_image(dir: &Path) -> PathBuf {
+    let p = dir.join("synth_carve.dd");
+    let mut buf = vec![0u8; 256 * 1024];
+    let marker = SYNTH_CARVE_MARKER.as_bytes();
+    let off = 100_000;
+    buf[off..off + marker.len()].copy_from_slice(marker);
+    std::fs::write(&p, &buf).expect("write synthetic carve image");
+    p
+}
+
+fn bulk_extractor_on_path() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("bulk_extractor");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    })
+}
+
+/// When `bulk_extractor` is installed, recover a known marker from a synthetic
+/// raw image via the `find` scanner. Skips cleanly when the binary is absent
+/// (CI without DFIR tools). Does **not** measure SCHARDT/nhc-003 recall.
+#[test]
+fn bulk_extract_recovers_synthetic_marker_when_binary_present() {
+    let Some(bin) = bulk_extractor_on_path() else {
+        eprintln!("skip: bulk_extractor not on PATH — synthetic carve recovery unmeasured here");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let case_id = "synth-carve-case";
+    make_case(&home, case_id);
+    let image = write_synthetic_carve_image(tmp.path());
+    let _guard = EnvGuard::set(&home, &bin);
+
+    let mut input = sample_input(case_id, image);
+    input.scanners = vec![BulkScanner::Find];
+    input.find_regexes = vec![SYNTH_CARVE_MARKER.to_string()];
+    input.limit = Some(50);
+
+    let out = bulk_extract(&input).expect("bulk_extract with real binary should Ok");
+    assert!(
+        out.bulk_extractor_available,
+        "binary on PATH must set bulk_extractor_available"
+    );
+    assert!(
+        out.features_seen > 0 || !out.features.is_empty(),
+        "expected at least one feature for planted marker; got features_seen={} features={:?}",
+        out.features_seen,
+        out.features
+    );
+    let recovered = out
+        .features
+        .iter()
+        .any(|f| f.feature.contains(SYNTH_CARVE_MARKER) || f.context.contains(SYNTH_CARVE_MARKER));
+    assert!(
+        recovered,
+        "planted marker must appear in feature or context; features={:?}",
+        out.features
+    );
+    // Determinism: two runs produce identical JSON (custody hash input).
+    let a = serde_json::to_string(&out).unwrap();
+    let out2 = bulk_extract(&input).expect("second run");
+    let b = serde_json::to_string(&out2).unwrap();
+    assert_eq!(a, b, "synthetic carve output must be deterministic for custody replay");
 }

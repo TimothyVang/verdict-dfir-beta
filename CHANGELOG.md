@@ -12,6 +12,18 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.10] - 2026-07-09
+
+Synthetic free-space carve recovery smoke. **Still toolkit-only.** **SCHARDT/nhc-003 recall remains unmeasured.**
+
+### Added
+
+- **Synthetic carve fixture test** for `bulk_extract` — when `bulk_extractor` is on
+  PATH, plants `VERDICT_SYNTH_CARVE_MARKER_nhc003_v1` in a 256 KiB raw image and
+  asserts recovery + deterministic re-run. Skips when the binary is absent.
+  Mechanism only; not a NIST recall number. (PR #176)
+
+
 ## [v0.5.0-beta.9] - 2026-07-09
 
 Local-LLM seal hardening: reject agent `signer:"stub"` unless explicitly opted
