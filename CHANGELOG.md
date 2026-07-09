@@ -12,6 +12,19 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.12] - 2026-07-09
+
+L1 smoke wiring for offline seal-proof + optional Spark endpoint probe.
+**Toolkit-only.** **SCHARDT/nhc-003 unmeasured.** Live Spark agent seal is
+covered by caseforge PR #12 (separate repo), not this tarball.
+
+### Added
+
+- **`scripts/spark-endpoint-smoke.sh`** — GET Spark/Ollama `/api/tags`; PASS or
+  SKIP (never fail offline). Wired into `run-all-smokes.sh`. (PR #178)
+- **`local-ed25519-seal-proof` registered** in `run-all-smokes.sh` (PR #178)
+
+
 ## [v0.5.0-beta.11] - 2026-07-09
 
 Operator seal-proof path for real local ed25519 custody. **Still toolkit-only.**

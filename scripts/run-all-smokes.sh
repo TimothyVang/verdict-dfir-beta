@@ -97,6 +97,15 @@ run_smoke \
     "uv run --directory services/agent_mcp python ../../scripts/agent-mcp-smoke.py" \
     "[ -d services/agent_mcp ]"
 
+# 2a. Local ed25519 seal-proof (no Spark): default + explicit ed25519 finalize
+#     verifies cryptographically offline; stub signer is coerced unless
+#     FINDEVIL_ALLOW_STUB_SIGNER=1. Runs when uv + agent_mcp are present; SKIPs
+#     cleanly without them. When run, a seal-proof failure fails this gate.
+run_smoke \
+    "local-ed25519-seal-proof (offline ed25519 seals verify; stub coerced by default)" \
+    "bash scripts/local-ed25519-seal-proof.sh" \
+    "command -v uv && [ -d services/agent_mcp ]"
+
 # 2b. Finding evidence-anchor firewall (P0-4): a CONFIRMED/INFERRED finding can't
 # be constructed blank-cited; HYPOTHESIS leads are exempt.
 run_smoke \
@@ -323,6 +332,13 @@ run_smoke \
 run_smoke \
     "package-devpost-smoke (submission zip smoke mode)" \
     "mkdir -p tmp && FINDEVIL_DEVPOST_MODE=smoke RELEASE_TAG=v-submit-smoke OUT_ZIP=tmp/package-devpost-smoke.zip RELEASE_ASSETS_DIR=tmp/package-devpost-assets BENCHMARK_CSV=tmp/package-devpost-benchmark.csv bash scripts/package-devpost.sh"
+
+# 10b. Soft Spark/Ollama reachability. GET /api/tags with a short timeout.
+#      Always exit 0: PASS when reachable (prints model names), SKIP when
+#      offline or curl missing — never fails CI for a cold Spark box.
+run_smoke \
+    "spark-endpoint-smoke (GET /api/tags; SKIP when Spark offline)" \
+    "bash scripts/spark-endpoint-smoke.sh"
 
 # 11. Post-verdict grounding contract. Offline checks (claim extraction, bundle
 #     merge, never-evidence boundary) always run; the live anti-hallucination
