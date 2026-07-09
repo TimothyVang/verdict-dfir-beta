@@ -12,6 +12,18 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.13] - 2026-07-09
+
+nhc-003 measurement scaffold (honest UNMEASURED). **No recall number.**
+**Toolkit-only.**
+
+### Added
+
+- **`scripts/nhc003-carve-status.sh`** — reports bulk_extractor + SCHARDT image
+  presence; optional bounded probe; always STATUS=UNMEASURED until a real golden
+  score exists. Wired into run-all-smokes. (PR #179)
+
+
 ## [v0.5.0-beta.12] - 2026-07-09
 
 L1 smoke wiring for offline seal-proof + optional Spark endpoint probe.
