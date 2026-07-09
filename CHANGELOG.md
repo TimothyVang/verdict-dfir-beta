@@ -12,6 +12,23 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.9] - 2026-07-09
+
+Local-LLM seal hardening: reject agent `signer:"stub"` unless explicitly opted
+in. **Still toolkit-only.** **nhc-003 recall remains unmeasured.**
+
+### Fixed
+
+- **`manifest_finalize` coerces `signer:"stub"` → `ed25519`** unless
+  `FINDEVIL_ALLOW_STUB_SIGNER=1` (tests only). A weak model can no longer
+  request a non-proof stub seal by default; the coerce reason is recorded in
+  `fallback_reason`. (PR #175)
+
+### Notes
+
+- CaseForge prompt companions (EVTX survey + forbid stub) already on caseforge
+  `main` (PR #9). This release is the toolkit half of the seal story.
+
 ## [v0.5.0-beta.8] - 2026-07-09
 
 Local-LLM seal fragility follow-up. **Still toolkit-only** (no CaseForge /
@@ -28,8 +45,7 @@ opencode embed). CaseForge prompt-side companions live in caseforge-core PR #9.
 ### Notes
 
 - Crypto default was already `ed25519` for `manifest_finalize`; no signer default
-  change in this release. Stub-signed seals remain a prompt-side failure mode
-  fixed in caseforge-core, not here.
+  change in that release.
 
 ## [v0.5.0-beta.7] - 2026-07-09
 

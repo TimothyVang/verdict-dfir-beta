@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from findevil_agent_mcp.tools.manifest_finalize import (
     SPEC as FINALIZE_SPEC,
 )
@@ -223,6 +225,32 @@ class TestManifestVerify:
         assert result.merkle_root_ok is False
         assert result.merkle_root_detail is not None
         assert "ff" in result.merkle_root_detail
+
+
+class TestStubSignerCoercion:
+    async def test_stub_coerced_to_ed25519_without_allow_env(
+        self,
+        seeded_audit_log: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Agent-supplied signer:stub must not produce a non-proof seal by default."""
+        monkeypatch.delenv("FINDEVIL_ALLOW_STUB_SIGNER", raising=False)
+        out_path = tmp_path / "run.manifest.json"
+        result = await FINALIZE_SPEC.handler(
+            ManifestFinalizeInput(
+                case_id="case-coerce",
+                run_id="run-coerce",
+                started_at="2026-04-25T00:00:00Z",
+                audit_log_path=str(seeded_audit_log),
+                output_path=str(out_path),
+                signer="stub",
+            )
+        )
+        assert result.signer_effective == "ed25519"
+        assert result.fallback_reason is not None
+        assert "stub coerced to ed25519" in result.fallback_reason
+        assert out_path.is_file()
 
 
 class TestCitationGateAtToolBoundary:

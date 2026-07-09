@@ -18,6 +18,7 @@ and test-only placeholders.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
@@ -32,6 +33,36 @@ from findevil_agent.crypto.signer import FallbackSigner, Signer, StubSigner, mak
 from pydantic import BaseModel, ConfigDict, Field
 
 from findevil_agent_mcp.tools._base import ToolSpec
+
+# Explicit opt-in for tests / deterministic dry-runs. Without this, a model
+# that passes signer:"stub" is coerced to ed25519 so local seals stay real.
+_STUB_ALLOW_ENV = "FINDEVIL_ALLOW_STUB_SIGNER"
+
+
+def _stub_signer_allowed() -> bool:
+    return os.environ.get(_STUB_ALLOW_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _resolve_signer_request(requested: str) -> tuple[str, str | None]:
+    """Return (effective_request, coerce_reason).
+
+    Coerces ``stub`` → ``ed25519`` unless :envvar:`FINDEVIL_ALLOW_STUB_SIGNER`
+    is set. Does not alter sigstore/ed25519 requests.
+    """
+    if requested != "stub":
+        return requested, None
+    if _stub_signer_allowed():
+        return "stub", None
+    return (
+        "ed25519",
+        "stub coerced to ed25519 "
+        f"(set {_STUB_ALLOW_ENV}=1 for the test-only stub placeholder)",
+    )
 
 
 class ManifestFinalizeInput(BaseModel):
@@ -125,9 +156,12 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
     # the signer; ed25519 signs with the local keypair (offline). Requests are
     # wrapped so a failed signer honestly degrades — sigstore -> ed25519 ->
     # stub, ed25519 -> stub — with the reason recorded; never crashes the run.
-    if inp.signer == "stub":
+    # Agent-supplied signer:"stub" is coerced to ed25519 unless the operator
+    # explicitly opts into the test placeholder via FINDEVIL_ALLOW_STUB_SIGNER.
+    requested, coerce_reason = _resolve_signer_request(inp.signer)
+    if requested == "stub":
         signer: Signer = StubSigner(run_id=inp.run_id)
-    elif inp.signer == "ed25519":
+    elif requested == "ed25519":
         signer = FallbackSigner(make_signer(kind="ed25519"), StubSigner(run_id=inp.run_id))
     else:  # sigstore
         signer = FallbackSigner(
@@ -164,6 +198,13 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
             transparency_anchored = bool(block.get("anchored"))
 
     sig = manifest.signature or {}
+    degrade_reason = (
+        str(sig.get("fallback_reason")) if sig.get("fallback_reason") else None
+    )
+    if coerce_reason and degrade_reason:
+        combined_reason = f"{coerce_reason}; {degrade_reason}"
+    else:
+        combined_reason = coerce_reason or degrade_reason
     return ManifestFinalizeOutput(
         manifest_path=str(out_path),
         merkle_root_hex=manifest.merkle_root_hex,
@@ -175,7 +216,7 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
             str(sig.get("cert_fingerprint")) if sig.get("cert_fingerprint") else None
         ),
         signer_effective=str(sig.get("kind") or "stub"),
-        fallback_reason=(str(sig.get("fallback_reason")) if sig.get("fallback_reason") else None),
+        fallback_reason=combined_reason,
         transparency_anchored=transparency_anchored,
         transparency_kind=transparency_kind,
     )

@@ -23,6 +23,13 @@ def _fact_fidelity_gate_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FIND_EVIL_REQUIRE_ASSERTED_VALUES", "0")
 
 
+@pytest.fixture(autouse=True)
+def _allow_stub_signer_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Production coerces signer:"stub" → ed25519 unless this opt-in is set.
+    # Manifest tests intentionally exercise the deterministic stub path.
+    monkeypatch.setenv("FINDEVIL_ALLOW_STUB_SIGNER", "1")
+
+
 @pytest.fixture
 def seeded_audit_log(tmp_path: Path) -> Path:
     """Audit log with the seven-record fixture used by manifest tests."""
