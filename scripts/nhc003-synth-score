@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""End-to-end nhc-003 *mechanism* score on the synthetic carve image.
+
+Steps:
+  1. Ensure fixtures/nhc003-synth-carve.dd exists (generate if missing).
+  2. Prefer real bulk_extractor email features when the binary is on PATH;
+     otherwise plant the known feature rows (still scores the matcher/emitter).
+  3. Emit Pool-B bulk deleted-email finding via find_evil_auto helpers.
+  4. Write a minimal case dir + verdict.json and run score-recall.py.
+
+Never claims SCHARDT recall. Exit 0 only when nhc-003 is matched and RESULT PASS.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+IMAGE = ROOT / "fixtures" / "nhc003-synth-carve.dd"
+GOLDEN = ROOT / "goldens" / "nhc003-synth-carve"
+MAKE = ROOT / "scripts" / "make-nhc003-synth-image.py"
+
+
+def _load_find_evil_auto():
+    path = ROOT / "scripts" / "find_evil_auto.py"
+    spec = importlib.util.spec_from_file_location("find_evil_auto", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    # find_evil_auto is large; load for candidates/emitter only.
+    sys.modules["find_evil_auto"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _ensure_image() -> Path:
+    if not IMAGE.is_file():
+        subprocess.run([sys.executable, str(MAKE), str(IMAGE)], check=True, cwd=ROOT)
+    return IMAGE
+
+
+def _features_from_bulk_extractor(image: Path, work: Path) -> dict[str, Any] | None:
+    be = shutil.which("bulk_extractor")
+    if not be:
+        return None
+    out_dir = work / "be-out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        be,
+        "-q",
+        "-j",
+        "1",
+        "-o",
+        str(out_dir),
+        "-e",
+        "email",
+        "-e",
+        "find",
+        "--",
+        str(image),
+    ]
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"bulk_extractor rc={proc.returncode}: {proc.stderr[:300]}", file=sys.stderr)
+        return None
+    features: list[dict[str, Any]] = []
+    # email.txt often empty for bare RFC822 in free space; rfc822.txt + find.txt hold content.
+    for name, ftype in (
+        ("email.txt", "email"),
+        ("rfc822.txt", "rfc822"),
+        ("find.txt", "find"),
+    ):
+        path = out_dir / name
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t", 2)
+            feature = parts[1] if len(parts) > 1 else line
+            context = parts[2] if len(parts) > 2 else line
+            # find.txt feature cell is often a single keyword; fold full line into context.
+            if ftype == "find":
+                context = line[:500]
+            features.append(
+                {
+                    "feature_type": ftype,
+                    "offset": parts[0] if parts else "0",
+                    "feature": feature[:500],
+                    "context": context[:500],
+                }
+            )
+    if not features:
+        return None
+    return {
+        "bulk_extractor_available": True,
+        "features": features,
+        "features_seen": len(features),
+        "source": "bulk_extractor",
+    }
+
+
+def _features_planted() -> dict[str, Any]:
+    """Deterministic fallback when bulk_extractor is not installed."""
+    return {
+        "bulk_extractor_available": True,
+        "features": [
+            {
+                "feature_type": "email",
+                "offset": "80000",
+                "feature": "Subject: Recovered deleted email discussing the intrusion plan",
+                "context": (
+                    "From: planner@example.test Subject: Recovered deleted email "
+                    "discussing the intrusion plan Outlook free space carve fixture"
+                ),
+            }
+        ],
+        "features_seen": 1,
+        "source": "planted_fallback_no_bulk_extractor",
+    }
+
+
+def main() -> int:
+    print("nhc003-synth-score")
+    image = _ensure_image()
+    print(f"  image: {image}")
+
+    with tempfile.TemporaryDirectory(prefix="nhc003-synth-") as td:
+        work = Path(td)
+        be_out = _features_from_bulk_extractor(image, work)
+        if be_out is None:
+            print("  bulk_extractor: absent or failed — using planted feature fallback")
+            be_out = _features_planted()
+        else:
+            print(
+                f"  bulk_extractor: ok features_seen={be_out.get('features_seen')} "
+                f"rows={len(be_out.get('features') or [])}"
+            )
+
+        fea = _load_find_evil_auto()
+        cands = fea.bulk_extract_deleted_email_candidates(be_out, "tc-synth-bulk")
+        print(f"  candidates: {len(cands)}")
+        if not cands:
+            print("STATUS=FAIL")
+            print("reason: no bulk_extract_deleted_email_candidates from synth features")
+            print(f"  be_out_source={be_out.get('source')}")
+            return 1
+
+        inv = fea.Investigation(str(image), unattended=True, with_report=False)
+        inv.handle = {"id": "nhc003-synth-carve"}
+        inv._emit_bulk_extract_deleted_email_finding(cands)
+        findings = list(inv.findings_pool_b)
+        if not findings:
+            print("STATUS=FAIL")
+            print("reason: emitter produced no findings")
+            return 1
+
+        case_dir = work / "case"
+        case_dir.mkdir()
+        verdict = {
+            "case_id": "nhc003-synth-carve",
+            "verdict": "SUSPICIOUS",
+            "findings": [
+                {
+                    "finding_id": f.get("finding_id"),
+                    "description": f.get("description"),
+                    "confidence": f.get("confidence"),
+                    "tool_call_id": f.get("tool_call_id"),
+                    "artifact_path": f.get("artifact_path"),
+                }
+                for f in findings
+            ],
+        }
+        (case_dir / "verdict.json").write_text(
+            json.dumps(verdict, indent=2) + "\n", encoding="utf-8"
+        )
+
+        score = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "score-recall.py"),
+                str(case_dir),
+                "--golden",
+                str(GOLDEN),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        sys.stdout.write(score.stdout)
+        if score.stderr:
+            sys.stderr.write(score.stderr)
+
+        score_path = case_dir / "recall-score.json"
+        if score_path.is_file():
+            # Persist under repo tmp for operators (gitignored via .project-local if needed)
+            out_dir = ROOT / ".project-local" / "tmp" / "nhc003-synth-score"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(score_path, out_dir / "recall-score.json")
+            (out_dir / "verdict.json").write_text(
+                json.dumps(verdict, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"  wrote {out_dir / 'recall-score.json'}")
+
+        if score.returncode != 0:
+            print("STATUS=FAIL")
+            return 1
+
+        data = json.loads(score_path.read_text(encoding="utf-8")) if score_path.is_file() else {}
+        unmatched = data.get("unmatched") or []
+        nhc_missed = any(u.get("finding_id") == "nhc-003" for u in unmatched)
+        if nhc_missed:
+            print("STATUS=FAIL")
+            print("reason: score-recall still lists nhc-003 as unmatched")
+            return 1
+
+        print("STATUS=MATCHED")
+        print(
+            "note: synthetic mechanism score only — SCHARDT nhc-003 remains ABSENT "
+            "(see scripts/nhc003-absence-check / docs/internal/nhc003-schardt-absence-receipt.md)"
+        )
+        return 0
+
+
+if __name__ == "__main__":
+    # Allow import of find_evil_auto without requiring full package path hacks
+    os.chdir(ROOT)
+    raise SystemExit(main())
