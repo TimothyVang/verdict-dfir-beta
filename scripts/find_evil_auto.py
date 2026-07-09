@@ -3196,6 +3196,112 @@ def oe_dbx_deleted_email_candidates(
     return out
 
 
+_BULK_EMAIL_FEATURE_TYPES = frozenset({"email", "rfc822", "find"})
+_BULK_EMAIL_TOKENS = (
+    "@",
+    "from:",
+    "to:",
+    "subject:",
+    "message-id:",
+    "outlook",
+    "email",
+    "mail",
+)
+_BULK_ATTACK_PLAN_TERMS = (
+    "intrusion",
+    "plan",
+    "planning",
+    "attack",
+    "hacking",
+    "hack",
+    "exploit",
+    "target",
+)
+
+
+def _bulk_feature_text(feature: dict[str, Any]) -> str:
+    return f"{feature.get('feature') or ''} {feature.get('context') or ''}"
+
+
+def _contains_word(text: str, term: str) -> bool:
+    return re.search(rf"\b{re.escape(term)}\b", text, flags=re.IGNORECASE) is not None
+
+
+def _bulk_emailish_feature(feature: dict[str, Any]) -> bool:
+    feature_type = str(feature.get("feature_type") or "").lower()
+    if feature_type not in _BULK_EMAIL_FEATURE_TYPES:
+        return False
+    text = _bulk_feature_text(feature).lower()
+    return any(token in text for token in _BULK_EMAIL_TOKENS)
+
+
+def _bulk_feature_snippet(feature: dict[str, Any], *, limit: int = 160) -> str:
+    text = _bulk_feature_text(feature)
+    text = re.sub(r"\\0[0-9]{2}|\\x[0-9a-fA-F]{2}", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def bulk_extract_deleted_email_candidates(
+    output: dict[str, Any], tool_call_id: str
+) -> list[dict[str, Any]]:
+    """Return free-space email-recovery candidates from ``bulk_extract`` output.
+
+    ``bulk_extract`` scans the raw image, including unallocated/free-space bytes.
+    A generic carved email row is too weak for nhc-003: it may be allocated or
+    unrelated. Emit only when the recovered email-like rows themselves contain
+    broad attack-planning vocabulary. The vocabulary is evidence-agnostic and the
+    resulting finding stays a HYPOTHESIS, because a raw feature row confirms bytes
+    were present, not authorship, intent, or deletion state by itself.
+    """
+    if not isinstance(output, dict) or not output.get("bulk_extractor_available"):
+        return []
+    features = output.get("features") or []
+    if not isinstance(features, list):
+        return []
+
+    relevant: list[dict[str, Any]] = []
+    observed_terms: set[str] = set()
+    feature_types: set[str] = set()
+    for feature in features:
+        if not isinstance(feature, dict) or not _bulk_emailish_feature(feature):
+            continue
+        text = _bulk_feature_text(feature)
+        terms = {term for term in _BULK_ATTACK_PLAN_TERMS if _contains_word(text, term)}
+        if not terms:
+            continue
+        relevant.append(feature)
+        observed_terms.update(terms)
+        feature_types.add(str(feature.get("feature_type") or "unknown"))
+
+    required = {"intrusion", "plan"}
+    if not required.issubset(observed_terms):
+        return []
+
+    snippets: list[str] = []
+    seen_snippets: set[str] = set()
+    for feature in relevant:
+        snippet = _bulk_feature_snippet(feature)
+        if snippet and snippet not in seen_snippets:
+            snippets.append(snippet)
+            seen_snippets.add(snippet)
+        if len(snippets) >= 6:
+            break
+
+    return [
+        {
+            "kind": "bulk_deleted_email",
+            "tool_call_id": tool_call_id,
+            "feature_count": len(relevant),
+            "feature_types": sorted(feature_types),
+            "observed_terms": sorted(observed_terms),
+            "snippets": snippets,
+        }
+    ]
+
+
 # URL/path tells that mark an MSIE history row as an illicit / tool download
 # rather than ordinary browsing. ``warez``/``crack``/``keygen``/``serialz`` are
 # piracy markers; an executable/installer extension fetched over the web is a
@@ -12484,6 +12590,64 @@ class Investigation:
             f"{len(candidates)} store(s))"
         )
 
+    def _emit_bulk_extract_deleted_email_finding(
+        self, candidates: list[dict[str, Any]]
+    ) -> None:
+        """Emit ONE Pool B HYPOTHESIS lead from raw-image email feature recovery.
+
+        ``bulk_extract`` can see allocated and unallocated/free-space bytes that
+        filesystem parsers miss. A matching candidate means email-like feature
+        rows carried recovered attack-planning terms; it does NOT prove the row
+        came from deleted space, and it does NOT prove intent or authorship.
+        """
+        if not candidates:
+            return
+        primary = max(candidates, key=lambda c: int(c.get("feature_count") or 0))
+        primary_tcid = str(primary.get("tool_call_id") or "")
+        feature_count = int(primary.get("feature_count") or 0)
+        feature_types = [
+            str(t) for t in (primary.get("feature_types") or []) if str(t).strip()
+        ]
+        observed_terms = [
+            str(t) for t in (primary.get("observed_terms") or []) if str(t).strip()
+        ]
+        snippets = [
+            str(s) for s in (primary.get("snippets") or []) if str(s).strip()
+        ][:4]
+        feature_types_text = ", ".join(feature_types) if feature_types else "feature"
+        terms_text = ", ".join(observed_terms) if observed_terms else "none"
+        snippets_text = (
+            "; ".join(snippets) if snippets else "feature context unavailable"
+        )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for(
+                "f-B-bulk-deleted-email", primary_tcid, force_suffix=True
+            ),
+            "tool_call_id": primary_tcid,
+            "artifact_path": "bulk_extract/free-space email feature rows",
+            "description": (
+                "hypothesis: recovered deleted email / free-space carve lead from "
+                "bulk_extractor raw-image feature recovery: "
+                f"{feature_count} email-like {feature_types_text} row(s) carried "
+                f"intrusion-planning terms ({terms_text}). Recovered snippets include: "
+                f"{snippets_text}. bulk_extract scans allocated and unallocated/free-space "
+                "bytes, so this is the product's deleted-email/free-space recovery "
+                "surface for Outlook/PST/RFC822 remnants. It is not, on its own, "
+                "proof that the message was deleted, proof of intent, or proof of "
+                "actor identity; corroborate with filesystem, mailbox, timeline, "
+                "or network evidence before operational claims."
+            ),
+            "confidence": "HYPOTHESIS",
+            "pool_origin": "B",
+            "derived_from": [primary_tcid] if primary_tcid else [],
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B bulk deleted-email/free-space finding: {finding['finding_id']} "
+            f"(HYPOTHESIS, {feature_count} recovered row(s))"
+        )
+
     def _corroborate_execution_with_userassist(
         self,
         rust: SshMcpClient,
@@ -12640,7 +12804,7 @@ class Investigation:
         )
         be_available = bool(be_out.get("bulk_extractor_available"))
         features_seen = int(be_out.get("features_seen") or 0)
-        self._record_tool(
+        tcid = self._record_tool(
             py,
             "bulk_extract",
             self._output_hash(be_out),
@@ -12664,6 +12828,8 @@ class Investigation:
             print("  bulk_extract: bulk_extractor not installed (custody-only)")
         else:
             print(f"  bulk_extract: {features_seen} free-space feature(s) recovered")
+            candidates = bulk_extract_deleted_email_candidates(be_out, tcid)
+            self._emit_bulk_extract_deleted_email_finding(candidates)
 
     def investigate_extracted_disk_artifacts(
         self,

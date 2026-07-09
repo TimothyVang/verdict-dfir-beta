@@ -214,3 +214,85 @@ class TestDeletedEmailRecoveryEmitter:
         inv = self._inv()
         inv._emit_deleted_email_recovery_finding([])
         assert inv.findings_pool_b == []
+
+
+class TestBulkExtractDeletedEmailRecovery:
+    def _inv(self):
+        inv = fea.Investigation("disk.img", unattended=True, with_report=False)
+        inv.handle = {"id": "case-bulk"}
+        return inv
+
+    def test_planning_email_feature_is_candidate(self) -> None:
+        out = {
+            "bulk_extractor_available": True,
+            "features": [
+                {
+                    "feature_type": "email",
+                    "offset": "12345",
+                    "feature": "Subject: intrusion plan",
+                    "context": "Recovered Outlook message discusses the intrusion plan.",
+                },
+                {
+                    "feature_type": "url",
+                    "offset": "45678",
+                    "feature": "http://example.invalid",
+                    "context": "ordinary url row",
+                },
+            ],
+            "features_seen": 2,
+        }
+
+        cands = fea.bulk_extract_deleted_email_candidates(out, "tc-bulk")
+
+        assert len(cands) == 1
+        cand = cands[0]
+        assert cand["kind"] == "bulk_deleted_email"
+        assert cand["tool_call_id"] == "tc-bulk"
+        assert cand["feature_count"] == 1
+        assert cand["observed_terms"] == ["intrusion", "plan"]
+        assert "intrusion plan" in " ".join(cand["snippets"]).lower()
+
+    def test_generic_carved_email_is_not_candidate(self) -> None:
+        out = {
+            "bulk_extractor_available": True,
+            "features": [
+                {
+                    "feature_type": "email",
+                    "offset": "12345",
+                    "feature": "alice@example.net",
+                    "context": "Subject: lunch",
+                }
+            ],
+            "features_seen": 1,
+        }
+
+        assert fea.bulk_extract_deleted_email_candidates(out, "tc-bulk") == []
+
+    def test_candidate_becomes_pool_b_finding_matching_nhc003_terms(self) -> None:
+        inv = self._inv()
+        inv._emit_bulk_extract_deleted_email_finding(
+            [
+                {
+                    "kind": "bulk_deleted_email",
+                    "tool_call_id": "tc-bulk",
+                    "feature_count": 2,
+                    "feature_types": ["email", "rfc822"],
+                    "observed_terms": ["intrusion", "plan"],
+                    "snippets": [
+                        "Subject: intrusion plan",
+                        "Recovered Outlook message discusses the intrusion plan.",
+                    ],
+                }
+            ]
+        )
+
+        assert len(inv.findings_pool_b) == 1
+        f = inv.findings_pool_b[0]
+        assert f["confidence"] == "HYPOTHESIS"
+        assert f["tool_call_id"] == "tc-bulk"
+        assert f["finding_id"].startswith("f-B-bulk-deleted-email")
+        desc = f["description"].lower()
+        assert "recovered deleted email" in desc
+        assert "free-space" in desc and "carve" in desc
+        assert "intrusion" in desc and "plan" in desc
+        assert "not, on its own, proof that the message was deleted" in desc
