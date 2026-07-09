@@ -256,9 +256,10 @@ its facts (registry Run-key, EVTX EID 1102, the prefetch execution lead) and
 every INFERRED finding declares `asserted_values` or cites `derived_from`.
 
 The full-coverage run that gates this flip is committed: `SCHARDT.dd` with the
-gate on, `manifest_verify` **overall: true**. Recall for this case is **10/14 =
-71%**, at its floor (measured 2026-07-01, `docs/benchmark/RESULTS.md`; reproduces
-at 10/14 across repeat runs). The gate governs fact-fidelity — which structured
+gate on, `manifest_verify` **overall: true**. Live NIST recall is **11/14 = 79%**
+under #189 (`docs/benchmark/RESULTS.md`, 2026-07-09); committed
+`docs/sample-run/nist-hacking-case` still re-scores **10/14 = 71%** with
+`nhc-003: MISSED` (historical sealed packet). The gate governs fact-fidelity — which structured
 values a CONFIRMED finding may assert — not recall, so enabling it did not drop
 any legitimate finding. The reject path still has teeth
 (`test_entailment.py`, `test_verifier.py::TestEntailmentCheck`,

@@ -73,7 +73,7 @@ as of this report:
 | # | Case | Class | Golden outcome | Recall bar | Result | Status |
 |---|---|---|---|---|---|---|
 | 1 | `nitroba` | network (pcap) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 80% | **5/5 = 100%** · run `INDETERMINATE` | **PASS** — committed sample run `docs/sample-run/nitroba/`; custody-verified (`manifest_verify` overall true, replay 9/9) |
-| 2 | `nist-hacking-case` | disk (XP) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 71% | **10/14 = 71%** · run `SUSPICIOUS` | **PASS** — at the 71% floor; measured 2026-07-01 (`docs/benchmark/RESULTS.md`) and reproduced from `evidence/SCHARDT.dd`. Caveat: SCHARDT is in the golden set, so treat a strong score here as regression signal, not blind generalization |
+| 2 | `nist-hacking-case` | disk (XP) | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 71% | **11/14 = 79%** live re-carve · run `SUSPICIOUS` | **PASS** — live SCHARDT under #189 bulk free-space carve (`docs/benchmark/RESULTS.md`, 2026-07-09). Committed `docs/sample-run/nist-hacking-case` remains historical **10/14 = 71%** with `nhc-003: MISSED` (pre-#189 sealed packet; not regenerated). Caveat: SCHARDT is in the golden set, so treat a strong score here as regression signal, not blind generalization |
 | 3 | `nist-data-leakage` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 60% | — | staged, scheduled (local TSK / SIFT parity) |
 | 4 | `alihadi-09-encrypt` | disk (FP control) | **INDETERMINATE** | 50% | — | staged, scheduled (local TSK / SIFT parity) |
 | 5 | `alihadi-01-webserver` | disk | SUSPICIOUS (legacy label: CONFIRMED_EVIL) | 60% | — | staged, scheduled (local TSK / SIFT parity) |
@@ -85,21 +85,31 @@ as of this report:
 | 11 | `synthetic-decoy` | decoy / FP control | **NO_EVIL** (0 planted bait asserted) | 100% | **0/0 = 100%**, 0 planted bait · run `INDETERMINATE` | **PASS** — committed sample run `docs/sample-run/synthetic-decoy/`; custody-verified |
 
 **Honest summary:** on the local-runnable corpus (evidence stageable without gated downloads),
-**9 of 9 cases pass** with aggregate recall **23/27 = 85%** (Tier B, goldens-scored; measured
-2026-07-01 in [`benchmark/RESULTS.md`](benchmark/RESULTS.md), `manifest_verify` overall:true on
-every run). `nist-hacking-case` now **passes at its 71% floor (10/14)** — up from the earlier
-36-50% range — and reproduces from `evidence/SCHARDT.dd`. It recalls ten of the golden's fourteen
-canonical claims: recent-search history (ACMru), hacking-tool MFT artifacts, Prefetch execution, IE
-internet history, shellbag and removable-media **LNK** staging traces, **Recycle Bin** staging, the
-**suspiciously-named SAM account** (T1136.001), the **recently-opened-file MRU**, and service-recon
-enumeration. It misses four, each for a documented reason: **nhc-002** (USB insertion history —
-`USBSTOR` is queried but returns empty on this image), **nhc-003** (recovered deleted email —
-deleted-file carve gap), **nhc-012** (logon events — the golden's `SecEvent.Evt` is empty, so it is
-unsatisfiable from the evidence), and **nhc-013** (thumbcache — this image ships no `Thumbs.db`). To
-reproduce: run `scripts/verdict evidence/SCHARDT.dd`, then score the run dir with
-`scripts/score-recall.py --golden goldens/nist-hacking-case`. The larger gated disk/memory cases
-(rows 3-9) remain fixture-staged and **not yet run** — scheduled, not measured. We publish the gap,
-and the progress, rather than hide either. The adversarial posture is tracked in
+**9 of 9 cases pass** with aggregate recall **24/27 = 89%** when NIST is scored from a live
+SCHARDT auto-run (Tier B, goldens-scored; measured 2026-07-09 in
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md), `manifest_verify` overall:true on the live NIST
+re-carve). Live `nist-hacking-case` is **11/14 = 79%** under the #189 bulk free-space email carve
+matcher — up from the earlier 36–71% range — and reproduces from `evidence/SCHARDT.dd`. It recalls
+eleven of the golden's fourteen canonical claims: recent-search history (ACMru), **recovered
+deleted-email / free-space carve lead (nhc-003)**, hacking-tool MFT artifacts, Prefetch execution,
+IE internet history, shellbag and removable-media **LNK** staging traces, **Recycle Bin** staging,
+the **suspiciously-named SAM account** (T1136.001), the **recently-opened-file MRU**, and
+service-recon enumeration. Remaining live misses (three): **nhc-002** (USB insertion history —
+`USBSTOR` is queried but returns empty on this image), **nhc-012** (logon events — the golden's
+`SecEvent.Evt` is empty, so it is unsatisfiable from the evidence), and **nhc-013** (thumbcache —
+this image ships no `Thumbs.db`).
+
+**Sample-run vs live (do not invent MATCHED on the sealed packet):**
+`python3 scripts/nhc003-golden-check docs/sample-run/nist-hacking-case` →
+`recall: 10/14 = 71%` / `nhc-003: MISSED` — the committed packet has OE Deleted Items
+("Welcome to Outlook Express 6") and newsgroup affiliation, but **no** `f-B-bulk-deleted-email-*`
+finding (pre-#189). Live re-carve under #189 → `recall: 11/14 = 79%` /
+`nhc-003: MATCHED … matched_run_finding_id=f-B-bulk-deleted-email-bcaaa39b`. The sealed sample-run
+is not regenerated (custody packet stays byte-stable); the measured NIST row is the live score.
+To reproduce live: run `scripts/verdict evidence/SCHARDT.dd`, then
+`python3 scripts/nhc003-golden-check <run-dir>`. The larger gated disk/memory cases (rows 3-9)
+remain fixture-staged and **not yet run** — scheduled, not measured. We publish the gap, and the
+progress, rather than hide either. The adversarial posture is tracked in
 [`red-team-challenge.md`](red-team-challenge.md): unsupported artifact evil, benign admin activity,
 single-source execution traps, log clearing, DKOM-vs-smear, exfil-without-network, and parser-failure
 cases are expected to pass by staying scoped, preserving limitations, and producing replayable
@@ -142,16 +152,12 @@ per scored case when a trustworthy answer key and completed run output exist.
 Misses are documented explicitly so partial coverage cannot be mistaken for
 clearance:
 
-- `nist-hacking-case` recalls **10/14 expected claims (71%)**, at the 71% bar, and reproduces at
-  10/14 across repeat runs from `evidence/SCHARDT.dd`. The ten matched: `nhc-001` (ACMru
-  recent-search history), `nhc-004` (hacking-tool files in the MFT), `nhc-005` (Prefetch execution),
-  `nhc-006` (IE internet history), `nhc-007` (shellbag removable-media navigation), `nhc-008` (LNK
-  removable-media traces), `nhc-009` (Recycle Bin staging), `nhc-010` (suspiciously-named SAM
-  account, T1136.001), `nhc-011` (OpenSaveMRU installers), and `nhc-014` (service / named-pipe
-  recon). The four unmatched, each with a documented cause: `nhc-002` (USB insertion history —
-  `USBSTOR` is queried but returns empty on this image), `nhc-003` (recovered deleted email —
-  deleted-file carve gap), `nhc-012` (logon events — the golden's `SecEvent.Evt` is empty, so it is
-  unsatisfiable from the evidence), and `nhc-013` (thumbcache — this image ships no `Thumbs.db`).
+- `nist-hacking-case` live re-carve recalls **11/14 expected claims (79%)** under #189; remaining
+  unmatched: `nhc-002` (USBSTOR empty on this image), `nhc-012` (logon `.evt` empty / unsatisfiable),
+  `nhc-013` (no `Thumbs.db`). Live scorer quote: `recall: 11/14 = 79%` /
+  `nhc-003: MATCHED … f-B-bulk-deleted-email-bcaaa39b`. Committed
+  `docs/sample-run/nist-hacking-case` still scores **10/14 = 71%** with `nhc-003: MISSED` because
+  that sealed packet pre-dates the bulk free-space carve finding and is not rewritten.
 - Large or gated datasets remain marked `staged, run pending evidence` until the
   exact fixture is available and scored. No recall number is fabricated for
   those rows.
@@ -215,11 +221,12 @@ exercise. The checks we expect judges to run are:
 - **False positives found:** `alihadi-09-encrypt` remains an explicit control for
   benign or dual-use encryption-tool presence. The correct answer is scoped
   `INDETERMINATE`, not a confident suspicious verdict from tool presence alone.
-- **Missed artifacts:** the public NIST Hacking Case score is **10/14 recall (71%)**, at its floor.
-  The four remaining misses — USB insertion history (`nhc-002`), recovered deleted email
-  (`nhc-003`), logon events (`nhc-012`, unsatisfiable: the golden's `SecEvent.Evt` is empty), and
-  thumbcache (`nhc-013`, no `Thumbs.db` on this image) — are published as misses rather than hidden
-  behind a broad accuracy claim.
+- **Missed artifacts:** live NIST Hacking Case score is **11/14 recall (79%)** (above the 71%
+  floor) with `nhc-003` MATCHED via bulk free-space carve (#189). Remaining live misses —
+  USB insertion history (`nhc-002`), logon events (`nhc-012`, unsatisfiable empty `SecEvent.Evt`),
+  and thumbcache (`nhc-013`, no `Thumbs.db`) — are published as misses rather than hidden behind a
+  broad accuracy claim. The committed sample-run packet still shows **10/14** with `nhc-003: MISSED`
+  (historical sealed output; not an invented MATCHED).
 - **Hallucination and overclaim classes caught:** uncited Findings, replay hash
   drift, unsupported execution wording, single-source execution claims, and
   unsupported exfiltration claims are vetoed, downgraded, or held as warnings by
