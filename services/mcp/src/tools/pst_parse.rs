@@ -149,6 +149,9 @@ pub enum PstError {
     #[error("case dir not found for case_id {0:?} (call case_open first)")]
     CaseNotFound(String),
 
+    #[error("invalid case_id (must match [A-Za-z0-9_-]+, no path separators or '.'/'..'): {0}")]
+    InvalidCaseId(String),
+
     #[error("could not create export staging dir {path}: {source}")]
     StagingCreate {
         path: PathBuf,
@@ -297,6 +300,9 @@ fn resolve_pffexport() -> Option<PathBuf> {
 
 /// Resolve `$FINDEVIL_HOME/cases/<case_id>` (mirrors the disk tool's helper).
 fn case_dir(case_id: &str) -> Result<PathBuf, PstError> {
+    if !super::case_id::is_valid_case_id(case_id) {
+        return Err(PstError::InvalidCaseId(case_id.to_string()));
+    }
     let dir = findevil_home()
         .ok_or_else(|| PstError::CaseNotFound(case_id.to_string()))?
         .join("cases")

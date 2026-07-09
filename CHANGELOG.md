@@ -12,6 +12,24 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.7] - 2026-07-09
+
+Security hardening follow-up to beta.6. **Still toolkit-only** (no CaseForge /
+opencode embed). **nhc-003 recall remains unmeasured.**
+
+### Fixed
+
+- **Systemic `case_id` path-segment validation** — shared `is_valid_case_id`
+  (`[A-Za-z0-9_-]+`) gates `$FINDEVIL_HOME/cases/<case_id>` joins in `disk`,
+  `pst_parse`, and `srum_parse` (plus the existing `bulk_extract` path) so
+  traversal ids cannot reach create/delete under the case sandbox. (PR #174,
+  closes #172)
+
+### Notes
+
+- Merged on local gates (fmt, unit, clippy); hosted Actions may still be
+  billing-gated on the private dev repo.
+
 ## [v0.5.0-beta.6] - 2026-07-09
 
 Toolkit snapshot from `develop` after bulk free-space feature recovery and

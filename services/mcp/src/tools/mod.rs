@@ -21,6 +21,7 @@ pub mod ausearch;
 pub mod bits_parse;
 pub mod browser_history;
 pub mod bulk_extract;
+pub mod case_id;
 pub mod case_open;
 pub mod cloud_audit;
 pub mod disk;
@@ -74,6 +75,7 @@ pub use bulk_extract::{
     bulk_extract, BulkExtractError, BulkExtractInput, BulkExtractOutput, BulkFeature, BulkScanner,
     StagedFeatureFile,
 };
+pub use case_id::is_valid_case_id;
 pub use case_open::{case_open, CaseHandle, CaseOpenError, CaseOpenInput};
 pub use cloud_audit::{
     cloud_audit, is_allowed_provider, CloudAuditError, CloudAuditInput, CloudAuditOutput,

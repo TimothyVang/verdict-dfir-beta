@@ -165,6 +165,9 @@ pub enum SrumError {
     #[error("case {0} not found under FINDEVIL_HOME/cases (run case_open first)")]
     CaseNotFound(String),
 
+    #[error("invalid case_id (must match [A-Za-z0-9_-]+, no path separators or '.'/'..'): {0}")]
+    InvalidCaseId(String),
+
     #[error("could not prepare SRUM staging directory {path}: {source}")]
     Staging {
         path: PathBuf,
@@ -471,6 +474,9 @@ fn prepare_staging_dir(case_id: &str) -> Result<PathBuf, SrumError> {
 /// Locate the case directory, mirroring the canonical
 /// `$FINDEVIL_HOME/cases/<case_id>` layout used across the tool surface.
 fn case_dir(case_id: &str) -> Result<PathBuf, SrumError> {
+    if !super::case_id::is_valid_case_id(case_id) {
+        return Err(SrumError::InvalidCaseId(case_id.to_string()));
+    }
     let dir = findevil_home()?.join("cases").join(case_id);
     if dir.is_dir() {
         Ok(dir)

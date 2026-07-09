@@ -212,6 +212,8 @@ struct SessionLedger {
 pub enum DiskError {
     #[error("case not found: {0}")]
     CaseNotFound(String),
+    #[error("invalid case_id (must match [A-Za-z0-9_-]+, no path separators or '.'/'..'): {0}")]
+    InvalidCaseId(String),
     #[error("evidence image not found: {0}")]
     ImageNotFound(PathBuf),
     #[error("mount resource not found: {0}")]
@@ -1703,6 +1705,9 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
 }
 
 pub(crate) fn case_dir(case_id: &str) -> Result<PathBuf, DiskError> {
+    if !super::case_id::is_valid_case_id(case_id) {
+        return Err(DiskError::InvalidCaseId(case_id.to_string()));
+    }
     let dir = findevil_home()?.join("cases").join(case_id);
     if dir.is_dir() {
         Ok(dir)
@@ -1793,10 +1798,10 @@ fn tail_utf8_lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_subrank, class_priority, classify_artifact_path, direct_tsk_mount,
+        artifact_subrank, case_dir, class_priority, classify_artifact_path, direct_tsk_mount,
         ewfmount_available, is_missing_binary, mock_list, parse_fls_line, parse_mmls_partitions,
         parse_mmls_primary_partition_offset, safe_join, select_artifacts, unmount_steps,
-        wanted_kinds, Candidate, FlsEntry, DIRECT_TSK_COMMAND,
+        wanted_kinds, Candidate, DiskError, FlsEntry, DIRECT_TSK_COMMAND,
     };
     use std::path::Path;
 
@@ -2464,5 +2469,21 @@ Units are in 512-byte sectors
         let output = r"Cannot determine partition type
 ";
         assert!(parse_mmls_partitions(output).is_empty());
+    }
+
+    #[test]
+    fn case_dir_rejects_traversal_case_id_before_join() {
+        match case_dir("../../etc") {
+            Err(DiskError::InvalidCaseId(id)) => assert_eq!(id, "../../etc"),
+            other => panic!("expected InvalidCaseId, got {other:?}"),
+        }
+        match case_dir("a/b") {
+            Err(DiskError::InvalidCaseId(_)) => {}
+            other => panic!("expected InvalidCaseId for slash, got {other:?}"),
+        }
+        match case_dir("..") {
+            Err(DiskError::InvalidCaseId(_)) => {}
+            other => panic!("expected InvalidCaseId for .., got {other:?}"),
+        }
     }
 }

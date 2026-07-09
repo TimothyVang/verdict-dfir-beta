@@ -744,18 +744,8 @@ fn resolve_case_dir(case_id: &str) -> Result<PathBuf, BulkExtractError> {
     }
 }
 
-/// Whether a `case_id` is safe to use as a single path component.
-///
-/// True iff it is non-empty and every character is ASCII alphanumeric,
-/// `-`, or `_`. This excludes `/`, `\`, `.` (so `.`/`..` traversal), and
-/// NUL. Pure + tested.
-#[must_use]
-pub fn is_valid_case_id(case_id: &str) -> bool {
-    !case_id.is_empty()
-        && case_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+/// Re-export shared allowlist (see [`crate::tools::case_id`]).
+pub use super::case_id::is_valid_case_id;
 
 /// Replace every absolute path in `roots` (as a substring) with a stable
 /// `<redacted-path>` token.
