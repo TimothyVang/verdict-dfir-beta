@@ -12,6 +12,18 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.14] - 2026-07-09
+
+nhc-003 **partial** SCHARDT probe (`STATUS=PARTIAL_PROBE_UNMEASURED`). **No recall %.**
+**Toolkit-only.** Golden nhc-003 match still open.
+
+### Changed
+
+- **`scripts/nhc003-carve-status.sh`** — samples first `NHC003_PROBE_MB` of large
+  images (default 512) so SCHARDT.dd can be probed without a full-disk score;
+  reports `PARTIAL_PROBE_UNMEASURED` when the partial find probe finishes.
+  (PR #180)
+
 ## [v0.5.0-beta.13] - 2026-07-09
 
 nhc-003 measurement scaffold (honest UNMEASURED). **No recall number.**

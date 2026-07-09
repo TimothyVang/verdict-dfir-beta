@@ -8,11 +8,21 @@
 #   0 — STATUS=UNMEASURED or STATUS=PARTIAL_PROBE_UNMEASURED
 #   1 — STATUS=ERROR (tool failure when a probe was attempted)
 #
-# Env:
-#   NHC003_IMAGE / VERDICT_SCHARDT_IMAGE — override path to disk image
-#   NHC003_SKIP_PROBE=1 — only check prerequisites
-#   NHC003_PROBE_MB=512 — bytes to sample from the start of a large image (default 512)
-#   NHC003_PROBE_TIMEOUT=180 — seconds for bulk_extractor (default 180)
+# Image selection, in order:
+#   1. NHC003_IMAGE
+#   2. VERDICT_SCHARDT_IMAGE
+#   3. evidence/SCHARDT.dd, evidence/SCHARDT.E01, evidence/cases/SCHARDT.dd
+#
+# Probe controls:
+#   NHC003_SKIP_PROBE=1     — only check prerequisites; do not run bulk_extractor
+#   NHC003_PROBE_MB=512     — MiB to sample from the start of a larger image
+#                              (default 512, minimum 16)
+#   NHC003_PROBE_TIMEOUT=180 — seconds to allow bulk_extractor (default 180,
+#                              minimum 30)
+#
+# A larger NHC003_PROBE_MB can make the partial probe less shallow. It still
+# does not become a recall measurement, and this script still exits
+# STATUS=UNMEASURED or STATUS=PARTIAL_PROBE_UNMEASURED unless the tool fails.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,7 +56,7 @@ echo "nhc003-carve-status"
 echo "  bulk_extractor: $([ "$have_bin" = 1 ] && echo "yes ($bin_path)" || echo "no")"
 echo "  schardt_image:  $([ "$have_img" = 1 ] && echo "yes ($img_path)" || echo "no (set NHC003_IMAGE or place evidence/SCHARDT.dd)")"
 echo "  note: synthetic carve smoke is separate (bulk_extract_smoke); this script never claims recall %"
-echo "  golden_nhc003: description='Recovered deleted email discussing the intrusion plan' hint='Outlook PST / free space carve'"
+echo "  scorer: none; probe rows are diagnostic-only and are not golden matches"
 
 if [ "$have_bin" != 1 ] || [ "$have_img" != 1 ]; then
   echo "STATUS=UNMEASURED"
@@ -78,16 +88,18 @@ img_size="$(wc -c <"${img_path}" | tr -d ' ')"
 sample="${tmp}/sample.dd"
 need_bytes=$((probe_mb * 1024 * 1024))
 if [ "${img_size}" -gt "${need_bytes}" ]; then
-  echo "  probe_sample: first ${probe_mb} MiB of ${img_size} byte image (partial; not full-disk score)"
+  echo "  probe_sample: first ${probe_mb} MiB of ${img_size} byte image (partial probe; not a score)"
   dd if="${img_path}" of="${sample}" bs=1M count="${probe_mb}" status=none 2>/dev/null \
     || dd if="${img_path}" of="${sample}" bs=1048576 count="${probe_mb}" 2>/dev/null
   probe_img="${sample}"
+  probe_was_partial=1
 else
-  echo "  probe_sample: full image (${img_size} bytes)"
+  echo "  probe_sample: full image (${img_size} bytes; still unscored)"
   probe_img="${img_path}"
+  probe_was_partial=0
 fi
 
-# Hint-derived find patterns only (from golden description/hint words — not full answer key).
+# Broad probe terms only. Matching rows are not interpreted as a golden hit.
 patterns_file="${tmp}/patterns.txt"
 printf '%s\n' 'intrusion' 'email' 'outlook' 'plan' 'hacking' >"${patterns_file}"
 
@@ -119,12 +131,12 @@ feat_lines=0
 if [ -f "${tmp}/out/find.txt" ]; then
   feat_lines="$(grep -cv '^#' "${tmp}/out/find.txt" 2>/dev/null || echo 0)"
 fi
-# Sample up to 3 non-comment feature lines for operator visibility (no golden match).
-if [ -f "${tmp}/out/find.txt" ]; then
-  echo "  probe_find_sample:"
-  grep -v '^#' "${tmp}/out/find.txt" 2>/dev/null | head -3 | sed 's/^/    /' || true
-fi
 echo "  probe_find_rows: ${feat_lines}"
-echo "STATUS=PARTIAL_PROBE_UNMEASURED"
-echo "reason: partial free-space find probe finished; golden nhc-003 match is not scored by this script"
+if [ "${probe_was_partial}" = "1" ]; then
+  echo "STATUS=PARTIAL_PROBE_UNMEASURED"
+  echo "reason: partial find probe finished; no golden scorer was run"
+else
+  echo "STATUS=UNMEASURED"
+  echo "reason: find probe finished; no golden scorer was run"
+fi
 exit 0
