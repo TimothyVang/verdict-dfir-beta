@@ -84,14 +84,7 @@ It:
   image, mount the evidence read-only at `/evidence`, build the MCP in-container);
 - skips the host `cargo build` — the MCP is built in the container;
 - swaps in the docker MCP transport (`.mcp.json.docker` over `.mcp.json`, backed
-  up and restored on exit, exactly as `--sift` swaps `.mcp.json.sift`) — this is
-  what the **interactive** Claude Code path reads;
-- selects the **deterministic engine's** own `docker exec` transport
-  (`FIND_EVIL_DOCKER=1`): `scripts/find_evil_auto.py` drives `findevil-mcp` /
-  `findevil-agent-mcp` over `docker exec -i <container>`, the container analog of
-  its SSH (`--sift`) transport. The case dir is written under `/workspace`
-  (the repo bind mount), so it lands on the host with no copy step, and
-  `manifest_verify` reproduces `output_sha256` from inside the container;
+  up and restored on exit, exactly as `--sift` swaps `.mcp.json.sift`);
 - hands the run the in-container evidence path (`/evidence`, where the evidence
   is bind-mounted read-only), since the tools run in the container and see it
   there;
@@ -151,11 +144,10 @@ this image.
   long-tail lanes (e.g. `mac_triage` / mac_apt) are not in the image and still
   degrade to `BinaryNotFound`. Prefer `--sift` when you need one of those lanes.
 - **Multi-segment E01.** The image ships Ubuntu 22.04's `libewf` (`ewfmount
-  20140807`). A real multi-segment E01 (`.E01` + `.E02`) live run (Szechuan DC)
-  mounted and read the full ~11 GB C: volume (114,999 filesystem entries, 107
-  EVTX, 4 registry hives via `fls`), so no truncation was observed there. If a
-  truncated read does surface on a larger segmented image, `ewfexport` the
-  `.E01`/`.E02` to a single raw `.dd` first and point VERDICT at the `.dd`.
+  20140807`), the same era as the SIFT VM. A truncated multi-segment E01 read
+  seen on the VM may persist. Workaround until a newer `libewf` is pinned:
+  `ewfexport` the segmented `.E01`/`.E02` to a single raw `.dd` first, then point
+  VERDICT at the `.dd`.
 - **The MCP server is built at bring-up, not baked into the image**, so the image
   stays decoupled from any single repo snapshot. First bring-up compiles
   `findevil-mcp` inside the container; subsequent starts reuse it.

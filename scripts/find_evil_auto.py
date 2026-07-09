@@ -2055,40 +2055,6 @@ def _registry_target_from_data(data_str: str) -> str:
     return data.split()[0]
 
 
-# Signature of an encoded/obfuscated PowerShell payload stashed in a Run/RunOnce
-# value: a PowerShell launcher plus an encoded-command / download-cradle / hidden
-# tell (or a long unbroken base64 run). GENERAL signature only — never a specific
-# value/hive path. This is the classic in-memory shellcode-injector persistence
-# pattern (a base64 blob passed to ``powershell -enc``), which the file-path Run
-# -key classifier misses because the value data is not a file path.
-_ENCODED_PS_LAUNCHER_TOKENS = ("powershell", "pwsh")
-_ENCODED_PS_PAYLOAD_TOKENS = (
-    "-enc",
-    "-e ",
-    "-ec ",
-    "encodedcommand",
-    "frombase64string",
-    "-nop",
-    "-noprofile",
-    "hidden",
-    "downloadstring",
-    "downloadfile",
-    "iex",
-    "invoke-expression",
-)
-
-
-def _run_value_encoded_powershell(data: str) -> bool:
-    """True when a Run/RunOnce value's data is an encoded PowerShell payload."""
-    d = (data or "").lower()
-    if not any(t in d for t in _ENCODED_PS_LAUNCHER_TOKENS):
-        return False
-    if any(t in d for t in _ENCODED_PS_PAYLOAD_TOKENS):
-        return True
-    # A long unbroken base64-ish run after the launcher is itself the tell.
-    return bool(re.search(r"[a-z0-9+/=]{80,}", d))
-
-
 def registry_persistence_candidates(
     rows: list[dict[str, Any]], key_path: str | None
 ) -> list[dict[str, Any]]:
@@ -2113,21 +2079,6 @@ def registry_persistence_candidates(
                 name = str(v.get("name") or "")
                 data = str(v.get("data_str") or "")
                 if not data or name.lower() in BENIGN_REGISTRY_RUN_VALUES:
-                    continue
-                # Encoded-PowerShell Run value: the value data is a PowerShell
-                # command with an encoded/base64 payload rather than a file path,
-                # so the path-based target gate below never fires on it. This is
-                # the in-memory shellcode-injector persistence pattern; flag it on
-                # the general signature (never a specific value).
-                if _run_value_encoded_powershell(data):
-                    out.append(
-                        {
-                            "kind": "run_key_encoded_ps",
-                            "value_name": name,
-                            "hive_key": row_key,
-                            "last_write_time_iso": lw,
-                        }
-                    )
                     continue
                 target = _registry_target_from_data(data)
                 if not target:
@@ -2855,110 +2806,6 @@ def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, An
                 )
                 break
     return out
-
-
-# Windows system directories where a legitimate executable is an OS component; an
-# unexpected/masqueraded binary here (T1036.005) is the tell.
-_MFT_SYSTEM_DIRS: tuple[str, ...] = (
-    "/windows/system32/",
-    "/windows/syswow64/",
-    "/winnt/system32/",
-)
-# Update/system-update mimicry tokens: a binary in a system directory whose name
-# poses as a Windows update component. General signature, never a specific name.
-_MFT_UPDATE_MASQUERADE_TOKENS: tuple[str, ...] = ("update", "updater", "upd")
-# Genuine Windows update/servicing binaries the mimicry check must not flag.
-_MFT_BENIGN_UPDATE_EXES: frozenset[str] = frozenset(
-    {
-        "wuauclt.exe",
-        "usoclient.exe",
-        "mousocoreworker.exe",
-        "trustedinstaller.exe",
-        "tiworker.exe",
-        "wuauserv.exe",
-        "sihclient.exe",
-    }
-)
-# Archive extensions and the staging-suggestive roots where an archive is a
-# collection/exfil-staging lead (T1560) rather than benign install media.
-_MFT_ARCHIVE_EXTS: tuple[str, ...] = (
-    ".zip",
-    ".rar",
-    ".7z",
-    ".tar",
-    ".gz",
-    ".tgz",
-    ".cab",
-    ".iso",
-)
-_MFT_ARCHIVE_BENIGN_ROOTS: tuple[str, ...] = (
-    "/program files",
-    "/windows/",
-    "/winnt/",
-    "/$recycle",
-    "/system volume information/",
-    "package cache",
-    "/installer/",
-)
-
-
-def mft_masquerade_and_staging_candidates(
-    rows: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Classify $MFT rows into (masquerade-exe, archive-staging) candidates.
-
-    Pure function. Two GENERAL signatures keyed only on the parsed path/name,
-    never a specific value:
-      * masquerade_exe (T1036.005): an executable created inside a Windows system
-        directory whose name poses as an update/system component but is not a
-        genuine Windows servicing binary.
-      * archive_staging (T1560): an archive file outside install/system roots —
-        the shape of data collected and staged for exfil. Deduped by basename.
-    """
-    masq: list[dict[str, Any]] = []
-    archives: list[dict[str, Any]] = []
-    seen_m: set[str] = set()
-    seen_a: set[str] = set()
-    for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        path = str(row.get("full_path") or row.get("name") or "")
-        low = path.lower().replace("\\", "/")
-        base = low.rsplit("/", 1)[-1]
-        created = row.get("fn_created_iso") or row.get("si_created_iso")
-        if (
-            base.endswith(".exe")
-            and any(d in low for d in _MFT_SYSTEM_DIRS)
-            and base not in _MFT_BENIGN_UPDATE_EXES
-            and any(t in base for t in _MFT_UPDATE_MASQUERADE_TOKENS)
-            and base not in seen_m
-        ):
-            seen_m.add(base)
-            masq.append(
-                {
-                    "kind": "masquerade_exe",
-                    "path": path,
-                    "name": base,
-                    "created": created,
-                    "record_number": row.get("record_number"),
-                }
-            )
-        if (
-            any(base.endswith(e) for e in _MFT_ARCHIVE_EXTS)
-            and not any(r in low for r in _MFT_ARCHIVE_BENIGN_ROOTS)
-            and base not in seen_a
-        ):
-            seen_a.add(base)
-            archives.append(
-                {
-                    "kind": "archive_staging",
-                    "path": path,
-                    "name": base,
-                    "created": created,
-                    "record_number": row.get("record_number"),
-                }
-            )
-    return masq, archives
 
 
 def _ci_get(row: dict[str, Any], *names: str) -> str:
@@ -3947,24 +3794,15 @@ COMMON_BROWSER_IMAGES = {
     "safari.exe",
 }
 
-# Volume floor (in the pcap_triage conversation `count`, i.e. packets) and count
-# cap for surfacing external OUTBOUND TCP sessions as C2-beacon / data-transfer
-# LEADS. A command-and-control beacon and an exfiltration channel both present
-# as a sustained internal->external session; keyed only on that general volume
-# signature (never a specific IP:port). The floor drops trivial short flows; the
-# cap bounds how many top external talkers are surfaced so a busy capture does
-# not flood the finding set. Both are HYPOTHESIS leads (leads-until-corroborated).
-PCAP_C2_MIN_PACKETS = 300
-PCAP_C2_MAX_CANDIDATES = 8
-# Executable-ish URI suffixes that strengthen the read of an HTTP GET as a
-# tool/payload download (T1105). General extensions only, never a filename.
-PCAP_INGRESS_EXE_SUFFIXES = (".exe", ".dll", ".ps1", ".scr", ".bat", ".hta", ".vbs")
-
 TOOL_ARTIFACT_CLASSES = {
     "case_open": "custody",
+    "bits_parse": "disk/filesystem",
     "browser_history": "browser_history",
+    "bulk_extract": "disk/filesystem",
     "cloud_audit": "cloud",
+    "email_parse": "disk/filesystem",
     "evtx_query": "evtx",
+    "exif_parse": "disk/filesystem",
     "ez_parse": "disk/filesystem",
     "hashset_lookup": "disk/filesystem",
     "hayabusa_scan": "evtx",
@@ -3977,8 +3815,13 @@ TOOL_ARTIFACT_CLASSES = {
     "pcap_triage": "network",
     "plaso_parse": "timeline",
     "prefetch_parse": "prefetch",
+    "pst_parse": "disk/filesystem",
     "registry_query": "registry",
+    "srum_parse": "disk/filesystem",
     "suricata_eve": "network",
+    "vss_list": "disk/filesystem",
+    "vss_mount": "disk/filesystem",
+    "wmi_persist_parse": "disk/filesystem",
     "sysmon_network_query": "network",
     "thumbcache_parse": "disk/filesystem",
     "usnjrnl_query": "usnjrnl",
@@ -4008,6 +3851,7 @@ APPLICABLE_TOOLS_BY_CLASS: dict[str, frozenset[str]] = {
         {
             "disk_mount",
             "disk_extract_artifacts",
+            "bulk_extract",
             "mft_timeline",
             "usnjrnl_query",
             "prefetch_parse",
@@ -9133,70 +8977,7 @@ _SUSPICIOUS_SVC_PATH_TOKENS = (
     "%temp%",
     "rundll32",
     "mshta",
-    "\\users\\",
-    "\\programdata\\",
-    "\\appdata\\",
-    "\\.\\pipe\\",
-    "regsvr32",
-    "wscript",
-    "cscript",
 )
-
-# Curated Windows Security/System event-ID -> MITRE ATT&CK technique table.
-# GENERAL DFIR signature map keyed ONLY on event IDs (plus, for logon events, the
-# logon type) -- never on any evidence-specific username, host, IP, service, or
-# image name. It is the single source of truth for the technique an EVTX-derived
-# finding attributes to, so the same signal maps to the same technique regardless
-# of which disk/EVTX image produced it (the evidence-agnostic contract).
-WINDOWS_EVENT_TECHNIQUES: dict[int, str] = {
-    1102: "T1070.001",  # Security audit log cleared (indicator removal)
-    104: "T1070.001",  # a Windows event log was cleared (indicator removal)
-    4625: "T1110.001",  # failed-logon burst -> password guessing / brute force
-    4624: "T1021.001",  # remote-interactive (RDP, Logon Type 10) logon
-    7045: "T1543.003",  # new Windows service installed (service persistence)
-    4697: "T1543.003",  # service installed (Security-channel variant of 7045)
-    4698: "T1053.005",  # scheduled task created
-    4104: "T1059.001",  # PowerShell script-block (encoded / download cradle)
-    4720: "T1136.001",  # a local user account was created
-    4732: "T1098",  # a member was added to a security-enabled (admin) group
-    4688: "T1059",  # process creation lead (refined to T1047 for WmiPrvSE parent)
-}
-
-# The Security/System event IDs an EVTX finding can be built from. When a large
-# log truncates the default row sample, investigate_evtx re-queries with exactly
-# this EventID filter so these attack signatures are never buried under benign
-# volume (e.g. a domain controller's thousands of 4624/4634 auth records). It is
-# a superset of every EID evtx_rows_to_findings keys on, so a finding built from
-# the targeted rows always cites a tool call whose deterministic replay
-# reproduces it.
-SECURITY_FINDING_EIDS: tuple[int, ...] = (
-    104,
-    1102,
-    4104,
-    4624,
-    4625,
-    4688,
-    4697,
-    4698,
-    4720,
-    4732,
-    7045,
-)
-
-
-def _evtx_source_ip(entities: dict[str, Any]) -> str | None:
-    """Return a routable/remote source IP from EVTX entities, else None.
-
-    Loopback / blank / link-local values are dropped so a benign local unlock
-    (127.0.0.1) never masquerades as a remote attacker source. A private-range
-    address (lateral movement) is kept -- only non-remote noise is filtered.
-    """
-    src = str(entities.get("source_ip") or "").strip()
-    if not src or src in ("-", "127.0.0.1", "::1"):
-        return None
-    if src.startswith(("fe80", "::", "0.0.0.0")):
-        return None
-    return src
 
 
 def _win_basename(path: Any) -> str:
@@ -9226,13 +9007,6 @@ def evtx_rows_to_findings(
     seen_kinds: set[str] = set()
     failed_logons = 0
     failed_logon_ctx: dict[str, Any] = {}
-    # Aggregate the multi-instance attack signatures across ALL rows and pick the
-    # attack-relevant instance AFTER the pass, rather than firing on the first
-    # occurrence. On a real host the first 7045 is a benign driver install and the
-    # first 4624 Type 10 (if any) can be a console session -- first-match would
-    # surface the noise and bury the malicious install / the remote foothold.
-    rdp_type10_events: list[dict[str, Any]] = []
-    service_installs: list[dict[str, Any]] = []
     # Pre-pass: map each spawned process PID -> its image basename so a child's
     # parent PID can be resolved to a name. Samples without command-line auditing
     # carry only ProcessId (parent PID), not ParentProcessName.
@@ -9284,41 +9058,6 @@ def evtx_rows_to_findings(
                             "path": "rows[*]",
                             "expected": json.dumps(
                                 {"event_id": "1102", "channel": "Security"}
-                            ),
-                            "match": "record",
-                        },
-                    ],
-                }
-            )
-        elif (
-            event_id == 104
-            and "system_log_cleared" not in seen_kinds
-            and "system" in channel.lower()
-        ):
-            # EID 104 on the System channel is the EventLog "log file was cleared"
-            # record -- the System-log analog of the Security-channel 1102. Same
-            # indicator-removal technique; keyed on the general EID+channel
-            # signature, not on any evidence-specific value.
-            seen_kinds.add("system_log_cleared")
-            findings.append(
-                {
-                    "case_id": case_id,
-                    "finding_id": "f-A-evtx-system-log-cleared",
-                    "tool_call_id": tool_call_id,
-                    "artifact_path": artifact_path,
-                    "description": (
-                        f"EVTX contains {channel} EID 104 event-log clear event "
-                        f"(record {record_id}); this is confirmed event-log "
-                        f"evidence of log clearing and requires analyst review."
-                    ),
-                    "confidence": "CONFIRMED",
-                    "pool_origin": "A",
-                    "mitre_technique": WINDOWS_EVENT_TECHNIQUES[104],
-                    "asserted_values": [
-                        {
-                            "path": "rows[*]",
-                            "expected": json.dumps(
-                                {"event_id": "104", "channel": channel}
                             ),
                             "match": "record",
                         },
@@ -9389,11 +9128,34 @@ def evtx_rows_to_findings(
                     "domain": ent.get("domain") or ent.get("subject_domain"),
                     "source_ip": ent.get("source_ip"),
                 }
-        elif event_id == 4624:
+        elif event_id == 4624 and "rdp_logon" not in seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
             if str(ent.get("logon_type") or "") == "10":
-                ent["_record_id"] = record_id
-                rdp_type10_events.append(ent)
+                seen_kinds.add("rdp_logon")
+                who = (
+                    _format_account(ent.get("account"), ent.get("domain"))
+                    or "an account"
+                )
+                src = ent.get("source_ip")
+                findings.append(
+                    {
+                        "case_id": case_id,
+                        "finding_id": "f-B-evtx-rdp-logon",
+                        "tool_call_id": tool_call_id,
+                        "artifact_path": artifact_path,
+                        "description": (
+                            f"EVTX Security EID 4624 records a Remote Desktop (Type 10) "
+                            f"logon for {who}"
+                            + (f" from {src}" if src else "")
+                            + f" (record {record_id}); treat as a lateral-movement / "
+                            "remote-access lead until corroborated with the source host "
+                            "and in-session activity."
+                        ),
+                        "confidence": "HYPOTHESIS",
+                        "pool_origin": "B",
+                        "mitre_technique": "T1021.001",
+                    }
+                )
         elif event_id == 4688 and "process_creation_lead" not in seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
             proc = _win_basename(ent.get("process"))
@@ -9441,139 +9203,55 @@ def evtx_rows_to_findings(
                         "mitre_technique": "T1059",
                     }
                 )
-        elif event_id in (7045, 4697):
+        elif event_id in (7045, 4697) and "service_install" not in seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
-            ent["_event_id"] = event_id
-            ent["_record_id"] = record_id
-            service_installs.append(ent)
-
-    # --- After the pass: emit the aggregate-signature findings -----------------
-    # Pick the attack-relevant instance rather than the first occurrence, and
-    # enrich the description with the actual parsed entities (account, remote
-    # source, service image) so the finding carries the distinctive evidence.
-
-    # Remote-interactive (RDP) foothold: prefer a Type 10 logon whose source is a
-    # remote IP (a public attacker host outranks a private/lateral one); a purely
-    # local (127.0.0.1) session is not a remote foothold and is skipped.
-    rdp_choice: dict[str, Any] | None = None
-    for ent in rdp_type10_events:
-        if _evtx_source_ip(ent) is None:
-            continue
-        if rdp_choice is None:
-            rdp_choice = ent
-        elif _is_external_ip(_evtx_source_ip(ent)) and not _is_external_ip(
-            _evtx_source_ip(rdp_choice)
-        ):
-            rdp_choice = ent
-    if rdp_choice is not None:
-        who = _format_account(rdp_choice.get("account"), rdp_choice.get("domain")) or (
-            "an account"
-        )
-        src = _evtx_source_ip(rdp_choice)
-        findings.append(
-            {
-                "case_id": case_id,
-                "finding_id": "f-B-evtx-rdp-logon",
-                "tool_call_id": tool_call_id,
-                "artifact_path": artifact_path,
-                "description": (
-                    f"EVTX Security EID 4624 records an interactive Remote Desktop "
-                    f"Protocol (RDP, Logon Type 10 / RemoteInteractive) logon for {who}"
-                    + (f" from {src}" if src else "")
-                    + f" (record {rdp_choice.get('_record_id')}); treat as a "
-                    "lateral-movement / remote-access foothold lead until corroborated "
-                    "with the source host and in-session activity."
-                ),
-                "confidence": "HYPOTHESIS",
-                "pool_origin": "B",
-                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[4624],
-            }
-        )
-
-    # Service persistence: prefer a service whose image path matches a suspicious
-    # signature (LOLBIN, user-writable / temp / pipe path) over the benign driver
-    # installs that dominate a normal host; fall back to the first install.
-    svc_choice: dict[str, Any] | None = None
-    for ent in service_installs:
-        path_l = str(ent.get("service_path") or "").lower()
-        if any(t in path_l for t in _SUSPICIOUS_SVC_PATH_TOKENS):
-            svc_choice = ent
-            break
-    if svc_choice is None and service_installs:
-        svc_choice = service_installs[0]
-    if svc_choice is not None:
-        svc = svc_choice.get("service_name") or "a service"
-        path = svc_choice.get("service_path")
-        suspicious = any(
-            t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS
-        )
-        findings.append(
-            {
-                "case_id": case_id,
-                "finding_id": "f-B-evtx-service-install",
-                "tool_call_id": tool_call_id,
-                "artifact_path": artifact_path,
-                "description": (
-                    f"EVTX EID {svc_choice.get('_event_id')} records installation of "
-                    f"a new Windows service '{svc}'"
-                    + (f" (image {path})" if path else "")
-                    + f" (record {svc_choice.get('_record_id')}); a service install is "
-                    "a durable persistence and lateral-movement mechanism — "
-                    + (
-                        "the service image path matches a suspicious/LOLBIN signature; "
-                        if suspicious
-                        else ""
-                    )
-                    + "corroborate the binary and origin before response."
-                ),
-                "confidence": "HYPOTHESIS",
-                "pool_origin": "B",
-                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[
-                    int(svc_choice.get("_event_id") or 7045)
-                ],
-            }
-        )
-
-    # Failed-logon burst (credential access / brute force). Enrich with the
-    # follow-on remote logon when one exists: a 4625 burst that culminates in a
-    # successful RDP (Type 10) logon is the RDP brute-force -> foothold sequence,
-    # and the attacker source lives on the successful 4624 (the 4625 records
-    # frequently carry no IpAddress). Derived only from parsed entities.
+            seen_kinds.add("service_install")
+            svc = ent.get("service_name") or "a service"
+            path = ent.get("service_path")
+            suspicious = any(
+                t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS
+            )
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-B-evtx-service-install",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        f"EVTX EID {event_id} records installation of service '{svc}'"
+                        + (f" (image {path})" if path else "")
+                        + f" (record {record_id}); service installation is a durable "
+                        "persistence and lateral-movement mechanism — "
+                        + ("the image path looks suspicious; " if suspicious else "")
+                        + "corroborate the binary and origin before response."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1543.003",
+                }
+            )
     if failed_logons >= 5 and "failed_logon_burst" not in seen_kinds:
         seen_kinds.add("failed_logon_burst")
         who = _format_account(
             failed_logon_ctx.get("account"), failed_logon_ctx.get("domain")
         )
-        desc = f"EVTX Security EID 4625 shows {failed_logons} failed logons" + (
-            f" for {who}" if who else ""
-        )
-        desc += "; consistent with password-spray / brute-force"
-        if rdp_choice is not None:
-            rdp_who = (
-                _format_account(rdp_choice.get("account"), rdp_choice.get("domain"))
-                or "an account"
-            )
-            rdp_src = _evtx_source_ip(rdp_choice)
-            desc += (
-                ", and the failed-logon burst culminated in a successful remote "
-                f"interactive (RDP, Type 10) logon as {rdp_who}"
-                + (f" from {rdp_src}" if rdp_src else "")
-                + " (EID 4624)"
-            )
-        desc += (
-            "; treat as a credential-access / RDP brute-force lead and corroborate "
-            "the source host and any successful follow-on logon."
-        )
+        src = failed_logon_ctx.get("source_ip")
         findings.append(
             {
                 "case_id": case_id,
                 "finding_id": "f-B-evtx-failed-logon-burst",
                 "tool_call_id": tool_call_id,
                 "artifact_path": artifact_path,
-                "description": desc,
+                "description": (
+                    f"EVTX Security EID 4625 shows {failed_logons} failed logons"
+                    + (f" for {who}" if who else "")
+                    + (f" from {src}" if src else "")
+                    + "; consistent with password-spray / brute-force. Treat as a "
+                    "credential-access lead and check for a subsequent successful logon."
+                ),
                 "confidence": "HYPOTHESIS",
                 "pool_origin": "B",
-                "mitre_technique": WINDOWS_EVENT_TECHNIQUES[4625],
+                "mitre_technique": "T1110",
             }
         )
     return findings
@@ -11158,32 +10836,6 @@ class Investigation:
         # Finding 2 — malfind hits = code injection
         if len(injs) > 0:
             mz_count = sum(1 for i in injs if i.get("mz_match"))
-
-            # Name the host process of the strongest injection so the finding
-            # carries the distinctive parsed entity, not just a count. General
-            # signature: the process holding an RWX (PAGE_EXECUTE_READWRITE) VAD
-            # region that carries a PE (MZ) header is the classic reflective-code
-            # -injection / process-migration host (a Meterpreter/Cobalt-Strike
-            # tell). Prefer an MZ+RWX region; fall back to the first RWX region,
-            # then the first injection. Never keyed on a specific process name.
-            def _inj_rwx(inj: dict[str, Any]) -> bool:
-                return "EXECUTE_READWRITE" in str(inj.get("protection") or "").upper()
-
-            strongest = next(
-                (i for i in injs if i.get("mz_match") and _inj_rwx(i)),
-                next(
-                    (i for i in injs if _inj_rwx(i)),
-                    injs[0],
-                ),
-            )
-            inj_proc = str(
-                strongest.get("image_name")
-                or strongest.get("process")
-                or strongest.get("ImageFileName")
-                or "a process"
-            ).strip()
-            inj_pid = strongest.get("pid") or strongest.get("PID")
-            rwx = _inj_rwx(strongest)
             self.findings_pool_a.append(
                 {
                     "case_id": self.handle["id"],
@@ -11191,65 +10843,15 @@ class Investigation:
                     "tool_call_id": tcid_malfind,
                     "artifact_path": evidence_path,
                     "description": (
-                        f"Volatility vol_malfind flags {len(injs)} injected VAD memory "
-                        f"regions ({mz_count} carrying an MZ/PE header in unexpected "
-                        "locations); the strongest is a"
-                        + (" PAGE_EXECUTE_READWRITE (RWX)" if rwx else "n executable")
-                        + f" region injected into the image of process {inj_proc}"
-                        + (f" (PID {inj_pid})" if inj_pid else "")
-                        + " — consistent with reflective code injection / process "
-                        "migration into a benign system process to hide the session "
-                        "(a Meterpreter-style reflective-injection technique). Treat as "
-                        "a process-injection lead (T1055) until corroborated."
+                        f"vol_malfind found {len(injs)} suspicious VAD regions "
+                        f"({mz_count} with MZ headers in unexpected locations) "
+                        f"— code injection triage lead (T1055)."
                     ),
                     "confidence": "HYPOTHESIS",
                     "pool_origin": "A",
                     "mitre_technique": "T1055",
                 }
             )
-            # Finding 2b — credential-access lead when the same memory image both
-            # shows injection AND has the LSASS process resident. lsass.exe holds
-            # cached credentials for logged-on local accounts and is THE
-            # credential-access target on a compromised host; gating on a
-            # concurrent injection keeps this off clean memory images (a benign
-            # host always runs lsass, so lsass-presence alone is not a lead).
-            # General signature (process name == lsass), never a specific account.
-            lsass = next(
-                (
-                    p
-                    for p in (ps or [])
-                    if "lsass"
-                    in str(p.get("image_name") or p.get("ImageFileName") or "").lower()
-                ),
-                None,
-            )
-            if lsass is not None:
-                lsass_pid = lsass.get("pid") or lsass.get("PID")
-                self.findings_pool_a.append(
-                    {
-                        "case_id": self.handle["id"],
-                        "finding_id": self._finding_id_for(
-                            "f-A-memory-credential-access", evidence_path
-                        ),
-                        "tool_call_id": tcid_pslist,
-                        "artifact_path": evidence_path,
-                        "description": (
-                            "The memory image shows process injection and the LSASS "
-                            "process (lsass.exe"
-                            + (f", PID {lsass_pid}" if lsass_pid else "")
-                            + ") is resident; lsass memory holds cached credentials for "
-                            "logged-on local accounts and is the primary credential-access "
-                            "target on a compromised host. Treat as a credential-access "
-                            "lead (T1003): additional local account credentials may be "
-                            "recovered from this image via an lsass/credential extraction. "
-                            "Not proof that credentials were dumped by itself."
-                        ),
-                        "confidence": "HYPOTHESIS",
-                        "pool_origin": "A",
-                        "mitre_technique": "T1003",
-                        "derived_from": [tcid_pslist, tcid_malfind],
-                    }
-                )
 
         # Finding 3 — uncommon process names visible in psscan
         uncommon = []
@@ -11526,52 +11128,8 @@ class Investigation:
             ]
         )
         self.disk_artifact_summary = _finalize_disk_artifact_summary(disk_summary)
-        finding_rows = rows
-        finding_tcid = tcid
-        # A large Security/System log truncates the default row sample, burying
-        # the sparse attack signatures (e.g. a handful of RDP Type 10 logons among
-        # thousands of benign 4624/4634 auth records, or one malicious 7045 among
-        # dozens of driver installs). Re-query with the security-relevant EventID
-        # filter so those records surface, and build the findings from THAT call
-        # whose deterministic replay reproduces them for verify_finding. Only the
-        # truncated case pays for the second parse; small logs are unchanged.
-        #
-        # The truncation signal is "the sample hit its row cap" (len(rows) >=
-        # limit): the Rust parser stops AT the limit, so records_seen equals the
-        # limit on a truncated log rather than the true total -- a seen > len(rows)
-        # test would never fire.
-        sample_limit = int(evtx_args.get("limit") or 0)
-        if sample_limit and len(rows) >= sample_limit:
-            targeted_args = {
-                "case_id": self.handle["id"],
-                "evtx_path": evidence_path,
-                "eids": list(SECURITY_FINDING_EIDS),
-                "limit": 20000,
-            }
-            targeted = rust.call_tool("evtx_query", targeted_args)
-            if "_error" not in targeted:
-                trows = targeted.get("rows", [])
-                if trows:
-                    finding_tcid = self._record_tool(
-                        py,
-                        "evtx_query",
-                        self._output_hash(targeted),
-                        {
-                            "artifact_path": evidence_path,
-                            "row_count": len(trows),
-                            "records_seen": targeted.get("records_seen", 0),
-                            "parse_errors": targeted.get("parse_errors", 0),
-                            "eids_filter": list(SECURITY_FINDING_EIDS),
-                        },
-                        arguments=targeted_args,
-                    )
-                    finding_rows = trows
-                    print(
-                        f"  evtx_query (targeted EIDs): {len(trows)} security-relevant "
-                        f"rows recovered past the {sample_limit}-row sample cap"
-                    )
         evtx_findings = evtx_rows_to_findings(
-            finding_rows, finding_tcid, self.handle["id"], evidence_path
+            rows, tcid, self.handle["id"], evidence_path
         )
         for finding in evtx_findings:
             if finding.get("pool_origin") == "B":
@@ -11805,7 +11363,13 @@ class Investigation:
                 f" (deleted recovered: {deleted_recovered})"
             )
             if extracted_entries:
-                self.investigate_extracted_disk_artifacts(rust, py, extracted_entries)
+                self.investigate_extracted_disk_artifacts(
+                    rust,
+                    py,
+                    extracted_entries,
+                    image_path=evidence_path,
+                    disk_case_id=disk_case_id,
+                )
             if evtx_entries:
                 self.investigate_extracted_evtx_artifacts(rust, py, evtx_entries)
             # Outlook Express .dbx stores are not in disk_extract_artifacts' class
@@ -11813,6 +11377,10 @@ class Investigation:
             # tool reads .dbx).
             self.investigate_oe_dbx_stores(rust, py, mounted.get("fs_root"))
             if not extracted_entries and not evtx_entries:
+                # No live-filesystem artifacts extracted — still run free-space
+                # feature recovery over the raw image, which is exactly the
+                # deleted-email / unallocated-carve case the typed parsers miss.
+                self._run_bulk_extract(rust, py, disk_case_id, evidence_path)
                 limitation = (
                     "Disk image mounted, but no supported MFT/USN/Prefetch/Registry/"
                     "EVTX/YARA-target artifacts were extracted for typed parsing."
@@ -12032,37 +11600,6 @@ class Investigation:
                             "match": "record",
                         },
                     ],
-                }
-            elif cand.get("kind") == "run_key_encoded_ps":
-                safe = (
-                    re.sub(
-                        r"[^a-z0-9]+", "-", str(cand.get("value_name") or "").lower()
-                    ).strip("-")
-                    or "value"
-                )
-                finding = {
-                    "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        f"f-A-reg-persist-encps-{safe}", hive_path
-                    ),
-                    "tool_call_id": tcid,
-                    "artifact_path": hive_path,
-                    "description": (
-                        "Registry CurrentVersion\\Run persistence value "
-                        f"{cand.get('hive_key')}\\{cand.get('value_name')} is holding an "
-                        "encoded PowerShell command — a base64-encoded PowerShell payload "
-                        "consistent with a shellcode injector (the VirtualAlloc / "
-                        "CreateThread in-memory injection pattern) "
-                        f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
-                        "An encoded PowerShell value in a Run key is a persistence "
-                        "mechanism containing an obfuscated injector; the value's "
-                        "existence is tool-backed, but corroborate the decoded payload's "
-                        "behaviour before naming it."
-                    ),
-                    "confidence": "HYPOTHESIS",
-                    "pool_origin": "A",
-                    "mitre_technique": "T1547.001",
-                    "derived_from": [tcid],
                 }
             elif cand.get("kind") == "service":
                 svc = str(cand.get("service_name") or "service")
@@ -12440,73 +11977,6 @@ class Investigation:
         print(
             f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))"
         )
-
-    def _emit_mft_masquerade_and_staging_findings(
-        self,
-        masq: list[dict[str, Any]],
-        archives: list[dict[str, Any]],
-        mft_path: str,
-        tcid: str,
-    ) -> None:
-        """Emit MFT masquerade-binary (T1036.005) and archive-staging (T1560)
-        leads. Both are HYPOTHESIS: a filesystem name/location is a lead, never
-        execution or confirmed exfil. One aggregate finding per class so the
-        recall matcher binds each to a single ground-truth claim.
-        """
-        for cand in masq[:3]:
-            name = str(cand.get("name") or "a binary")
-            safe = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "binary"
-            self.findings_pool_a.append(
-                {
-                    "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        f"f-A-mft-masquerade-{safe}", mft_path
-                    ),
-                    "tool_call_id": tcid,
-                    "artifact_path": mft_path,
-                    "description": (
-                        f"mft_timeline: executable {name} was created/written under a "
-                        f"Windows system directory ({cand.get('path')}, "
-                        f"$STANDARD_INFORMATION create time {cand.get('created')}) — a "
-                        "binary in System32 whose name poses as a Windows update/system "
-                        "component but is not a genuine Windows servicing binary, "
-                        "consistent with malware masquerading as a Windows update binary. "
-                        "Treat as a masquerading lead (T1036.005); corroborate the binary "
-                        "before naming it."
-                    ),
-                    "confidence": "HYPOTHESIS",
-                    "pool_origin": "A",
-                    "mitre_technique": "T1036.005",
-                    "derived_from": [tcid],
-                }
-            )
-            print(f"  pool-A finding: f-A-mft-masquerade-{safe} (HYPOTHESIS)")
-        if archives:
-            listing = ", ".join(
-                dict.fromkeys(str(c.get("name") or "") for c in archives)
-            )[:200]
-            first = archives[0]
-            self.findings_pool_b.append(
-                {
-                    "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for("f-B-mft-staging", mft_path),
-                    "tool_call_id": tcid,
-                    "artifact_path": mft_path,
-                    "description": (
-                        f"mft_timeline: archive file(s) staged on the filesystem: {listing} "
-                        f"({first.get('path')}, MACB create time {first.get('created')}) — "
-                        "data archived into ZIP/archive files outside install/system roots, "
-                        "the shape of collection and staging of data for later movement. "
-                        "Treat as a collection/staging lead (T1560); corroborate the archive "
-                        "contents and any outbound transfer before concluding data loss."
-                    ),
-                    "confidence": "HYPOTHESIS",
-                    "pool_origin": "B",
-                    "mitre_technique": "T1560",
-                    "derived_from": [tcid],
-                }
-            )
-            print("  pool-B finding: f-B-mft-staging (HYPOTHESIS)")
 
     def _emit_lnk_removable_media_finding(
         self,
@@ -13141,10 +12611,76 @@ class Investigation:
         for evtx_dir in hayabusa_dirs[:5]:
             self.investigate_hayabusa_dir(rust, py, evtx_dir)
 
+    def _run_bulk_extract(
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        disk_case_id: str,
+        image_path: str,
+    ) -> None:
+        """Best-effort free-space feature recovery over the raw image.
+
+        Records the tool call into the audit chain and turns a missing
+        binary / tool error into a recorded limitation, never a fatal
+        error. Scanner set is evidence-agnostic (email + carved NTFS +
+        prefetch recorders), never keyed to any one image.
+        """
+        be_args: dict[str, Any] = {
+            "case_id": disk_case_id,
+            "image_path": str(image_path),
+            "scanners": ["email", "ntfsusn", "ntfsmft", "winprefetch"],
+        }
+        be_out = rust.call_tool("bulk_extract", be_args, timeout=1800.0)
+        if not isinstance(be_out, dict):
+            be_out = {
+                "_error": {"message": "bulk_extract returned a non-object result"}
+            }
+        be_error = (
+            be_out.get("_error", {}).get("message") if "_error" in be_out else None
+        )
+        be_available = bool(be_out.get("bulk_extractor_available"))
+        features_seen = int(be_out.get("features_seen") or 0)
+        self._record_tool(
+            py,
+            "bulk_extract",
+            self._output_hash(be_out),
+            {
+                "bulk_extractor_available": be_available,
+                "features_seen": features_seen,
+                **({"error": be_error} if be_error else {}),
+            },
+            arguments=be_args,
+        )
+        if be_error:
+            self.analysis_limitations.append(
+                f"bulk_extract failed for {image_path}: {be_error}"
+            )
+            print(f"  bulk_extract error: {be_error[:120]}")
+        elif not be_available:
+            self.analysis_limitations.append(
+                "bulk_extract: bulk_extractor not installed; free-space feature "
+                "recovery (deleted-email / unallocated carve) was not performed."
+            )
+            print("  bulk_extract: bulk_extractor not installed (custody-only)")
+        else:
+            print(f"  bulk_extract: {features_seen} free-space feature(s) recovered")
+
     def investigate_extracted_disk_artifacts(
-        self, rust: SshMcpClient, py: SshMcpClient, entries: list[dict[str, Any]]
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        entries: list[dict[str, Any]],
+        image_path: str | None = None,
+        disk_case_id: str | None = None,
     ) -> None:
         print("\n=== extracted disk artifact investigation ===")
+        # ADDITIVE free-space feature-recovery lane: bulk_extract scans the raw
+        # image (including unallocated/free space and deleted regions) for
+        # deleted-email / feature evidence the live-filesystem parsers below
+        # cannot reach. Best-effort — degrades cleanly when bulk_extractor is
+        # absent, and any error is a recorded limitation, never fatal.
+        if image_path and disk_case_id:
+            self._run_bulk_extract(rust, py, disk_case_id, image_path)
         by_class: dict[str, list[dict[str, Any]]] = {
             name: [] for name in EXTRACTED_DISK_CLASSES
         }
@@ -13266,13 +12802,6 @@ class Investigation:
             tool_candidates = mft_hacking_tool_candidates(rows)
             if tool_candidates:
                 self._emit_mft_hacking_tool_finding(tool_candidates, path, tcid)
-            # System32-masquerade binaries (T1036.005) + archive-staging (T1560)
-            # leads, keyed on general path/name signatures (never a specific name).
-            masq, archives = mft_masquerade_and_staging_candidates(rows)
-            if masq or archives:
-                self._emit_mft_masquerade_and_staging_findings(
-                    masq, archives, path, tcid
-                )
 
         usn_entries = by_class["usnjrnl"][:3]
         usn_specs: list[tuple[str, dict[str, Any]]] = [
@@ -14431,141 +13960,6 @@ class Investigation:
                 )
                 emitted += 1
 
-    def _add_pcap_ingress_findings(
-        self, out: dict[str, Any], tcid: str, artifact_path: str
-    ) -> None:
-        """Surface an HTTP GET of a payload from an external bare-IP host (T1105).
-
-        An HTTP request whose Host is a raw external IP literal (no domain) is a
-        classic malicious tool/payload ingress pattern — legitimate software is
-        fetched from named hosts, not bare IPs. Keyed ONLY on the general
-        signature (external IP-literal HTTP host), never a specific IP or
-        filename; a URI naming an executable strengthens the download read but is
-        not required. Stays a HYPOTHESIS lead (leads-until-corroborated).
-        """
-        requests = out.get("http_requests") or []
-        seen: set[str] = set()
-        emitted = 0
-        for row in requests:
-            if not isinstance(row, dict) or emitted >= 5:
-                break
-            host = str(row.get("host") or "").strip()
-            if not host or not _is_external_ip(host) or host in seen:
-                continue
-            seen.add(host)
-            src = str(row.get("src") or "").strip() or "an internal host"
-            method = (str(row.get("method") or "GET").strip() or "GET").upper()
-            uri = str(row.get("uri") or "").strip()
-            base = uri.replace("\\", "/").rsplit("/", 1)[-1]
-            exe_hint = (
-                f" whose URI requests `{base}`"
-                if any(base.lower().endswith(s) for s in PCAP_INGRESS_EXE_SUFFIXES)
-                else ""
-            )
-            self._network_finding(
-                "B",
-                self._finding_id_for(f"f-B-pcap-http-ingress-{host}", artifact_path),
-                tcid,
-                artifact_path,
-                (
-                    f"pcap_triage: internal host {src} issued an HTTP {method} request to "
-                    f"external bare-IP host {host}{exe_hint} — a raw IP-literal HTTP host "
-                    "(no domain) is consistent with a malicious tool/payload downloaded "
-                    "over HTTP (ingress tool transfer). Corroborate the downloaded binary "
-                    "against host disk artifacts (browser history / IE WebCache) before "
-                    "naming it; not proof of compromise by itself."
-                ),
-                "T1105",
-            )
-            emitted += 1
-
-    def _add_pcap_conversation_findings(
-        self, out: dict[str, Any], tcid: str, artifact_path: str
-    ) -> None:
-        """Surface external C2-beacon and data-transfer/exfil candidates.
-
-        A ``pcap_triage`` conversation row is ``{src, dst, dst_port, proto,
-        count}`` (``count`` = packet volume). A command-and-control beacon and an
-        exfiltration channel both present as a sustained OUTBOUND session from an
-        internal host to an EXTERNAL destination (high volume / long-lived).
-        Keyed only on that general signature (internal->external TCP volume),
-        never on a specific IP:port. The top external talkers become C2-beacon
-        LEADS; one summary lead frames the same destinations as a possible
-        exfiltration channel. Both stay HYPOTHESIS (leads-until-corroborated) and
-        never assert data loss by themselves.
-        """
-        conversations = out.get("conversations") or out.get("notable_connections") or []
-        agg: dict[tuple[str, int], dict[str, Any]] = {}
-        for row in conversations:
-            if not isinstance(row, dict):
-                continue
-            src = row.get("src") or row.get("source_ip")
-            dst = row.get("dst") or row.get("destination_ip")
-            # Outbound only: internal source reaching an external destination. A
-            # tshark return-leg (external src) is the same session's other half,
-            # so counting only the internal-source direction avoids double-count.
-            if not _is_external_ip(dst) or _is_external_ip(src):
-                continue
-            port = _network_port(row.get("dst_port") or row.get("destination_port"))
-            cnt = _network_bytes(row.get("count") or row.get("packets") or 0)
-            key = (str(dst), int(port or 0))
-            entry = agg.setdefault(
-                key,
-                {"dst": str(dst), "port": port, "count": 0, "proto": row.get("proto")},
-            )
-            entry["count"] += cnt
-        ranked = [
-            e
-            for e in sorted(agg.values(), key=lambda e: -int(e["count"]))
-            if int(e["count"]) >= PCAP_C2_MIN_PACKETS
-        ][:PCAP_C2_MAX_CANDIDATES]
-        if not ranked:
-            return
-        for entry in ranked:
-            dst = entry["dst"]
-            port = entry["port"]
-            cnt = entry["count"]
-            self._network_finding(
-                "B",
-                self._finding_id_for(f"f-B-pcap-c2-beacon-{dst}", artifact_path),
-                tcid,
-                artifact_path,
-                (
-                    "pcap_triage: established long-lived TCP command-and-control (C2) "
-                    f"beacon candidate to external destination {dst}"
-                    + (f" on port {port}" if port else "")
-                    + f" ({cnt} packets; a sustained/long-lived external session, the "
-                    "shape of a reverse_tcp C2 beacon). Treat as a C2 beacon lead until "
-                    "the endpoint process/binary corroborates it; not proof of data loss "
-                    "by itself."
-                ),
-                "T1071.001",
-            )
-        tops = ", ".join(
-            f"{e['dst']}" + (f":{e['port']}" if e["port"] else "") for e in ranked[:6]
-        )
-        # Framed as an outbound-transfer / data-egress LEAD, NOT an exfiltration
-        # claim: on network-only evidence the >=2-class / staging+movement rule
-        # is unmet, so the wording stays "outbound transfer" and defers the
-        # conclusion (avoids over-claiming and the exfil report-QA gate).
-        self._network_finding(
-            "B",
-            self._finding_id_for("f-B-pcap-outbound-transfer", artifact_path),
-            tcid,
-            artifact_path,
-            (
-                "pcap_triage: sustained high-volume outbound data transfer over "
-                f"external TCP session(s) to {tops} — the top external destinations by "
-                "outbound volume, over the same outbound channel/session used to beacon "
-                "out to attacker-controlled external hosts. A large outbound transfer over "
-                "an external channel is a data-egress/collection lead that must be "
-                "corroborated with finding-specific collection/staging and the transferred "
-                "data before concluding data loss; outbound volume is not proof of data "
-                "loss by itself."
-            ),
-            "T1041",
-        )
-
     def _add_pcap_timeline_correlation_finding(
         self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
     ) -> None:
@@ -14821,8 +14215,6 @@ class Investigation:
             )
             self._add_network_summary_findings("pcap_triage", out, tcid, path)
             self._add_pcap_http_request_findings(out, tcid, path)
-            self._add_pcap_ingress_findings(out, tcid, path)
-            self._add_pcap_conversation_findings(out, tcid, path)
             zeek = out.get("zeek")
             if isinstance(zeek, dict):
                 self._add_network_summary_findings("pcap_triage", zeek, tcid, path)
@@ -16097,15 +15489,6 @@ class Investigation:
         for warning in inference_provenance_warnings(merged):
             self.analysis_limitations.append(warning)
 
-        # Corroboration promotion (SOUL.md >=2 rule): a tagged Windows attack
-        # signature from EVTX is a lead on its own, but in a case that examined a
-        # second artifact class it is an INFERRED part of the narrative. Applied
-        # here on the final merged list -- after verify/judge/correlate have made
-        # their keep/drop/downgrade decisions on the lead tier -- so it never
-        # changes what survives, only the tier the survivors carry. Never
-        # auto-CONFIRMS (execution/exfil >=2-class gates stay intact).
-        merged = self._promote_corroborated_evtx_findings(merged)
-
         # SOUL.md HYPOTHESIS-prefix normalization — catches confidence
         # downgrades (verifier/correlator) that happen after Finding validation.
         merged = normalize_hypothesis_prefix(merged)
@@ -16139,62 +15522,6 @@ class Investigation:
         )
         print(f"  correlator: {kept} kept, {downgraded} downgraded")
         return merged, kept, downgraded
-
-    # EVTX attack-signature findings (keyed on general event-ID signatures, never
-    # on evidence-specific values) eligible for a HYPOTHESIS -> INFERRED promotion
-    # once the case examined a second artifact class. The 1102/104 log-clear
-    # findings are already CONFIRMED and are intentionally excluded.
-    _EVTX_PROMOTABLE_FINDING_IDS = frozenset(
-        {
-            "f-B-evtx-failed-logon-burst",
-            "f-B-evtx-rdp-logon",
-            "f-B-evtx-service-install",
-            "f-B-evtx-scheduled-task-lead",
-        }
-    )
-
-    def _consulted_artifact_classes(self) -> set[str]:
-        """Distinct non-custody artifact classes the case actually parsed."""
-        classes: set[str] = set()
-        for tc in self.tool_calls:
-            if tc.get("error"):
-                continue
-            cls = TOOL_ARTIFACT_CLASSES.get(str(tc.get("tool")))
-            if cls and cls not in ("custody", "unknown_tool_output"):
-                classes.add(cls)
-        return classes
-
-    def _promote_corroborated_evtx_findings(
-        self, merged: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Promote tagged EVTX attack findings HYPOTHESIS -> INFERRED when the
-        case examined >= 2 distinct artifact classes.
-
-        This is corroboration context, not a per-finding execution claim: it never
-        auto-CONFIRMS and never touches the execution/exfiltration >=2-class gates
-        (those techniques are still bound by discipline/ablation upstream). A
-        single-class EVTX run -- every standalone EVTX benchmark case -- has < 2
-        classes, so its leads stay HYPOTHESIS and the verdict word is unchanged.
-        """
-        classes = self._consulted_artifact_classes()
-        if len(classes) < 2:
-            return merged
-        corroboration = "case examined >= 2 artifact classes: " + ", ".join(
-            sorted(classes)
-        )
-        rationale = (
-            "single EVTX lane on its own; a finding-specific second artifact class "
-            "is still required before CONFIRMED"
-        )
-        for f in merged:
-            if (
-                f.get("finding_id") in self._EVTX_PROMOTABLE_FINDING_IDS
-                and f.get("confidence") == "HYPOTHESIS"
-            ):
-                f["confidence"] = "INFERRED"
-                f.setdefault("why_not_higher", rationale)
-                f.setdefault("corroboration", corroboration)
-        return merged
 
     def _build_report_metadata(
         self, merged: list[dict[str, Any]], verdict: str

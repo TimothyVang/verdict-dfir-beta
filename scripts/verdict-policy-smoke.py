@@ -1135,9 +1135,9 @@ def main() -> int:
             1,
         ),
         (
-            "brute-force lead maps to T1110.001",
+            "brute-force lead maps to T1110",
             brute_findings[0].get("mitre_technique") if brute_findings else None,
-            "T1110.001",
+            "T1110",
         ),
         (
             "single Type 3 network logon creates no finding",

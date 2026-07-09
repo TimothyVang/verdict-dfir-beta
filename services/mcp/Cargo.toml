@@ -89,6 +89,19 @@ rusqlite = { version = "=0.32.1", features = ["bundled"] }
 # (toolchain is pinned at 1.88).
 cfb = "=0.14.0"
 
+# kamadak-exif — BSD-2/Apache-2, pure-Rust EXIF metadata reader. Used by
+# `exif_parse` to read camera/GPS/timestamp/software tags from user-content
+# images (JPEG/TIFF/HEIF/PNG/WebP containers). Read-only; no image bytes leave
+# the tool, only structured tag values. Pinned exact per the library-pin
+# discipline.
+kamadak-exif = "=0.6.1"
+
+# mail-parser — Apache-2/MIT, pure-Rust RFC 5322 / MIME reader. Used by
+# `email_parse` to read `.eml` single messages and `.mbox` archives (headers +
+# attachment metadata; never decodes/exports body payloads to disk). Deterministic
+# structured output. Pinned exact.
+mail-parser = "=0.11.4"
+
 # UUID v4 for deterministic case_id generation.
 uuid = { version = "1", features = ["v4", "serde"] }
 

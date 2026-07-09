@@ -17,9 +17,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::ewf_segments::{is_first_ewf_segment, segment_paths_for_image};
+
 const LEDGER_NAME: &str = "session_resources.json";
 const STDERR_TAIL_BYTES: usize = 4096;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+/// Command sentinel recorded for a mount that performs no FUSE/loop operation:
+/// The Sleuth Kit reads the image directly, so `disk_extract_artifacts` (which
+/// already reads off the recorded `image_path` via `fls`/`icat`) needs no live
+/// mount. It is distinct from the `mock` sentinel so extraction still takes the
+/// real-TSK path, and lets `disk_unmount` skip a teardown that never mounted
+/// anything.
+const DIRECT_TSK_COMMAND: &str = "direct-tsk";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +126,13 @@ pub struct DiskMountOutput {
     pub command: Vec<String>,
     pub stderr_tail: String,
     pub note: String,
+    /// Every filesystem partition enumerated from the image's `mmls` table (empty
+    /// for a bare volume image with no table, in mock mode, or when mmls is
+    /// unavailable). The tool mounts/extracts the primary (largest) volume; this
+    /// list makes any additional volumes visible so multi-volume disks are not
+    /// silently reduced to one. Defaults keep older ledgers deserializing.
+    #[serde(default)]
+    pub partitions: Vec<MmlsPartition>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -208,6 +224,8 @@ pub enum DiskError {
     UnsupportedPlatform,
     #[error("subprocess failed ({status}): {stderr_tail}")]
     SubprocessFailed { status: String, stderr_tail: String },
+    #[error("{0}")]
+    EwfSegmentSet(String),
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("cannot serialize session resource ledger: {0}")]
@@ -226,6 +244,11 @@ pub fn disk_mount(input: &DiskMountInput) -> Result<DiskMountOutput, DiskError> 
         .clone()
         .unwrap_or_else(|| case_dir.join("mounts").join(&mount_id));
     create_dir(&mount_point)?;
+    let image_paths = match input.mode {
+        DiskMode::Mock => vec![input.image_path.clone()],
+        DiskMode::Auto => segment_paths_for_image(&input.image_path)
+            .map_err(|err| DiskError::EwfSegmentSet(err.to_string()))?,
+    };
 
     let (status, fs_root, command, stderr_tail, note) = match input.mode {
         DiskMode::Mock => (
@@ -235,7 +258,14 @@ pub fn disk_mount(input: &DiskMountInput) -> Result<DiskMountOutput, DiskError> 
             String::new(),
             "mock mount registered; no privileged filesystem operation ran".to_string(),
         ),
-        DiskMode::Auto => auto_mount(&input.image_path, &mount_point)?,
+        DiskMode::Auto => auto_mount(&image_paths, &mount_point)?,
+    };
+
+    // Best-effort full partition table so multi-volume disks are visible; never
+    // gates the mount (empty in mock mode / bare volume / no mmls).
+    let partitions = match input.mode {
+        DiskMode::Mock => Vec::new(),
+        DiskMode::Auto => enumerate_partitions(&image_paths),
     };
 
     let now = now_iso();
@@ -267,6 +297,7 @@ pub fn disk_mount(input: &DiskMountInput) -> Result<DiskMountOutput, DiskError> 
         command,
         stderr_tail,
         note,
+        partitions,
     })
 }
 
@@ -296,13 +327,15 @@ pub fn disk_extract_artifacts(
     if !image_path.is_file() {
         return Err(DiskError::ImageNotFound(image_path));
     }
+    let image_paths = segment_paths_for_image(&image_path)
+        .map_err(|err| DiskError::EwfSegmentSet(err.to_string()))?;
 
     let extract_id = format!("disk-extract-{}", Uuid::new_v4());
     let output_dir = case_dir.join("extracted").join("disk").join(&extract_id);
     create_dir(&output_dir)?;
     let wanted = wanted_kinds(&input.artifact_kinds);
 
-    let sector_offset = primary_partition_sector_offset(&image_path);
+    let sector_offset = primary_partition_sector_offset(&image_paths);
 
     // Enumerate every file once and keep the wanted classes. Selection then
     // allocates the `limit` *fairly across classes* (round-robin) so a
@@ -322,7 +355,7 @@ pub fn disk_extract_artifacts(
     let mock_root: Option<PathBuf> = (mount.command.first().map(String::as_str) == Some("mock"))
         .then(|| mount.fs_root.clone())
         .flatten();
-    let (listed, via_walk) = match tsk_list(&image_path, sector_offset) {
+    let (listed, via_walk) = match tsk_list(&image_paths, sector_offset) {
         Ok(files) if !files.is_empty() => (files, false),
         tsk_result => match &mock_root {
             Some(root) => (mock_list(root)?, true),
@@ -347,7 +380,7 @@ pub fn disk_extract_artifacts(
                 &mut stats,
             )?,
             _ => tsk_extract(
-                &image_path,
+                &image_paths,
                 sector_offset,
                 candidate,
                 &output_dir,
@@ -415,13 +448,26 @@ pub fn disk_unmount(input: &DiskUnmountInput) -> Result<DiskUnmountOutput, DiskE
         .clone()
         .unwrap_or_else(|| mount_point.clone());
 
-    let (status, command, stderr_tail) = match input.mode {
-        DiskMode::Mock => (
+    // A direct-TSK mount never ran a FUSE/loop mount, so there is nothing to
+    // release: an `umount` would just fail on an unmounted path. Mark it
+    // unmounted without a privileged teardown.
+    let is_direct_tsk =
+        ledger.resources[idx].command.first().map(String::as_str) == Some(DIRECT_TSK_COMMAND);
+    let (status, command, stderr_tail) = if is_direct_tsk {
+        (
             "unmounted".to_string(),
-            vec!["mock".to_string(), "disk_unmount".to_string()],
+            vec![DIRECT_TSK_COMMAND.to_string(), "disk_unmount".to_string()],
             String::new(),
-        ),
-        DiskMode::Auto => auto_unmount(&mount_point, &fs_root)?,
+        )
+    } else {
+        match input.mode {
+            DiskMode::Mock => (
+                "unmounted".to_string(),
+                vec!["mock".to_string(), "disk_unmount".to_string()],
+                String::new(),
+            ),
+            DiskMode::Auto => auto_unmount(&mount_point, &fs_root)?,
+        }
     };
     ledger.resources[idx].status.clone_from(&status);
     ledger.resources[idx].updated_at = now_iso();
@@ -439,42 +485,60 @@ pub fn disk_unmount(input: &DiskUnmountInput) -> Result<DiskUnmountOutput, DiskE
 }
 
 fn auto_mount(
-    image_path: &Path,
+    image_paths: &[PathBuf],
     mount_point: &Path,
 ) -> Result<(String, PathBuf, Vec<String>, String, String), DiskError> {
     if cfg!(windows) {
         return Err(DiskError::UnsupportedPlatform);
     }
-    if is_ewf_image(image_path) {
-        return auto_mount_ewf(image_path, mount_point);
+    let image_path = image_paths
+        .first()
+        .ok_or_else(|| DiskError::ImageNotFound(PathBuf::from("<empty image set>")))?;
+    if is_first_ewf_segment(image_path) {
+        return auto_mount_ewf(image_paths, mount_point);
     }
     auto_mount_raw(image_path, mount_point)
 }
 
-fn is_ewf_image(image_path: &Path) -> bool {
-    let ext = image_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    ext == "e01" || ext == "ex01"
-}
-
 fn auto_mount_ewf(
-    image_path: &Path,
+    image_paths: &[PathBuf],
     mount_point: &Path,
 ) -> Result<(String, PathBuf, Vec<String>, String, String), DiskError> {
+    let bin = std::env::var("EWF_MOUNT_BIN").unwrap_or_else(|_| "ewfmount".to_string());
+    // ewfmount (FUSE E01 -> raw) is only a convenience: The Sleuth Kit reads EWF
+    // images directly, and disk_extract_artifacts already reads artifacts off the
+    // recorded image_path via fls/icat, never off this mount. When ewfmount is
+    // unavailable — notably the GIFT-PPA libewf/Plaso apt conflict that evicts
+    // ewf-tools — register a direct-TSK mount so the disk lane keeps working
+    // instead of hard-failing the whole Case. Extraction reads the same image
+    // bytes either way, so custody replay is unaffected.
+    let image_path = image_paths
+        .first()
+        .ok_or_else(|| DiskError::ImageNotFound(PathBuf::from("<empty image set>")))?;
+    if !ewfmount_available(&bin) {
+        return Ok(direct_tsk_mount(
+            image_path,
+            &format!("{bin} not found; reading the EWF image directly with The Sleuth Kit"),
+        ));
+    }
     let ewf_dir = mount_point.join("ewf");
     create_dir(&ewf_dir)?;
-    let bin = std::env::var("EWF_MOUNT_BIN").unwrap_or_else(|_| "ewfmount".to_string());
-    let args = vec![
-        image_path.to_string_lossy().to_string(),
-        ewf_dir.to_string_lossy().to_string(),
-    ];
+    let mut args: Vec<String> = image_paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    args.push(ewf_dir.to_string_lossy().to_string());
     // ewfmount must run as root: /etc/fuse.conf has no `user_allow_other`, so a
     // user-owned FUSE device is unreadable by the (root) loop/mount syscalls.
     let result = run_sudo_fixed(&bin, &args)?;
     if !result.0 {
+        // A PATH-present ewfmount can still be unreachable under sudo's
+        // secure_path ("sudo: ewfmount: command not found"); fall through to the
+        // direct-TSK read rather than failing the Case.
+        if is_missing_binary(&result.2) {
+            let _ = fs::remove_dir(&ewf_dir);
+            return Ok(direct_tsk_mount(image_path, &result.2));
+        }
         return Err(DiskError::SubprocessFailed {
             status: result.1,
             stderr_tail: result.2,
@@ -518,6 +582,47 @@ fn auto_mount_ewf(
                 .to_string(),
         ))
     }
+}
+
+/// Register a mount that performs no FUSE/loop operation. The returned tuple has
+/// the same shape as a real EWF/raw mount, but `status = "mounted"`,
+/// `fs_root = image_path` (the raw image itself), and the [`DIRECT_TSK_COMMAND`]
+/// sentinel so `disk_extract_artifacts` reads directly with The Sleuth Kit and
+/// `disk_unmount` skips a no-op teardown. Preserves the whole disk lane when
+/// `ewfmount` is unavailable — the extracted bytes are identical (same
+/// `fls`/`icat` off the same image + #147 largest-partition offset), so the
+/// audit chain replays to the same `output_sha256`.
+fn direct_tsk_mount(
+    image_path: &Path,
+    reason: &str,
+) -> (String, PathBuf, Vec<String>, String, String) {
+    (
+        "mounted".to_string(),
+        image_path.to_path_buf(),
+        vec![DIRECT_TSK_COMMAND.to_string()],
+        String::new(),
+        format!("registered direct Sleuth Kit read of the image (no FUSE/loop mount): {reason}"),
+    )
+}
+
+/// Whether `bin` (`ewfmount`) can be spawned at all. A failure to spawn
+/// (`ErrorKind::NotFound`, i.e. the binary is not on PATH) means the direct-TSK
+/// fallback must be used; any other outcome — it ran, or errored for another
+/// reason — is treated as available. Probing with `-h` never mounts anything.
+fn ewfmount_available(bin: &str) -> bool {
+    match Command::new(bin).arg("-h").output() {
+        Ok(_) => true,
+        Err(err) => err.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether a subprocess `stderr` tail indicates the binary itself was missing
+/// (as opposed to a genuine mount failure). Covers `sudo`'s
+/// "sudo: ewfmount: command not found" and exec-wrapper "executable file not
+/// found" phrasings.
+fn is_missing_binary(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("command not found") || lower.contains("executable file not found")
 }
 
 /// Loop-mount an NTFS volume read-only with the kernel `ntfs3` driver, under
@@ -578,6 +683,28 @@ fn primary_partition_byte_offset_sudo(image_path: &Path) -> Option<u64> {
     parse_mmls_primary_partition_offset(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Enumerate every filesystem partition in the image for the mount output. Tries
+/// a plain `mmls` first, then `sudo -n mmls` (the EWF device is root-owned),
+/// mirroring the offset helpers. Returns an empty vec for a bare volume image,
+/// when mmls is unavailable, or on any error — enumeration is best-effort and
+/// never fails the mount.
+fn enumerate_partitions(image_paths: &[PathBuf]) -> Vec<MmlsPartition> {
+    let run = |cmd: &mut Command| -> Option<String> {
+        let output = cmd.output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut direct = Command::new("mmls");
+    append_image_args(&mut direct, image_paths);
+    let mut sudo = Command::new("sudo");
+    sudo.args(["-n", "mmls"]);
+    append_image_args(&mut sudo, image_paths);
+    let text = run(&mut direct).or_else(|| run(&mut sudo));
+    text.map(|t| parse_mmls_partitions(&t)).unwrap_or_default()
+}
+
 fn auto_mount_raw(
     image_path: &Path,
     mount_point: &Path,
@@ -602,7 +729,8 @@ fn auto_mount_raw(
 
     let direct_status = result.1;
     let direct_stderr = result.2;
-    if let Some(offset) = primary_partition_byte_offset(image_path) {
+    let image_paths = vec![image_path.to_path_buf()];
+    if let Some(offset) = primary_partition_byte_offset(&image_paths) {
         let offset_args = vec![
             "-o".to_string(),
             format!("ro,loop,offset={offset}"),
@@ -678,8 +806,10 @@ fn auto_mount_raw(
     })
 }
 
-fn primary_partition_byte_offset(image_path: &Path) -> Option<u64> {
-    let output = Command::new("mmls").arg(image_path).output().ok()?;
+fn primary_partition_byte_offset(image_paths: &[PathBuf]) -> Option<u64> {
+    let mut command = Command::new("mmls");
+    append_image_args(&mut command, image_paths);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -698,9 +828,33 @@ fn primary_partition_byte_offset(image_path: &Path) -> Option<u64> {
 /// keys on a general disk-layout property (fully evidence-agnostic) and lands
 /// on the OS/data volume instead. Returns `None` for a bare volume image (no
 /// partition table), where TSK and the loop mount read at offset 0.
-fn parse_mmls_primary_partition_offset(output: &str) -> Option<u64> {
-    // Best seen so far, as (length_in_sectors, start_sector).
-    let mut best: Option<(u64, u64)> = None;
+/// One filesystem partition enumerated from an `mmls` partition table. Byte and
+/// sector offsets are derived from the reported start sector (512-byte sectors,
+/// the mmls default the tool relies on elsewhere). Surfaced so a multi-volume
+/// disk (e.g. a separate data volume, or a FAT/exFAT/ext partition beside the
+/// primary NTFS OS volume) is visible rather than silently reduced to the single
+/// largest volume — a precondition for honest per-filesystem coverage claims.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MmlsPartition {
+    /// mmls slot index (the leading `NNN:` column), e.g. 2 for `002:`.
+    pub slot: u32,
+    /// Start sector as reported by mmls.
+    pub start_sector: u64,
+    /// Length in sectors as reported by mmls.
+    pub length_sectors: u64,
+    /// Byte offset of the partition (`start_sector * 512`).
+    pub byte_offset: u64,
+    /// Free-text filesystem description from mmls (e.g. `NTFS / exFAT (0x07)`).
+    pub description: String,
+}
+
+/// Enumerate **every** filesystem partition an `mmls` listing reports, in table
+/// order. Metadata and unallocated rows are skipped; only rows whose description
+/// matches a known filesystem ([`matches_filesystem_description`]) are kept. Pure
+/// over the text so it is unit-tested without invoking mmls. Deterministic: the
+/// order follows the mmls table, which is stable for a given image.
+fn parse_mmls_partitions(output: &str) -> Vec<MmlsPartition> {
+    let mut partitions = Vec::new();
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
         if lower.contains("meta")
@@ -709,6 +863,13 @@ fn parse_mmls_primary_partition_offset(output: &str) -> Option<u64> {
         {
             continue;
         }
+        // The leading `NNN:` slot index (before the CHS `000:000` column). Take
+        // the first token, strip a trailing colon, parse as the slot number.
+        let slot = line
+            .split_whitespace()
+            .next()
+            .and_then(|tok| tok.strip_suffix(':'))
+            .and_then(|n| n.parse::<u32>().ok());
         // The columns after the slot labels are Start, End, Length (decimal
         // sector counts), then the free-text description. Collect the decimal
         // fields in order; the index ("002:") and CHS-style slot ("000:000")
@@ -721,15 +882,53 @@ fn parse_mmls_primary_partition_offset(output: &str) -> Option<u64> {
         else {
             continue;
         };
-        let is_better = match best {
-            Some((best_len, _)) => length > best_len,
-            None => true,
+        let Some(byte_offset) = start.checked_mul(512) else {
+            continue;
         };
-        if is_better {
-            best = Some((length, start));
+        // Description is the trailing free text after the three decimal columns.
+        let description = mmls_description(line);
+        partitions.push(MmlsPartition {
+            slot: slot.unwrap_or_default(),
+            start_sector: start,
+            length_sectors: length,
+            byte_offset,
+            description,
+        });
+    }
+    partitions
+}
+
+/// The free-text filesystem description trailing an mmls row (everything after
+/// the Start/End/Length decimal columns), trimmed. Empty if the shape is off.
+fn mmls_description(line: &str) -> String {
+    // Find the third all-decimal token (Length) and take the remainder.
+    let mut seen_decimals = 0usize;
+    let mut idx_after = None;
+    for (i, tok) in line.split_whitespace().enumerate() {
+        if !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()) {
+            seen_decimals += 1;
+            if seen_decimals == 3 {
+                idx_after = Some(i);
+                break;
+            }
         }
     }
-    best.and_then(|(_, start)| start.checked_mul(512))
+    idx_after.map_or_else(String::new, |i| {
+        line.split_whitespace()
+            .skip(i + 1)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+/// Byte offset of the **primary** filesystem partition — the largest-by-length
+/// filesystem partition, reusing the full enumeration so selection and the
+/// surfaced partition table can never disagree.
+fn parse_mmls_primary_partition_offset(output: &str) -> Option<u64> {
+    parse_mmls_partitions(output)
+        .into_iter()
+        .max_by_key(|p| p.length_sectors)
+        .map(|p| p.byte_offset)
 }
 
 fn matches_filesystem_description(line: &str) -> bool {
@@ -846,12 +1045,18 @@ fn run_fixed(bin: &str, args: &[String]) -> Result<(bool, String, String), DiskE
     ))
 }
 
+fn append_image_args(command: &mut Command, image_paths: &[PathBuf]) {
+    for path in image_paths {
+        command.arg(path);
+    }
+}
+
 /// Sector offset of the primary (largest) filesystem partition for
 /// `fls`/`icat -o`, or None for a bare volume image (TSK reads it at offset 0).
 /// mmls reports the start
 /// sector; the byte helper multiplies by 512, so divide it back to sectors.
-fn primary_partition_sector_offset(image_path: &Path) -> Option<u64> {
-    primary_partition_byte_offset(image_path).map(|bytes| bytes / 512)
+fn primary_partition_sector_offset(image_paths: &[PathBuf]) -> Option<u64> {
+    primary_partition_byte_offset(image_paths).map(|bytes| bytes / 512)
 }
 
 /// One `fls -r -p` listing entry. `deleted` marks an unallocated directory
@@ -878,14 +1083,17 @@ struct Candidate {
 
 /// Enumerate every regular file in the image via `fls -r -p` — live files and
 /// deleted-but-addressable entries alike. Reads the image directly (no mount).
-fn tsk_list(image_path: &Path, sector_offset: Option<u64>) -> Result<Vec<FlsEntry>, DiskError> {
+fn tsk_list(
+    image_paths: &[PathBuf],
+    sector_offset: Option<u64>,
+) -> Result<Vec<FlsEntry>, DiskError> {
     let bin = std::env::var("FINDEVIL_FLS_BIN").unwrap_or_else(|_| "fls".to_string());
     let mut command = Command::new(&bin);
     command.args(["-r", "-p"]);
     if let Some(offset) = sector_offset {
         command.arg("-o").arg(offset.to_string());
     }
-    command.arg(image_path);
+    append_image_args(&mut command, image_paths);
     let output = command.output().map_err(|source| DiskError::Io {
         path: PathBuf::from(&bin),
         source,
@@ -1200,7 +1408,7 @@ struct ExtractStats {
 /// not fatal; a zero-byte recovered-deleted file counts as a failed recovery.
 #[allow(clippy::too_many_arguments)]
 fn tsk_extract(
-    image_path: &Path,
+    image_paths: &[PathBuf],
     sector_offset: Option<u64>,
     candidate: &Candidate,
     output_dir: &Path,
@@ -1223,7 +1431,8 @@ fn tsk_extract(
     if let Some(offset) = sector_offset {
         command.arg("-o").arg(offset.to_string());
     }
-    command.arg(image_path).arg(&candidate.inode);
+    append_image_args(&mut command, image_paths);
+    command.arg(&candidate.inode);
     let file = fs::File::create(&dest).map_err(|source| DiskError::Io {
         path: dest.clone(),
         source,
@@ -1493,7 +1702,7 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
     wanted
 }
 
-fn case_dir(case_id: &str) -> Result<PathBuf, DiskError> {
+pub(crate) fn case_dir(case_id: &str) -> Result<PathBuf, DiskError> {
     let dir = findevil_home()?.join("cases").join(case_id);
     if dir.is_dir() {
         Ok(dir)
@@ -1584,9 +1793,10 @@ fn tail_utf8_lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_subrank, class_priority, classify_artifact_path, mock_list, parse_fls_line,
+        artifact_subrank, class_priority, classify_artifact_path, direct_tsk_mount,
+        ewfmount_available, is_missing_binary, mock_list, parse_fls_line, parse_mmls_partitions,
         parse_mmls_primary_partition_offset, safe_join, select_artifacts, unmount_steps,
-        wanted_kinds, Candidate, FlsEntry,
+        wanted_kinds, Candidate, FlsEntry, DIRECT_TSK_COMMAND,
     };
     use std::path::Path;
 
@@ -2102,6 +2312,48 @@ mod tests {
     }
 
     #[test]
+    fn direct_tsk_mount_registers_a_mounted_read_off_the_image() {
+        // The ewfmount-less fallback must register a resource disk_extract can
+        // consume: status "mounted", fs_root == the image itself, and a sentinel
+        // command that is neither "mock" (which would force the walk path) nor a
+        // real mount command (which disk_unmount would try to tear down).
+        let image = Path::new("/evidence/host-c-drive.E01");
+        let (status, fs_root, command, stderr_tail, note) =
+            direct_tsk_mount(image, "ewfmount gone");
+        assert_eq!(status, "mounted");
+        assert_eq!(fs_root, image);
+        assert_eq!(command, vec![DIRECT_TSK_COMMAND.to_string()]);
+        assert_ne!(command.first().map(String::as_str), Some("mock"));
+        assert!(stderr_tail.is_empty());
+        assert!(note.contains("no FUSE/loop mount"), "note was: {note}");
+    }
+
+    #[test]
+    fn ewfmount_available_is_false_for_a_missing_binary() {
+        // A binary that cannot be spawned (ENOENT) is the exact condition that
+        // must trigger the direct-TSK fallback.
+        assert!(!ewfmount_available(
+            "findevil-definitely-not-a-real-binary-zzz"
+        ));
+    }
+
+    #[test]
+    fn is_missing_binary_matches_command_not_found_variants() {
+        // The reported live failure was literally this line.
+        assert!(is_missing_binary("sudo: ewfmount: command not found"));
+        assert!(is_missing_binary("ewfmount: command not found"));
+        assert!(is_missing_binary(
+            "exec: \"ewfmount\": executable file not found in $PATH"
+        ));
+        // A genuine mount failure must NOT be mistaken for a missing binary —
+        // that stays a surfaced error, not a silent fallback.
+        assert!(!is_missing_binary(
+            "ewfmount: unable to open file(s): permission denied"
+        ));
+        assert!(!is_missing_binary(""));
+    }
+
+    #[test]
     fn mmls_parser_returns_sole_filesystem_partition_offset() {
         let output = r"DOS Partition Table
 Offset Sector: 0
@@ -2165,5 +2417,52 @@ Units are in 512-byte sectors
             parse_mmls_primary_partition_offset(output),
             Some(2048 * 512)
         );
+    }
+
+    #[test]
+    fn mmls_enumerates_every_filesystem_partition_in_table_order() {
+        // A full Windows disk: System Reserved stub + the large C: volume + a
+        // separate FAT data volume. All three are filesystems; the Meta and
+        // Unallocated rows must be excluded. Enumeration keeps every volume so a
+        // multi-volume disk is not silently reduced to just the primary.
+        let output = r"DOS Partition Table
+Offset Sector: 0
+Units are in 512-byte sectors
+
+      Slot      Start        End          Length       Description
+000:  Meta      0000000000   0000000000   0000000001   Primary Table (#0)
+001:  -------   0000000000   0000002047   0000002048   Unallocated
+002:  000:000   0000002048   0000718847   0000716800   NTFS / exFAT (0x07)
+003:  000:001   0000718848   0023590911   0022872064   NTFS / exFAT (0x07)
+004:  000:002   0023590912   0025590911   0002000000   FAT32 (0x0c)
+";
+        let parts = parse_mmls_partitions(output);
+        assert_eq!(
+            parts.len(),
+            3,
+            "three filesystem partitions, no meta/unalloc"
+        );
+        assert_eq!(parts[0].slot, 2);
+        assert_eq!(parts[0].start_sector, 2048);
+        assert_eq!(parts[0].byte_offset, 2048 * 512);
+        assert_eq!(parts[1].slot, 3);
+        assert_eq!(parts[1].length_sectors, 22_872_064);
+        assert_eq!(parts[1].byte_offset, 718_848 * 512);
+        assert_eq!(parts[2].slot, 4);
+        assert!(parts[2].description.to_lowercase().contains("fat32"));
+        // The primary selector agrees with the enumeration: largest = slot 3.
+        assert_eq!(
+            parse_mmls_primary_partition_offset(output),
+            Some(718_848 * 512)
+        );
+    }
+
+    #[test]
+    fn mmls_enumeration_empty_for_bare_volume_no_table() {
+        // A bare volume image (no partition table) yields no partitions; callers
+        // fall back to reading at offset 0.
+        let output = r"Cannot determine partition type
+";
+        assert!(parse_mmls_partitions(output).is_empty());
     }
 }

@@ -12,6 +12,86 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.6] - 2026-07-09
+
+Toolkit snapshot from `develop` after bulk free-space feature recovery and
+multi-segment EWF preservation. **Does not include** CaseForge or
+verdict-opencode (those ship from their own repos).
+
+### Added
+
+- **`bulk_extract` MCP tool** (findevil-mcp) — wraps `bulk_extractor` for
+  disk-wide keyword/regex and unallocated-space feature recovery with custody
+  hashing (`output_sha256`), single-threaded deterministic scan (`-j 1`),
+  closed scanner allowlist, and honest degradation when the binary is absent
+  (`bulk_extractor_available: false`, sealed empty result — never fabricated).
+  Security guards: argv end-of-options for image paths, reject dash-leading
+  image names, `case_id` path-segment validation before staging
+  create/delete. (PR #171)
+
+### Fixed
+
+- **Split EWF segment sets** — multi-segment `.E01`/`.E02`… handling preserves
+  the full set instead of under-extracting. (PR #170)
+
+### Not proven this release
+
+- **nhc-003 recall is unmeasured.** No committed carving fixture ties a
+  recoverable deleted intrusion-plan email to the golden; `bulk_extract` is
+  the mechanism only. Do not treat this beta as a measured NIST-hacking-case
+  recall improvement.
+
+### Notes
+
+- Dev GitHub Actions remain account/billing-gated; merge gates for #170/#171
+  were local receipts, not hosted CI.
+
+## [v0.4.0-beta.1] - 2026-07-04
+
+Attack-flow visualization: a presentation-only layer that turns a finished case's
+signed `verdict.json` into offline, on-brand visual artifacts, and makes the
+analyst report open with an at-a-glance technique summary. Live-verified in a real
+`scripts/verdict` run and guarded by render/interaction + host-python smokes.
+
+### Added — attack-flow visualization
+
+- **Seven canonical artifacts** per case under `tmp/auto-runs/<case>/attack-flow/`:
+  `attack-summary.html` (technique-grouped, Confirmed-first), `timeline.html`
+  (branded forensic timeline), `process-tree.html` (interactive collapsible tree),
+  STIX 2.1 `incident.attack-flow.json` (opens in MITRE Attack Flow Builder),
+  `attack-flow.mmd` (GitHub-native Mermaid), `navigator-layer.json`, and an
+  `attack-flow.md` index. Emitted by a new deterministic, offline package
+  (`services/agent/findevil_agent/attackflow/`) plus the standalone
+  `scripts/attack-flow <case-dir>`.
+- **Report leads with the summary** — the analyst report now opens with the
+  technique-grouped attack-flow summary (right after the title), with pointers to
+  the timeline, the process tree, and Attack Flow Builder.
+- **Forensic timeline** — full event stream on a real UTC axis with a
+  confidence-stacked activity-density histogram, a brushable time axis, faceted
+  filters (confidence + significance), and collapsible days. Brand fonts (Archivo
+  Narrow / Inter / JetBrains Mono / Caveat, OFL) are vendored and inlined, so the
+  artifact is fully self-contained and offline.
+
+### Guarantees & guards
+
+- Presentation only: never creates a Finding, never mints a `tool_call_id`, makes
+  no network/LLM calls, reads only the case dir's own JSON. Deterministic (uuid5
+  ids, sorted output), evidence-agnostic, and every evidence-derived string is
+  HTML-escaped in context.
+- New smokes wired into `run-all-smokes.sh`: `attackflow-smoke` (emits the 7),
+  `attackflow-hostpy-smoke` (drives the report hook under the engine's host python
+  — guards the regression below), and `attackflow-render-smoke` (drives the emitted
+  HTML in headless Chrome — histogram height, facet filtering, brush, tree
+  expand — and skips cleanly where no browser exists).
+
+### Fixed
+
+- **Attack-flow visualization was silently inert in the live pipeline.** The
+  engine runs under host python (may be 3.10), where importing the 3.11-only
+  `findevil_agent` package fails; the report hook swallowed the error and emitted
+  nothing. The hook now imports `attackflow` as a top-level package. Guarded by
+  `attackflow-hostpy-smoke`.
+
 ## [v0.3.0-beta.1] - 2026-07-02
 
 The v2 brand system plus a large round of detection, custody, and report-QA

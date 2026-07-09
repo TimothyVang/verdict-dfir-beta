@@ -13,7 +13,10 @@
       "sha256": null,
       "license": "Public domain (17 USC 105)",
       "tier": "amber",
-      "note": "Raw .dd parses locally (no SIFT). SCHARDT is in the golden set; treat a strong score as regression signal, not blind generalization."
+      "note": "Raw .dd parses locally (no SIFT). SCHARDT is in the golden set; treat a strong score as regression signal, not blind generalization.",
+      "mechanism_coverage": {
+        "nhc-003": "Deleted-email / free-space feature recovery (goldens/nist-hacking-case/expected-findings.json finding nhc-003, 'Outlook PST / free space carve') is now MECHANISM-SCOREABLE via the bulk_extract MCP tool (wraps bulk_extractor over the raw image's unallocated space), which closes the prior engine false-negative. NOT YET MEASURED here: an end-to-end recall delta needs BOTH the bulk_extractor binary AND a carving fixture with a recoverable deleted email; the tool + determinism/degradation are verified, the SCHARDT recall improvement is not asserted until scored."
+      }
     },
     {
       "name": "nitroba",
@@ -200,7 +203,7 @@
       "sha256": null,
       "license": "DFIR Madness - free for education (redistribute URL + hash, not the image)",
       "tier": "amber",
-      "note": "DFIR Madness Case 001: disk+memory+pcap across 2 hosts (~16GB), full public answer key. The best-fit multi-class fusion benchmark for VERDICT's corroboration-first design. Golden goldens/szechuan/expected-findings.json is NOT YET AUTHORED (author from the answer key; strong held-out candidate for Phase 6). Needs SIFT for the disk half and a 16GB staged download."
+      "note": "DFIR Madness Case 001: disk+memory+pcap across 2 hosts (~16GB), full public answer key. The best-fit multi-class fusion benchmark for VERDICT's corroboration-first design. Golden goldens/szechuan/expected-findings.json IS AUTHORED from the answer key (7 findings across log/network/disk/memory), but the case is HELD-OUT: runnable_local=false because it needs SIFT for the disk half and a ~16GB staged download, so VERDICT has not yet scored it. min_recall_percent in the golden is a placeholder floor to recalibrate after the first real scripts/benchmark run."
     }
   ]
 }

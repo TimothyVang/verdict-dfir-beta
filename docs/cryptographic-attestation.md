@@ -269,6 +269,17 @@ and certification (the Rule 902(11) notice requirement).
     of the current chain.** Bitcoin offered a stronger no-single-party
     timestamp; Rekor trusts the LF to operate the log honestly. Either
     way, this is supplementary to — not part of — the 902(14) requirement.
+  - **Merkle-root anchoring opt-in (verified 2026-07-05):** publishing the
+    audit Merkle root to Rekor (RFC-3161 TSA fallback) is a double-locked
+    opt-in — the `manifest_finalize` call must pass `anchor_transparency=True`
+    **and** the operator must set `FINDEVIL_REKOR_ENABLE=1`; requesting it
+    without the env fails closed, and when off the manifest is byte-identical
+    with no network touched. The crypto path (signer + manifest + anchor) is
+    clean-venv verified: 75 `test_crypto_*` cases pass in a freshly synced
+    `services/agent` venv, including that a present-but-corrupted anchor is
+    flagged without gating the offline `signature_verified` pass (the anchor is
+    attached after signing and excluded from the signed body). The opt-in stays
+    off by default; only the bare 32-byte root egresses when enabled.
 
 A court looking at a `run.manifest.json` three years from now
 establishes the record's integrity from the hash chain and signature

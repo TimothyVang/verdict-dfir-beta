@@ -41,6 +41,11 @@ pub use crate::tools::browser_history::{
     browser_history, path_looks_like_browser_history, BrowserHistoryError, BrowserHistoryInput,
     BrowserHistoryOutput, BrowserHistoryRow,
 };
+pub use crate::tools::bulk_extract::{
+    build_bulk_args, bulk_extract, compare_offset, image_name_is_dash_leading, is_valid_case_id,
+    parse_feature_line, sanitize_stem, scrub_absolute_paths, sort_features, BulkExtractError,
+    BulkExtractInput, BulkExtractOutput, BulkFeature, BulkScanner, StagedFeatureFile,
+};
 pub use crate::tools::case_open::{case_open, CaseHandle, CaseOpenError, CaseOpenInput};
 pub use crate::tools::cloud_audit::{
     cloud_audit, is_allowed_provider, CloudAuditError, CloudAuditInput, CloudAuditOutput,

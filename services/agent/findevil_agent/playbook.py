@@ -79,6 +79,12 @@ TOOL_SEQUENCES: dict[str, list[PlaybookStep]] = {
         PlaybookStep("disk_mount", "Mount the disk image via libewf", pool="both"),
         PlaybookStep("disk_extract_artifacts", "Extract filesystem artifacts", pool="both"),
         PlaybookStep(
+            "bulk_extract",
+            "Free-space feature recovery (deleted email / unallocated carve)",
+            pool="both",
+            optional=True,
+        ),
+        PlaybookStep(
             "mft_timeline", "MFT timeline with timestomp detection ($SI vs $FN)", pool="both"
         ),
         PlaybookStep("usnjrnl_query", "UsnJrnl change log — file create/delete/rename", pool="A"),

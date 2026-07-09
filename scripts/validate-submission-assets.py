@@ -859,7 +859,17 @@ def verify_manifest_signature(manifest: dict, blockers: list[str], label: str) -
     if signature.get("kind") != "ed25519":
         blockers.append(f"{label} signature kind is not ed25519")
         return
-    body = {key: value for key, value in manifest.items() if key != "signature"}
+    # The signed body excludes BOTH ``signature`` and ``transparency_log``: the
+    # Rekor/RFC-3161 anchor is attached AFTER signing, so the signer
+    # (crypto/manifest.py::_to_json_safe(exclude_signature=True)) and the offline
+    # verifier strip both. Excluding only ``signature`` here would hash a body the
+    # signer never signed and spuriously fail whenever a transparency_log key is
+    # present (which it is by default, since the Rekor field landed).
+    body = {
+        key: value
+        for key, value in manifest.items()
+        if key not in ("signature", "transparency_log")
+    }
     body_bytes = canonicalize_json(body)
     if signature.get("payload_sha256") != hash_bytes(body_bytes):
         blockers.append(

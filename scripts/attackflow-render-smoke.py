@@ -187,8 +187,21 @@ HARNESS = r"""
     if(!(k1<k0)){return fail('facet did not reduce kept rows '+k0+'->'+k1);}
     chip.click(); // restore
     if(kept()!==k0){return fail('facet toggle not reversible '+k0+'->'+kept());}
-    // 4) brush a window -> filters kept rows AND shows a date-range label
-    var svg=document.querySelector('.tl-hist'); var b=svg.getBoundingClientRect();
+    // 4) brush a window -> filters kept rows AND shows a date-range label.
+    // The histogram SVG is width:100% of its container; in headless (no real
+    // paint loop) that container is intermittently zero-width for the whole
+    // virtual-time budget, and the brush handler maps clientX through
+    // getBoundingClientRect().width — a zero width collapses the drag. Pin the
+    // SVG to its own viewBox width so the client rect is deterministically real;
+    // this only fixes the harness's measurement, not the interaction under test
+    // (a real viewport never sizes the histogram at zero).
+    var svg=document.querySelector('.tl-hist');
+    if(!svg){return fail('no histogram svg');}
+    var vb=(svg.getAttribute('viewBox')||'').split(/\s+/);
+    var vbw=(vb.length===4?parseFloat(vb[2]):0)||900;
+    svg.style.width=vbw+'px'; svg.style.maxWidth='none';
+    var b=svg.getBoundingClientRect();  // getBoundingClientRect forces reflow
+    if(!(b.width>10)){return fail('histogram not laid out even after pinning width ('+Math.round(b.width)+')');}
     var y=b.top+b.height*0.5;
     function m(t,x){var e=new MouseEvent(t,{bubbles:true,clientX:x,clientY:y}); (t==='mousedown'?svg:window).dispatchEvent(e);}
     m('mousedown', b.left+b.width*0.40); m('mousemove', b.left+b.width*0.62); m('mouseup', b.left+b.width*0.62);
@@ -246,12 +259,24 @@ def _title_from_dom(dom: str) -> str:
     return dom[lo + 7 : hi] if lo != -1 and hi != -1 else ""
 
 
-def _drive(chrome: str, html_path: Path, profile: Path, label: str) -> bool:
+def _drive(chrome: str, html_path: Path, label: str) -> bool:
+    # A FRESH profile per launch. A shared/reused --user-data-dir races on
+    # Chrome's SingletonLock across the sequential launches, and a launch that
+    # loses the race dumps a DOM whose harness never ran ("no result title").
+    # Keep it under a short base dir (~/.cache) so the control socket path stays
+    # under the 108-char unix-socket limit.
+    profile = Path(tempfile.mkdtemp(prefix="afrs-", dir=str(Path.home() / ".cache")))
     cmd = [
         chrome,
         "--headless=new",
         "--no-sandbox",
         "--disable-gpu",
+        # A definite viewport so the histogram SVG lays out with a real,
+        # non-zero client width. Headless without this can size an inline SVG at
+        # ~0 width, and the brush handler maps clientX through
+        # getBoundingClientRect().width — a zero width collapses the drag and the
+        # date-range label never appears (the root cause of a rare flake).
+        "--window-size=1280,1024",
         "--virtual-time-budget=6000",
         f"--user-data-dir={profile}",
         "--dump-dom",
@@ -266,6 +291,8 @@ def _drive(chrome: str, html_path: Path, profile: Path, label: str) -> bool:
     except (subprocess.SubprocessError, OSError) as exc:
         print(f"FAIL: chrome failed for {label}: {exc}")
         return False
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
     title = _title_from_dom(r.stdout)
     if title.startswith("RENDERSMOKE:OK"):
         print(f"  {label}: {title}")
@@ -286,7 +313,6 @@ def main() -> int:
     sys.path.insert(0, str(ATTACKFLOW_PARENT))
     from attackflow import emit  # top-level, host-py safe
 
-    profile = Path.home() / ".cache" / "afrs-profile"
     with tempfile.TemporaryDirectory() as td:
         case = Path(td) / "case"
         case.mkdir()
@@ -306,7 +332,7 @@ def main() -> int:
             harness_path.write_text(
                 (af / name).read_text(encoding="utf-8") + harness, encoding="utf-8"
             )
-            ok = _drive(chrome, harness_path, profile, label) and ok
+            ok = _drive(chrome, harness_path, label) and ok
 
     if ok:
         print("attack-flow render/interaction smoke: OK")

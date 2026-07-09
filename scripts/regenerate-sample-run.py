@@ -123,10 +123,15 @@ class FilePlan:
 # ---------------------------------------------------------------------------
 
 
-def count_machine_paths(data: bytes | str) -> int:
-    """Count ``/home/<user>`` / ``/Users/<user>`` machine-path hits in DATA."""
+def count_machine_paths(data: bytes | str, *, run_dir_abs: str = "") -> int:
+    """Count machine-path hits in DATA.
+
+    Counts both supported leak classes: ``/home/<user>`` / ``/Users/<user>``
+    prefixes and the exact absolute ``--from`` run-dir prefix.
+    """
     text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
-    return len(HOME_PREFIX_RE.findall(text))
+    run_dir_hits = text.count(run_dir_abs) if run_dir_abs else 0
+    return run_dir_hits + len(HOME_PREFIX_RE.findall(text))
 
 
 def scrub_text(
@@ -228,7 +233,7 @@ def plan_regeneration(
                     dst=dst,
                     payload=raw,
                     scrub_count=0,
-                    leak_count=count_machine_paths(raw),
+                    leak_count=count_machine_paths(raw, run_dir_abs=run_dir_abs),
                 )
             )
             continue
@@ -245,7 +250,7 @@ def plan_regeneration(
                     dst=dst,
                     payload=raw,
                     scrub_count=0,
-                    leak_count=count_machine_paths(raw),
+                    leak_count=count_machine_paths(raw, run_dir_abs=run_dir_abs),
                     binary_fallback=True,
                 )
             )
@@ -267,7 +272,7 @@ def plan_regeneration(
                 dst=dst,
                 payload=payload,
                 scrub_count=n,
-                leak_count=count_machine_paths(scrubbed),
+                leak_count=count_machine_paths(scrubbed, run_dir_abs=run_dir_abs),
             )
         )
     return plans

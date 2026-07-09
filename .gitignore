@@ -221,3 +221,6 @@ scripts/make-demo-video/.tts-cache/
 /docs/plans/
 /docs/specs/
 docs/benchmark/results.json
+
+# local MCP config backups (tooling-generated, never committed)
+.mcp.json.local.bak

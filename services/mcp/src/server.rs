@@ -41,11 +41,15 @@ use sha2::{Digest, Sha256};
 
 use crate::tools::{
     ausearch::ausearch,
+    bits_parse::bits_parse,
     browser_history::browser_history,
+    bulk_extract::bulk_extract,
     case_open,
     cloud_audit::cloud_audit,
     disk::{disk_extract_artifacts, disk_mount, disk_unmount},
+    email_parse::email_parse,
     evtx_query::evtx_query,
+    exif_parse::exif_parse,
     ez_parse::ez_parse,
     hashset_lookup::hashset_lookup,
     hayabusa_scan::hayabusa_scan,
@@ -59,7 +63,9 @@ use crate::tools::{
     pcap_triage::pcap_triage,
     plaso_parse::plaso_parse,
     prefetch_parse::prefetch_parse,
+    pst_parse::pst_parse,
     registry_query::registry_query,
+    srum_parse::srum_parse,
     suricata_eve::suricata_eve,
     sysmon_network_query::sysmon_network_query,
     thumbcache_parse::thumbcache_parse,
@@ -70,15 +76,19 @@ use crate::tools::{
     vol_psscan::vol_psscan,
     vol_psxview::vol_psxview,
     vol_run::vol_run,
+    vss::{vss_list, vss_mount},
+    wmi_persist_parse::wmi_persist_parse,
     yara_scan::yara_scan,
     zeek_summary::zeek_summary,
-    AusearchInput, BrowserHistoryInput, CaseOpenInput, CloudAuditInput, DiskExtractArtifactsInput,
-    DiskMountInput, DiskUnmountInput, EvtxQueryInput, EzParseInput, HashsetLookupInput,
-    HayabusaInput, IndxParseInput, JournalctlQueryInput, LoginAccountingInput, MacTriageInput,
-    MftInput, NfdumpQueryInput, OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput,
-    RegistryInput, SuricataEveInput, SysmonNetworkInput, ThumbcacheParseInput, UsnJrnlInput,
-    VelCollectInput, VolMalfindInput, VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput,
-    YaraInput, ZeekSummaryInput,
+    AusearchInput, BitsParseInput, BrowserHistoryInput, BulkExtractInput, CaseOpenInput,
+    CloudAuditInput, DiskExtractArtifactsInput, DiskMountInput, DiskUnmountInput, EmailParseInput,
+    EvtxQueryInput, ExifParseInput, EzParseInput, HashsetLookupInput, HayabusaInput,
+    IndxParseInput, JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput,
+    NfdumpQueryInput, OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput,
+    PstParseInput, RegistryInput, SrumParseInput, SuricataEveInput, SysmonNetworkInput,
+    ThumbcacheParseInput, UsnJrnlInput, VelCollectInput, VolMalfindInput, VolPslistInput,
+    VolPsscanInput, VolPsxviewInput, VolRunInput, VssListInput, VssMountInput,
+    WmiPersistParseInput, YaraInput, ZeekSummaryInput,
 };
 use crate::CRATE_VERSION;
 
@@ -289,6 +299,43 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<DiskUnmountInput>(),
             handler: |args| dispatch_disk_unmount(args),
+        },
+        ToolEntry {
+            name: "bulk_extract",
+            description:
+                "Run bulk_extractor over a raw/E01 disk image to recover FEATURES from the whole \
+                 byte stream — allocated files AND unallocated/free space, slack, and deleted \
+                 regions the filesystem no longer references. THE tool for deleted-email / \
+                 free-space feature recovery that the live-filesystem parsers (mft_timeline, \
+                 disk_extract_artifacts) cannot reach: it recovers an email whose directory \
+                 entry is gone. Use AFTER case_open; image_path is the image, scanners[] is an \
+                 allow-listed set of real bulk_extractor scanners (email — which also emits the \
+                 rfc822/url/domain recorders — accts, httplogs, gps, exif, json, net, zip, gzip, \
+                 pdf, sqlite, utmp, winlnk, winprefetch, ntfsusn, ntfsmft, evtx, find). \
+                 Keyword/regex hits come ONLY from find_regexes[] or an operator \
+                 keyword_file (or $FINDEVIL_BULK_KEYWORD_FILE) — never image-specific literals. \
+                 DETERMINISTIC for verify_finding replay: runs single-threaded (-j 1), sorts \
+                 feature rows in-tool, records case-relative staged paths with per-file SHA-256, \
+                 and includes the bulk_extractor version (never a wall-clock) in the hashed body. \
+                 INSTALL-FIRST: degrades to bulk_extractor_available=false when the binary is \
+                 absent (custody-only, not an error). Binary discovery: \
+                 $FINDEVIL_BULK_EXTRACTOR_BIN then PATH. \
+                 Returns bulk_extractor_available, engine_version, scanners_requested[], \
+                 features[] (feature_type, offset, feature, context), features_seen, \
+                 staged_files[] (feature_type, path, sha256, line_count), and stderr_tail. \
+                 ERRORS: NotFound/NotRegular (verify image_path), CaseNotFound (run case_open), \
+                 KeywordFileNotFound (verify keyword_file), InvalidRegex (a find_regexes entry \
+                 has a newline/NUL), SubprocessFailed (bulk_extractor returned non-zero — check \
+                 stderr).",
+            annotations: ToolAnnotations {
+                title: "Recover Free-space Features (bulk_extractor)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<BulkExtractInput>(),
+            handler: |args| dispatch_bulk_extract(args),
         },
         ToolEntry {
             name: "evtx_query",
@@ -797,6 +844,172 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<OeDbxParseInput>(),
             handler: |args| dispatch_oe_dbx_parse(args),
+        },
+        ToolEntry {
+            name: "email_parse",
+            description: "Parse loose email on disk: a single RFC 5322 .eml message or an mbox \
+                 archive of many. No other product tool reads mail files (browser_history is \
+                 SQLite-only; oe_dbx_parse is Outlook Express .dbx). Returns per-message \
+                 sender/recipient/subject/date and attachment FILENAMES (metadata only — never \
+                 decodes or writes body/attachment payloads), plus deduped/sorted aggregates. \
+                 Output is deterministic for verify_finding replay. Returns is_email=false for \
+                 non-email input. Use AFTER case_open / disk_mount; artifact_path is one .eml or \
+                 mbox file. ERRORS: ArtifactNotFound (verify the path), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse Email (.eml / mbox)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<EmailParseInput>(),
+            handler: |args| dispatch_email_parse(args),
+        },
+        ToolEntry {
+            name: "exif_parse",
+            description: "Read EXIF metadata from a user-content image (JPEG/TIFF/HEIF and other \
+                 EXIF containers): camera make/model, editing software, capture timestamps, and — \
+                 most valuable — GPS coordinates as signed decimal degrees, surfacing geolocation \
+                 and device-fingerprint leads otherwise invisible to the pipeline. Reads structured \
+                 tag values only; no image pixel bytes leave the tool. Output is sorted/ \
+                 deterministic for verify_finding replay. Returns has_exif=false for input with no \
+                 EXIF. Use AFTER case_open / disk_mount (feeds on carved/extracted images); \
+                 artifact_path is one image file. ERRORS: ArtifactNotFound (verify the path), Read \
+                 (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Read Image EXIF Metadata (GPS/camera/timestamps)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<ExifParseInput>(),
+            handler: |args| dispatch_exif_parse(args),
+        },
+        ToolEntry {
+            name: "bits_parse",
+            description: "Parse a Windows BITS (Background Intelligent Transfer Service) state \
+                 store — the legacy binary qmgr0.dat/qmgr1.dat queue, or DETECT the Win10 1709+ ESE \
+                 qmgr.db (which needs esedbexport, a separate tool). BITS is abused for stealthy \
+                 background download + persistence (MITRE T1197). Conservatively extracts the \
+                 remote URLs and local destination paths embedded as UTF-16LE in the job store, \
+                 flagging raw-IPv4 hosts and executable-extension payloads as leads — it reports \
+                 strings actually present, not decoded job state, so a misparse cannot invent job \
+                 semantics. Output is sorted/deterministic for verify_finding replay. Use AFTER \
+                 case_open / disk_mount; artifact_path is one qmgr*.dat / qmgr.db file. ERRORS: \
+                 ArtifactNotFound (verify the path), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse Windows BITS Jobs (qmgr — T1197)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<BitsParseInput>(),
+            handler: |args| dispatch_bits_parse(args),
+        },
+        ToolEntry {
+            name: "srum_parse",
+            description: "Parse the Windows SRUM (System Resource Usage Monitor) database \
+                 (System32/sru/SRUDB.dat) — the network-usage provider records per-application \
+                 BytesSent/BytesRecvd per hour, the closest thing Windows has to a built-in \
+                 data-transfer-volume ledger, plus application execution provenance. Two-stage: \
+                 esedbexport (libesedb) dumps the ESE tables, then the network table is decoded \
+                 in Rust; degrades to esedbexport_available=false when libesedb is absent (the \
+                 pipeline pivots). Byte volumes are an exfil-volume LEAD, never proof. Output is \
+                 sorted/deterministic for verify_finding replay. Use AFTER case_open / \
+                 disk_mount; artifact_path is SRUDB.dat. ERRORS: ArtifactNotFound (verify path).",
+            annotations: ToolAnnotations {
+                title: "Parse Windows SRUM Network Usage (SRUDB.dat)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<SrumParseInput>(),
+            handler: |args| dispatch_srum_parse(args),
+        },
+        ToolEntry {
+            name: "pst_parse",
+            description: "Parse an Outlook PST/OST mail store via pffexport (libpff). No other \
+                 product tool reads PST/OST (email_parse is .eml/mbox; oe_dbx_parse is Outlook \
+                 Express .dbx). pffexport -m all also RECOVERS deleted/orphaned messages from \
+                 unallocated PST space. Returns per-message from/to/subject/delivery-time/folder \
+                 and a recovered flag (metadata only — never message bodies), plus deduped \
+                 aggregates. Degrades to pffexport_available=false when libpff is absent. Output \
+                 is sorted/deterministic for verify_finding replay. Use AFTER case_open / \
+                 disk_mount; artifact_path is one .pst/.ost. ERRORS: ArtifactNotFound (verify \
+                 the path), plus typed staging/IO errors.",
+            annotations: ToolAnnotations {
+                title: "Parse Outlook PST/OST (recovers deleted mail)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<PstParseInput>(),
+            handler: |args| dispatch_pst_parse(args),
+        },
+        ToolEntry {
+            name: "wmi_persist_parse",
+            description: "Surface WMI event-consumer persistence (MITRE T1546.003) from the CIM \
+                 repository (wbem/Repository/OBJECTS.DATA). Conservatively scans the repository \
+                 bytes for the persistence class-name signatures (__EventFilter, \
+                 CommandLineEventConsumer/ActiveScriptEventConsumer, __FilterToConsumerBinding) \
+                 and the command lines / script bodies adjacent to a consumer — reporting strings \
+                 actually present, not decoded CIM objects, so a misparse cannot invent structure. \
+                 Flags the consumer+filter+binding triad as a persistence LEAD (not proof the \
+                 subscription is active). Output is sorted/deterministic for verify_finding \
+                 replay. Use AFTER case_open / disk_mount; artifact_path is OBJECTS.DATA. ERRORS: \
+                 ArtifactNotFound (verify the path), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse WMI Persistence (OBJECTS.DATA — T1546.003)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<WmiPersistParseInput>(),
+            handler: |args| dispatch_wmi_persist_parse(args),
+        },
+        ToolEntry {
+            name: "vss_list",
+            description: "Enumerate Windows Volume Shadow Copies in a volume image via \
+                 vshadowinfo (libvshadow): the point-in-time snapshots that often still hold a \
+                 file/registry value an attacker deleted or changed on the live volume. Returns \
+                 the shadow stores (number, identifier, creation time). Degrades to \
+                 vshadowinfo_available=false when libvshadow is absent. Output is sorted/ \
+                 deterministic. Use AFTER case_open; image_path is a raw volume image or mounted \
+                 volume device. ERRORS: ImageNotFound (verify the path).",
+            annotations: ToolAnnotations {
+                title: "List Volume Shadow Copies (VSS)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<VssListInput>(),
+            handler: |args| dispatch_vss_list(args),
+        },
+        ToolEntry {
+            name: "vss_mount",
+            description: "Mount a volume image's Volume Shadow Copies via vshadowmount \
+                 (libvshadow), exposing each snapshot as a vssN raw-volume file under a \
+                 case-scoped mount that the normal disk tools then read unchanged — so a snapshot \
+                 can be analyzed like any other volume and diffed against the live one \
+                 (anti-forensics signal). Returns a mount_id + the exposed shadow-store paths. \
+                 Read-only; degrades to vshadowmount_available=false when libvshadow is absent. \
+                 Use AFTER case_open; image_path holds the shadow store. ERRORS: ImageNotFound, \
+                 Case (case dir unusable), MountPoint (could not create mount dir).",
+            annotations: ToolAnnotations {
+                title: "Mount Volume Shadow Copies (VSS)",
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            schema: || schema_for::<VssMountInput>(),
+            handler: |args| dispatch_vss_mount(args),
         },
         ToolEntry {
             name: "thumbcache_parse",
@@ -1366,9 +1579,18 @@ fn finalize_tool_output(name: &str, payload: &Value) -> Result<Value, ToolError>
 
 fn dispatch_case_open(args: Value) -> Result<Value, ToolError> {
     let input: CaseOpenInput = parse_args(args)?;
-    let handle =
-        case_open::case_open(&input).map_err(|e| ToolError::Internal(format!("case_open: {e}")))?;
-    serde_json::to_value(handle).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+    match case_open::case_open(&input) {
+        Ok(handle) => {
+            serde_json::to_value(handle).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::CaseOpenError::ImageNotFound(_)
+            | crate::tools::CaseOpenError::ImageNotRegular(_)
+            | crate::tools::CaseOpenError::ImageHashMismatch { .. }
+            | crate::tools::CaseOpenError::EwfSegmentSet(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("case_open: {e}"))),
+    }
 }
 
 fn dispatch_disk_mount(args: Value) -> Result<Value, ToolError> {
@@ -1380,6 +1602,7 @@ fn dispatch_disk_mount(args: Value) -> Result<Value, ToolError> {
         Err(
             e @ (crate::tools::DiskError::CaseNotFound(_)
             | crate::tools::DiskError::ImageNotFound(_)
+            | crate::tools::DiskError::EwfSegmentSet(_)
             | crate::tools::DiskError::UnsupportedPlatform),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("disk_mount: {e}"))),
@@ -1396,9 +1619,33 @@ fn dispatch_disk_extract_artifacts(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::DiskError::CaseNotFound(_)
             | crate::tools::DiskError::MountNotFound(_)
             | crate::tools::DiskError::MountNotMounted(_)
-            | crate::tools::DiskError::MountRootNotFound(_)),
+            | crate::tools::DiskError::MountRootNotFound(_)
+            | crate::tools::DiskError::ImageNotFound(_)
+            | crate::tools::DiskError::EwfSegmentSet(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("disk_extract_artifacts: {e}"))),
+    }
+}
+
+fn dispatch_bulk_extract(args: Value) -> Result<Value, ToolError> {
+    let input: BulkExtractInput = parse_args(args)?;
+    // NotFound / NotRegular / CaseNotFound / KeywordFileNotFound / InvalidRegex
+    // are user-input territory → -32602 so the agent corrects the call.
+    // SubprocessFailed / Io are system-state issues → -32603.
+    match bulk_extract(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::BulkExtractError::NotFound(_)
+            | crate::tools::BulkExtractError::NotRegular(_)
+            | crate::tools::BulkExtractError::DashLeadingImageName(_)
+            | crate::tools::BulkExtractError::CaseNotFound(_)
+            | crate::tools::BulkExtractError::InvalidCaseId(_)
+            | crate::tools::BulkExtractError::KeywordFileNotFound(_)
+            | crate::tools::BulkExtractError::InvalidRegex { .. }),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("bulk_extract: {e}"))),
     }
 }
 
@@ -1700,6 +1947,114 @@ fn dispatch_oe_dbx_parse(args: Value) -> Result<Value, ToolError> {
             Err(ToolError::InvalidParams(format!("{e}")))
         }
         Err(e) => Err(ToolError::Internal(format!("oe_dbx_parse: {e}"))),
+    }
+}
+
+fn dispatch_email_parse(args: Value) -> Result<Value, ToolError> {
+    let input: EmailParseInput = parse_args(args)?;
+    match email_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::EmailParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("email_parse: {e}"))),
+    }
+}
+
+fn dispatch_exif_parse(args: Value) -> Result<Value, ToolError> {
+    let input: ExifParseInput = parse_args(args)?;
+    match exif_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::ExifParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("exif_parse: {e}"))),
+    }
+}
+
+fn dispatch_bits_parse(args: Value) -> Result<Value, ToolError> {
+    let input: BitsParseInput = parse_args(args)?;
+    match bits_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::BitsParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("bits_parse: {e}"))),
+    }
+}
+
+fn dispatch_srum_parse(args: Value) -> Result<Value, ToolError> {
+    let input: SrumParseInput = parse_args(args)?;
+    match srum_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::SrumError::NotFound(_)
+            | crate::tools::SrumError::NotRegular(_)
+            | crate::tools::SrumError::CaseNotFound(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("srum_parse: {e}"))),
+    }
+}
+
+fn dispatch_pst_parse(args: Value) -> Result<Value, ToolError> {
+    let input: PstParseInput = parse_args(args)?;
+    match pst_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::PstError::NotFound(_)
+            | crate::tools::PstError::NotRegular(_)
+            | crate::tools::PstError::CaseNotFound(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("pst_parse: {e}"))),
+    }
+}
+
+fn dispatch_wmi_persist_parse(args: Value) -> Result<Value, ToolError> {
+    let input: WmiPersistParseInput = parse_args(args)?;
+    match wmi_persist_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::WmiPersistParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("wmi_persist_parse: {e}"))),
+    }
+}
+
+fn dispatch_vss_list(args: Value) -> Result<Value, ToolError> {
+    let input: VssListInput = parse_args(args)?;
+    match vss_list(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::VssError::ImageNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("vss_list: {e}"))),
+    }
+}
+
+fn dispatch_vss_mount(args: Value) -> Result<Value, ToolError> {
+    let input: VssMountInput = parse_args(args)?;
+    match vss_mount(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ (crate::tools::VssError::ImageNotFound(_) | crate::tools::VssError::Case(_))) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("vss_mount: {e}"))),
     }
 }
 
@@ -2078,6 +2433,14 @@ mod tests {
             "vel_collect",
             "browser_history",
             "oe_dbx_parse",
+            "email_parse",
+            "exif_parse",
+            "bits_parse",
+            "srum_parse",
+            "pst_parse",
+            "wmi_persist_parse",
+            "vss_list",
+            "vss_mount",
             "hashset_lookup",
             "thumbcache_parse",
         ];

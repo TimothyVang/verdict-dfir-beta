@@ -4,7 +4,7 @@ The agent has access to two MCP servers, both auto-spawned by Claude Code via `.
 
 | Server | Lang | Tools |
 |---|---|---|
-| `findevil-mcp` | Rust (`services/mcp/`) | 34 typed DFIR tools |
+| `findevil-mcp` | Rust (`services/mcp/`) | 42 typed DFIR tools |
 | `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 14 crypto + ACH + memory + ACP + expert-feedback + accuracy + AI-signature tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
 
 Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the canonical JSON output). Findings cite tool calls by `tool_call_id`. The verifier vetoes any finding that doesn't.
@@ -45,6 +45,11 @@ USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` pat
 Args: `{image_path: str, expected_sha256?: str, label?: str}`
 Returns: `{id, image_path, image_hash, size_bytes, opened_at}`
 Use when: starting an investigation. **Must be called first** — every subsequent tool needs the `case_id`. The image hash is the first audit-chain leaf; if the agent passes `expected_sha256` and it doesn't match, `case_open` errors before any other tool runs.
+
+### bulk_extract
+Args: `{case_id, image_path, scanners?: enum[], find_regexes?: str[], keyword_file?: str, limit?}`
+Returns: `{bulk_extractor_available, engine_version, scanners_requested[], features[]: {feature_type, offset, feature, context}, features_seen, staged_files[]: {feature_type, path, sha256, line_count}, stderr_tail, note}`
+Use when: a raw/E01 disk image is in scope and you need FEATURES from the whole byte stream — allocated files AND unallocated/free space, slack, and deleted regions the filesystem no longer references. This is the deleted-email / free-space feature-recovery surface that the live-filesystem parsers (`mft_timeline`, `disk_extract_artifacts`) cannot reach: it recovers an email whose directory entry is gone. Wraps `bulk_extractor` (Simson Garfinkel). `scanners[]` is the allow-listed set of real scanner names (`email` — which also emits the rfc822/url/domain recorders — `accts`, `httplogs`, `gps`, `exif`, `json`, `net`, `zip`, `gzip`, `pdf`, `sqlite`, `utmp`, `winlnk`, `winprefetch`, `ntfsusn`, `ntfsmft`, `evtx`, `find`); empty runs bulk_extractor's defaults. Keyword/regex hits come ONLY from `find_regexes[]` or an operator `keyword_file` (or `$FINDEVIL_BULK_KEYWORD_FILE`) — NEVER image-specific literals. DETERMINISTIC for `verify_finding` replay: runs single-threaded (`-j 1`), sorts feature rows in-tool, records case-relative staged paths with per-file SHA-256, and puts the bulk_extractor version (never a wall-clock) in the hashed body. INSTALL-FIRST — degrades to `bulk_extractor_available=false` (custody-only, not an error). `$FINDEVIL_BULK_EXTRACTOR_BIN` then PATH. HONEST SCOPE: a recovered feature CONFIRMS the string was present in the imaged bytes; it does not by itself prove authorship, intent, or a live filesystem path.
 
 ### evtx_query
 Args: `{case_id, evtx_path, eids?: int[], xpath?: str, limit?}`
@@ -195,6 +200,46 @@ Use when: a carved XP `Thumbs.db` or Vista+ `thumbcache_*.db` / `iconcache_*.db`
 Args: `{case_id, hashes[] (hex MD5/SHA1/SHA256, ≤10k), hashset_paths?[]: {path, disposition: known_good|known_bad, name?}}`
 Returns: `{results[]: {hash, disposition: known_good|known_bad|unknown, matched_sets[]}, sets_loaded[], hashes_checked}`
 Use when: triaging extracted/recovered file hashes against NSRL known-good or operator known-bad sets. **Pure Rust, in-process** — text sets stream (never loaded whole), SQLite sets (NSRL RDS v3 `FILE` schema or generic `hashes(hash)`) open read-only-immutable, parameterized queries only. Defaults to `$FINDEVIL_HASHSET_DIR/known_good/**` + `known_bad/**`; no sets configured degrades to all-`unknown`, never an error. HONEST SCOPE: `known_good` supports demotion/suppression, `known_bad` is a lead requiring corroboration — a hash match alone is never execution evidence. Fixture-tested only; not yet run against a full NSRL RDS download.
+
+### email_parse
+Args: `{case_id, artifact_path}`
+Returns: `{is_email, format: "eml"|"mbox", message_count, messages[]: {from?, to[], subject?, date?, attachment_names[], attachment_count}, unique_senders[], unique_recipients[], subjects[], attachment_names[]}`
+Use when: a loose `.eml` message or `mbox` archive is in scope (no other tool reads them; `oe_dbx_parse` is Outlook Express `.dbx`). **Pure Rust, in-process** (`mail-parser`). HONEST SCOPE: headers + attachment **filenames** only — it never decodes or writes body/attachment payloads, so a surfaced sender/subject CONFIRMS mail *content* at header granularity, never execution or exfil. Deterministic for replay.
+
+### exif_parse
+Args: `{case_id, artifact_path}`
+Returns: `{has_exif, camera_make?, camera_model?, software?, datetime_original?, datetime?, gps_decimal?: [lat, lon], artist?, copyright?, other_fields[], field_count}`
+Use when: a user-content image (JPEG/TIFF/HEIF/…) may carry EXIF — camera/software fingerprint, capture timestamps, and GPS geolocation. **Pure Rust, in-process** (`kamadak-exif`); reads clean ASCII values (never quoted). HONEST SCOPE: metadata is a device/location LEAD (a photo's GPS is where the shot was taken, not where a person was); no pixel bytes leave the tool. Feeds on carved/extracted images.
+
+### bits_parse
+Args: `{case_id, artifact_path}`
+Returns: `{format: "binary_qmgr"|"ese_qmgr_db"|"unknown", is_bits, ese_requires_external_tool, url_count, urls[], local_path_count, local_paths[], suspicious_url_count}`
+Use when: a Windows BITS state store (`qmgr*.dat` legacy binary, or `qmgr.db` ESE) is in scope — BITS is abused for stealthy download + persistence (MITRE **T1197**). **Pure Rust, in-process**; conservatively extracts embedded UTF-16LE URLs/paths from the legacy format and DETECTS (does not decode) the Win10 1709+ ESE `qmgr.db`. HONEST SCOPE: reports strings actually present (not decoded job state); raw-IPv4 hosts + executable payloads are flagged as T1197 leads, never proof.
+
+### srum_parse
+Args: `{case_id, artifact_path}`
+Returns: `{esedbexport_available, table_found, row_count, rows[]: {app_id, interface_luid?, bytes_sent, bytes_recvd, timestamp?}, total_bytes_sent, total_bytes_recvd, top_talkers[]}`
+Use when: the SRUM database `SRUDB.dat` is in scope — per-app network BytesSent/BytesRecvd per hour, the closest Windows has to a built-in data-transfer-volume ledger. Two-stage: `esedbexport` (libesedb) dumps the ESE tables, then the network table is decoded in Rust. INSTALL-FIRST — degrades to `esedbexport_available=false`. `$FINDEVIL_ESEDBEXPORT_BIN` then PATH. HONEST SCOPE: byte volume is an exfil-VOLUME lead requiring finding-specific corroboration, never proof of exfiltration.
+
+### pst_parse
+Args: `{case_id, artifact_path}`
+Returns: `{pffexport_available, message_count, messages[]: {from?, to[], subject?, delivery_time?, folder?, recovered}, recovered_deleted_count, unique_senders[], subjects[]}`
+Use when: an Outlook `.pst`/`.ost` mail store is in scope (no other tool reads them). `pffexport -m all` (libpff) also RECOVERS deleted/orphaned messages from unallocated PST space. INSTALL-FIRST — degrades to `pffexport_available=false`. `$FINDEVIL_PFFEXPORT_BIN` then PATH. HONEST SCOPE: metadata only (from/to/subject/date/folder + recovered flag), never bodies; a recovered message CONFIRMS mail content at header granularity.
+
+### wmi_persist_parse
+Args: `{case_id, artifact_path}`
+Returns: `{is_wmi_repository, consumer_classes_found[], filter_count, binding_count, command_strings[], script_strings[], persistence_pattern_present}`
+Use when: the WMI CIM repository `OBJECTS.DATA` is in scope — WMI permanent event subscriptions are a fileless persistence primitive (MITRE **T1546.003**). **Pure Rust, in-process, conservative** (no `python-cim` dependency): scans for the persistence class-name signatures (`__EventFilter`, `CommandLineEventConsumer`/`ActiveScriptEventConsumer`, `__FilterToConsumerBinding`) and the command/script strings adjacent to a consumer. HONEST SCOPE: reports strings present (not decoded CIM objects); the consumer+filter+binding triad is flagged as a persistence LEAD, never proof the subscription is active.
+
+### vss_list
+Args: `{case_id, image_path}`
+Returns: `{vshadowinfo_available, has_shadow_store, store_count, stores[]: {store_number, identifier?, creation_time?}}`
+Use when: enumerating Windows Volume Shadow Copies in a volume image — snapshots often still hold a file/registry value deleted or changed on the live volume. `vshadowinfo` (libvshadow). INSTALL-FIRST — degrades to `vshadowinfo_available=false`. `$FINDEVIL_VSHADOWINFO_BIN` then PATH.
+
+### vss_mount
+Args: `{case_id, image_path, mount_point?}`
+Returns: `{vshadowmount_available, mount_id, status, mount_point, shadow_store_paths[], command}`
+Use when: mounting a volume image's shadow copies so a snapshot can be analyzed like any other volume (and diffed against the live one — anti-forensics signal). `vshadowmount` (libvshadow) exposes each snapshot as a `vssN` raw-volume file; returns a case-scoped `mount_id` the normal disk tools read unchanged. Read-only. INSTALL-FIRST — degrades to `vshadowmount_available=false`. `$FINDEVIL_VSHADOWMOUNT_BIN` then PATH.
 
 ---
 

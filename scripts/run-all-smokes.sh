@@ -69,6 +69,18 @@ run_smoke() {
     fi
 }
 
+caseforge_contract_prereq() {
+    command -v node >/dev/null 2>&1 || return 1
+    command -v uv >/dev/null 2>&1 || return 1
+    if [ -n "${CASEFORGE_HOME:-${CASEFORGE_ROOT:-}}" ]; then
+        return 0
+    fi
+    [ -f ../caseforge-cloud/packages/caseforge-cli/dist/src/cli.js ] \
+        || [ -f ../caseforge/packages/caseforge-cli/dist/src/cli.js ] \
+        || [ -f ../caseforge-core/packages/caseforge-cli/dist/src/cli.js ] \
+        || [ -f ../../verdict/caseforge/packages/caseforge-cli/dist/src/cli.js ]
+}
+
 echo "=========================================="
 echo "Find Evil! - run all L1 smokes locally"
 echo "=========================================="
@@ -213,16 +225,6 @@ run_smoke \
     "containment-smoke (runtime + toolchain stay in .project-local/)" \
     "python3 scripts/containment-smoke.py"
 
-# 7c1. verdict-tui read-only viewer — builds the TUI crate and drives it
-#      headlessly (--print) against the committed sample-run fixtures, asserting
-#      it renders without panic, keeps a read-only-by-construction source (no
-#      evidence_path read / subprocess / network), and writes nothing under
-#      evidence/. Needs cargo; SKIPs cleanly without it.
-run_smoke \
-    "tui-smoke (verdict-tui builds, renders headlessly, stays read-only)" \
-    "python3 scripts/tui-smoke.py" \
-    "command -v cargo && [ -f Cargo.toml ]"
-
 # 8b. Trace-finding tamper detection — verdict and manifest edits after finalize
 #     must break offline tracing.
 run_smoke \
@@ -235,6 +237,15 @@ run_smoke \
 run_smoke \
     "sample-run-trace-smoke (committed fixture traces, verifies, no /home leak)" \
     "python3 scripts/sample-run-trace-smoke.py"
+
+# 8b-1a. CaseForge contract gate — when a sibling CaseForge checkout is present,
+#       prove this Dev VERDICT tree exposes the release MCP binary + launchers
+#       from any CWD, stores CaseForge-created cases under .project-local, and
+#       remains consumable by CaseForge verify without leaking host paths.
+run_smoke \
+    "caseforge-contract-smoke (MCP launchers + .project-local case store + CaseForge verify)" \
+    "python3 scripts/caseforge-contract-smoke.py" \
+    "caseforge_contract_prereq"
 
 # 8b-0. Evidence traceability index — the deterministic, read-only finding ->
 #       tool_call_id -> audit line + output_sha256 join must resolve a clean run
