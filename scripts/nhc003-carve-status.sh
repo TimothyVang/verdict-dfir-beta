@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # scripts/nhc003-carve-status.sh — honest status for nhc-003 free-space carve measurement.
 #
-# Never prints a recall percentage. Never claims SCHARDT improvement without
-# a real image + bulk_extractor + recovered content path.
+# Never prints a recall percentage. Never claims SCHARDT improvement without a
+# scored golden match (this script does not implement golden scoring).
 #
 # Exit codes:
-#   0 — STATUS=UNMEASURED (normal when prerequisites missing) or STATUS=PROBE_OK
-#       (binary+image present and a probe ran without tool failure)
+#   0 — STATUS=UNMEASURED or STATUS=PARTIAL_PROBE_UNMEASURED
 #   1 — STATUS=ERROR (tool failure when a probe was attempted)
 #
 # Env:
 #   NHC003_IMAGE / VERDICT_SCHARDT_IMAGE — override path to disk image
-#   NHC003_SKIP_PROBE=1 — only check prerequisites, never run bulk_extractor
+#   NHC003_SKIP_PROBE=1 — only check prerequisites
+#   NHC003_PROBE_MB=512 — bytes to sample from the start of a large image (default 512)
+#   NHC003_PROBE_TIMEOUT=180 — seconds for bulk_extractor (default 180)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,6 +46,7 @@ echo "nhc003-carve-status"
 echo "  bulk_extractor: $([ "$have_bin" = 1 ] && echo "yes ($bin_path)" || echo "no")"
 echo "  schardt_image:  $([ "$have_img" = 1 ] && echo "yes ($img_path)" || echo "no (set NHC003_IMAGE or place evidence/SCHARDT.dd)")"
 echo "  note: synthetic carve smoke is separate (bulk_extract_smoke); this script never claims recall %"
+echo "  golden_nhc003: description='Recovered deleted email discussing the intrusion plan' hint='Outlook PST / free space carve'"
 
 if [ "$have_bin" != 1 ] || [ "$have_img" != 1 ]; then
   echo "STATUS=UNMEASURED"
@@ -58,35 +60,71 @@ if [ "${NHC003_SKIP_PROBE:-0}" = "1" ]; then
   exit 0
 fi
 
-# Bounded probe: only proves the image is readable by bulk_extractor, not golden match.
+probe_mb="${NHC003_PROBE_MB:-512}"
+if ! [[ "${probe_mb}" =~ ^[0-9]+$ ]] || [ "${probe_mb}" -lt 16 ]; then
+  probe_mb=512
+fi
+timeout_s="${NHC003_PROBE_TIMEOUT:-180}"
+if ! [[ "${timeout_s}" =~ ^[0-9]+$ ]] || [ "${timeout_s}" -lt 30 ]; then
+  timeout_s=180
+fi
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-# tiny timeout: status probe, not a full SCHARDT score
+
+# Large images (e.g. full SCHARDT ~4.6G): sample only the first NHC003_PROBE_MB
+# so the status gate stays operator-friendly. This is explicitly a partial probe.
+img_size="$(wc -c <"${img_path}" | tr -d ' ')"
+sample="${tmp}/sample.dd"
+need_bytes=$((probe_mb * 1024 * 1024))
+if [ "${img_size}" -gt "${need_bytes}" ]; then
+  echo "  probe_sample: first ${probe_mb} MiB of ${img_size} byte image (partial; not full-disk score)"
+  dd if="${img_path}" of="${sample}" bs=1M count="${probe_mb}" status=none 2>/dev/null \
+    || dd if="${img_path}" of="${sample}" bs=1048576 count="${probe_mb}" 2>/dev/null
+  probe_img="${sample}"
+else
+  echo "  probe_sample: full image (${img_size} bytes)"
+  probe_img="${img_path}"
+fi
+
+# Hint-derived find patterns only (from golden description/hint words — not full answer key).
+patterns_file="${tmp}/patterns.txt"
+printf '%s\n' 'intrusion' 'email' 'outlook' 'plan' 'hacking' >"${patterns_file}"
+
 set +e
-timeout 120 bulk_extractor -q -j 1 -o "$tmp/out" -E find \
-  -F <(printf '%s\n' 'intrusion' 'hacking' '@') \
-  -- "$img_path" >/tmp/nhc003-probe.log 2>&1
-rc=$?
+if command -v timeout >/dev/null 2>&1; then
+  timeout "${timeout_s}" bulk_extractor -q -j 1 -o "${tmp}/out" -E find \
+    -F "${patterns_file}" -- "${probe_img}" >"${tmp}/probe.log" 2>&1
+  rc=$?
+else
+  bulk_extractor -q -j 1 -o "${tmp}/out" -E find \
+    -F "${patterns_file}" -- "${probe_img}" >"${tmp}/probe.log" 2>&1
+  rc=$?
+fi
 set -e
 
-if [ "$rc" -eq 124 ]; then
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
   echo "STATUS=UNMEASURED"
-  echo "reason: bulk_extractor probe timed out (image present; measurement not completed)"
+  echo "reason: bulk_extractor probe timed out after ${timeout_s}s (partial sample; measurement not completed)"
   exit 0
 fi
 if [ "$rc" -ne 0 ]; then
   echo "STATUS=ERROR"
-  echo "reason: bulk_extractor exited $rc (see probe log if retained)"
-  tail -5 /tmp/nhc003-probe.log 2>/dev/null || true
+  echo "reason: bulk_extractor exited ${rc}"
+  tail -8 "${tmp}/probe.log" 2>/dev/null || true
   exit 1
 fi
 
-# Even on success we do NOT assert golden nhc-003 match here.
 feat_lines=0
-if [ -f "$tmp/out/find.txt" ]; then
-  feat_lines="$(grep -cv '^#' "$tmp/out/find.txt" 2>/dev/null || echo 0)"
+if [ -f "${tmp}/out/find.txt" ]; then
+  feat_lines="$(grep -cv '^#' "${tmp}/out/find.txt" 2>/dev/null || echo 0)"
+fi
+# Sample up to 3 non-comment feature lines for operator visibility (no golden match).
+if [ -f "${tmp}/out/find.txt" ]; then
+  echo "  probe_find_sample:"
+  grep -v '^#' "${tmp}/out/find.txt" 2>/dev/null | head -3 | sed 's/^/    /' || true
 fi
 echo "  probe_find_rows: ${feat_lines}"
-echo "STATUS=UNMEASURED"
-echo "reason: probe completed but golden nhc-003 match is not scored by this script"
+echo "STATUS=PARTIAL_PROBE_UNMEASURED"
+echo "reason: partial free-space find probe finished; golden nhc-003 match is not scored by this script"
 exit 0

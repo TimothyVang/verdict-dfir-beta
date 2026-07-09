@@ -340,10 +340,10 @@ run_smoke \
     "spark-endpoint-smoke (GET /api/tags; SKIP when Spark offline)" \
     "bash scripts/spark-endpoint-smoke.sh"
 
-# 10c. nhc-003 carve measurement status. Always exit 0 with STATUS=UNMEASURED
-#      when SCHARDT image or bulk_extractor is missing — never invents recall.
+# 10c. nhc-003 carve measurement status. Exit 0 with STATUS=UNMEASURED or
+#      STATUS=PARTIAL_PROBE_UNMEASURED — never invents recall %.
 run_smoke \
-    "nhc003-carve-status (honest UNMEASURED unless image+binary; never prints recall %)" \
+    "nhc003-carve-status (UNMEASURED/PARTIAL_PROBE_UNMEASURED; never prints recall %)" \
     "bash scripts/nhc003-carve-status.sh"
 
 # 11. Post-verdict grounding contract. Offline checks (claim extraction, bundle
