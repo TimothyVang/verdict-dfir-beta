@@ -12,6 +12,29 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+### Measured
+
+- **SCHARDT / nhc-003 full re-carve under the #189 bulk-email matcher**
+  (`scripts/verdict --skip-build` on `evidence/SCHARDT.dd`, case
+  `tmp/auto-runs/auto-f3f7a2e2-ff6a-403c-b2ab-1540a2b5b33c`). Exact scorer lines:
+
+  ```
+  recall: 11/14 = 79%
+  nhc-003: MATCHED - Recovered deleted email discussing the intrusion plan matched_run_finding_id=f-B-bulk-deleted-email-bcaaa39b
+  STATUS=SCORED
+  ```
+
+  Committed `docs/sample-run/nist-hacking-case` still scores:
+
+  ```
+  recall: 10/14 = 71%
+  nhc-003: MISSED - Recovered deleted email discussing the intrusion plan
+  STATUS=SCORED
+  ```
+
+  (historical sample-run predates the bulk free-space carve emitter; not
+  regenerated in this change.)
+
 ## [v0.5.0-beta.14] - 2026-07-09
 
 nhc-003 **partial** SCHARDT probe (`STATUS=PARTIAL_PROBE_UNMEASURED`). **No recall %.**
