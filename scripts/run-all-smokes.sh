@@ -341,9 +341,9 @@ run_smoke \
     "bash scripts/spark-endpoint-smoke.sh"
 
 # 10c. nhc-003 carve measurement status. Exit 0 with STATUS=UNMEASURED or
-#      STATUS=PARTIAL_PROBE_UNMEASURED — never invents recall %.
+#      STATUS=PARTIAL_PROBE — never invents recall %.
 run_smoke \
-    "nhc003-carve-status (UNMEASURED/PARTIAL_PROBE_UNMEASURED; never prints recall %)" \
+    "nhc003-carve-status (UNMEASURED/PARTIAL_PROBE; never prints recall %)" \
     "bash scripts/nhc003-carve-status.sh"
 
 # 11. Post-verdict grounding contract. Offline checks (claim extraction, bundle

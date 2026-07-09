@@ -5,7 +5,7 @@
 # scored golden match (this script does not implement golden scoring).
 #
 # Exit codes:
-#   0 — STATUS=UNMEASURED or STATUS=PARTIAL_PROBE_UNMEASURED
+#   0 — STATUS=UNMEASURED or STATUS=PARTIAL_PROBE
 #   1 — STATUS=ERROR (tool failure when a probe was attempted)
 #
 # Image selection, in order:
@@ -22,7 +22,7 @@
 #
 # A larger NHC003_PROBE_MB can make the partial probe less shallow. It still
 # does not become a recall measurement, and this script still exits
-# STATUS=UNMEASURED or STATUS=PARTIAL_PROBE_UNMEASURED unless the tool fails.
+# STATUS=UNMEASURED or STATUS=PARTIAL_PROBE unless the tool fails.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -133,7 +133,7 @@ if [ -f "${tmp}/out/find.txt" ]; then
 fi
 echo "  probe_find_rows: ${feat_lines}"
 if [ "${probe_was_partial}" = "1" ]; then
-  echo "STATUS=PARTIAL_PROBE_UNMEASURED"
+  echo "STATUS=PARTIAL_PROBE"
   echo "reason: partial find probe finished; no golden scorer was run"
 else
   echo "STATUS=UNMEASURED"

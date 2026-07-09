@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Honest nhc-003 score status.
+
+This script may print STATUS=SCORED only after it has run scripts/score-recall.py
+against a finished case directory in this invocation. Without a real case dir, or
+when the scorer cannot run, it reports STATUS=UNMEASURED and prints no recall
+number.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_GOLDEN = ROOT / "goldens" / "nist-hacking-case"
+NHC003_ID = "nhc-003"
+
+
+def _resolve_user_path(raw: str, *, default_root: Path = ROOT) -> Path:
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+
+    cwd_candidate = (Path.cwd() / path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    return (default_root / path).resolve()
+
+
+def _score_arg(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _case_check(case_dir: Path) -> tuple[bool, str]:
+    if not case_dir.is_dir():
+        return False, "case dir missing"
+
+    verdict_path = case_dir / "verdict.json"
+    verdict = _load_json(verdict_path)
+    if verdict is None:
+        return False, "verdict.json missing or invalid"
+
+    if not verdict.get("case_id"):
+        return False, "verdict.json has no case_id"
+    if not verdict.get("verdict"):
+        return False, "verdict.json has no verdict"
+    if not isinstance(verdict.get("findings"), list):
+        return False, "verdict.json findings is not a list"
+    return True, "verdict.json parsed"
+
+
+def _golden_file(golden_dir_or_file: Path) -> Path:
+    if golden_dir_or_file.is_file():
+        return golden_dir_or_file
+    return golden_dir_or_file / "expected-findings.json"
+
+
+def _nhc003_status(score: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    for record in score.get("matched") or []:
+        if isinstance(record, dict) and record.get("finding_id") == NHC003_ID:
+            return "MATCHED", record
+    for record in score.get("unmatched") or []:
+        if isinstance(record, dict) and record.get("finding_id") == NHC003_ID:
+            return "MISSED", record
+    for record in (score.get("missed_by_name") or {}).get("items") or []:
+        if isinstance(record, dict) and record.get("finding_id") == NHC003_ID:
+            return "MISSED", record
+    return "NOT_IN_SCORE", None
+
+
+def _print_unmeasured(case_dir: Path | None, golden: Path, reason: str) -> int:
+    print("nhc003-golden-check")
+    if case_dir is not None:
+        print(f"  case_dir: {_score_arg(case_dir)}")
+    else:
+        print("  case_dir: none (pass a case dir or set NHC003_CASE_DIR)")
+    print(f"  golden: {_score_arg(golden)}")
+    print("  score_recall: not run")
+    print("STATUS=UNMEASURED")
+    print(f"reason: {reason}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run score-recall.py before reporting nhc-003 scored status."
+    )
+    parser.add_argument(
+        "case_dir",
+        nargs="?",
+        help="Finished VERDICT case dir. Also accepted via NHC003_CASE_DIR.",
+    )
+    parser.add_argument(
+        "--golden",
+        default=os.environ.get("NHC003_GOLDEN", str(DEFAULT_GOLDEN)),
+        help="Golden dir or expected-findings.json (default: goldens/nist-hacking-case).",
+    )
+    args = parser.parse_args(argv[1:])
+
+    case_raw = args.case_dir or os.environ.get("NHC003_CASE_DIR")
+    golden = _resolve_user_path(args.golden)
+    golden_file = _golden_file(golden)
+
+    if not golden_file.is_file():
+        return _print_unmeasured(
+            _resolve_user_path(case_raw) if case_raw else None,
+            golden,
+            "golden expected-findings.json missing",
+        )
+
+    if not case_raw:
+        return _print_unmeasured(None, golden, "no case dir supplied")
+
+    case_dir = _resolve_user_path(case_raw)
+    ok, reason = _case_check(case_dir)
+    if not ok:
+        return _print_unmeasured(case_dir, golden, reason)
+
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "score-recall.py"),
+        _score_arg(case_dir),
+        "--golden",
+        _score_arg(golden_file),
+        "--quiet",
+    ]
+    completed = subprocess.run(
+        cmd, cwd=ROOT, text=True, capture_output=True, check=False
+    )
+    if completed.returncode not in (0, 1):
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        return _print_unmeasured(
+            case_dir,
+            golden,
+            f"score-recall.py exited {completed.returncode}{suffix}",
+        )
+
+    score_path = case_dir / "recall-score.json"
+    score = _load_json(score_path)
+    if score is None:
+        return _print_unmeasured(
+            case_dir, golden, "score-recall.py produced no score JSON"
+        )
+
+    nhc_status, record = _nhc003_status(score)
+    recalled = score.get("recalled_n")
+    expected = score.get("expected_n")
+    percent = score.get("recall_percent")
+
+    print("nhc003-golden-check")
+    print(f"  case_dir: {_score_arg(case_dir)}")
+    print(f"  golden: {_score_arg(golden_file)}")
+    print(f"  score_recall: ran (exit {completed.returncode})")
+    print(f"  scorer_result: {'PASS' if score.get('pass') else 'FAIL'}")
+    print(f"  recall: {recalled}/{expected} = {percent}%")
+    if record:
+        desc = record.get("description") or ""
+        matched_run = record.get("matched_run_finding_id")
+        suffix = f" matched_run_finding_id={matched_run}" if matched_run else ""
+        print(f"  {NHC003_ID}: {nhc_status} - {desc}{suffix}")
+    else:
+        print(f"  {NHC003_ID}: {nhc_status}")
+    print("STATUS=SCORED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
