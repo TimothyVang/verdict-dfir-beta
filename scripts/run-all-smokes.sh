@@ -340,6 +340,11 @@ run_smoke \
     "spark-endpoint-smoke (GET /api/tags; SKIP when Spark offline)" \
     "bash scripts/spark-endpoint-smoke.sh"
 
+# 10b2. Offline doctor profile — scripts/verdict must not require Claude login.
+run_smoke \
+    "doctor-offline-smoke (Claude credential optional; scripts/verdict --offline preflight)" \
+    "python3 scripts/doctor-offline-smoke.py"
+
 # 10c. nhc-003 carve measurement status. Exit 0 with STATUS=UNMEASURED or
 #      STATUS=PARTIAL_PROBE — never invents recall %.
 run_smoke \

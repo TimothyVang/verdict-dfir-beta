@@ -5,7 +5,8 @@
 # five-second up-front checklist. Reports, for a stock Linux / SIFT Workstation:
 #
 #   REQUIRED   — without these no investigation can run at all
-#                (claude CLI, cargo/rustc, uv).
+#                (online: claude CLI + credential; offline: python/git/cargo/uv
+#                + MCP only — Claude login is optional).
 #   DFIR tools — the external binaries the Rust MCP server shells out to.
 #                Resolved the SAME way the server resolves them ($VOLATILITY_BIN
 #                then vol/vol.py/volatility3, $HAYABUSA_BIN then hayabusa, etc.).
@@ -38,8 +39,22 @@ c_off=$'\033[0m'
 
 # --json emits a machine-readable report (consumed by /api/doctor + /setup) and
 # suppresses the human output. Without it, behaviour is unchanged.
+#
+# --offline (or VERDICT_OFFLINE=1 / DOCTOR_OFFLINE=1) is the Spark / GB10 / pure
+# engine path: Claude CLI + Anthropic login are optional. The default rulebook
+# engine (scripts/find_evil_auto.py via scripts/verdict) never needs Claude.
+# install.sh keeps the online (Claude Code) profile unless DOCTOR_OFFLINE is set.
 JSON_MODE=""
-for _arg in "$@"; do [ "${_arg}" = "--json" ] && JSON_MODE=1; done
+OFFLINE_MODE=""
+for _arg in "$@"; do
+  case "${_arg}" in
+    --json) JSON_MODE=1 ;;
+    --offline) OFFLINE_MODE=1 ;;
+  esac
+done
+if [ -z "${OFFLINE_MODE}" ] && { [ "${VERDICT_OFFLINE:-}" = "1" ] || [ "${DOCTOR_OFFLINE:-}" = "1" ]; }; then
+  OFFLINE_MODE=1
+fi
 declare -a JSON_ROWS=()
 GROUP="general"
 
@@ -126,11 +141,17 @@ optional() {
 if [ -z "${JSON_MODE}" ]; then
   echo "=========================================="
   echo "Find Evil! — environment doctor"
+  if [ -n "${OFFLINE_MODE}" ]; then
+    echo "profile: offline (rulebook / local-engine; Claude not required)"
+  else
+    echo "profile: online (Claude Code agent path)"
+  fi
   echo "=========================================="
 fi
 
 # ---------------------------------------------------------------------------
 # Claude credential mode (mirrors scripts/install.sh §1).
+# Offline profile: warn-only — scripts/verdict uses find_evil_auto without Claude.
 # ---------------------------------------------------------------------------
 GROUP="Claude credential"
 [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}Claude credential${c_off}"; }
@@ -141,9 +162,14 @@ elif command -v claude >/dev/null 2>&1 && [ -d "${HOME}/.claude" ]; then
 elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   row ok "credential" "mode 3: ANTHROPIC_API_KEY"
 else
-  row err "credential" "none of the 3 modes detected"
-  REMEDIES+=("credential: run 'claude setup-token', or 'claude auth login', or export ANTHROPIC_API_KEY")
-  missing_required=$((missing_required + 1))
+  if [ -n "${OFFLINE_MODE}" ]; then
+    row warn "credential" "none detected — offline profile OK (rulebook engine does not need Claude)"
+    REMEDIES+=("credential (opt for offline): run 'claude setup-token' only if you want Claude Code /verdict, not required for scripts/verdict")
+  else
+    row err "credential" "none of the 3 modes detected"
+    REMEDIES+=("credential: run 'claude setup-token', or 'claude auth login', or export ANTHROPIC_API_KEY (or: bash scripts/doctor.sh --offline for rulebook-only)")
+    missing_required=$((missing_required + 1))
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -157,12 +183,47 @@ require "git"     "install git from https://git-scm.com/downloads" \
         git --version
 require "unzip"   "install unzip: apt install unzip / brew install unzip / choco install unzip" \
         unzip -v
-require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
-        claude --version
+if [ -n "${OFFLINE_MODE}" ]; then
+  if command -v claude >/dev/null 2>&1; then
+    row ok "claude" "$(claude --version 2>&1 | head -1)"
+  else
+    row warn "claude" "absent — optional offline (Claude Code /verdict path only)"
+    REMEDIES+=("claude (opt for offline): npm install -g @anthropic-ai/claude-code")
+  fi
+else
+  require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
+          claude --version
+fi
 require "cargo"   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" \
         cargo --version
 require "uv"      "curl -LsSf https://astral.sh/uv/install.sh | sh" \
         uv --version
+
+# Offline engine surface (informational): VERDICT_BIN / OPENCODE_BIN / local LLM.
+if [ -n "${OFFLINE_MODE}" ]; then
+  GROUP="Offline engine"
+  [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}Offline engine${c_off} ${c_dim}(optional; rulebook find_evil_auto is enough for EVTX hard-quiz)${c_off}"; }
+  if [ -n "${VERDICT_BIN:-}" ] && [ -x "${VERDICT_BIN}" ]; then
+    row ok "VERDICT_BIN" "${VERDICT_BIN}"
+  elif command -v verdict >/dev/null 2>&1; then
+    row ok "verdict" "$(command -v verdict)"
+  else
+    row warn "verdict" "no VERDICT_BIN — scripts/verdict uses find_evil_auto.py directly"
+  fi
+  if [ -n "${OPENCODE_BIN:-}" ] && [ -x "${OPENCODE_BIN}" ]; then
+    row ok "OPENCODE_BIN" "${OPENCODE_BIN}"
+  elif command -v opencode >/dev/null 2>&1; then
+    row ok "opencode" "$(command -v opencode)"
+  else
+    row warn "opencode" "absent — only needed for agent/Spark harness, not rulebook"
+  fi
+  llm_base="${VERDICT_LLM_BASEURL:-${CASEFORGE_SPARK_ENDPOINT:-}}"
+  if [ -n "${llm_base}" ]; then
+    row ok "local LLM URL" "${llm_base}"
+  else
+    row warn "local LLM URL" "unset — set VERDICT_LLM_BASEURL for Spark/Ollama agent path"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # MCP servers — the typed tool surface Claude Code auto-spawns from .mcp.json.
@@ -304,6 +365,8 @@ fi
 if [ -n "${JSON_MODE}" ]; then
   ready=true
   [ "${missing_required}" -ne 0 ] && ready=false
+  offline_json=false
+  [ -n "${OFFLINE_MODE}" ] && offline_json=true
   saved_ifs="${IFS}"
   IFS=,
   rows_joined="${JSON_ROWS[*]:-}"
@@ -315,8 +378,8 @@ if [ -n "${JSON_MODE}" ]; then
       rem_json+="\"$(json_escape "${r}")\""
     done
   fi
-  printf '{"ready":%s,"missing_required":%d,"checks":[%s],"remedies":[%s]}\n' \
-    "${ready}" "${missing_required}" "${rows_joined}" "${rem_json}"
+  printf '{"ready":%s,"missing_required":%d,"offline":%s,"checks":[%s],"remedies":[%s]}\n' \
+    "${ready}" "${missing_required}" "${offline_json}" "${rows_joined}" "${rem_json}"
   exit 0
 fi
 
@@ -331,8 +394,13 @@ if [ "${#REMEDIES[@]}" -gt 0 ]; then
 fi
 
 if [ "${missing_required}" -eq 0 ]; then
-  echo "${c_grn}READY${c_off} — all required tools present. EVTX investigations run fully in-process;"
-  echo "any missing DFIR binary above just surfaces as a clean BinaryNotFound the agent pivots on."
+  if [ -n "${OFFLINE_MODE}" ]; then
+    echo "${c_grn}READY${c_off} (offline) — rulebook / local-engine path is unblocked without Claude login."
+    echo "EVTX investigations run fully in-process; Claude Code remains optional."
+  else
+    echo "${c_grn}READY${c_off} — all required tools present. EVTX investigations run fully in-process;"
+    echo "any missing DFIR binary above just surfaces as a clean BinaryNotFound the agent pivots on."
+  fi
   echo "=========================================="
   exit 0
 else

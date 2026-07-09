@@ -1631,11 +1631,17 @@ run_fleet() {
 [[ "${FLEET}" == "1" ]] && run_fleet
 
 # 1. preflight ---------------------------------------------------------------
+# Default engine is find_evil_auto (no Claude). Doctor --offline skips Claude
+# login as a hard requirement. Set VERDICT_REQUIRE_CLAUDE=1 for online doctor.
 log "1/4 preflight"
+DOCTOR_ARGS=(--offline)
+if [[ "${VERDICT_REQUIRE_CLAUDE:-}" == "1" ]]; then
+  DOCTOR_ARGS=()
+fi
 if [[ "${DRY}" == "1" ]]; then
-  ok "DRY-RUN: bash scripts/doctor.sh"
+  ok "DRY-RUN: bash scripts/doctor.sh ${DOCTOR_ARGS[*]:-}"
 elif [[ -f scripts/doctor.sh ]]; then
-  bash scripts/doctor.sh || fail "doctor reported missing dependencies — fix them, then re-run"
+  bash scripts/doctor.sh "${DOCTOR_ARGS[@]}" || fail "doctor reported missing dependencies — fix them, then re-run"
 else
   warn "scripts/doctor.sh not found; skipping preflight"
 fi

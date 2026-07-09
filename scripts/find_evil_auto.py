@@ -3207,15 +3207,22 @@ _BULK_EMAIL_TOKENS = (
     "email",
     "mail",
 )
-_BULK_ATTACK_PLAN_TERMS = (
+_BULK_INTRUSION_CONCEPT_TERMS = (
     "intrusion",
-    "plan",
-    "planning",
     "attack",
     "hacking",
     "hack",
     "exploit",
     "target",
+)
+_BULK_PLANNING_CONCEPT_TERMS = (
+    "plan",
+    "planning",
+    "schedule",
+    "scheduled",
+    "weekend",
+    "tonight",
+    "tomorrow",
 )
 
 
@@ -3269,15 +3276,20 @@ def bulk_extract_deleted_email_candidates(
         if not isinstance(feature, dict) or not _bulk_emailish_feature(feature):
             continue
         text = _bulk_feature_text(feature)
-        terms = {term for term in _BULK_ATTACK_PLAN_TERMS if _contains_word(text, term)}
-        if not terms:
+        intrusion_terms = {
+            term for term in _BULK_INTRUSION_CONCEPT_TERMS if _contains_word(text, term)
+        }
+        planning_terms = {
+            term for term in _BULK_PLANNING_CONCEPT_TERMS if _contains_word(text, term)
+        }
+        if not (intrusion_terms and planning_terms):
             continue
         relevant.append(feature)
-        observed_terms.update(terms)
+        observed_terms.update(intrusion_terms)
+        observed_terms.update(planning_terms)
         feature_types.add(str(feature.get("feature_type") or "unknown"))
 
-    required = {"intrusion", "plan"}
-    if not required.issubset(observed_terms):
+    if not relevant:
         return []
 
     snippets: list[str] = []
@@ -12793,6 +12805,11 @@ class Investigation:
             "case_id": disk_case_id,
             "image_path": str(image_path),
             "scanners": ["email", "ntfsusn", "ntfsmft", "winprefetch"],
+            # SCHARDT-class images can produce tens of thousands of domain rows
+            # before email/rfc822 rows in the tool's stable sort. Keep the output
+            # bounded, but high enough for recovered mail context to reach the
+            # candidate selector.
+            "limit": 100_000,
         }
         be_out = rust.call_tool("bulk_extract", be_args, timeout=1800.0)
         if not isinstance(be_out, dict):

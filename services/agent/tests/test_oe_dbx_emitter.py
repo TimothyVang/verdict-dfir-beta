@@ -268,6 +268,26 @@ class TestBulkExtractDeletedEmailRecovery:
 
         assert fea.bulk_extract_deleted_email_candidates(out, "tc-bulk") == []
 
+    def test_hack_weekend_rfc822_subject_is_candidate(self) -> None:
+        out = {
+            "bulk_extractor_available": True,
+            "features": [
+                {
+                    "feature_type": "rfc822",
+                    "offset": "1851240893",
+                    "feature": "Subject: P4 hack release s this weekend?",
+                    "context": "alt.dss.hack Subject: P4 hack release s this weekend?",
+                }
+            ],
+            "features_seen": 1,
+        }
+
+        cands = fea.bulk_extract_deleted_email_candidates(out, "tc-bulk")
+
+        assert len(cands) == 1
+        assert cands[0]["observed_terms"] == ["hack", "weekend"]
+        assert "p4 hack release" in " ".join(cands[0]["snippets"]).lower()
+
     def test_candidate_becomes_pool_b_finding_matching_nhc003_terms(self) -> None:
         inv = self._inv()
         inv._emit_bulk_extract_deleted_email_finding(
