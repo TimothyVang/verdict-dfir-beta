@@ -12,6 +12,18 @@ canonical GitHub repo before any refreshed release.
 
 ## [Unreleased]
 
+## [v0.5.0-beta.11] - 2026-07-09
+
+Operator seal-proof path for real local ed25519 custody. **Still toolkit-only.**
+**SCHARDT/nhc-003 recall unmeasured. Live Spark agent seal not claimed.**
+
+### Added
+
+- **`scripts/local-ed25519-seal-proof.sh`** — one-command uv gate for ed25519
+  finalize+verify and stub-coerce (PR #177). Proves the custody path offline;
+  does not run a live LLM on Spark.
+
+
 ## [v0.5.0-beta.10] - 2026-07-09
 
 Synthetic free-space carve recovery smoke. **Still toolkit-only.** **SCHARDT/nhc-003 recall remains unmeasured.**
