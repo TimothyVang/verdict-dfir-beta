@@ -15,7 +15,7 @@
       "tier": "amber",
       "note": "Raw .dd parses locally (no SIFT). SCHARDT is in the golden set; treat a strong score as regression signal, not blind generalization.",
       "mechanism_coverage": {
-        "nhc-003": "Deleted-email / free-space feature recovery (goldens/nist-hacking-case/expected-findings.json finding nhc-003, 'Outlook PST / free space carve') is now MECHANISM-SCOREABLE via the bulk_extract MCP tool (wraps bulk_extractor over the raw image's unallocated space), which closes the prior engine false-negative. NOT YET MEASURED here: an end-to-end recall delta needs BOTH the bulk_extractor binary AND a carving fixture with a recoverable deleted email; the tool + determinism/degradation are verified, the SCHARDT recall improvement is not asserted until scored."
+        "nhc-003": "Deleted-email / free-space feature recovery (nhc-003, 'Outlook PST / free space carve') is MECHANISM-SCOREABLE via bulk_extract + bulk_extract_deleted_email_candidates (requires co-located intrusion+plan on email-like feature rows). CONTENT PROBE: scripts/nhc003-absence-check over bulk_extractor email.txt/find.txt. On SCHARDT.dd full-image email probe (m17/m18): STATUS=ABSENT \u2014 zero co-located intrusion+plan email-like rows (subjects are MSN welcome / spam / newsgroups; no PST). Honest ceiling remains 10/14 = 71% until a different image supplies recoverable content. Do not invent a SCHARDT true positive."
       }
     },
     {

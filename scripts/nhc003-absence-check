@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Honest nhc-003 content-absence / presence probe over bulk_extractor feature files.
+
+Never invents a golden match. Never prints a recall percentage.
+
+STATUS values:
+  ABSENT     — probe ran; zero co-located intrusion+plan email-like rows
+  PRESENT    — co-located intrusion+plan email-like rows found (diagnostic only;
+               not a golden match until score-recall on a real case)
+  UNMEASURED — no probe inputs / skipped
+  ERROR      — unreadable input
+
+Inputs (any combination):
+  --email-txt PATH   bulk_extractor email.txt (or feature file with email rows)
+  --find-txt PATH    bulk_extractor find.txt
+  --probe-dir PATH   directory containing email.txt and/or find.txt
+
+Environment fallbacks:
+  NHC003_PROBE_DIR  default probe directory
+  NHC003_EMAIL_TXT / NHC003_FIND_TXT
+
+Exit 0 for ABSENT / PRESENT / UNMEASURED; exit 1 for ERROR.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+_INTRUSION = re.compile(r"\bintrusion\b", re.I)
+_PLAN = re.compile(r"\bplans?\b|\bplanning\b", re.I)
+_EMAILISH = re.compile(
+    r"@|subject:|from:|to:|message-id:|outlook|email|rfc822|msn_welcome",
+    re.I,
+)
+
+
+def _resolve(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        cwd = (Path.cwd() / path).resolve()
+        if cwd.exists():
+            return cwd
+        return (ROOT / path).resolve()
+    return path.resolve()
+
+
+def _count_lines(path: Path) -> tuple[int, int, int, list[str]]:
+    """Return (total, intrusion_hits, co_located_intrusion_plan, sample_co_rows)."""
+    total = 0
+    intrusion = 0
+    colocated = 0
+    samples: list[str] = []
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        total += 1
+        if not _INTRUSION.search(line):
+            continue
+        intrusion += 1
+        if _PLAN.search(line) and _EMAILISH.search(line):
+            colocated += 1
+            if len(samples) < 5:
+                samples.append(line[:200])
+        elif _PLAN.search(line):
+            # plan+intrusion but not emailish — still count as colocated content
+            # only when email-ish for nhc-003 email claim
+            pass
+    return total, intrusion, colocated, samples
+
+
+def _count_intrusion_plan_any(path: Path) -> int:
+    n = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if _INTRUSION.search(line) and _PLAN.search(line):
+            n += 1
+    return n
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--email-txt", default=os.environ.get("NHC003_EMAIL_TXT"))
+    parser.add_argument("--find-txt", default=os.environ.get("NHC003_FIND_TXT"))
+    parser.add_argument("--probe-dir", default=os.environ.get("NHC003_PROBE_DIR"))
+    args = parser.parse_args(argv[1:])
+
+    email = _resolve(args.email_txt)
+    find = _resolve(args.find_txt)
+    probe_dir = _resolve(args.probe_dir)
+
+    if probe_dir and probe_dir.is_dir():
+        if email is None and (probe_dir / "email.txt").is_file():
+            email = probe_dir / "email.txt"
+        if find is None and (probe_dir / "find.txt").is_file():
+            find = probe_dir / "find.txt"
+        # bulk_extractor often nests under out/
+        out = probe_dir / "out"
+        if out.is_dir():
+            if email is None and (out / "email.txt").is_file():
+                email = out / "email.txt"
+            if find is None and (out / "find.txt").is_file():
+                find = out / "find.txt"
+
+    print("nhc003-absence-check")
+    print(f"  email_txt: {email if email and email.is_file() else 'none'}")
+    print(f"  find_txt:  {find if find and find.is_file() else 'none'}")
+    print("  note: co-located intrusion+plan on email-like rows only; not a golden score")
+
+    if (email is None or not email.is_file()) and (find is None or not find.is_file()):
+        print("STATUS=UNMEASURED")
+        print("reason: no email.txt/find.txt probe inputs (run bulk_extractor or pass --probe-dir)")
+        return 0
+
+    email_co = 0
+    find_co_any = 0
+    email_total = 0
+    email_intr = 0
+    samples: list[str] = []
+
+    if email is not None and email.is_file():
+        try:
+            email_total, email_intr, email_co, samples = _count_lines(email)
+        except OSError as exc:
+            print("STATUS=ERROR")
+            print(f"reason: cannot read email.txt: {exc}")
+            return 1
+        print(f"  email_rows: {email_total}")
+        print(f"  email_intrusion_hits: {email_intr}")
+        print(f"  email_colocated_intrusion_plan_emailish: {email_co}")
+
+    if find is not None and find.is_file():
+        try:
+            find_co_any = _count_intrusion_plan_any(find)
+            find_total = sum(
+                1
+                for line in find.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip() and not line.startswith("#")
+            )
+        except OSError as exc:
+            print("STATUS=ERROR")
+            print(f"reason: cannot read find.txt: {exc}")
+            return 1
+        print(f"  find_rows: {find_total}")
+        print(f"  find_colocated_intrusion_plan_any: {find_co_any}")
+
+    if samples:
+        print("  samples:")
+        for s in samples:
+            print(f"    - {s}")
+
+    if email_co > 0:
+        print("STATUS=PRESENT")
+        print(
+            "reason: co-located intrusion+plan email-like feature rows found "
+            "(diagnostic only — run score-recall on a sealed case for golden match)"
+        )
+        return 0
+
+    # Honest ABSENT only when we actually scanned an email feature file.
+    if email is not None and email.is_file():
+        print("STATUS=ABSENT")
+        print(
+            "reason: bulk_extractor email feature rows contain no co-located "
+            "intrusion+plan email-like content; nhc-003 remains unmatched on this probe"
+        )
+        if find_co_any:
+            print(
+                f"note: find.txt has {find_co_any} intrusion+plan co-locations that are "
+                "not email-like (e.g. web/docs noise); not counted as nhc-003 content"
+            )
+        return 0
+
+    print("STATUS=UNMEASURED")
+    print("reason: only find.txt provided; email feature file required for ABSENT/PRESENT")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
