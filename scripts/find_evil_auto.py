@@ -17352,7 +17352,7 @@ def main() -> int:
         "--agent-provider",
         metavar="NAME",
         default=None,
-        help="Agent LLM provider (default: anthropic / $FINDEVIL_AGENT_PROVIDER).",
+        help="Agent LLM provider (default: claude_cli / $FINDEVIL_AGENT_PROVIDER).",
     )
     p.add_argument(
         "--agent-model",

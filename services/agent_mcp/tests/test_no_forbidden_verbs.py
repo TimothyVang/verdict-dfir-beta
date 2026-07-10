@@ -128,7 +128,7 @@ def rust_tool_names() -> set[str]:
 
     The names are declared exactly once, in ``build_registry()``, as
     ``name: "<tool>",`` lines on each ``ToolEntry``. We anchor the regex to
-    that exact shape so we pick up the 31 real registrations and not the
+    that exact shape so we pick up the 43 real registrations and not the
     JSON ``"name":`` keys or ``params`` literals used elsewhere in the file.
     """
     server_rs = Path(__file__).resolve().parents[2] / "mcp" / "src" / "server.rs"
@@ -149,9 +149,9 @@ def python_tool_names() -> set[str]:
 
 class TestNoForbiddenVerbs:
     def test_rust_registry_enumerates_expected_count(self) -> None:
-        # Sanity: the Rust product surface is 34 audit-chained tools.
+        # Sanity: the Rust product surface is 43 audit-chained tools.
         names = rust_tool_names()
-        assert len(names) == 34, f"expected 34 Rust tools, parsed {len(names)}: {sorted(names)}"
+        assert len(names) == 43, f"expected 43 Rust tools, parsed {len(names)}: {sorted(names)}"
 
     def test_python_registry_enumerates_expected_count(self) -> None:
         # Sanity: the Python product surface is 14 audit-chained tools.

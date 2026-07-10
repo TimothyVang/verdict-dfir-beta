@@ -24,8 +24,10 @@ from .claude_cli import ClaudeCliProvider
 from .openai_provider import OpenAIProvider
 from .types import ChatProvider
 
-DEFAULT_PROVIDER = "anthropic"
-# Workhorse default for a long tool-using investigation loop; operators can raise to
+# Subscription-backed default: headless Claude Code CLI (no API key). Cloud egress
+# still requires --acknowledge-evidence-egress because evidence reaches Anthropic.
+DEFAULT_PROVIDER = "claude_cli"
+# Workhorse default for the anthropic Messages API path; operators can raise to
 # a deeper-reasoning model via FINDEVIL_AGENT_MODEL / --model.
 DEFAULT_MODEL = "claude-sonnet-4-6"
 # Per-provider default model. The OpenAI-compatible family has no universal default —

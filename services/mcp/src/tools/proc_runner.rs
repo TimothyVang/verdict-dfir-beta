@@ -370,6 +370,10 @@ mod tests {
             );
         }
 
+        // Linux-only: the whole-group-reap guarantee is implemented via `/proc`.
+        // On other Unix (macOS/BSD) the runner deliberately degrades to a
+        // leader-only kill, so this stronger property does not hold there.
+        #[cfg(target_os = "linux")]
         #[test]
         fn spawned_child_owns_a_distinct_group() {
             // Proves process_group(0) takes effect here: a child launched the way
@@ -400,6 +404,10 @@ mod tests {
             let _ = child.wait();
         }
 
+        // Linux-only: see note on spawned_child_owns_a_distinct_group. The
+        // whole-group `/proc` reap is a Linux guarantee; macOS/BSD degrade to a
+        // leader-only kill and would (correctly) leak the grandchild here.
+        #[cfg(target_os = "linux")]
         #[test]
         fn timeout_reaps_whole_process_group_not_just_leader() {
             // Distinguishes a whole-group kill from a leader-only kill. The leader

@@ -63,6 +63,19 @@ def test_claude_cli_selected_with_default_model() -> None:
     assert p.model == "claude-opus-4-8"  # CLI-appropriate per-provider default
 
 
+def test_bare_agent_defaults_to_claude_cli_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented subscription-backed default must not require an API key."""
+    monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("FINDEVIL_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    provider = build_provider(acknowledge_evidence_egress=True)
+
+    assert isinstance(provider, ClaudeCliProvider)
+
+
 def test_claude_cli_requires_egress_ack() -> None:
     with pytest.raises(EvidenceEgressError):
         build_provider(provider="claude_cli", acknowledge_evidence_egress=False)
@@ -127,7 +140,7 @@ def test_provider_requires_egress_ack_flags_cloud_but_not_on_prem(
 def test_provider_requires_egress_ack_defaults_to_cloud(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Bare --agent (no provider) resolves to the anthropic default, which is cloud.
+    # Bare --agent resolves to the claude_cli default, which is still cloud.
     monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
     assert provider_requires_egress_ack(None) is True
 
@@ -138,4 +151,4 @@ def test_resolve_provider_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_provider("LOCAL") == "local"  # explicit wins, lowercased
     assert resolve_provider(None) == "openrouter"  # env
     monkeypatch.delenv("FINDEVIL_AGENT_PROVIDER", raising=False)
-    assert resolve_provider(None) == "anthropic"  # default
+    assert resolve_provider(None) == "claude_cli"  # subscription-backed default

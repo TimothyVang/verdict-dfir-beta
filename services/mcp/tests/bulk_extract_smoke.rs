@@ -156,8 +156,10 @@ fn bulk_extract_rejects_traversal_case_id() {
     let input = sample_input("../../foo", image);
     let err = bulk_extract(&input).unwrap_err();
     assert!(matches!(err, BulkExtractError::InvalidCaseId(_)));
-    // Nothing was created outside the sandbox.
-    assert!(!home.join("cases").join("..").exists());
+    // Rejected before any filesystem mutation: no case sandbox was created at
+    // all. (Avoid a `..`-suffixed path check — Windows normalizes `cases/..`
+    // to an existing dir lexically, unlike POSIX stat, giving a false failure.)
+    assert!(!home.join("cases").exists());
 }
 
 // --- honest degradation (forced) -------------------------------------------
