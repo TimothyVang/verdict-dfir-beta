@@ -12,19 +12,25 @@
 //! `vol_psxview` for process-view corroboration, then use
 //! `vol_malfind` for code-injection triage.
 //!
-//! Volatility invocation: `<vol> -f <memory> -r json windows.pslist`.
+//! Volatility invocation: `<vol> --offline -f <memory> -r json windows.pslist`.
 //! `-r json` writes a clean JSON array to stdout. Binary discovery
 //! tries `$VOLATILITY_BIN`, then `vol`, `vol.py`, `volatility3`,
 //! `volatility` on PATH.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const TIMEOUT_ENV: &str = "FINDEVIL_VOL_TIMEOUT_SECS";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +116,12 @@ pub enum VolError {
     #[error("volatility exited {exit_code}: {stderr}")]
     SubprocessFailed { exit_code: i32, stderr: String },
 
+    #[error("volatility exceeded its {seconds} s time budget and was killed")]
+    Timeout { seconds: u64 },
+
+    #[error("volatility {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit { stream: String, limit: usize },
+
     #[error("could not parse volatility JSON output: {0}")]
     OutputParse(String),
 }
@@ -137,23 +149,17 @@ pub fn vol_pslist(input: &VolPslistInput) -> Result<VolPslistOutput, VolError> {
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
 
     let mut cmd = Command::new(&binary);
-    cmd.arg("-f")
-        .arg(&input.memory_path)
-        .arg("-r")
-        .arg("json")
-        .arg("-q") // quiet — suppress progress on stderr where possible
-        .arg("windows.pslist");
+    cmd.args(crate::tools::vol_run::build_vol_args(
+        &input.memory_path,
+        "windows.pslist",
+        None,
+    ));
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            VolError::BinaryNotFound
-        } else {
-            VolError::SubprocessFailed {
-                exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
-            }
-        }
-    })?;
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(map_run_error)?;
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -171,6 +177,45 @@ pub fn vol_pslist(input: &VolPslistInput) -> Result<VolPslistOutput, VolError> {
         limit,
         stderr_tail,
     )
+}
+
+fn map_run_error(error: RunError) -> VolError {
+    match error {
+        RunError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            VolError::BinaryNotFound
+        }
+        RunError::Timeout(duration) => VolError::Timeout {
+            seconds: duration.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => VolError::OutputLimit {
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::Spawn(error) => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("spawn failed: {error}"),
+        },
+        RunError::Io(error) => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("io error: {error}"),
+        },
+        RunError::PipeStillOpen { streams } => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => VolError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "volatility output reader thread panicked".to_string(),
+        },
+    }
 }
 
 fn resolve_binary() -> Result<PathBuf, VolError> {

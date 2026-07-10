@@ -1,10 +1,10 @@
 > **Status: ACTIVE.** Operator-facing per-tool guidance for the under-documented corners of the typed MCP surface — the args, hive locations, scope caps, and failure modes that the per-tool entries in `agent-config/TOOLS.md` summarize but don't expand. Read this before driving these tools on a Case; read `agent-config/MEMORY.md` for the Tier-1 artifact caveats it builds on.
 
-Scope: the 48 product tools (34 Rust `findevil-mcp` + 14 Python `findevil-agent-mcp`) are the only audit-chained surface; `.mcp.json` registers 6 servers total (4 non-product, incl. `qmd` dev-memory). Canonical inventory and pins:
+Scope: the 57 product tools (43 Rust `findevil-mcp` + 14 Python `findevil-agent-mcp`) are the only audit-chained surface; `.mcp.json` registers 6 servers total (4 non-product, incl. `qmd` dev-memory). Canonical inventory and pins:
 
 - Tool inventory & server map → [`docs/reference/mcp-and-tools.md`](../reference/mcp-and-tools.md)
 - Crate/binary versions → [`docs/reference/dependencies.md`](../reference/dependencies.md)
-- Env-var overrides (`$VOLATILITY_BIN`, `$VELOCIRAPTOR_BIN`, `$TSHARK_BIN`/`$ZEEK_BIN`, YARA rule paths) → [`docs/reference/environment-variables.md`](../reference/environment-variables.md)
+- Env-var overrides (`$VOLATILITY_BIN`, `$TSHARK_BIN`/`$ZEEK_BIN`, YARA rule paths) → [`docs/reference/environment-variables.md`](../reference/environment-variables.md)
 
 Every successful call carries `_meta.output_sha256`; every Finding cites a `tool_call_id`. Nothing below changes that contract.
 
@@ -86,31 +86,19 @@ The tool also accepts any `*.dat` file by extension. An optional `HKLM\` / `HKCU
 
 ---
 
-## 4. `vel_collect` — Velociraptor artifact trampoline
+## 4. Velociraptor collection ZIPs
 
-Generic wrapper over `velociraptor artifacts collect <artifact> --format jsonl [--args k=v ...]`. The wrapper bakes in **no** artifact knowledge — you pick the artifact name and its parameters.
-
-### Artifact dotted-path selection
-
-`artifact` must be a **dotted ASCII path** (`Windows.Forensics.Prefetch`, `Generic.Forensic.LocalHashes`, `Windows.Persistence.Services`). The validator (`is_valid_artifact_name`) accepts only `[A-Za-z0-9_]` segments joined by single dots — no leading/trailing dot, no double dot, **no spaces, slashes, semicolons, or `--flags`**. That last point is the injection guard: the artifact name becomes argv, so `Has--Flag` or `Has/Slash` is rejected up front. Discover valid names out-of-band (`velociraptor artifacts list`) — this tool will not enumerate them for you.
-
-### Arg validation (keys strict, values free)
-
-`args` is a `key=value` map. **Keys** are validated to `[A-Za-z_][A-Za-z0-9_]*` (≤64 chars) — a key containing a dash or `=` is rejected because that's the only way to smuggle a flag into argv. **Values are deliberately NOT sanitized**: Velociraptor unquotes its own `--args` values and arbitrary path/glob content is the whole point. So `{"Path": "/mnt/case/Users/*/NTUSER.DAT"}` is fine; `{"max-size": "10"}` is rejected (dash in key — use `max_size`).
-
-| Arg | Default | Notes |
-|---|---|---|
-| `artifact` | — | dotted path; validated |
-| `args` | none | `key=value` map; keys validated, values passed through |
-| `limit` | `10_000` rows | `rows_seen` reports the pre-cap total |
-
-Rows are **free-form** (`{artifact, fields}`) — every artifact has its own column shape; do not assume a fixed schema. Output is parsed as JSONL with a single-JSON-array fallback for older Velociraptor builds.
+The former generic `vel_collect` trampoline was removed from the product MCP. Stock catalogs
+contain shell, PowerShell, upload, kill, and network-capable artifacts, which cannot be made
+read-only by validating only an artifact name or argument key. Acquire collections out-of-band and
+supply the resulting ZIP as evidence. VERDICT extracts it under the run directory with byte/member
+ceilings and redispatches recognized contained artifacts only through typed parsers.
 
 ---
 
 ## 5. `yara_scan` — YARA-X in-process scan
 
-Compiles a rules file (or a directory of `.yar`/`.yara`/`.yarx`, merged into one ruleset) and scans `target_path`. Backed by `yara-x = 1.12.0` (pinned: 1.13+ needs rustc 1.89, repo is on 1.88).
+Compiles a rules file (or a directory of `.yar`/`.yara`/`.yarx`, merged into one ruleset) and scans `target_path`. Backed by lockstep-pinned `yara-x = 1.19.0` on the Wasmtime 43 runtime.
 
 | Arg | Default | Notes |
 |---|---|---|
@@ -136,12 +124,10 @@ These are the conditions that look like results but aren't — read each before 
 | Symptom | Tool(s) | What it actually means | Operator action |
 |---|---|---|---|
 | **`vol_pslist` processes=0 + `vol_psscan` processes>0** | `vol_pslist` / `vol_psscan` | Could be T1014 (DKOM unlink) OR an **acquisition smear / kernel-global read failure**. Disambiguate first. | If `psscan` recovered **core OS singletons** (System/csrss/lsass) only, a **duplicate `System` (PID 4)** EPROCESS appears, or `windows.info` shows **`KeNumberProcessors`=0** → the active-list walk failed image-wide = **smear**. Label **HYPOTHESIS**, not T1014. Require ≥2 artifact classes before asserting Rootkit; corroborate with `vol_psxview`. Do not fold the three views — divergence is the signal. |
-| **`BinaryNotFound`** | `vol_*`, `hayabusa_scan`, `vel_collect`, `pcap_triage` | The external tool isn't on PATH and its `$*_BIN` env var is unset. This is an **environment limitation, NOT evidence absence.** | Set the override (`$VOLATILITY_BIN`, `$HAYABUSA_BIN`, `$VELOCIRAPTOR_BIN`, `$TSHARK_BIN`/`$ZEEK_BIN`) or install the tool ([dependencies.md](../reference/dependencies.md)). Never report "no processes/no hits" — report the gap. The Verdict stays **INDETERMINATE** for that lane, not `NO_EVIL`. |
+| **`BinaryNotFound`** | `vol_*`, `hayabusa_scan`, `pcap_triage` | The external tool isn't on PATH and its `$*_BIN` env var is unset. This is an **environment limitation, NOT evidence absence.** | Set the override (`$VOLATILITY_BIN`, `$HAYABUSA_BIN`, `$TSHARK_BIN`/`$ZEEK_BIN`) or install the tool ([dependencies.md](../reference/dependencies.md)). Never report "no processes/no hits" — report the gap. The Verdict stays **INDETERMINATE** for that lane, not `NO_EVIL`. |
 | **Nonzero `parse_errors`** | `evtx_query`, `mft_timeline`, `usnjrnl_query`, `sysmon_network_query`, `registry_query`, `zeek_summary` | Some records were malformed/unsupported and **skipped** — `records_seen`/`rows_seen` still counts them, the row list does not. | Read it as a coverage caveat: a high ratio of `parse_errors` to `records_seen` means partial coverage; surface it in the Finding's confidence, don't silently treat the row list as complete. A few errors on a large EVTX/journal is normal. |
 | **Empty `memory_recall` hits** | `memory_recall` | A **useful signal**, not a failure — this IOC/hash/TTP has not been CONFIRMED in a prior Case. | Proceed on current-Case evidence. Note: query semantics are **exact-phrase** — a multi-word query (`powershell encoded`) becomes one phrase and may return zero even when both tokens exist separately. **Pass single tokens** (`certutil`, `T1059.001`) for broad recall before concluding "never seen." A prior-Case hit is context only; it never satisfies the ≥2-artifact-class rule. |
-| **`SubprocessFailed` (nonzero exit)** | `vel_collect`, `vol_*`, `hayabusa_scan`, `pcap_triage` | The external tool ran but errored — check `stderr_tail` (capped 4096B) in the error. | Common causes: wrong artifact params, unreadable evidence path, wrong volatility symbol set. Fix the args; this is a tool error, not a Finding. |
-| **`InvalidArtifactName` / `InvalidArgName`** | `vel_collect` | The boundary validator rejected an artifact name or arg **key** (injection guard) — nothing ran. | Use a dotted path with no spaces/slashes/flags; use identifier-shape arg keys (`max_size`, not `max-size`). Arg **values** are unrestricted. |
-| **`OutputParse`** | `vel_collect` | Velociraptor stdout was neither JSONL nor a JSON array — usually a **version mismatch**. | Confirm the `velociraptor` build; the wrapper expects `--format jsonl`. |
+| **`SubprocessFailed` (nonzero exit)** | `vol_*`, `hayabusa_scan`, `pcap_triage` | The external tool ran but errored — check `stderr_tail` (capped 4096B) in the error. | Common causes: wrong artifact params, unreadable evidence path, wrong volatility symbol set. Fix the args; this is a tool error, not a Finding. |
 | **Empty result on a custody-only disk** | any disk tool after `case_open` | `case_open` alone is an **analysis limitation**, not a clean Verdict. | Per `MEMORY.md`, this is **not** `NO_EVIL` — supply mounted artifacts or stay **INDETERMINATE**. `covered_no_finding` means scoped tools ran without qualifying evidence; it is not "cleared" or "disproven." |
 
 ---

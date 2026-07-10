@@ -50,12 +50,12 @@ the matching `investigate_*` method too, or the two paths drift.**
 
 ---
 
-## Tool inventory (45 product tools)
+## Tool inventory (57 product tools)
 
 The complete typed surface both paths can drive. Argument/output shapes live in `TOOLS.md`; this is
 the at-a-glance map of *what exists* and *when it runs*.
 
-### Rust `findevil-mcp` (32) — DFIR primitives, read-only on evidence, SHA-256 every output
+### Rust `findevil-mcp` (43 Rust tools) — DFIR primitives, read-only on evidence, SHA-256 every output
 
 | Tool | What | Runs for |
 |---|---|---|
@@ -63,13 +63,14 @@ the at-a-glance map of *what exists* and *when it runs*.
 | `disk_mount` | Loop/EWF-mount a disk image read-only (`ewfmount`+inner volume via TSK) | disk |
 | `disk_extract_artifacts` | Carve MFT/USN/Prefetch/Registry/yara-targets from the mount; recovers deleted-but-metadata-intact files (`__deleted__/<inode>/`, realloc'd inodes skipped) | disk |
 | `disk_unmount` | Release the mount (finally-block) | disk |
+| `bulk_extract` | Recover allow-listed features from allocated, slack, and unallocated raw-image bytes | disk (best-effort) |
 | `mft_timeline` | `$MFT` timeline, `$SI` vs `$FN` timestomp detection | disk |
 | `usnjrnl_query` | `$UsnJrnl` change log — corroborates MFT, surfaces deletes | disk |
 | `prefetch_parse` | Per-binary execution evidence (run_count, last-run times) | disk |
 | `registry_query` | Run/RunOnce/IFEO/Services/WMI/Tasks keys | disk |
-| `browser_history` | Visited-URL timeline from an extracted Chrome/Edge `History` or Firefox `places.sqlite` (read-only, `immutable=1`) | disk (browser DB) |
+| `browser_history` | Schema-detected Chrome/Edge History visits+downloads, Firefox history, or Chromium cookie/autofill/login metadata (read-only, `immutable=1`; cookie/autofill values and password/form/note contents excluded; username metadata retained) | disk (browser DB) |
 | `evtx_query` | Parse a single `.evtx` (EID histogram, 4624/4625/4688/7045…) | evtx, disk, velo |
-| `hayabusa_scan` | Sigma rules over an EVTX **directory** (dir-based; not single files) | evtx-dir, velo, disk-extracted |
+| `hayabusa_scan` | Sigma rules over an EVTX **directory** (single files are staged into a case-local temp dir by the auto-engine) | evtx-dir, single-evtx staged, velo, disk-extracted |
 | `yara_scan` | YARA over a memory image or extracted disk yara-targets | memory, disk (if targets) |
 | `vol_pslist` | Active-list process walk | memory |
 | `vol_psscan` | EPROCESS pool signature scan (DKOM detection vs pslist) | memory |
@@ -78,9 +79,32 @@ the at-a-glance map of *what exists* and *when it runs*.
 | `sysmon_network_query` | Sysmon network-connection events | network |
 | `zeek_summary` | Zeek conn/dns/http summaries | network |
 | `pcap_triage` | PCAP/PCAPNG triage (can drive Zeek internally) | network |
-| `vel_collect` | Velociraptor live-collection (note: velo **zips** are unzipped + re-dispatched locally, not via this tool) | velociraptor |
+| bounded ZIP extraction | Velociraptor collection ZIPs are unpacked under the run directory and re-dispatched only to typed parsers | velociraptor |
+| `srum_parse` | Windows SRUM application/network-usage records | disk (SRUDB.dat) |
+| `bits_parse` | BITS job queue URL/path/state leads | disk (qmgr artifacts) |
+| `wmi_persist_parse` | WMI repository consumer/filter/binding persistence leads | disk (OBJECTS.DATA) |
+| `email_parse` | RFC 5322/mbox header and attachment metadata | disk, case directory |
+| `pst_parse` | Outlook PST/OST message metadata export | disk, case directory |
+| `oe_dbx_parse` | Outlook Express DBX header metadata | disk, case directory |
+| `thumbcache_parse` | XP Thumbs.db and Vista+ thumbnail/icon cache metadata | disk |
+| `exif_parse` | Image EXIF device, software, timestamp, and GPS metadata | disk (user images) |
+| `setupapi_parse` | Windows SetupAPI device-install history | disk |
+| `vss_list` | Enumerate Volume Shadow Copy stores | disk |
+| `vss_mount` | Mount one shadow store read-only for scoped follow-up | disk (when available) |
+| `hashset_lookup` | Check hashes against operator known-good/known-bad and NSRL sets | disk/file triage |
+| `vol_run` | Run one allow-listed long-tail Volatility plugin | memory |
+| `ez_parse` | Run one allow-listed Eric Zimmerman artifact decoder | disk |
+| `plaso_parse` | Run one allow-listed Plaso parser and normalize events | disk, host logs |
+| `mac_triage` | Run one allow-listed mac_apt module | macOS |
+| `cloud_audit` | Normalize allow-listed cloud/identity audit logs | cloud logs |
+| `journalctl_query` | Query an offline systemd journal | Linux |
+| `login_accounting` | Parse wtmp/btmp login accounting | Linux |
+| `ausearch` | Query an offline auditd log with fixed argv | Linux |
+| `nfdump_query` | Query NetFlow/IPFIX records with fixed argv | network |
+| `suricata_eve` | Produce/read Suricata EVE records for a PCAP | network |
+| `indx_parse` | Parse NTFS `$I30`/INDX slack | disk |
 
-### Python `findevil-agent-mcp` (13) — reasoning, crypto/custody, memory; run in the reason/seal phase
+### Python `findevil-agent-mcp` (14 Python tools) — reasoning, crypto/custody, memory; run in the reason/seal phase
 
 | Tool | What | When |
 |---|---|---|
@@ -97,6 +121,7 @@ the at-a-glance map of *what exists* and *when it runs*.
 | `pool_handoff` | Structured ACP handoff (verifier→judge, pool_a→pool_b) | per handoff |
 | `expert_miss_capture` | Record a 1% expert correction as a future playbook/gate | on expert edit |
 | `accuracy_compare` | Read-only TP/FP/FN + precision/recall/F1/hallucination diagnostic of a finished Case's `verdict.json` vs a curated golden — a **diagnostic, never a Finding** | offline (post-Case QA, not in the in-run flow) |
+| `find_ai_signatures` | Scan supplied text/artifacts for AI/agent-tradecraft signatures; emits leads, never conclusions | targeted triage |
 
 The 4 **non-product** MCP servers (`n8n-mcp`, `playwright`, `puppeteer`, `qmd`) never touch evidence
 and never emit Findings — they are not in this inventory.
@@ -123,21 +148,27 @@ Note: `scripts/find-evil-auto` intentionally deviates today for raw disk images:
 | 6 | `usnjrnl_query` | Filesystem mutation log — corroborates MFT, surfaces deletes | both |
 | 7 | `registry_query` | Run / RunOnce / IFEO / Services / WMI consumers / Scheduled Tasks | A |
 | 8 | `evtx_query` | Security.evtx (4624/4625/4688/7045), System.evtx, Application.evtx | A |
-| 9 | `browser_history` | Extracted Chrome/Edge/Firefox browser DBs | B |
+| 9 | `browser_history` | Extracted Chrome/Edge History/Cookies/Web Data/Login Data and Firefox places DBs | B |
 | 10 | `ez_parse` | LNK, JumpLists, Amcache, and modern Recycle Bin decoders | both |
 | 11 | `plaso_parse` | Legacy EVT, IE index.dat, task, and Recycle Bin timelines | both |
 | 12 | `hayabusa_scan` | Sigma rules over the **extracted EVTX directory** (dir-based) | A |
-| 13 | `yara_scan` | YARA over extracted yara-target files — **skipped when extraction yields no yara-targets** (see gap note) | B |
-| 14 | `vel_collect` (optional) | Additional OS-level artifacts the wrappers don't cover | both |
-| 15 | `disk_unmount` | Release the mount (finally-block) | both |
+| 13 | `yara_scan` | YARA over extracted yara-target files — default ruleset `assets/yara/disk-triage.yar` when env unset; still only extracted yara-targets (see gap note) | B |
+| 14 | `srum_parse` / `bits_parse` / `wmi_persist_parse` / `email_parse` | Auto-driven after extract when those artifact classes are present | A/B |
+| 15 | `setupapi_parse` / `exif_parse` / `vss_list` | USB install history (secondary to USBSTOR), image EXIF leads, VSS inventory | B |
+| 16 | `disk_unmount` | Release the mount (finally-block) | both |
 
 The headless engine runs steps 4-7 **in parallel** across a pool of `findevil-mcp` connections
 (`--parallel`, default on; `--workers 2`); records stay serial so the verdict is identical to serial.
 
-> **Coverage gap (yara on disk).** `yara_scan` runs only over files `disk_extract_artifacts`
-> classified as yara-targets; on a stock image that can be 0, so yara is skipped. A fallback that
-> recursively YARA-scans the whole mount is *possible* but perf-sensitive on large images (a 23GB
-> mount) — left as a deliberate follow-up, not bolted on.
+> **Coverage gap (yara on disk).** By default `yara_scan` runs only over files
+> `disk_extract_artifacts` classified as yara-targets (plus the bundled
+> `assets/yara/disk-triage.yar` when `FIND_EVIL_DISK_YARA_RULES` is unset). That can
+> be 0 on a stock image. **Opt-in whole-mount recursive YARA:** set
+> `FIND_EVIL_DISK_YARA_WHOLE_MOUNT=1` so the auto-engine calls the same typed
+> `yara_scan` with `recursive=true` on the live `disk_mount` `fs_root` before
+> unmount. Optional bounds: `FIND_EVIL_DISK_YARA_WHOLE_MOUNT_TIMEOUT` (seconds,
+> default 1800) and `FIND_EVIL_DISK_YARA_WHOLE_MOUNT_LIMIT` (match cap, default 500).
+> Off by default — large mounts are perf-sensitive. Hits remain HYPOTHESIS leads.
 
 ### `.mem` / `.raw` / `.dmp` / `.vmem` — memory image
 
@@ -154,7 +185,7 @@ Memory tells you what was *running*, not just what was *installed*.
 
 **The `vol_pslist` + `vol_psscan` pair is mandatory, not optional.** pslist walks the kernel's active list; psscan signature-scans EPROCESS pool memory for blocks unlinked from that list. **Divergence between the two outputs IS the forensic finding** — `pslist=0` + `psscan>0` is the textbook MITRE ATT&CK T1014 (Rootkit) DKOM signature. Always emit a `vol_psscan` call after `vol_pslist`, even if pslist returned a healthy count, so the audit chain has both for cross-validation. When the pair diverges, run `vol_psxview` next to identify which process-enumeration views miss each recovered PID.
 
-After memory: if a disk image for the same host is available, **cross-reference** PIDs from `vol_pslist` against `prefetch_parse` run lists. A process running in memory with no Prefetch entry is a strong signal of an unprefetched (likely manual or scripted) execution. This is an **analyst-driven cross-artifact check** the interactive agent performs when both classes are present; the headless engine does not yet auto-emit it as a Finding (a documented depth gap, not an implemented automated Finding — do not claim it as one).
+After memory: if a disk image for the same host is available, **cross-reference** PIDs from `vol_pslist` against `prefetch_parse` run lists. A process running in memory with no Prefetch entry is a strong signal of an unprefetched (likely manual or scripted) execution. The headless engine now auto-emits fusion leads when both memory and disk lanes ran: Prefetch↔memory name matches can upgrade to CONFIRMED multi-class execution; memory-only names become a HYPOTHESIS unprefetched-process lead. Disable with `FIND_EVIL_CROSS_ARTIFACT_PID=0` if needed.
 
 ### `.evtx` — single Windows event log
 
@@ -221,7 +252,7 @@ then a fleet report (`render_fleet_report`); outputs land in `tmp/fleet-runs/<fl
 **resumable** — a host whose run-summary already exists is skipped — so a long fleet can be driven in
 one command. How to operate it well:
 
-1. **Validate on one host first.** Run a single representative host end to end (verdict + `manifest_verify.overall=true`) before fanning out, so a pipeline problem surfaces on host 1, not host 7.
+1. **Validate on one host first.** Run a single representative host end to end (verdict + `manifest_verify.overall=true` + authenticated `signature_verified=true`) before fanning out, so a pipeline problem surfaces on host 1, not host 7.
 2. **SIFT mount-in-place for large images.** Evidence already inside the VM (e.g. a read-only shared folder) is mounted read-only *in place* — pass the in-VM path and skip copy-staging tens of GB per host. VERDICT treats an evidence path that is not on the host but exists in the VM as an in-VM path.
 3. **Manage VM space.** Per-host extracts accumulate; on a small VM, clean a finished host's extracted/mount dirs before the next host. Never delete source evidence or another tool's data without operator approval.
 4. **Fuse disk + memory for ≥2-class corroboration.** Put a host's disk image **and** its memory image in one folder so they run as a single cross-artifact Case (the memory lane first, disk lane last). This is how an EVTX-only execution/persistence lead reaches the two-artifact-class bar — pairing adds a class, it does not lower the bar.
@@ -254,7 +285,7 @@ When the analyst is not present (CI runs, batch processing, demo recordings):
 
 - **Contradictions** are auto-resolved by trusting the higher-credibility pool, and the auto-trust decision is logged with `approved_by: "auto"` in the audit chain. This is auditable; it is not a free pass.
 - **HYPOTHESIS-tier Findings are kept** rather than dropped — the verifier vetoes only Findings without a `tool_call_id`.
-- **Network-touching tools** (`vel_collect` artifacts that hit external systems; sigstore Rekor submission inside `manifest_finalize`) still run. If network is unreachable, log the failure to the audit chain and continue; don't abort the manifest. (Pre-A5 this list also included `ots_stamp`; that tool was removed.)
+- **Network-touching signing** (sigstore Rekor submission inside `manifest_finalize`) still runs. If network is unreachable, log the failure to the audit chain and continue; don't abort the manifest. The product MCP exposes no open-world collection tool.
 - **Final verdict** is rendered to stdout AND written to `$FINDEVIL_HOME/cases/<id>/verdict.json` so a downstream process can read it without re-parsing terminal output.
 
 In attended mode, the supervisor pauses at:
@@ -280,5 +311,5 @@ Even in unattended mode, halt and surface to the analyst when:
 ## What this playbook is NOT
 
 - **Not a script.** The supervisor is the agent; this file is its prior. If a case looks weird, deviate.
-- **Not exhaustive of DFIR.** It covers what the 32 typed Rust MCP tools can reach, including the allow-listed `plaso_parse`, `vol_run`, `ez_parse`, `mac_triage`, and `cloud_audit` long-tail verbs. If the case needs broad unstructured carving, a parser outside the allow-lists, or interactive packet reconstruction beyond `pcap_triage` / `zeek_summary` / `suricata_eve`, surface that as a gap to the analyst. (Browser history IS covered now — see `browser_history`.)
+- **Not exhaustive of DFIR.** It covers what the 43 typed Rust MCP tools can reach, including the allow-listed `plaso_parse`, `vol_run`, `ez_parse`, `mac_triage`, and `cloud_audit` long-tail verbs. If the case needs broad unstructured carving, a parser outside the allow-lists, or interactive packet reconstruction beyond `pcap_triage` / `zeek_summary` / `suricata_eve`, surface that as a gap to the analyst. (Offline Chromium/Firefox browser visits, downloads, and privacy-bounded cookie/autofill/login metadata are covered by `browser_history`; secret/value columns are excluded, username metadata is retained, and live-browser state is outside scope.)
 - **Not a substitute for SOUL.md or AGENTS.md.** Read those first; this file is the operational layer that sits below the epistemic and role-definition layers.

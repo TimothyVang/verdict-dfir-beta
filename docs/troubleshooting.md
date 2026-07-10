@@ -84,15 +84,16 @@ re-dispatched.
 
 **You do not need SIFT mode for every case.** Local mode handles memory, EVTX, PCAP,
 Velociraptor collections, and supported disk artifacts (Prefetch + registry/UserAssist) via
-Sleuth Kit direct-read when Sleuth Kit/libewf prerequisites are available. The 9.3 GB gated SIFT
-OVA is recommended when you need VM-isolated disk mount/extract (disk-image) parity; the compact
-historical NIST receipt is in `docs/release-evidence/l3-local-sift.json`.
+Sleuth Kit direct-read when Sleuth Kit/libewf prerequisites are available. The DFIR container
+(`scripts/verdict --docker`, a ~2.3 GB `docker pull`) is the recommended backend when you need
+isolated disk mount/extract; the 9.3 GB gated SIFT OVA remains the path for `mac_triage` and
+`--fleet`. The compact historical NIST receipt is in `docs/release-evidence/l3-local-sift.json`.
 
 ## 6. Dashboard
 
 | Symptom | Detector | Fix |
 |---|---|---|
-| Port 3000 occupied / wrong app opens | `scripts/verdict` opens `http://localhost:3000` | Free the port (`lsof -i :3000`), or start the dashboard on another port: `pnpm --filter @findevil/web exec next dev -p 3100` and open `http://localhost:3100/?case=<case_dir>` with `scripts/verdict --no-dashboard` |
+| Port 3000 occupied / wrong app opens | `scripts/verdict` opens `http://localhost:3000` | Free the port (`lsof -i :3000`), or start the loopback-only dashboard on another port: `pnpm --filter @findevil/web exec next dev --hostname 127.0.0.1 -p 3100` and open `http://localhost:3100/?case=<case_dir>` with `scripts/verdict --no-dashboard` |
 | `dashboard slow to start — open ... manually` | `scripts/verdict` 40 s readiness wait | Cold webpack build can exceed the wait; pre-start with `pnpm --filter @findevil/web dev`, then run verdict |
 | `?case=` deep link returns API 400 | dashboard needs the repo root | `export FINDEVIL_REPO_ROOT=$PWD` and `FINDEVIL_DASHBOARD_EXTRA_ROOTS=$PWD/tmp/auto-runs` before starting the dashboard (scripts/verdict sets these for you) |
 

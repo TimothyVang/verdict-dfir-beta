@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from findevil_agent.contradiction import (
     AntiForensicsPattern,
     _extract_entities,
@@ -15,6 +17,7 @@ from findevil_agent.contradiction import (
     to_events,
 )
 from findevil_agent.events import ContradictionFound, Finding
+from findevil_agent.resource_limits import SemanticInputLimitError
 
 
 def _f(
@@ -479,3 +482,10 @@ class TestToEvents:
         events = to_events(contradictions, case_id="c-1", resolution_required=True)
         assert len(events) == 1
         assert events[0].conflicting_tool_call_ids == ["tc-A", "tc-B"]
+
+
+def test_pairwise_detector_caps_generators_before_quadratic_scan() -> None:
+    finding = _f("f-limit", pool="A")
+    pool_a = (finding for _ in range(51))
+    with pytest.raises(SemanticInputLimitError, match="pool_a exceeds limit 50"):
+        detect_contradictions(pool_a, [])

@@ -136,8 +136,8 @@ mod tests {
 
     #[test]
     fn record_neutralization_appends_jsonl_line_to_override_path() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
         let ledger = tmp.path().join("alerts.jsonl");
         let prev_override = std::env::var("FINDEVIL_INJECTION_LEDGER").ok();
         // SAFETY: env mutation is serialized by ENV_LOCK and restored below.
@@ -162,8 +162,8 @@ mod tests {
 
     #[test]
     fn record_neutralization_no_ops_on_empty_counts() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
         let ledger = tmp.path().join("alerts.jsonl");
         let prev_override = std::env::var("FINDEVIL_INJECTION_LEDGER").ok();
         std::env::set_var("FINDEVIL_INJECTION_LEDGER", &ledger);
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn no_ledger_path_resolves_to_no_write() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::env_lock();
         let prev_override = std::env::var("FINDEVIL_INJECTION_LEDGER").ok();
         let prev_home = std::env::var("FINDEVIL_HOME").ok();
         std::env::remove_var("FINDEVIL_INJECTION_LEDGER");

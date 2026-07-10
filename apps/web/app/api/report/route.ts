@@ -1,5 +1,5 @@
-// Report-artifact serve endpoint — lets the dashboard view/download the signed
-// PDF report (and its sibling artifacts) for a case, same-origin, so the
+// Report-artifact serve endpoint — lets the dashboard view/download the
+// presentation PDF (and sibling artifacts) for a case, same-origin, so the
 // browser's native PDF viewer can render it in an iframe with no X-Frame
 // issues. `buildReportLinks()` (lib/codex-server.ts) emits file:// links the
 // browser blocks from an http://localhost origin; this route is the http shim.
@@ -14,10 +14,14 @@
 // (`isAllowedCasePath`); `file` is validated against a hard allow-list of
 // known artifact names (+ figures/<name>.png) so no arbitrary path escapes.
 
-import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { isAllowedCasePath } from "@/lib/audit-tail";
+import {
+  readAllowedCaseFile,
+  resolveAllowedCasePath,
+  statAllowedCaseFile,
+} from "@/lib/audit-tail";
+import { authorizeDashboardRequest } from "@/lib/dashboard-auth";
 import { REPORT_ARTIFACT_NAMES, REPORT_ARTIFACTS } from "@/lib/report-artifacts";
 
 export const runtime = "nodejs";
@@ -32,6 +36,34 @@ const CONTENT_TYPES: Record<string, string> = {
   ".csv": "text/csv; charset=utf-8",
   ".png": "image/png",
 };
+
+const ARTIFACT_SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  // REPORT.html intentionally contains presentation JavaScript. CSP sandbox
+  // permits that rendering while withholding same-origin authority, cookies,
+  // network access, navigation, forms, and external assets.
+  "Content-Security-Policy": [
+    "sandbox allow-scripts",
+    "default-src 'none'",
+    "script-src 'unsafe-inline'",
+    "style-src 'unsafe-inline' data:",
+    "img-src data:",
+    "font-src data:",
+    "connect-src 'none'",
+    "form-action 'none'",
+    "base-uri 'none'",
+    "frame-src 'none'",
+    "object-src 'none'",
+  ].join("; "),
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store",
+};
+
+function artifactTrust(file: string): string {
+  return file.startsWith("REPORT") || file.startsWith("timeline.")
+    ? "presentation-only-unverified"
+    : "independent-read-unverified";
+}
 
 /** Validate the requested file name. Returns the safe relative path, or null. */
 function safeFile(file: string | null): string | null {
@@ -54,11 +86,12 @@ function resolveCase(url: URL): { dir: string } | { error: Response } {
   if (!caseDir) {
     return { error: new Response("missing required ?case=<absolute-case-dir>", { status: 400 }) };
   }
-  const resolved = path.resolve(caseDir);
-  if (!isAllowedCasePath(resolved)) {
+  const requested = path.resolve(caseDir);
+  const resolved = resolveAllowedCasePath(requested);
+  if (!resolved) {
     return {
       error: new Response(
-        JSON.stringify({ error: "case path not in allow-list", reason: resolved }),
+        JSON.stringify({ error: "case path not in allow-list", reason: requested }),
         { status: 400, headers: { "Content-Type": "application/json" } },
       ),
     };
@@ -67,6 +100,8 @@ function resolveCase(url: URL): { dir: string } | { error: Response } {
 }
 
 export async function GET(request: Request): Promise<Response> {
+  const denied = authorizeDashboardRequest(request);
+  if (denied) return denied;
   const url = new URL(request.url);
   const resolved = resolveCase(url);
   if ("error" in resolved) return resolved.error;
@@ -77,8 +112,10 @@ export async function GET(request: Request): Promise<Response> {
     const files = await Promise.all(
       REPORT_ARTIFACTS.map(async ({ name }) => {
         try {
-          const stat = await fs.stat(path.join(caseDir, name));
-          return { name, available: true, bytes: stat.size };
+          const stat = await statAllowedCaseFile(caseDir, name);
+          return stat
+            ? { name, available: true, bytes: stat.size }
+            : { name, available: false, bytes: 0 };
         } catch {
           return { name, available: false, bytes: 0 };
         }
@@ -101,10 +138,8 @@ export async function GET(request: Request): Promise<Response> {
     return new Response("forbidden", { status: 400 });
   }
 
-  let data: Buffer;
-  try {
-    data = await fs.readFile(filePath);
-  } catch {
+  const data = await readAllowedCaseFile(caseDir, file);
+  if (!data) {
     return new Response("not found", { status: 404 });
   }
 
@@ -113,12 +148,15 @@ export async function GET(request: Request): Promise<Response> {
     headers: {
       "Content-Type": contentTypeFor(file),
       "Content-Disposition": `${disposition}; filename="${path.basename(file)}"`,
-      "Cache-Control": "no-store",
+      "X-Verdict-Artifact-Trust": artifactTrust(file),
+      ...ARTIFACT_SECURITY_HEADERS,
     },
   });
 }
 
 export async function HEAD(request: Request): Promise<Response> {
+  const denied = authorizeDashboardRequest(request);
+  if (denied) return denied;
   const url = new URL(request.url);
   const resolved = resolveCase(url);
   if ("error" in resolved) return new Response(null, { status: 400 });
@@ -128,10 +166,6 @@ export async function HEAD(request: Request): Promise<Response> {
   if (filePath !== resolved.dir && !filePath.startsWith(resolved.dir + path.sep)) {
     return new Response(null, { status: 400 });
   }
-  try {
-    await fs.access(filePath);
-    return new Response(null, { status: 200 });
-  } catch {
-    return new Response(null, { status: 404 });
-  }
+  const stat = await statAllowedCaseFile(resolved.dir, file);
+  return new Response(null, { status: stat ? 200 : 404 });
 }

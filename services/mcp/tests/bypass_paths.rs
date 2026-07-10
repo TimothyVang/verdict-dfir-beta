@@ -5,8 +5,8 @@
 //! None of them build a shell command line: there is no `sh -c` anywhere in the
 //! tool surface, and the subprocess tools (Volatility / Hayabusa / tshark / mount)
 //! invoke `Command::new(bin).args([...])` with a FIXED argv, so a path is always a
-//! single argv element, never re-parsed as a flag or a shell fragment (the
-//! `vel_collect` arg-name/artifact-name tests cover that injection boundary). That
+//! single argv element, never re-parsed as a flag or a shell fragment. The former
+//! open-world Velociraptor trampoline is not part of the product MCP. That
 //! means there is no execution sink for a malicious path to reach.
 //!
 //! These tests pin that contract: a path crafted to look like a shell-injection

@@ -28,7 +28,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tools::proc_runner::{run_with_timeout, timeout_from_env, RunError};
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
 
 const DEFAULT_LIMIT: usize = 10_000;
 
@@ -40,6 +40,7 @@ const TIMEOUT_ENV: &str = "FINDEVIL_PLASO_TIMEOUT_SECS";
 /// stage can no longer block the MCP server indefinitely. Override with
 /// [`TIMEOUT_ENV`].
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
+const HARD_TIMEOUT: Duration = Duration::from_secs(14_400);
 
 /// Allow-listed plaso parser names. Curated from the parser-coverage roadmap's
 /// log section — the cross-OS text/binary logs plaso normalizes well. These are
@@ -132,6 +133,13 @@ pub enum PlasoParseError {
          (raise $FINDEVIL_PLASO_TIMEOUT_SECS for legitimately long parses)"
     )]
     Timeout { stage: String, seconds: u64 },
+
+    #[error("{stage} {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit {
+        stage: String,
+        stream: String,
+        limit: usize,
+    },
 
     #[error("could not read plaso output: {0}")]
     OutputRead(String),
@@ -369,35 +377,56 @@ fn run_stage(binary: &Path, args: &[OsString], stage: &str) -> Result<String, Pl
     cmd.args(args);
     // Run in its own process group under a per-stage wall-clock budget so a hung
     // log2timeline/psort is force-killed and reaped instead of blocking forever.
-    let proc =
-        run_with_timeout(cmd, timeout_from_env(TIMEOUT_ENV, DEFAULT_TIMEOUT)).map_err(|err| {
-            match err {
-                RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    PlasoParseError::BinaryNotFound {
-                        binary: stage.to_string(),
-                    }
-                }
-                RunError::Spawn(e) => PlasoParseError::SubprocessFailed {
-                    stage: stage.to_string(),
-                    exit_code: -1,
-                    stderr: format!("spawn failed: {e}"),
-                },
-                RunError::Io(e) => PlasoParseError::SubprocessFailed {
-                    stage: stage.to_string(),
-                    exit_code: -1,
-                    stderr: format!("io error: {e}"),
-                },
-                RunError::Timeout(d) => PlasoParseError::Timeout {
-                    stage: stage.to_string(),
-                    seconds: d.as_secs(),
-                },
-                RunError::ReaderPanicked => PlasoParseError::SubprocessFailed {
-                    stage: stage.to_string(),
-                    exit_code: -1,
-                    stderr: "plaso output reader thread panicked".to_string(),
-                },
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|err| match err {
+        RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            PlasoParseError::BinaryNotFound {
+                binary: stage.to_string(),
             }
-        })?;
+        }
+        RunError::Spawn(e) => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: format!("spawn failed: {e}"),
+        },
+        RunError::Io(e) => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: format!("io error: {e}"),
+        },
+        RunError::Timeout(d) => PlasoParseError::Timeout {
+            stage: stage.to_string(),
+            seconds: d.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => PlasoParseError::OutputLimit {
+            stage: stage.to_string(),
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::PipeStillOpen { streams } => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => PlasoParseError::SubprocessFailed {
+            stage: stage.to_string(),
+            exit_code: -1,
+            stderr: "plaso output reader thread panicked".to_string(),
+        },
+    })?;
     // Normalize plaso's run-varying log tokens (timestamp + PID) at the point of
     // capture so BOTH the success `stderr_tail` and the `SubprocessFailed` error
     // are reproducible — a `verify_finding` replay must recompute the same

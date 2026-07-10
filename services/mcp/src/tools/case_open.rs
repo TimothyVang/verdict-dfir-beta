@@ -30,6 +30,34 @@ use uuid::Uuid;
 use super::ewf_segments::segment_paths_for_image;
 
 const SHA_BUFFER_SIZE: usize = 1 << 20; // 1 MiB — good streaming tradeoff
+const MAX_CASE_LABEL_BYTES: usize = 256;
+
+pub(crate) const fn validate_case_label(label: Option<&str>) -> Result<(), CaseOpenError> {
+    if let Some(label) = label {
+        if label.len() > MAX_CASE_LABEL_BYTES {
+            return Err(CaseOpenError::LabelTooLong {
+                actual: label.len(),
+                max: MAX_CASE_LABEL_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_single_link_regular(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 /// Agent-supplied input.
 ///
@@ -128,6 +156,9 @@ pub enum CaseOpenError {
 
     #[error("cannot serialize case manifest: {0}")]
     ManifestSerialize(#[from] serde_json::Error),
+
+    #[error("case label exceeds the {max} byte UTF-8 limit ({actual} bytes)")]
+    LabelTooLong { actual: usize, max: usize },
 }
 
 /// Tool entrypoint. Pure function over filesystem side-effects; no
@@ -137,6 +168,8 @@ pub enum CaseOpenError {
 /// `$HOME/.findevil` root. Pass it via tests to avoid stomping on
 /// the developer's real case store.
 pub fn case_open(input: &CaseOpenInput) -> Result<CaseHandle, CaseOpenError> {
+    validate_case_label(input.label.as_deref())?;
+
     // 1. Resolve + verify the image path. `symlink_metadata` (lstat) does
     //    NOT follow symlinks, so a link planted in the evidence drop zone
     //    pointing at an arbitrary host file is refused as not-regular —
@@ -145,9 +178,15 @@ pub fn case_open(input: &CaseOpenInput) -> Result<CaseHandle, CaseOpenError> {
     let image_path = &input.image_path;
     let meta = fs::symlink_metadata(image_path)
         .map_err(|_| CaseOpenError::ImageNotFound(image_path.clone()))?;
-    if !meta.is_file() {
+    if !is_single_link_regular(&meta) {
         return Err(CaseOpenError::ImageNotRegular(image_path.clone()));
     }
+    let canonical_image_path = crate::pathnorm::canonicalize(image_path).map_err(|source| {
+        CaseOpenError::ImageUnreadable {
+            path: image_path.clone(),
+            source,
+        }
+    })?;
 
     let image_segments = segment_paths_for_image(image_path)
         .map_err(|err| CaseOpenError::EwfSegmentSet(err.to_string()))?;
@@ -158,7 +197,7 @@ pub fn case_open(input: &CaseOpenInput) -> Result<CaseHandle, CaseOpenError> {
             .try_fold(meta.len(), |total, segment| {
                 let segment_meta = fs::symlink_metadata(segment)
                     .map_err(|_| CaseOpenError::ImageNotFound(segment.clone()))?;
-                if !segment_meta.is_file() {
+                if !is_single_link_regular(&segment_meta) {
                     return Err(CaseOpenError::ImageNotRegular(segment.clone()));
                 }
                 Ok(total.saturating_add(segment_meta.len()))
@@ -209,7 +248,11 @@ pub fn case_open(input: &CaseOpenInput) -> Result<CaseHandle, CaseOpenError> {
 
     // 5. Persist a minimal manifest for later tools + audit.
     let manifest_path = case_dir.join("case.json");
-    let manifest = serde_json::to_string_pretty(&CaseManifest::from_handle(&handle, input))?;
+    let manifest = serde_json::to_string_pretty(&CaseManifest::from_handle(
+        &handle,
+        input,
+        &canonical_image_path,
+    ))?;
     fs::write(&manifest_path, manifest).map_err(|source| CaseOpenError::ManifestWrite {
         path: manifest_path,
         source,
@@ -231,10 +274,10 @@ struct CaseManifest<'a> {
 }
 
 impl<'a> CaseManifest<'a> {
-    fn from_handle(h: &'a CaseHandle, inp: &'a CaseOpenInput) -> Self {
+    fn from_handle(h: &'a CaseHandle, inp: &'a CaseOpenInput, image_path: &'a Path) -> Self {
         Self {
             id: &h.id,
-            image_path: &inp.image_path,
+            image_path,
             image_hash: &h.image_hash,
             image_size_bytes: h.image_size_bytes,
             image_segments: &h.image_segments,
@@ -324,7 +367,7 @@ mod tests {
 
     #[test]
     fn resolve_home_respects_findevil_override() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // SAFETY: env mutation is restricted to this test; tests run
         // single-threaded under `cargo test -- --test-threads=1` by
@@ -342,7 +385,7 @@ mod tests {
 
     #[test]
     fn resolve_home_errors_when_no_env() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::env_lock();
         let prev_findevil = std::env::var("FINDEVIL_HOME").ok();
         let prev_home = std::env::var("HOME").ok();
         let prev_userprofile = std::env::var("USERPROFILE").ok();

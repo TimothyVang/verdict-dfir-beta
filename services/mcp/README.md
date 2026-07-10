@@ -10,9 +10,9 @@ Typed Rust MCP server for Find Evil! per the public architecture contract.
 | Component | Status |
 |---|---|
 | Workspace + crate scaffold | ✅ |
-| All 32 typed DFIR tools | ✅ shipped |
+| All 43 typed Rust DFIR tools | ✅ shipped |
 | Hand-rolled JSON-RPC 2.0 stdio server (MCP 2024-11-05) | ✅ in `src/server.rs` |
-| End-to-end stdio smoke (`scripts/rust-mcp-smoke.py`) | ✅ all 32 tools dispatch over the wire |
+| End-to-end stdio smoke (`scripts/rust-mcp-smoke.py`) | ✅ all 43 tools dispatch over the wire |
 | M2 sigstore + rs_merkle integration | partial (rs_merkle live; sigstore lives in `services/agent_mcp/`) |
 
 ## Quick start
@@ -36,10 +36,10 @@ Per Spec #2 §6 (which enumerates 11) plus memory cross-validation, disk mount/e
 | `disk_unmount` | `tools/disk.rs` | fixed subprocess wrappers / mock mode | A/B (disk cleanup) |
 | `evtx_query` | `tools/evtx_query.rs` | in-process: `evtx = 0.11.2` | A |
 | `prefetch_parse` | `tools/prefetch_parse.rs` | in-process: `frnsc-prefetch + forensic-rs` | A (execution) |
-| `mft_timeline` | `tools/mft_timeline.rs` | in-process: `mft = 0.6.1` | A (timeline) |
+| `mft_timeline` | `tools/mft_timeline.rs` | in-process: `mft = 0.7.0` | A (timeline) |
 | `registry_query` | `tools/registry_query.rs` | in-process: `frnsc-hive = 0.13.4` | A (persistence) |
 | `browser_history` | `tools/browser_history.rs` | in-process: `rusqlite` (vendored SQLite) | A/B (browser artifact) |
-| `yara_scan` | `tools/yara_scan.rs` | in-process: `yara-x = 1.12.0` | B (malware/IOC) |
+| `yara_scan` | `tools/yara_scan.rs` | in-process: `yara-x = 1.19.0` | B (malware/IOC) |
 | `usnjrnl_query` | `tools/usnjrnl_query.rs` | in-process: `usnjrnl-forensic = 0.6.0` | A/B (filesystem changes) |
 | `hayabusa_scan` | `tools/hayabusa_scan.rs` | subprocess: `hayabusa` (AGPL) | A (Sigma rules) |
 | `vol_pslist` | `tools/vol_pslist.rs` | subprocess: `volatility3` (BSD-2) | A (active-list processes) |
@@ -57,7 +57,6 @@ Per Spec #2 §6 (which enumerates 11) plus memory cross-validation, disk mount/e
 | `nfdump_query` | `tools/nfdump_query.rs` | fixed subprocess: `nfdump` | B (NetFlow) |
 | `suricata_eve` | `tools/suricata_eve.rs` | in-process JSONL parser | B (IDS alerts) |
 | `indx_parse` | `tools/indx_parse.rs` | fixed parser wrapper for INDX/I30 data | A (NTFS internals) |
-| `vel_collect` | `tools/vel_collect.rs` | subprocess: `velociraptor` (Apache-2.0) | A/B (live response) |
 | `sysmon_network_query` | `tools/sysmon_network_query.rs` | in-process: `evtx = 0.11.2` | B (network) |
 | `zeek_summary` | `tools/zeek_summary.rs` | in-process TSV parser | B (network) |
 | `pcap_triage` | `tools/pcap_triage.rs` | fixed subprocess: `tshark` or `zeek` | B (network) |
@@ -65,7 +64,7 @@ Per Spec #2 §6 (which enumerates 11) plus memory cross-validation, disk mount/e
 
 The `vol_pslist` + `vol_psscan` pair is deliberately redundant — pslist walks the kernel's `PsActiveProcessHead` linked list, psscan signature-scans EPROCESS pool memory. Divergence between the two outputs IS the forensic finding (T1014/Rootkit, DKOM unlink). `vol_psxview` is the follow-up cross-view corroborator; do not fold these tools together.
 
-Subprocess tools resolve their binary via a tool-specific env var first (`$HAYABUSA_BIN`, `$VOLATILITY_BIN`, `$VELOCIRAPTOR_BIN`), then PATH lookup. AGPL/GPL backing tools are NEVER linked — see Spec #2 invariant in `CLAUDE.md`.
+Subprocess tools resolve their binary via a tool-specific env var first (`$HAYABUSA_BIN`, `$VOLATILITY_BIN`), then PATH lookup. AGPL/GPL backing tools are NEVER linked — see Spec #2 invariant in `CLAUDE.md`.
 
 ## Structure for new tools
 
@@ -93,9 +92,9 @@ Core MCP plumbing:
 Forensic parsers (in-process):
 - `evtx = =0.11.2` — Windows Event Log
 - `frnsc-prefetch = =0.13.3` + `forensic-rs = =0.13` — Prefetch
-- `mft = =0.6.1` — `$MFT` (pinned 0.6.1: 0.7+ requires rustc 1.90)
-- `frnsc-hive = =0.13.4` — Registry hives (notatin 1.0.1 broke under rustc 1.88)
-- `yara-x = =1.12.0` + `yara-x-{macros,parser,proto} = =1.12.0` — YARA scan (1.13+ requires rustc 1.89)
+- `mft = =0.7.0` — `$MFT` with `jiff` timestamp handling
+- `frnsc-hive = =0.13.4` — historical Registry parser; the supported reader is now in-tree
+- `yara-x = =1.19.0` + lockstep `yara-x-{macros,parser,proto}` — YARA scan on Wasmtime 43
 - `usnjrnl-forensic = =0.6.0` — USN Journal
 
 Subprocess tools (AGPL/GPL, never linked): hayabusa, volatility3, velociraptor.

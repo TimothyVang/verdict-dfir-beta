@@ -98,7 +98,6 @@ TOOL_SEQUENCES: dict[str, list[PlaybookStep]] = {
         PlaybookStep(
             "prefetch_parse", "Prefetch execution evidence (cross-ref with memory PIDs)", pool="A"
         ),
-        PlaybookStep("vel_collect", "Pull additional OS artifacts", pool="both", optional=True),
     ],
     "memory": [
         PlaybookStep("vol_pslist", "PsActiveProcessHead active-list walk", pool="both"),
@@ -124,9 +123,7 @@ TOOL_SEQUENCES: dict[str, list[PlaybookStep]] = {
             "sysmon_network_query", "Sysmon network events (EID 3/22)", pool="B", optional=True
         ),
     ],
-    "velociraptor": [
-        PlaybookStep("vel_collect", "Inventory the Velociraptor collection zip", pool="both"),
-    ],
+    "velociraptor": [],
     "extracted_disk": [
         PlaybookStep("mft_timeline", "MFT timeline", pool="both", optional=True),
         PlaybookStep("prefetch_parse", "Prefetch execution evidence", pool="A", optional=True),
@@ -152,6 +149,13 @@ TOOL_SEQUENCES: dict[str, list[PlaybookStep]] = {
             "disk_extract_artifacts", "Classify and route artifacts in case directory", pool="both"
         ),
     ],
+    "browser": [
+        PlaybookStep(
+            "browser_history",
+            "Offline browser visits, downloads, and privacy-bounded metadata",
+            pool="B",
+        ),
+    ],
     "unknown": [],
 }
 
@@ -170,11 +174,12 @@ EVIDENCE_TYPE_RULES: list[tuple[str, str]] = [
     ("pcap", "network"),
     ("raw_disk_ext", "disk"),
     ("zip", "velociraptor"),
+    ("browser_db", "browser"),
 ]
 
 
 def detect_evidence_type(path: str) -> str:
-    """Return one of: directory, memory, evtx, disk, network, velociraptor, unknown.
+    """Return a supported coarse evidence type, including standalone browser DBs.
 
     Pure function — no filesystem I/O.  For directory detection callers
     must check ``Path(path).is_dir()`` themselves before calling.
@@ -192,6 +197,15 @@ def detect_evidence_type(path: str) -> str:
         return "disk"
     if name.endswith(".zip"):
         return "velociraptor"
+    if name in {
+        "history",
+        "archived history",
+        "places.sqlite",
+        "web data",
+        "cookies",
+        "login data",
+    } or name.endswith(".sqlite"):
+        return "browser"
     return "unknown"
 
 
@@ -260,7 +274,33 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
         return {
             "artifact_class": "srum",
             "evidence_type": "extracted_disk",
-            "parser_tool": None,
+            "parser_tool": "srum_parse",
+        }
+    if name in {"qmgr0.dat", "qmgr1.dat", "qmgr.db"} and (
+        "network/downloader" in lower_path or "microsoft/network/downloader" in lower_path
+    ):
+        return {
+            "artifact_class": "bits",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "bits_parse",
+        }
+    if name == "objects.data" and "wbem/repository" in lower_path:
+        return {
+            "artifact_class": "wmi_repository",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "wmi_persist_parse",
+        }
+    if name.endswith((".eml", ".mbox")):
+        return {
+            "artifact_class": "email",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "email_parse",
+        }
+    if name.endswith((".pst", ".ost")):
+        return {
+            "artifact_class": "email",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "pst_parse",
         }
     if (
         name in {"$j", "$usnjrnl", "usnjrnl", "usnjrnl.j"}
@@ -321,6 +361,7 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
         }
     if name in {
         "history",
+        "archived history",
         "places.sqlite",
         "web data",
         "cookies",
@@ -341,7 +382,7 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
         return {
             "artifact_class": "velociraptor",
             "evidence_type": "velociraptor",
-            "parser_tool": "vel_collect",
+            "parser_tool": None,
         }
     return {"artifact_class": "unknown", "evidence_type": "unknown", "parser_tool": None}
 

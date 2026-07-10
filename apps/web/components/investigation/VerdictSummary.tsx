@@ -10,6 +10,11 @@ import {
   type VerdictWord,
 } from "@/lib/verdict-summary-policy";
 import {
+  selectCustodyDisplayEvents,
+  type BrowserAuditLine,
+} from "@/lib/custody-display";
+import { validateCustodySnapshotResponse } from "@/lib/custody-snapshot";
+import {
   VERDICT,
   SERIF,
   GROTESK,
@@ -19,21 +24,14 @@ import {
   Stamp,
 } from "@/lib/verdict-ui";
 import {
+  parseAuditRecord,
+  splitAuditLines,
   verifyCustodyChain,
   type CustodyVerification,
   type JsonValue,
 } from "@/lib/verify-chain";
 
-// Keep in sync with apps/web/app/page.tsx:AuditLine (importing from
-// lib/audit-tail would drag node:fs into the client bundle).
-interface AuditLine {
-  seq: number;
-  kind: string;
-  ts: string;
-  payload: Record<string, unknown>;
-  line_hash?: string;
-  raw_line: string;
-}
+type AuditLine = BrowserAuditLine;
 
 interface VerdictMeta {
   color: string;
@@ -64,9 +62,19 @@ interface VerdictSummaryProps {
   caseDir: string;
   manifestDone: boolean;
   evidenceName?: string;
+  onAuthenticatedSnapshot?: (
+    snapshot: AuthenticatedCustodyDisplaySnapshot | null,
+  ) => void;
 }
 
-interface CustodyBadge {
+export interface AuthenticatedCustodyDisplaySnapshot {
+  events: BrowserAuditLine[];
+  verdict: VerdictPayload;
+  custody: CustodyVerification;
+  snapshotSha256: string;
+}
+
+export interface CustodyBadge {
   label: string;
   color: string;
   detail: string;
@@ -78,7 +86,7 @@ interface CustodyBadge {
  * + leaf count and (for ed25519) re-checked the signature — it does not
  * upgrade the verdict or replace the authoritative manifest_verify.json.
  */
-function describeCustody(
+export function describeCustody(
   custody: CustodyVerification | null,
   custodyError: string | null,
 ): CustodyBadge {
@@ -96,27 +104,47 @@ function describeCustody(
       detail: "Recomputing the custody chain with Web Crypto.",
     };
   }
-  if (custody.overall) {
-    const sig =
-      custody.signatureVerified === true
-        ? `${custody.signatureKind} signature verified`
-        : `${custody.signatureKind} signature (advisory)`;
+  if (custody.overall && custody.signatureVerified === true) {
     return {
       label: "Independent browser re-verify: PASS",
       color: VERDICT.confirmed,
-      detail: `Chain, Merkle root, and leaf count re-derived offline; ${sig}.`,
+      detail:
+        "Chain, Merkle root, leaf count, and verdict bytes re-derived offline; " +
+        `${custody.signatureKind} signature verified.`,
+    };
+  }
+  const integrityOk =
+    custody.auditChainOk === true &&
+    custody.merkleRootOk === true &&
+    custody.leafCountOk === true &&
+    custody.signaturePayloadOk === true &&
+    custody.transparencyOk === true &&
+    custody.verdictArtifactOk === true;
+  if (integrityOk && custody.signatureVerified !== true) {
+    const reason = custody.signaturePresent
+      ? String(custody.signatureVerified)
+      : "no authenticated signature is present";
+    return {
+      label: "Independent browser integrity: UNAUTHENTICATED",
+      color: VERDICT.inferred,
+      detail: reason,
     };
   }
   const fails: string[] = [];
   if (custody.auditChainOk !== true) fails.push(`chain (${custody.auditChainOk})`);
   if (custody.merkleRootOk !== true) fails.push(`Merkle (${custody.merkleRootOk})`);
   if (custody.leafCountOk !== true) fails.push(`leaf count (${custody.leafCountOk})`);
+  if (custody.transparencyOk !== true) {
+    fails.push(`transparency anchor (${custody.transparencyOk})`);
+  }
+  if (custody.verdictArtifactOk !== true) {
+    fails.push(`verdict artifact (${custody.verdictArtifactOk})`);
+  }
   if (!custody.signaturePresent) {
     fails.push("signature absent");
-  } else if (
-    !["stub", "sigstore"].includes(custody.signatureKind) &&
-    custody.signatureVerified !== true
-  ) {
+  } else if (custody.signaturePayloadOk !== true) {
+    fails.push(`signature payload (${custody.signaturePayloadOk})`);
+  } else if (custody.signatureVerified !== true) {
     fails.push(`signature (${custody.signatureVerified})`);
   }
   return {
@@ -131,7 +159,8 @@ function describeCustody(
  * "is this machine compromised, how sure are we, and is it proven?" — before
  * the reader has to wade through the live terminal stream below it.
  *
- * The verdict word is taken from the signed verdict.json once the run finalizes;
+ * The verdict word is taken from hash-bound verdict.json bytes only after the
+ * joint audit/manifest/verdict snapshot authenticates;
  * until then (or for curated cases without a verdict.json) it is DERIVED from
  * the live findings' confidence tiers, so the banner is correct for both a
  * live run and a replayed/curated case.
@@ -141,10 +170,34 @@ export function VerdictSummary({
   caseDir,
   manifestDone,
   evidenceName,
+  onAuthenticatedSnapshot,
 }: VerdictSummaryProps) {
+  const [snapshotState, setSnapshotState] = useState<{
+    custody: CustodyVerification;
+    events: BrowserAuditLine[];
+    verdict: VerdictPayload | null;
+    snapshotSha256: string;
+  } | null>(null);
+  const [custodyError, setCustodyError] = useState<string | null>(null);
+  const custody = snapshotState?.custody ?? null;
+  const custodyAuthenticated =
+    custody?.overall === true &&
+    custody.signatureVerified === true &&
+    custody.verdictArtifactOk === true &&
+    snapshotState?.verdict !== null;
+  const displayEvents = useMemo(
+    () =>
+      selectCustodyDisplayEvents({
+        liveEvents: events,
+        snapshotEvents: snapshotState?.events ?? [],
+        custodyAuthenticated,
+        sealObserved: manifestDone,
+      }),
+    [events, snapshotState, custodyAuthenticated, manifestDone],
+  );
   const findings = useMemo(
-    () => deriveInvestigationStream(events).findings,
-    [events],
+    () => deriveInvestigationStream(displayEvents).findings,
+    [displayEvents],
   );
 
   const tally = useMemo(() => {
@@ -160,73 +213,118 @@ export function VerdictSummary({
     return { confirmed, inferred, hypothesis, total: findings.length };
   }, [findings]);
 
-  // Authoritative verdict packet from the signed verdict.json once finalized.
-  const [verdictPayload, setVerdictPayload] = useState<VerdictPayload | null>(null);
-  useEffect(() => {
-    if (!manifestDone || !caseDir) return;
-    let cancelled = false;
-    const tryFetch = async () => {
-      try {
-        const r = await fetch(
-          `/api/report?case=${encodeURIComponent(caseDir)}&file=verdict.json`,
-        );
-        if (!r.ok) return;
-        const d = (await r.json()) as VerdictPayload;
-        if (!cancelled) setVerdictPayload(d);
-      } catch {
-        /* verdict.json may not exist (curated case) — fall back to derivation */
-      }
-    };
-    void tryFetch();
-    const id = setInterval(tryFetch, 2000);
-    const stop = setTimeout(() => clearInterval(id), 12000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-      clearTimeout(stop);
-    };
-  }, [manifestDone, caseDir]);
-
-  // Independent, browser-side custody re-verification. Once the run is sealed,
-  // re-derive the chain from the audit tail + signed manifest with Web Crypto
+  // Independent browser-side re-verification once a terminal packet makes the
+  // three-artifact snapshot ready to attempt.
+  // re-derive the chain from one jointly stability-checked audit + manifest +
+  // verdict snapshot with Web Crypto
   // (lib/verify-chain) — a second implementation of the offline manifest_verify
   // path — instead of trusting the displayed values. PURE READ-SIDE: it only
-  // fetches the two artifacts and recomputes; it never mutates anything.
-  const [custody, setCustody] = useState<CustodyVerification | null>(null);
-  const [custodyError, setCustodyError] = useState<string | null>(null);
+  // fetches the paired artifacts and recomputes; it never mutates anything.
   useEffect(() => {
-    if (!manifestDone || !caseDir) return;
+    if (!manifestDone || !caseDir) {
+      setSnapshotState(null);
+      setCustodyError(null);
+      onAuthenticatedSnapshot?.(null);
+      return;
+    }
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    const deadline = Date.now() + 12_000;
     const reverify = async () => {
       try {
-        const base = `/api/report?case=${encodeURIComponent(caseDir)}`;
-        const [auditRes, manifestRes] = await Promise.all([
-          fetch(`${base}&file=audit.jsonl`),
-          fetch(`${base}&file=run.manifest.json`),
+        const [snapshotRes, policyRes] = await Promise.all([
+          fetch(
+            `/api/custody-snapshot?case=${encodeURIComponent(caseDir)}`,
+          ),
+          fetch("/api/custody-policy"),
         ]);
-        if (!auditRes.ok || !manifestRes.ok) return;
-        const auditText = await auditRes.text();
-        const manifest = (await manifestRes.json()) as Record<string, JsonValue>;
-        const result = await verifyCustodyChain({ auditText, manifest });
+        if (!snapshotRes.ok || !policyRes.ok) {
+          throw new Error("stable custody snapshot is unavailable");
+        }
+        const snapshot = await validateCustodySnapshotResponse(
+          await snapshotRes.json(),
+          snapshotRes.headers.get("etag"),
+        );
+        const parsedManifest = JSON.parse(snapshot.manifestText) as unknown;
+        if (
+          typeof parsedManifest !== "object" ||
+          parsedManifest === null ||
+          Array.isArray(parsedManifest)
+        ) {
+          throw new Error("custody manifest is not an object");
+        }
+        const policy = (await policyRes.json()) as {
+          ed25519ExpectedFingerprint?: string | null;
+        };
+        const result = await verifyCustodyChain({
+          auditText: snapshot.auditText,
+          manifest: parsedManifest as Record<string, JsonValue>,
+          verdictText: snapshot.verdictText,
+          expectedEd25519Fingerprint:
+            policy.ed25519ExpectedFingerprint ?? undefined,
+        });
+        const snapshotEvents = splitAuditLines(snapshot.auditText).map((rawLine) => {
+          const record = parseAuditRecord(rawLine);
+          if (!record) throw new Error("custody audit contains an invalid record");
+          return {
+            seq: record.seq,
+            kind: record.kind,
+            ts: record.ts,
+            payload: record.payload as Record<string, unknown>,
+            raw_line: rawLine,
+          } satisfies BrowserAuditLine;
+        });
+        const verdict = result.verdict as VerdictPayload | null;
         if (!cancelled) {
-          setCustody(result);
+          setSnapshotState({
+            custody: result,
+            events: snapshotEvents,
+            verdict,
+            snapshotSha256: snapshot.snapshotSha256,
+          });
           setCustodyError(null);
+          if (
+            result.overall === true &&
+            result.signatureVerified === true &&
+            result.verdictArtifactOk === true &&
+            verdict !== null
+          ) {
+            onAuthenticatedSnapshot?.({
+              custody: result,
+              events: snapshotEvents,
+              verdict,
+              snapshotSha256: snapshot.snapshotSha256,
+            });
+            return;
+          }
+          onAuthenticatedSnapshot?.(null);
         }
       } catch (err) {
         if (!cancelled) {
           setCustodyError(err instanceof Error ? err.message : String(err));
+          setSnapshotState(null);
+          onAuthenticatedSnapshot?.(null);
         }
+      }
+      if (!cancelled && Date.now() < deadline) {
+        retry = setTimeout(() => void reverify(), 2_000);
       }
     };
     void reverify();
     return () => {
       cancelled = true;
+      if (retry) clearTimeout(retry);
     };
-  }, [manifestDone, caseDir]);
+  }, [manifestDone, caseDir, onAuthenticatedSnapshot]);
+
+  const verdictPayload = custodyAuthenticated ? snapshotState?.verdict ?? null : null;
 
   const verdict = useMemo(
-    () => deriveVerdictWord(verdictPayload?.verdict, tally, manifestDone),
-    [verdictPayload, tally, manifestDone],
+    () =>
+      manifestDone && !custodyAuthenticated
+        ? "INDETERMINATE"
+        : deriveVerdictWord(verdictPayload?.verdict, tally, manifestDone),
+    [verdictPayload, tally, manifestDone, custodyAuthenticated],
   );
 
   const caveats = useMemo(
@@ -238,12 +336,10 @@ export function VerdictSummary({
   if (!caseDir && events.length === 0) return null;
 
   const meta = VERDICT_META[verdict];
-  const summaryLine = buildVerdictSummaryLine(
-    verdict,
-    tally,
-    evidenceName,
-    caveats,
-  );
+  const summaryLine =
+    manifestDone && !custodyAuthenticated
+      ? "The terminal Case state is not authenticated; no verdict or finding tally is trusted for display."
+      : buildVerdictSummaryLine(verdict, tally, evidenceName, caveats);
   const custodyBadge = describeCustody(custody, custodyError);
 
   return (
@@ -333,8 +429,20 @@ export function VerdictSummary({
         {/* Case-file stamp — brand tactile accent, mirroring the video's
             CASE OPENED / CASE CLOSED letterpress stamps. */}
         <Stamp
-          label={manifestDone ? "Case Closed" : "Case Open"}
-          color={manifestDone ? VERDICT.confirmed : VERDICT.accentPurpleLight}
+          label={
+            custodyAuthenticated
+              ? "Case Closed"
+              : manifestDone
+                ? "Case Unverified"
+                : "Case Open"
+          }
+          color={
+            custodyAuthenticated
+              ? VERDICT.confirmed
+              : manifestDone
+                ? VERDICT.inferred
+                : VERDICT.accentPurpleLight
+          }
           rotate={-6}
           fontSize={13}
           style={{ marginBottom: 2 }}
@@ -362,7 +470,11 @@ export function VerdictSummary({
             fontWeight: 600,
             letterSpacing: 1,
             textTransform: "uppercase",
-            color: manifestDone ? VERDICT.confirmed : VERDICT.muted,
+            color: custodyAuthenticated
+              ? VERDICT.confirmed
+              : manifestDone
+                ? VERDICT.inferred
+                : VERDICT.muted,
             display: "inline-flex",
             alignItems: "center",
             gap: 7,
@@ -374,10 +486,20 @@ export function VerdictSummary({
               width: 8,
               height: 8,
               borderRadius: "50%",
-              background: manifestDone ? VERDICT.confirmed : VERDICT.mutedDark,
+              background: custodyAuthenticated
+                ? VERDICT.confirmed
+                : manifestDone
+                  ? VERDICT.inferred
+                  : VERDICT.mutedDark,
             }}
           />
-          {manifestDone ? "Signed · verifiable offline" : "Investigation running"}
+          {custodyAuthenticated
+            ? "Signed · authenticated offline"
+            : manifestDone
+              ? custody
+                ? "Terminal state · authentication failed"
+                : "Terminal state · verification pending"
+              : "Investigation running · live stream unverified"}
         </span>
         {manifestDone ? (
           <span

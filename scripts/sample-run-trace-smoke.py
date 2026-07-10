@@ -2,17 +2,20 @@
 """Regression smoke for the committed /home-free custody fixture.
 
 Guards ``docs/release-evidence/sample-run/`` — the public, deterministic VERDICT
-run committed so a judge can verify custody offline. The fixture must keep three
-invariants, all checked here against the four committed files:
+run committed so a judge can verify custody offline. This focused smoke checks
+three fixture invariants against the four committed files:
 
 1. ``scripts/trace-finding`` exits 0 (TRACE OK): the audit chain re-verifies and
    the single finding resolves to its tool execution and Merkle leaves.
-2. ``manifest_verify.json`` reports ``overall: true``.
+2. ``manifest_verify.json`` reports ``overall: true`` and authenticated
+   ``signature_verified: true``.
 3. No committed file leaks an absolute ``/home/...`` path (provenance fields are
    relativized to basenames by ``find_evil_auto._release_path``).
 
 This is the sibling of ``scripts/trace-finding-smoke.py`` (which exercises tamper
 detection on synthetic runs); this one pins the real, committed fixture instead.
+It does not trust-anchor the Ed25519 key itself; ``scripts/run-all-smokes.sh``
+separately runs ``manifest-verify-offline.py`` with the reviewed fixture fingerprint.
 """
 
 from __future__ import annotations
@@ -74,6 +77,13 @@ def _check_manifest_verify_overall() -> int:
             file=sys.stderr,
         )
         return 1
+    if data.get("signature_verified") is not True:
+        print(
+            "manifest_verify.json signature_verified is not true: "
+            f"{data.get('signature_verified')!r}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -102,7 +112,8 @@ def main() -> int:
         if rc != 0:
             return rc
     print(
-        "sample-run-trace-smoke: TRACE OK, manifest_verify overall=true, no /home leak"
+        "sample-run-trace-smoke: TRACE OK, manifest_verify overall=true + "
+        "signature_verified=true, no /home leak"
     )
     return 0
 

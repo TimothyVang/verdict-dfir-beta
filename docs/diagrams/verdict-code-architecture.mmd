@@ -14,10 +14,10 @@ flowchart TD
   end
   AGENT -->|"typed JSON-RPC &middot; no execute_shell"| MCP
   subgraph MCP[".mcp.json &mdash; 6 MCP servers"]
-    subgraph PROD["Product surface (audit-chained &middot; 45 tools)"]
+    subgraph PROD["Product surface (audit-chained &middot; 57 tools)"]
       direction LR
-      R["findevil-mcp<br/>services/mcp/  (Rust &middot; 32 DFIR tools)"]:::p
-      PY["findevil-agent-mcp<br/>services/agent_mcp/ shims &rarr; services/agent/<br/>(Python &middot; 13 crypto/ACH/memory/ACP/expert)"]:::p
+      R["findevil-mcp<br/>services/mcp/  (Rust &middot; 43 DFIR tools)"]:::p
+      PY["findevil-agent-mcp<br/>services/agent_mcp/ shims &rarr; services/agent/<br/>(Python &middot; 14 crypto/ACH/memory/ACP/expert)"]:::p
     end
     CONV["Convenience servers (never emit Findings):<br/>n8n &middot; playwright &middot; puppeteer &middot; qmd"]:::conv
   end

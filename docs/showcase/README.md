@@ -61,7 +61,7 @@ evidence as the committed, offline-verifiable
 A diagram (not a screen capture) of what `manifest_finalize` seals: the hash-chained
 `audit.jsonl`, one Merkle leaf per `tool_call_output`, and the `audit_log_final_hash` +
 `merkle_root_hex` bound into an ed25519-signed `run.manifest.json` that `manifest_verify` replays
-offline.
+offline against the trusted public-key fingerprint supplied outside the case.
 
 ![Chain of custody — manifest_finalize output](results-custody-chain.png)
 

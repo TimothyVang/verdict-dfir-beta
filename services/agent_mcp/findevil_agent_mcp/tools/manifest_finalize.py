@@ -3,8 +3,8 @@
 Wraps :func:`findevil_agent.crypto.manifest.build_manifest` plus
 :func:`write_manifest`. Three signer modes are exposed:
 
-* ``signer="ed25519"`` — default real local-keypair signature; verifies
-  offline from the public key embedded in the manifest bundle.
+* ``signer="ed25519"`` — default real local-keypair signature; authenticates
+  only against a trusted public-key fingerprint supplied outside the bundle.
 * ``signer="sigstore"`` — keyless sigstore signing via Fulcio + Rekor;
   the customer-release identity + transparency-log tier.
 * ``signer="stub"`` — deterministic ``StubSigner``; used by tests
@@ -18,6 +18,8 @@ and test-only placeholders.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +29,7 @@ from findevil_agent.crypto.anchor import (
     anchor_merkle_root,
     require_rekor_enabled,
 )
-from findevil_agent.crypto.audit_log import AuditLog
+from findevil_agent.crypto.audit_log import AuditLog, AuditLogSnapshot
 from findevil_agent.crypto.manifest import build_manifest, write_manifest
 from findevil_agent.crypto.signer import FallbackSigner, Signer, StubSigner, make_signer
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,6 +39,74 @@ from findevil_agent_mcp.tools._base import ToolSpec
 # Explicit opt-in for tests / deterministic dry-runs. Without this, a model
 # that passes signer:"stub" is coerced to ed25519 so local seals stay real.
 _STUB_ALLOW_ENV = "FINDEVIL_ALLOW_STUB_SIGNER"
+
+
+class ManifestWorkflowError(RuntimeError):
+    """The audit chain lacks controller-authenticated workflow prerequisites."""
+
+
+def validate_manifest_workflow(log: AuditLog | AuditLogSnapshot) -> None:
+    """Require verifier acceptance, handoff, and report QA before sealing.
+
+    This is defense in depth behind the private controller capability: even a
+    buggy controller cannot turn an uncited or unverified model assertion into
+    signed provenance merely by appending ``finding_approved``.
+    """
+    verifier_actions: dict[str, str] = {}
+    verifier_handoffs: dict[str, str] = {}
+    report_qa_seen = False
+    for record in log.iter_records():
+        payload = record.payload
+        if record.kind == "verifier_action":
+            finding_id = str(payload.get("finding_id") or "")
+            action = str(payload.get("action") or payload.get("verifier_action") or "")
+            replay = payload.get("replay_artifact")
+            entailment = replay.get("entailment") if isinstance(replay, dict) else None
+            replay_matched = payload.get("replay_matched") is True or (
+                isinstance(replay, dict) and replay.get("matched") is True
+            )
+            entailment_ok = not isinstance(entailment, dict) or entailment.get("passed") is True
+            if (
+                finding_id
+                and action in {"approved", "downgraded"}
+                and replay_matched
+                and entailment_ok
+            ):
+                verifier_actions[finding_id] = action
+        elif record.kind == "acp_handoff":
+            finding_id = str(payload.get("correlation_id") or "")
+            nested = payload.get("payload")
+            if (
+                payload.get("from_role") == "verifier"
+                and payload.get("to_role") == "judge"
+                and isinstance(nested, dict)
+                and str(nested.get("finding_id") or "") == finding_id
+            ):
+                verifier_handoffs[finding_id] = str(nested.get("action") or "")
+        elif record.kind == "finding_approved":
+            finding_id = str(payload.get("finding_id") or f"seq-{record.seq}")
+            action = verifier_actions.get(finding_id)
+            if action not in {"approved", "downgraded"}:
+                raise ManifestWorkflowError(
+                    f"finding {finding_id} lacks a successful verifier replay"
+                )
+            if verifier_handoffs.get(finding_id) != action:
+                raise ManifestWorkflowError(
+                    f"finding {finding_id} lacks its verifier-to-judge handoff"
+                )
+        elif record.kind == "report_qa":
+            report = payload.get("report_qa")
+            declared = str(payload.get("report_qa_sha256") or "")
+            if not isinstance(report, dict):
+                raise ManifestWorkflowError("report_qa record lacks its QA document")
+            actual = hashlib.sha256(
+                json.dumps(report, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if declared != actual:
+                raise ManifestWorkflowError("report_qa digest does not match its QA document")
+            report_qa_seen = True
+    if not report_qa_seen:
+        raise ManifestWorkflowError("an audited report_qa record is required before sealing")
 
 
 def _stub_signer_allowed() -> bool:
@@ -60,8 +130,7 @@ def _resolve_signer_request(requested: str) -> tuple[str, str | None]:
         return "stub", None
     return (
         "ed25519",
-        "stub coerced to ed25519 "
-        f"(set {_STUB_ALLOW_ENV}=1 for the test-only stub placeholder)",
+        f"stub coerced to ed25519 (set {_STUB_ALLOW_ENV}=1 for the test-only stub placeholder)",
     )
 
 
@@ -76,7 +145,7 @@ class ManifestFinalizeInput(BaseModel):
     signer: Literal["stub", "ed25519", "sigstore"] = Field(
         default="ed25519",
         description=(
-            "ed25519 = REAL local-keypair signature, verifies offline (default); "
+            "ed25519 = REAL local-keypair signature, verifies offline against a trusted fingerprint (default); "
             "sigstore = keyless Fulcio+Rekor, identity + transparency log "
             "(Spec #2 §7.1 tier 1; the customer-release tier); "
             "stub = deterministic test placeholder (explicit opt-in, never proof)."
@@ -90,13 +159,16 @@ class ManifestFinalizeInput(BaseModel):
         default=False,
         description=(
             "OPT-IN: publish the audit Merkle root to a public Sigstore Rekor "
-            "transparency log (RFC-3161 TSA fallback) so a third party can prove "
-            "when the sealed root existed. Absent by default — when false the "
-            "manifest is byte-identical and no network is touched. Requires the "
+            "transparency log. The RFC-3161 fallback records only a structural "
+            "imprint until a TSA chain is pinned; it is not authenticated time. "
+            "Absent by default — when false no network is touched. The request "
+            "boolean is committed inside the signed manifest body so a requested "
+            "anchor cannot be stripped as a silent downgrade. Requires the "
             "operator to also set FINDEVIL_REKOR_ENABLE=1; requesting it without "
             "that opt-in fails closed. Only the bare 32-byte SHA-256 root leaves "
-            "the host (no evidence text). The anchor is attached AFTER signing "
-            "and excluded from the signed body, so it never alters the signature."
+            "the host (no evidence text). The proof block is attached AFTER "
+            "signing and excluded from the signed body; the request commitment "
+            "itself is signed and gates verification when true."
         ),
     )
 
@@ -132,18 +204,25 @@ class ManifestFinalizeOutput(BaseModel):
         default=None,
         description="Why the requested signer degraded, when it did; null otherwise.",
     )
+    transparency_requested: bool = Field(
+        default=False,
+        description=(
+            "The signed transparency-anchor policy commitment. When true, "
+            "manifest_verify requires an authenticated anchor for overall=True."
+        ),
+    )
     transparency_anchored: bool = Field(
         default=False,
         description=(
-            "True iff a transparency anchor was successfully attached (Rekor or "
-            "RFC-3161 TSA fallback). False when anchoring was not requested or the "
-            "attempt honestly failed (see the manifest's transparency_log block)."
+            "True iff an authenticated Rekor transparency anchor was attached. "
+            "An RFC-3161 fallback remains structural-only until a pinned TSA "
+            "certificate chain is verified."
         ),
     )
     transparency_kind: str | None = Field(
         default=None,
         description=(
-            "The transparency anchor kind actually recorded: 'rekor', 'rfc3161', "
+            "The transparency proof kind actually recorded: 'rekor', 'rfc3161', "
             "'none' (attempted but failed), or null when anchoring was not requested."
         ),
     )
@@ -152,6 +231,10 @@ class ManifestFinalizeOutput(BaseModel):
 async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
     assert isinstance(inp, ManifestFinalizeInput)
     log = AuditLog(Path(inp.audit_log_path))
+    reserved_custody = (
+        os.environ.get("FINDEVIL_CUSTODY_BOUNDARY", "").strip() == "reserved_case"
+        and len(os.environ.get("FINDEVIL_CONTROLLER_CAPABILITY", "")) == 64
+    )
     # sigstore lazy-imports its identity token from $SIGSTORE_ID_TOKEN inside
     # the signer; ed25519 signs with the local keypair (offline). Requests are
     # wrapped so a failed signer honestly degrades — sigstore -> ed25519 ->
@@ -169,23 +252,38 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
             FallbackSigner(make_signer(kind="ed25519"), StubSigner(run_id=inp.run_id)),
         )
 
-    manifest = build_manifest(
-        case_id=inp.case_id,
-        run_id=inp.run_id,
-        started_at=inp.started_at,
-        audit_log=log,
-        signer=signer,
-        extra=inp.extra,
-    )
-    out_path = write_manifest(manifest, Path(inp.output_path))
-
+    # Verify once and hold a shared writer/file lock while workflow checks,
+    # leaf derivation, and signing consume one immutable record snapshot.
+    with log.verified_snapshot() as sealed_log:
+        if reserved_custody:
+            validate_manifest_workflow(sealed_log)
+        manifest = build_manifest(
+            case_id=inp.case_id,
+            run_id=inp.run_id,
+            started_at=inp.started_at,
+            audit_log=sealed_log,
+            signer=signer,
+            extra=inp.extra,
+            transparency_anchor_requested=inp.anchor_transparency,
+        )
+    sig = manifest.signature or {}
+    signer_effective = str(sig.get("kind") or "stub")
+    if (
+        os.environ.get("FINDEVIL_CUSTODY_BOUNDARY", "").strip() == "reserved_case"
+        and signer_effective != inp.signer
+    ):
+        raise RuntimeError(
+            "reserved custody signer degraded: "
+            f"requested {inp.signer}, effective {signer_effective}; "
+            "refusing to write a weaker manifest"
+        )
     # Optional, opt-in transparency anchoring. Absent by default: with
-    # anchor_transparency=False (the default) NOTHING below runs, so the manifest
-    # stays byte-identical and no network is touched. When requested, the env
-    # opt-in must also be set (fail-closed), then the anchor is attached AFTER
-    # signing and the manifest is RE-WRITTEN — the anchor is excluded from the
-    # already-computed signed body, so the re-write does NOT invalidate the
-    # signature.
+    # anchor_transparency=False (the default) NOTHING below runs and no network
+    # is touched. The request boolean was committed before signing above. When
+    # requested, the env opt-in must also be set (fail-closed), then the proof
+    # is attached AFTER signing. The proof block is excluded from the signed
+    # body while the request itself is included, closing anchor-stripping
+    # downgrades without making a network response part of the signature.
     transparency_anchored = False
     transparency_kind: str | None = None
     if inp.anchor_transparency:
@@ -193,14 +291,17 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
         block = anchor_merkle_root(manifest.merkle_root_hex)
         if block is not None:
             manifest = replace(manifest, transparency_log=block)
-            out_path = write_manifest(manifest, Path(inp.output_path))
             transparency_kind = str(block.get("kind") or "none")
             transparency_anchored = bool(block.get("anchored"))
+        else:
+            transparency_kind = "none"
+
+    # Write once, after any requested proof attempt, so a failed network opt-in
+    # cannot leave a transient requested-but-unattempted manifest on disk.
+    out_path = write_manifest(manifest, Path(inp.output_path))
 
     sig = manifest.signature or {}
-    degrade_reason = (
-        str(sig.get("fallback_reason")) if sig.get("fallback_reason") else None
-    )
+    degrade_reason = str(sig.get("fallback_reason")) if sig.get("fallback_reason") else None
     if coerce_reason and degrade_reason:
         combined_reason = f"{coerce_reason}; {degrade_reason}"
     else:
@@ -217,6 +318,7 @@ async def _handle(inp: BaseModel) -> ManifestFinalizeOutput:
         ),
         signer_effective=str(sig.get("kind") or "stub"),
         fallback_reason=combined_reason,
+        transparency_requested=inp.anchor_transparency,
         transparency_anchored=transparency_anchored,
         transparency_kind=transparency_kind,
     )
@@ -232,13 +334,16 @@ SPEC = ToolSpec(
         "extracting tool_call_output digests + finding digests as Merkle leaves, (3) "
         "computing the SHA-256 root, (4) signing the canonicalized body. "
         "signer='ed25519' (default) is a REAL local-keypair signature that verifies "
-        "offline; signer='sigstore' for production identity + transparency log "
+        "offline against an external trusted fingerprint; signer='sigstore' for production identity + transparency log "
         "(keyless Fulcio/Rekor — requires $SIGSTORE_ID_TOKEN); signer='stub' is an "
         "explicit dev placeholder. This is the terminal step — once the manifest is signed "
         "the run is closed. REFUSES to seal a run containing any finding_approved "
         "record without a tool_call_id recorded earlier in the audit chain — the "
         "'every Finding cites a tool_call_id' invariant is enforced here in code, "
-        "not just by prompts. "
+        "not just by prompts. anchor_transparency commits the request inside the "
+        "signed body before attaching the proof; when true, manifest_verify gates "
+        "overall on an authenticated Rekor anchor. RFC-3161 remains structural-only "
+        "until its TSA chain is pinned and verified. "
         "On error: most common cause is the audit_log_path doesn't exist or has been "
         "tampered with — run audit_verify first to confirm the chain is clean."
     ),

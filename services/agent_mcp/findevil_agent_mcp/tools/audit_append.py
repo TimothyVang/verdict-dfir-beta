@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from findevil_agent.crypto.audit_log import AuditLog
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
+from findevil_agent_mcp.tools._input_limits import enforce_json_budget
 
 
 class AuditAppendInput(BaseModel):
@@ -22,21 +23,31 @@ class AuditAppendInput(BaseModel):
 
     path: str = Field(
         ...,
+        min_length=1,
+        max_length=4096,
         description="Absolute path to audit.jsonl. Created if missing.",
     )
     kind: str = Field(
         ...,
         description="Event kind, e.g. 'tool_call_start', 'tool_call_output', 'finding_approved'.",
         min_length=1,
+        max_length=128,
     )
     payload: dict[str, Any] = Field(
         ...,
-        description="Event body. Will be RFC-8785 canonicalized before hashing.",
+        description="Event body. Encoded as VERDICT canonical JSON v1 before hashing.",
     )
     ts: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=64,
         description="Optional UTC ISO-8601Z timestamp; defaults to now().",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_input_budget(cls, value: Any) -> Any:
+        return enforce_json_budget(value, label="audit_append")
 
 
 class AuditAppendOutput(BaseModel):

@@ -59,10 +59,14 @@ fn yara_scan_errors_on_compile_failure() {
     let target = tmp.path().join("data.bin");
     std::fs::write(&target, b"some bytes").unwrap();
     let rules = tmp.path().join("bad.yar");
-    std::fs::write(&rules, "this is not yara at all").unwrap();
+    let attacker_controlled_source = "TOP_SECRET_RULE_SOURCE this is not yara at all";
+    std::fs::write(&rules, attacker_controlled_source).unwrap();
     let input = sample_input(target, rules);
     let err = yara_scan(&input).unwrap_err();
-    assert!(matches!(err, YaraError::RulesCompileFailed { .. }));
+    assert!(matches!(&err, YaraError::RulesCompileFailed { .. }));
+    let message = err.to_string();
+    assert!(!message.contains("TOP_SECRET_RULE_SOURCE"));
+    assert!(!message.contains(attacker_controlled_source));
 }
 
 #[test]

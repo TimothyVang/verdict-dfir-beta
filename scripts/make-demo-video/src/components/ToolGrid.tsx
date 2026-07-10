@@ -5,7 +5,7 @@ import { Scene } from "./shared/Scene";
 import { Kicker, KineticHeadline, PullQuote, RuleLine, Stamp } from "./shared/editorial-ui";
 import { spread } from "./shared/pacing";
 
-// Beat 4 — "The toolbox." VERDICT's 45 forensic tools as a grouped instrument
+// Beat 4 — "The toolbox." VERDICT's 57 forensic tools as a grouped instrument
 // tray: four plain-English questions, each a GROTESK header + a count badge that
 // counts up (mirrors FleetScene's big-numeral reveal) + a wrapped row of MONO
 // tool-name chips. Groups reveal left→right; chips stagger in with spring. The
@@ -20,12 +20,12 @@ interface ToolGroup {
   tools: string[];
 }
 
-// The 45-tool surface, verbatim: 32 Rust DFIR tools + 13 Python crypto/ACH
+// The product surface: 43 Rust DFIR tools + 14 Python crypto/ACH/custody tools.
 // tools, regrouped by the question each answers.
 const GROUPS: ToolGroup[] = [
   {
     question: "What ran on this machine?",
-    count: 19,
+    count: 24,
     tools: [
       "case_open",
       "disk_mount",
@@ -46,11 +46,16 @@ const GROUPS: ToolGroup[] = [
       "vol_malfind",
       "vol_run",
       "mac_triage",
+      "bulk_extract",
+      "exif_parse",
+      "thumbcache_parse",
+      "vss_list",
+      "vss_mount",
     ],
   },
   {
     question: "What did the system log?",
-    count: 8,
+    count: 11,
     tools: [
       "evtx_query",
       "hayabusa_scan",
@@ -60,16 +65,28 @@ const GROUPS: ToolGroup[] = [
       "login_accounting",
       "ausearch",
       "cloud_audit",
+      "setupapi_parse",
+      "srum_parse",
+      "wmi_persist_parse",
     ],
   },
   {
     question: "What left over the network?",
-    count: 5,
-    tools: ["pcap_triage", "zeek_summary", "suricata_eve", "nfdump_query", "yara_scan"],
+    count: 8,
+    tools: [
+      "pcap_triage",
+      "zeek_summary",
+      "suricata_eve",
+      "nfdump_query",
+      "yara_scan",
+      "bits_parse",
+      "email_parse",
+      "pst_parse",
+    ],
   },
   {
     question: "Can we prove it?",
-    count: 13,
+    count: 15,
     tools: [
       "audit_append",
       "audit_verify",
@@ -85,6 +102,7 @@ const GROUPS: ToolGroup[] = [
       "expert_miss_capture",
       "accuracy_compare",
       "find_ai_signatures",
+      "hashset_lookup",
     ],
   },
 ];
@@ -168,7 +186,7 @@ export function ToolGrid() {
           Exhibit D · Inside the SANS SIFT Workstation
         </Kicker>
         <div style={{ marginTop: 18 }}>
-          <KineticHeadline text="Forty-five" frame={frame} delay={sd(6)} size={92} />
+          <KineticHeadline text="Fifty-eight" frame={frame} delay={sd(6)} size={92} />
           <KineticHeadline text="tools." frame={frame} delay={sd(11)} size={92} />
           <KineticHeadline text="Zero shells." frame={frame} delay={sd(16)} size={92} italic color={C.alert} />
         </div>
@@ -215,7 +233,7 @@ export function ToolGrid() {
           }}
         >
           <span>Exhibit D-1 — Tool Surface</span>
-          <span style={{ color: C.inkFaint }}>32 rust · 13 python · 45 typed</span>
+          <span style={{ color: C.inkFaint }}>43 rust · 14 python · 57 typed</span>
         </div>
         <RuleLine frame={frame} delay={sd(20)} color={C.hairline} />
 

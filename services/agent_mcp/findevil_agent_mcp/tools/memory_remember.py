@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from findevil_agent.crypto.audit_log import AuditLog
 from findevil_agent.memory.store import MemoryStore
@@ -14,22 +15,34 @@ from findevil_agent_mcp.tools._base import ToolSpec
 class MemoryRememberInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    store_path: str = Field(..., description="Absolute path to memory.sqlite. Created if missing.")
-    case_id: str = Field(..., min_length=1)
-    kind: str = Field(
+    store_path: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Absolute path to memory.sqlite. Created if missing.",
+    )
+    case_id: str = Field(..., min_length=1, max_length=128)
+    kind: Literal["ioc", "hash", "ttp", "hostname", "finding_summary"] = Field(
         ..., description="One of: 'ioc', 'hash', 'ttp', 'hostname', 'finding_summary'."
     )
-    key: str = Field(..., min_length=1)
-    value: str = Field(..., min_length=1)
+    key: str = Field(..., min_length=1, max_length=4096)
+    value: str = Field(..., min_length=1, max_length=65_536)
     sha256: str = Field(
         ...,
         pattern=r"^sha256:[0-9a-f]{64}$",
         description="Lowercase hex SHA-256 with 'sha256:' prefix, e.g. 'sha256:ab12...'.",
     )
-    ts: str | None = Field(default=None, description="UTC ISO-8601Z; defaults to now().")
-    case_path: str | None = Field(default=None)
+    ts: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="UTC ISO-8601Z; defaults to now().",
+    )
+    case_path: str | None = Field(default=None, min_length=1, max_length=4096)
     audit_log_path: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=4096,
         description=(
             "Optional absolute path to the case audit.jsonl. When set, a "
             "'memory_remember' record is appended so the run records THAT a write "

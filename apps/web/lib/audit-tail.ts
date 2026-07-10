@@ -6,18 +6,16 @@
 // Per A3 plan Task 4.2.
 
 import { createHash } from "node:crypto";
+import { constants, lstatSync, realpathSync, type Stats } from "node:fs";
 import { promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import chokidar, { type FSWatcher } from "chokidar";
 
 import type { AgentEvent } from "@/lib/events";
 import { repoRoot } from "@/lib/repo-root";
-import {
-  canonicalizeJson,
-  extractContentRecord,
-  type JsonValue,
-} from "@/lib/verify-chain";
 
 /**
  * Default allow-listed case roots, resolved against the repo root. repoRoot()
@@ -44,6 +42,11 @@ const DEFAULT_ALLOWED_ROOTS = [
   "test-forensics",
 ];
 
+const DEFAULT_MAX_CASE_FILE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_AUDIT_STREAM_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_AUDIT_LINE_BYTES = 4 * 1024 * 1024;
+const AUDIT_READ_CHUNK_BYTES = 64 * 1024;
+
 /**
  * Return true iff `absPath` resolves to a location strictly INSIDE
  * one of the allow-listed roots (default roots + any
@@ -60,26 +63,332 @@ const DEFAULT_ALLOWED_ROOTS = [
  * @findevil/web dev` can run with cwd=apps/web, so repoRoot() walks up to the
  * repository marker unless `FINDEVIL_REPO_ROOT` is set explicitly.
  */
-export function isAllowedCasePath(absPath: string): boolean {
-  const resolved = path.resolve(absPath);
+function configuredAllowedRoots(): string[] {
   let base: string;
   try {
     base = repoRoot();
   } catch {
-    return false;
+    return [];
   }
   const extraRaw = process.env.FINDEVIL_DASHBOARD_EXTRA_ROOTS ?? "";
   const extras = extraRaw
     .split(path.delimiter)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  const allRoots = [...DEFAULT_ALLOWED_ROOTS, ...extras];
-  for (const root of allRoots) {
-    const rootAbs = path.isAbsolute(root) ? root : path.resolve(base, root);
-    if (resolved === rootAbs) return true;
-    if (resolved.startsWith(rootAbs + path.sep)) return true;
+  return [...DEFAULT_ALLOWED_ROOTS, ...extras].map((root) =>
+    path.isAbsolute(root) ? path.resolve(root) : path.resolve(base, root),
+  );
+}
+
+function isInside(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(root + path.sep);
+}
+
+/**
+ * Resolve an existing Case directory through the filesystem, rejecting every
+ * symlink/junction component beneath its configured root. Returning the real
+ * path (instead of the lexical request) lets routes keep one canonical trust
+ * boundary for all subsequent file reads.
+ */
+export function resolveAllowedCasePath(absPath: string): string | null {
+  const requested = path.resolve(absPath);
+  for (const rootAbs of configuredAllowedRoots()) {
+    if (!isInside(rootAbs, requested)) continue;
+    try {
+      const rootStat = lstatSync(rootAbs);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) continue;
+      const relative = path.relative(rootAbs, requested);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+
+      let current = rootAbs;
+      let rejected = false;
+      for (const component of relative.split(path.sep).filter(Boolean)) {
+        current = path.join(current, component);
+        const metadata = lstatSync(current);
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+          rejected = true;
+          break;
+        }
+      }
+      if (rejected) continue;
+
+      const rootReal = realpathSync(rootAbs);
+      const caseReal = realpathSync(requested);
+      if (isInside(rootReal, caseReal)) return caseReal;
+    } catch {
+      // Missing, inaccessible, raced, or non-directory paths fail closed.
+    }
   }
-  return false;
+  return null;
+}
+
+export function isAllowedCasePath(absPath: string): boolean {
+  return resolveAllowedCasePath(absPath) !== null;
+}
+
+interface OpenedCaseFile {
+  handle: FileHandle;
+  stat: Stats;
+  target: string;
+  casePath: string;
+}
+
+function stableRegularFile(left: Stats, right: Stats): boolean {
+  return (
+    left.isFile() &&
+    right.isFile() &&
+    left.nlink === 1 &&
+    right.nlink === 1 &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
+}
+
+async function openAllowedCaseFile(
+  caseDir: string,
+  relativeFile: string,
+): Promise<OpenedCaseFile | null> {
+  if (!relativeFile || path.isAbsolute(relativeFile)) return null;
+  const canonicalCase = resolveAllowedCasePath(caseDir);
+  if (!canonicalCase) return null;
+  const target = path.resolve(canonicalCase, relativeFile);
+  if (!isInside(canonicalCase, target) || target === canonicalCase) return null;
+
+  const relative = path.relative(canonicalCase, target);
+  let current = canonicalCase;
+  const components = relative.split(path.sep).filter(Boolean);
+  try {
+    for (const [index, component] of components.entries()) {
+      current = path.join(current, component);
+      const metadata = await fs.lstat(current);
+      if (metadata.isSymbolicLink()) return null;
+      const final = index === components.length - 1;
+      if ((!final && !metadata.isDirectory()) || (final && !metadata.isFile())) {
+        return null;
+      }
+      if (final && metadata.nlink !== 1) return null;
+    }
+  } catch {
+    return null;
+  }
+
+  let handle: FileHandle | null = null;
+  try {
+    const flags =
+      process.platform === "win32"
+        ? constants.O_RDONLY
+        : constants.O_RDONLY | constants.O_NOFOLLOW;
+    handle = await fs.open(target, flags);
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile() || openedStat.nlink !== 1) return null;
+
+    const targetReal = await fs.realpath(target);
+    if (!isInside(canonicalCase, targetReal)) return null;
+    const pathStat = await fs.lstat(target);
+    if (
+      pathStat.isSymbolicLink() ||
+      !stableRegularFile(pathStat, openedStat)
+    ) {
+      return null;
+    }
+    const result = {
+      handle,
+      stat: openedStat,
+      target,
+      casePath: canonicalCase,
+    };
+    handle = null;
+    return result;
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
+  }
+}
+
+async function readOpenedFile(
+  opened: OpenedCaseFile,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 0 ||
+    !Number.isSafeInteger(opened.stat.size) ||
+    opened.stat.size > maxBytes
+  ) {
+    return null;
+  }
+  const expected = opened.stat.size;
+  const data = Buffer.alloc(expected);
+  let offset = 0;
+  while (offset < expected) {
+    const { bytesRead } = await opened.handle.read(
+      data,
+      offset,
+      Math.min(AUDIT_READ_CHUNK_BYTES, expected - offset),
+      offset,
+    );
+    if (bytesRead === 0) return null;
+    offset += bytesRead;
+  }
+  return data;
+}
+
+async function openedFileRemainsStable(opened: OpenedCaseFile): Promise<boolean> {
+  try {
+    const descriptorStat = await opened.handle.stat();
+    const pathStat = await fs.lstat(opened.target);
+    if (
+      pathStat.isSymbolicLink() ||
+      !stableRegularFile(opened.stat, descriptorStat) ||
+      !stableRegularFile(descriptorStat, pathStat)
+    ) {
+      return false;
+    }
+    const relative = path.relative(opened.casePath, opened.target);
+    let current = opened.casePath;
+    const components = relative.split(path.sep).filter(Boolean);
+    for (const [index, component] of components.entries()) {
+      current = path.join(current, component);
+      const componentStat = await fs.lstat(current);
+      const final = index === components.length - 1;
+      if (
+        componentStat.isSymbolicLink() ||
+        (!final && !componentStat.isDirectory()) ||
+        (final && !componentStat.isFile())
+      ) {
+        return false;
+      }
+    }
+    const targetReal = await fs.realpath(opened.target);
+    return (
+      isInside(opened.casePath, targetReal) &&
+      resolveAllowedCasePath(opened.casePath) === opened.casePath
+    );
+  } catch {
+    return false;
+  }
+}
+
+export interface CaseFileSnapshotRequest {
+  relativeFile: string;
+  maxBytes?: number;
+}
+
+/**
+ * Read a set of Case files while every descriptor remains open, then validate
+ * every descriptor and path again. A writer/replacer racing any read rejects
+ * the whole set, preventing mixed custody artifacts from reaching the client.
+ */
+export async function readAllowedCaseFilesSnapshot(
+  caseDir: string,
+  requests: readonly CaseFileSnapshotRequest[],
+): Promise<Map<string, Buffer> | null> {
+  if (requests.length === 0) return new Map();
+  const openedFiles: OpenedCaseFile[] = [];
+  const names = new Set<string>();
+  try {
+    for (const request of requests) {
+      if (names.has(request.relativeFile)) return null;
+      names.add(request.relativeFile);
+      const opened = await openAllowedCaseFile(caseDir, request.relativeFile);
+      if (!opened) return null;
+      if (
+        openedFiles.length > 0 &&
+        opened.casePath !== openedFiles[0].casePath
+      ) {
+        await opened.handle.close().catch(() => undefined);
+        return null;
+      }
+      openedFiles.push(opened);
+    }
+
+    const result = new Map<string, Buffer>();
+    for (let index = 0; index < openedFiles.length; index += 1) {
+      const request = requests[index];
+      const data = await readOpenedFile(
+        openedFiles[index],
+        request.maxBytes ?? DEFAULT_MAX_CASE_FILE_BYTES,
+      );
+      if (!data) return null;
+      result.set(request.relativeFile, data);
+    }
+
+    for (const opened of openedFiles) {
+      if (!(await openedFileRemainsStable(opened))) return null;
+    }
+    return result;
+  } finally {
+    await Promise.all(
+      openedFiles.map((opened) =>
+        opened.handle.close().catch(() => undefined),
+      ),
+    );
+  }
+}
+
+/** Read one regular, non-linked file that remains stable inside a Case. */
+export async function readAllowedCaseFile(
+  caseDir: string,
+  relativeFile: string,
+  maxBytes = DEFAULT_MAX_CASE_FILE_BYTES,
+): Promise<Buffer | null> {
+  const snapshot = await readAllowedCaseFilesSnapshot(caseDir, [
+    { relativeFile, maxBytes },
+  ]);
+  return snapshot?.get(relativeFile) ?? null;
+}
+
+/** Stat one allowed Case file without following caller-created links. */
+export async function statAllowedCaseFile(
+  caseDir: string,
+  relativeFile: string,
+): Promise<Stats | null> {
+  const opened = await openAllowedCaseFile(caseDir, relativeFile);
+  if (!opened) return null;
+  await opened.handle.close().catch(() => undefined);
+  return opened.stat;
+}
+
+async function openRegularFileNoLinks(
+  filePath: string,
+): Promise<OpenedCaseFile | null> {
+  let handle: FileHandle | null = null;
+  try {
+    const before = await fs.lstat(filePath);
+    if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+      return null;
+    }
+    const flags =
+      process.platform === "win32"
+        ? constants.O_RDONLY
+        : constants.O_RDONLY | constants.O_NOFOLLOW;
+    handle = await fs.open(filePath, flags);
+    const opened = await handle.stat();
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      return null;
+    }
+    const result = {
+      handle,
+      stat: opened,
+      target: filePath,
+      casePath: path.dirname(filePath),
+    };
+    handle = null;
+    return result;
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
+  }
 }
 
 /** One selectable case in the dashboard picker. */
@@ -125,11 +434,13 @@ export async function listCases(): Promise<CaseEntry[]> {
     for (const e of entries) {
       if (!e.isDirectory()) continue;
       const dir = path.join(root, e.name);
-      if (seen.has(dir)) continue;
+      const canonicalDir = resolveAllowedCasePath(dir);
+      if (!canonicalDir || seen.has(canonicalDir)) continue;
       try {
-        const s = await fs.stat(path.join(dir, "audit.jsonl"));
-        out.push({ path: dir, name: e.name, mtime: s.mtimeMs });
-        seen.add(dir);
+        const s = await statAllowedCaseFile(canonicalDir, "audit.jsonl");
+        if (!s) continue;
+        out.push({ path: canonicalDir, name: e.name, mtime: s.mtimeMs });
+        seen.add(canonicalDir);
       } catch {
         // no audit.jsonl → not a case dir
       }
@@ -174,8 +485,27 @@ export interface AuditLine {
 export async function* tailAuditLog(
   auditPath: string,
   signal: AbortSignal,
+  trustedCaseDir?: string,
+  limits: { maxBytes?: number; maxLineBytes?: number } = {},
 ): AsyncGenerator<AuditLine, void, void> {
   const absPath = path.resolve(auditPath);
+  const opened = await (
+    trustedCaseDir
+      ? openAllowedCaseFile(trustedCaseDir, path.basename(absPath))
+      : openRegularFileNoLinks(absPath)
+  );
+  if (!opened) return;
+  const maxBytes = limits.maxBytes ?? DEFAULT_MAX_AUDIT_STREAM_BYTES;
+  const maxLineBytes = limits.maxLineBytes ?? DEFAULT_MAX_AUDIT_LINE_BYTES;
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes <= 0 ||
+    !Number.isSafeInteger(maxLineBytes) ||
+    maxLineBytes <= 0
+  ) {
+    await opened.handle.close().catch(() => undefined);
+    throw new Error("audit-tail limits must be positive safe integers");
+  }
 
   // Set up abort tracking up-front so a mid-drain abort doesn't get
   // lost. Without this, `signal.addEventListener("abort", …)` would
@@ -184,12 +514,15 @@ export async function* tailAuditLog(
   let done = false;
   let watcher: FSWatcher | null = null;
   let resolve: (() => void) | null = null;
+  let wakePending = false;
 
   const wakeup = (): void => {
     if (resolve) {
       const r = resolve;
       resolve = null;
       r();
+    } else {
+      wakePending = true;
     }
   };
 
@@ -204,106 +537,108 @@ export async function* tailAuditLog(
   };
 
   if (signal.aborted) {
+    await opened.handle.close().catch(() => undefined);
     return;
   }
   signal.addEventListener("abort", onAbort);
 
   try {
-    // 1. Initial drain — read whatever's already on disk so a late
-    //    connection sees full history.
     let position = 0;
-    try {
-      const stat = await fs.stat(absPath);
-      if (stat.size > 0) {
-        const initial = await fs.readFile(absPath, { encoding: "utf-8" });
-        position = Buffer.byteLength(initial, "utf-8");
-        for (const line of splitLines(initial)) {
-          if (done) return;
-          const parsed = parseLine(line);
-          if (parsed) yield parsed;
-        }
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      // File doesn't exist yet — that's fine; chokidar will catch
-      // the first append.
-    }
+    let totalRead = 0;
+    let lineBuffer = "";
+    const decoder = new StringDecoder("utf8");
 
-    if (done) return;
-
-    // 2. Watch for appends. Buffer partial lines across reads since
-    //    the writer (Python) may flush mid-line.
+    // Attach before the initial drain; wakePending coalesces events that race
+    // with the drain or arrive before the iterator begins waiting.
     watcher = chokidar.watch(absPath, {
       persistent: true,
       awaitWriteFinish: false,
       ignoreInitial: true,
     });
 
-    // The pending queue lets us yield from inside an async iterator
-    // without losing events that arrive while we're awaiting.
-    const pending: AuditLine[] = [];
-    let lineBuffer = "";
-
-    const readNew = async (p: string): Promise<void> => {
-      if (path.resolve(p) !== absPath) return;
-      try {
-        const stat = await fs.stat(absPath);
-        if (stat.size === position) return;
-        // Re-open per change to keep the implementation simple; for
-        // multi-MB audit logs we'd hold an fd open and seek instead.
-        const fd = await fs.open(absPath, "r");
-        try {
-          const length = stat.size - position;
-          if (length <= 0) return;
-          const buf = Buffer.alloc(length);
-          await fd.read(buf, 0, length, position);
-          position = stat.size;
-          lineBuffer += buf.toString("utf-8");
-          const newlineIdx = lineBuffer.lastIndexOf("\n");
-          if (newlineIdx === -1) return;
-          const ready = lineBuffer.slice(0, newlineIdx);
-          lineBuffer = lineBuffer.slice(newlineIdx + 1);
-          for (const line of splitLines(ready)) {
-            const parsed = parseLine(line);
-            if (parsed) {
-              pending.push(parsed);
-            }
-          }
-          wakeup();
-        } finally {
-          await fd.close();
-        }
-      } catch (err) {
-        console.error("audit-tail read error:", err);
-      }
-    };
-
-    watcher.on("add", (changedPath: string) => void readNew(changedPath));
-    watcher.on("change", (changedPath: string) => void readNew(changedPath));
+    watcher.on("add", (changedPath: string) => {
+      if (path.resolve(changedPath) === absPath) wakeup();
+    });
+    watcher.on("change", (changedPath: string) => {
+      if (path.resolve(changedPath) === absPath) wakeup();
+    });
+    watcher.on("ready", wakeup);
     watcher.on("error", (err: unknown) => {
       console.error("audit-tail watcher error:", err);
     });
 
     while (!done) {
-      while (pending.length > 0) {
-        const line = pending.shift();
-        if (line) yield line;
+      const handleStat = await opened.handle.stat();
+      const pathStat = await fs.lstat(absPath);
+      if (
+        !handleStat.isFile() ||
+        handleStat.nlink !== 1 ||
+        pathStat.isSymbolicLink() ||
+        !pathStat.isFile() ||
+        pathStat.nlink !== 1 ||
+        pathStat.dev !== handleStat.dev ||
+        pathStat.ino !== handleStat.ino
+      ) {
+        throw new Error("audit log identity changed while streaming");
       }
+      if (handleStat.size < position) {
+        throw new Error("audit log was truncated while streaming");
+      }
+      if (handleStat.size > maxBytes) {
+        throw new Error(`audit log exceeds the ${maxBytes}-byte stream limit`);
+      }
+
+      let readAny = false;
+      while (!done && position < handleStat.size) {
+        const remaining = Number(handleStat.size - position);
+        const buffer = Buffer.alloc(Math.min(AUDIT_READ_CHUNK_BYTES, remaining));
+        const { bytesRead } = await opened.handle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        readAny = true;
+        position += bytesRead;
+        totalRead += bytesRead;
+        if (totalRead > maxBytes) {
+          throw new Error(`audit stream exceeds the ${maxBytes}-byte connection limit`);
+        }
+        lineBuffer += decoder.write(buffer.subarray(0, bytesRead));
+
+        let newlineIndex = lineBuffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          let line = lineBuffer.slice(0, newlineIndex);
+          lineBuffer = lineBuffer.slice(newlineIndex + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (Buffer.byteLength(line, "utf8") > maxLineBytes) {
+            throw new Error(`audit line exceeds the ${maxLineBytes}-byte limit`);
+          }
+          if (line.length > 0) {
+            const parsed = parseLine(line);
+            if (parsed) yield parsed;
+          }
+          newlineIndex = lineBuffer.indexOf("\n");
+        }
+        if (Buffer.byteLength(lineBuffer, "utf8") > maxLineBytes) {
+          throw new Error(`audit line exceeds the ${maxLineBytes}-byte limit`);
+        }
+      }
+
       if (done) break;
+      if (readAny) continue;
+      if (wakePending) {
+        wakePending = false;
+        continue;
+      }
       await new Promise<void>((r) => {
         resolve = r;
       });
+      wakePending = false;
     }
   } finally {
     signal.removeEventListener("abort", onAbort);
     if (watcher) {
       await watcher.close().catch(() => undefined);
     }
+    await opened.handle.close().catch(() => undefined);
   }
-}
-
-function splitLines(text: string): string[] {
-  return text.split(/\r?\n/).filter((line) => line.length > 0);
 }
 
 function parseLine(line: string): AuditLine | null {
@@ -317,11 +652,9 @@ function parseLine(line: string): AuditLine | null {
       kind,
       ts,
       payload: (obj.payload ?? obj) as AgentEvent | Record<string, unknown>,
-      // On-disk lines carry no line_hash field, so derive the per-line chain
-      // hash here from the shared canonicalizer. A producer that DID embed one
-      // is trusted as-is.
-      line_hash:
-        typeof obj.line_hash === "string" ? obj.line_hash : computeLineHash(obj),
+      // Hash the exact bytes the stream read. Never trust an evidence-controlled
+      // line_hash field or reserialize floats/Unicode on this presentation path.
+      line_hash: createHash("sha256").update(line, "utf-8").digest("hex"),
       raw_line: line,
     };
   } catch {
@@ -329,19 +662,4 @@ function parseLine(line: string): AuditLine | null {
     // Future: surface as a `kind=tail_parse_error` synthetic event.
     return null;
   }
-}
-
-/**
- * SHA-256 of the canonical content-field projection of a parsed audit record —
- * the per-line hash the custody chain commits to. Shares the JCS canonicalizer
- * and CONTENT_FIELDS selection with the browser re-verifier
- * (lib/verify-chain), so the server-streamed line_hash equals what an
- * in-browser SubtleCrypto re-derivation produces for the same line. Read-only:
- * it derives a value and never mutates the audit chain.
- */
-function computeLineHash(obj: Record<string, unknown>): string {
-  const canonical = canonicalizeJson(
-    extractContentRecord(obj as Record<string, JsonValue>),
-  );
-  return createHash("sha256").update(canonical, "utf-8").digest("hex");
 }

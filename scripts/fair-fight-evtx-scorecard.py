@@ -55,7 +55,11 @@ def _load_corpus_cases() -> dict[str, dict[str, Any]]:
     if not _CORPUS.is_file():
         return {}
     data = json.loads(_CORPUS.read_text(encoding="utf-8"))
-    return {c["name"]: c for c in data.get("cases", []) if isinstance(c, dict) and "name" in c}
+    return {
+        c["name"]: c
+        for c in data.get("cases", [])
+        if isinstance(c, dict) and "name" in c
+    }
 
 
 def _expected_techniques(golden_dir: Path) -> list[str]:
@@ -110,7 +114,14 @@ def _resolve_case_dir(arm_root: Path, case_id: str) -> Path | None:
 
 
 def _score_case(case_dir: Path, golden: Path) -> dict[str, Any]:
-    cmd = [sys.executable, str(_SCORE), str(case_dir), "--golden", str(golden), "--quiet"]
+    cmd = [
+        sys.executable,
+        str(_SCORE),
+        str(case_dir),
+        "--golden",
+        str(golden),
+        "--quiet",
+    ]
     proc = subprocess.run(cmd, cwd=str(_REPO), capture_output=True, text=True)
     # score-recall writes recall-score.json next to case
     rs = case_dir / "recall-score.json"
@@ -222,7 +233,11 @@ def main() -> int:
     out_dir = (args.out or (_REPO / "tmp" / "fair-fight" / stamp)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    arms = _parse_arms(args.arm) if args.arm else {"rulebook": (_REPO / "tmp" / "auto-runs").resolve()}
+    arms = (
+        _parse_arms(args.arm)
+        if args.arm
+        else {"rulebook": (_REPO / "tmp" / "auto-runs").resolve()}
+    )
 
     if args.run_rulebook:
         print("==> running rulebook find_evil_auto for hard-quiz pack", flush=True)
@@ -244,7 +259,8 @@ def main() -> int:
                 # If run_dir is not named case_id, write a small pointer file
                 pointer_meta = rb_root / f"{case_id}.run-pointer.json"
                 pointer_meta.write_text(
-                    json.dumps({"case_id": case_id, "run_dir": str(run_dir)}, indent=2) + "\n",
+                    json.dumps({"case_id": case_id, "run_dir": str(run_dir)}, indent=2)
+                    + "\n",
                     encoding="utf-8",
                 )
                 # Score immediately into run_dir and also cache under fair-fight
@@ -274,7 +290,9 @@ def main() -> int:
                 ptr = arm_root / f"{case_id}.run-pointer.json"
                 if ptr.is_file():
                     try:
-                        case_dir = Path(json.loads(ptr.read_text(encoding="utf-8"))["run_dir"])
+                        case_dir = Path(
+                            json.loads(ptr.read_text(encoding="utf-8"))["run_dir"]
+                        )
                     except (json.JSONDecodeError, KeyError, TypeError):
                         case_dir = None
             # Fair-fight out cache
@@ -324,10 +342,15 @@ def main() -> int:
             # score-recall / accuracy.score emits explicit boolean "pass"
             if ar.get("pass") is True:
                 passed += 1
-            elif ar.get("pass") is None and ar.get("verdict_match") and (
-                float(ar.get("recall_percent") or 0)
-                >= float(ar.get("min_recall_percent") or 100)
-            ) and not ar.get("planted_bait"):
+            elif (
+                ar.get("pass") is None
+                and ar.get("verdict_match")
+                and (
+                    float(ar.get("recall_percent") or 0)
+                    >= float(ar.get("min_recall_percent") or 100)
+                )
+                and not ar.get("planted_bait")
+            ):
                 passed += 1
             for th in ar.get("technique_scorecard") or []:
                 tech_total += 1
@@ -338,7 +361,9 @@ def main() -> int:
             "cases_pass_recall": passed,
             "technique_hits": tech_hit,
             "technique_total": tech_total,
-            "technique_recall_percent": round(100.0 * tech_hit / tech_total, 1) if tech_total else None,
+            "technique_recall_percent": round(100.0 * tech_hit / tech_total, 1)
+            if tech_total
+            else None,
         }
 
     doc = {
@@ -357,7 +382,9 @@ def main() -> int:
         "summary": summary_arms,
         "rows": rows,
     }
-    (out_dir / "scorecard.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "scorecard.json").write_text(
+        json.dumps(doc, indent=2) + "\n", encoding="utf-8"
+    )
 
     # Markdown
     lines = [
@@ -385,7 +412,9 @@ def main() -> int:
     for row in rows:
         lines.append(f"### `{row['case_id']}`")
         lines.append(f"- evidence: `{row['evidence']}`")
-        lines.append(f"- expected techniques: {', '.join(row['expected_techniques']) or '(none)'}")
+        lines.append(
+            f"- expected techniques: {', '.join(row['expected_techniques']) or '(none)'}"
+        )
         for arm_name, ar in row["arms"].items():
             if ar.get("missing"):
                 lines.append(f"- **{arm_name}**: MISSING — {ar.get('note')}")
@@ -439,7 +468,9 @@ def main() -> int:
     if rb and rb.get("cases_scored", 0) > 0:
         if rb.get("cases_pass_recall", 0) < rb.get("cases_scored", 0):
             return 1
-        if rb.get("technique_total", 0) and rb.get("technique_hits", 0) < rb.get("technique_total", 0):
+        if rb.get("technique_total", 0) and rb.get("technique_hits", 0) < rb.get(
+            "technique_total", 0
+        ):
             return 1
     return 0
 

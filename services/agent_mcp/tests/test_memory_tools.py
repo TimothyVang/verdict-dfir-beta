@@ -6,6 +6,7 @@ import pytest
 from findevil_agent.crypto.audit_log import AuditLog
 from findevil_agent.crypto.manifest import build_manifest
 from findevil_agent.crypto.signer import StubSigner
+from pydantic import ValidationError
 
 from findevil_agent_mcp.tools.memory_recall import (
     SPEC as RECALL_SPEC,
@@ -125,6 +126,43 @@ async def test_memory_recall_returns_remembered_row(tmp_path: Path) -> None:
     assert len(out.hits) == 1
     assert out.hits[0].case_id == "case-recall-1"
     assert out.hits[0].confidence > 0.0
+
+
+# Explicit short ids keep the giant field values out of the test nodeid. pytest
+# writes the nodeid into PYTEST_CURRENT_TEST, and Windows rejects an environment
+# variable longer than 32767 chars, so an auto-generated id built from the
+# 65537-char "value" case would fail at setup on native Windows.
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("case_id", "c" * 129, id="case_id-too-long"),
+        pytest.param("kind", "not-a-memory-kind", id="kind-invalid"),
+        pytest.param("key", "k" * 4097, id="key-too-long"),
+        pytest.param("value", "v" * 65_537, id="value-too-long"),
+        pytest.param("case_path", "p" * 4097, id="case_path-too-long"),
+    ],
+)
+def test_memory_remember_rejects_oversized_or_invalid_fields(field: str, value: str) -> None:
+    payload = {
+        "store_path": "/tmp/memory.sqlite",
+        "case_id": "case-1",
+        "kind": "ioc",
+        "key": "evil.example",
+        "value": "evil.example",
+        "sha256": "sha256:" + "a" * 64,
+        field: value,
+    }
+    with pytest.raises(ValidationError):
+        MemoryRememberInput.model_validate(payload)
+
+
+def test_memory_recall_rejects_oversized_query_and_paths() -> None:
+    with pytest.raises(ValidationError):
+        MemoryRecallInput(store_path="/tmp/memory.sqlite", query="q" * 4097)
+    with pytest.raises(ValidationError):
+        MemoryRecallInput(store_path="s" * 4097, query="q")
+    with pytest.raises(ValidationError):
+        MemoryRecallInput(store_path="/tmp/memory.sqlite", query="q", audit_log_path="a" * 4097)
 
 
 class TestMemoryRememberAuditChaining:

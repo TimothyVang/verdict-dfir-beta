@@ -26,7 +26,7 @@ overclaims, and how checkable its output is.** It is vendor-neutral and reproduc
 | **Overclaim rate** *(headline)* | Findings asserted at a **tier higher than the evidence supports.** | tier diff (below) |
 | **Citation coverage** | % of findings with a valid `tool_call_id` + reproducible `output_sha256` (R1–R2). | `verdict.json` + replay |
 | **Fidelity pass rate** | % of asserted values **entailed** by their cited output (R3). | entailment re-check |
-| **Custody integrity** | `manifest_verify` → `overall: true`; **plus a tamper test**: flip one byte in `audit.jsonl` → the verifier must fail and name the moved record. | `manifest_verify.json` |
+| **Custody integrity** | `manifest_verify` → `overall: true` + authenticated `signature_verified: true` under trusted signer policy; **plus a tamper test**: flip one byte in `audit.jsonl` → the verifier must fail and name the moved record. | fresh verifier result + `manifest_verify.json` receipt |
 | **FP floor / calibration** | On the benign baseline, does it return `NO_EVIL` with **zero** findings? | benign corpus |
 
 **Overclaim is the metric that matters.** A finding overclaims when any of these is true:

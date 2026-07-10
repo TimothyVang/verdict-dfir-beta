@@ -27,7 +27,7 @@ pub mod cloud_audit;
 pub mod disk;
 pub mod email_parse;
 pub mod evtx_query;
-mod ewf_segments;
+pub(crate) mod ewf_segments;
 pub mod exif_parse;
 pub mod ez_parse;
 pub mod hashset_lookup;
@@ -46,12 +46,13 @@ pub mod proc_runner;
 pub mod pst_parse;
 pub mod regf;
 pub mod registry_query;
+pub mod setupapi_parse;
 pub mod srum_parse;
 pub mod suricata_eve;
 pub mod sysmon_network_query;
 pub mod thumbcache_parse;
 pub mod usnjrnl_query;
-pub mod vel_collect;
+mod usnjrnl_reader;
 pub mod vol_malfind;
 pub mod vol_pslist;
 pub mod vol_psscan;
@@ -68,8 +69,9 @@ pub use ausearch::{
 };
 pub use bits_parse::{bits_parse, BitsParseError, BitsParseInput, BitsParseOutput};
 pub use browser_history::{
-    browser_history, path_looks_like_browser_history, BrowserHistoryError, BrowserHistoryInput,
-    BrowserHistoryOutput, BrowserHistoryRow,
+    browser_history, path_looks_like_browser_history, BrowserArtifactKind, BrowserArtifactRow,
+    BrowserAutofillMetadataRow, BrowserCookieMetadataRow, BrowserDownloadRow, BrowserHistoryError,
+    BrowserHistoryInput, BrowserHistoryOutput, BrowserHistoryRow, BrowserLoginMetadataRow,
 };
 pub use bulk_extract::{
     bulk_extract, BulkExtractError, BulkExtractInput, BulkExtractOutput, BulkFeature, BulkScanner,
@@ -94,7 +96,7 @@ pub use exif_parse::{exif_parse, ExifParseError, ExifParseInput, ExifParseOutput
 pub use ez_parse::{ez_parse, is_allowed_ez_tool, EzParseError, EzParseInput, EzParseOutput};
 pub use hashset_lookup::{
     hashset_lookup, HashLookupRow, HashsetKind, HashsetLoaded, HashsetLookupError,
-    HashsetLookupInput, HashsetLookupOutput, HashsetRef, LookupDisposition, SetDisposition,
+    HashsetLookupInput, HashsetLookupOutput, LookupDisposition, SetDisposition,
 };
 pub use hayabusa_scan::{
     hayabusa_scan, HayabusaAlert, HayabusaError, HayabusaInput, HayabusaOutput,
@@ -130,6 +132,10 @@ pub use registry_query::{
     path_looks_like_hive, registry_query, RegistryEntry, RegistryError, RegistryInput,
     RegistryOutput, RegistryValue,
 };
+pub use setupapi_parse::{
+    path_looks_like_setupapi, setupapi_parse, SetupapiParseError, SetupapiParseInput,
+    SetupapiParseOutput, SetupapiUsbEvent,
+};
 pub use srum_parse::{
     srum_parse, SrumError, SrumNetworkRow, SrumParseInput, SrumParseOutput, SrumTopTalker,
 };
@@ -145,7 +151,6 @@ pub use thumbcache_parse::{
 pub use usnjrnl_query::{
     path_looks_like_usnjrnl, usnjrnl_query, UsnJrnlEntry, UsnJrnlError, UsnJrnlInput, UsnJrnlOutput,
 };
-pub use vel_collect::{vel_collect, VelCollectError, VelCollectInput, VelCollectOutput, VelRow};
 pub use vol_malfind::{
     vol_malfind, VolInjection, VolMalfindError, VolMalfindInput, VolMalfindOutput,
 };

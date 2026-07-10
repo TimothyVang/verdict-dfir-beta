@@ -6,11 +6,10 @@
 //! This tool compiles a rules file (or directory of `.yar`/`.yara`
 //! files) and scans a target file or directory.
 //!
-//! Backed by `yara-x = "=1.12.0"` (BSD-3-Clause, `VirusTotal`'s pure
+//! Backed by `yara-x = "=1.19.0"` (BSD-3-Clause, `VirusTotal`'s pure
 //! Rust YARA implementation — 99% rule-compatible with libyara,
-//! safer + faster). Pinned to 1.12.0 because 1.13+ requires rustc
-//! 1.89; we're at 1.88. The yara-x-{macros,parser,proto} subcrates
-//! are also pinned for the same reason.
+//! safer + faster). Sibling macros/parser/proto crates are pinned in
+//! lockstep; 1.19 moves the runtime to the patched Wasmtime 43 line.
 //!
 //! Output is intentionally lean: `file_path`, `rule_name`, namespace,
 //! tags, and per-pattern match offset/length/preview. Full matched
@@ -264,9 +263,9 @@ fn compile_rules(rule_files: &[PathBuf]) -> Result<Rules, YaraError> {
         compiler.new_namespace(&namespace);
         compiler
             .add_source(source.as_str())
-            .map_err(|err| YaraError::RulesCompileFailed {
+            .map_err(|_| YaraError::RulesCompileFailed {
                 path: path.clone(),
-                message: format!("{err}"),
+                message: "compiler rejected one rule source; diagnostics withheld".to_string(),
             })?;
     }
     Ok(compiler.build())

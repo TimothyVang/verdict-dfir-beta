@@ -1,4 +1,4 @@
-// ReportPanel — the payoff. Once the run finalizes, surfaces the signed PDF
+// ReportPanel — the payoff. Once the run finalizes, surfaces the presentation
 // report (view in-pane via same-origin iframe, download, share) plus the other
 // downloadable case artifacts (verdict, manifest, timeline). When the report is
 // gated for expert review (engine QA) it says so honestly and still offers the
@@ -8,7 +8,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { REPORT_ARTIFACT_LABELS } from "@/lib/report-artifacts";
+import {
+  REPORT_ARTIFACT_LABELS,
+  REPORT_PRESENTATION_NOTICE,
+} from "@/lib/report-artifacts";
 import { BODY, MONO, RADIUS, SectionHeading, VERDICT } from "@/lib/verdict-ui";
 
 interface ReportFile {
@@ -114,10 +117,13 @@ export function ReportPanel({ caseDir, manifestDone, onReadyChange }: ReportPane
 
       {!caseDir ? (
         <p style={{ fontFamily: BODY, fontSize: 13, color: VERDICT.mutedDark, margin: 0 }}>
-          connect a case to view its signed report.
+          connect a case to view its presentation report.
         </p>
       ) : pdf ? (
         <>
+          <p style={{ fontFamily: BODY, fontSize: 12, color: VERDICT.inferred, margin: "0 0 12px" }}>
+            {REPORT_PRESENTATION_NOTICE}
+          </p>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
             <button type="button" style={btnStyle(VERDICT.accentPurpleLight)} onClick={() => setShowViewer((v) => !v)}>
               {showViewer ? "Hide" : "View"}
@@ -141,14 +147,14 @@ export function ReportPanel({ caseDir, manifestDone, onReadyChange }: ReportPane
         <p style={{ fontFamily: BODY, fontSize: 13, color: VERDICT.muted, margin: "0 0 12px" }}>
           {manifestDone
             ? "no PDF report — it is gated for expert review (engine QA) or still rendering. Artifacts below are available."
-            : "the signed report appears here once the run finalizes."}
+            : "the presentation-only report appears here after rendering; its bytes are not custody-authenticated."}
         </p>
       )}
 
       {available.length > 0 ? (
         <div style={{ marginTop: 8 }}>
           <div style={{ fontFamily: BODY, fontSize: 12, color: VERDICT.mutedDark, marginBottom: 6 }}>
-            artifacts
+            artifacts · presentation sidecars are not custody-authenticated unless separately bound
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             {available

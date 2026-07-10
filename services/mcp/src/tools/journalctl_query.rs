@@ -19,18 +19,24 @@
 //! the field set varies per unit and per systemd version, and pinning a
 //! schema here would be hostile to the agent's flexibility.
 //!
-//! Binary discovery mirrors `vol_pslist` / `vel_collect`:
+//! Binary discovery mirrors `vol_pslist`:
 //! `$JOURNALCTL_BIN` env var first, then PATH lookup for `journalctl`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const HARD_TIMEOUT: Duration = Duration::from_secs(1_800);
+const TIMEOUT_ENV: &str = "FINDEVIL_JOURNALCTL_TIMEOUT_SECS";
 
 /// One parsed journal entry. Generic on purpose — the systemd field set
 /// varies per unit and per version, so a typed shape would drop fields.
@@ -156,13 +162,18 @@ pub fn journalctl_query(
         input.until.as_deref(),
     ));
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|err| {
+        if matches!(&err, RunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound)
+        {
             JournalctlQueryError::BinaryNotFound
         } else {
             JournalctlQueryError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             }
         }
     })?;

@@ -17,14 +17,34 @@
 //! Binary location: PATH lookup, overridable via `$HAYABUSA_BIN`.
 
 use std::ffi::OsString;
+use std::fs::Metadata;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{
+    byte_limit_from_env, open_stable_output_file, run_with_output_quota, timeout_from_env_clamped,
+    OutputQuota, RunError,
+};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const MAX_LIMIT: usize = 100_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1_800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7_200);
+const TIMEOUT_ENV: &str = "FINDEVIL_HAYABUSA_TIMEOUT_SECS";
+const OUTPUT_BYTES_ENV: &str = "FINDEVIL_HAYABUSA_OUTPUT_MAX_BYTES";
+const DEFAULT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const HARD_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RULE_FILES: usize = 500;
+const MAX_RULE_ENTRIES: usize = 10_000;
+const MAX_RULE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RULE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RULE_DEPTH: usize = 64;
 
 /// Sigma rule severity levels Hayabusa knows. Names mirror the CLI's
 /// `-m` flag; agent passes one of these as the minimum threshold.
@@ -110,6 +130,15 @@ pub enum HayabusaError {
     #[error("rule_set not found: {0}")]
     RuleSetNotFound(PathBuf),
 
+    #[error("rule_set is not an operator-approved Hayabusa rules path")]
+    RuleSetNotAuthorized,
+
+    #[error("rule_set is unsafe: {0}")]
+    RuleSetUnsafe(&'static str),
+
+    #[error("rule_set resource limit exceeded: {0}")]
+    RuleSetResourceLimit(&'static str),
+
     #[error(
         "hayabusa binary not on PATH (set $HAYABUSA_BIN to override). \
          Install: https://github.com/Yamato-Security/hayabusa/releases"
@@ -121,6 +150,9 @@ pub enum HayabusaError {
 
     #[error("could not parse hayabusa JSON output: {0}")]
     OutputParse(String),
+
+    #[error("hayabusa output exceeded its {0} byte limit")]
+    OutputLimit(usize),
 
     #[error(
         "invalid min_level {0:?}; expected one of: informational, low, medium, high, critical"
@@ -223,11 +255,11 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
     if !input.evtx_dir.is_dir() {
         return Err(HayabusaError::EvtxDirNotDirectory(input.evtx_dir.clone()));
     }
-    if let Some(ref rules) = input.rule_set {
-        if !rules.exists() {
-            return Err(HayabusaError::RuleSetNotFound(rules.clone()));
-        }
-    }
+    let authorized_rules = input
+        .rule_set
+        .as_deref()
+        .map(authorize_rule_set)
+        .transpose()?;
     if let Some(ref level) = input.min_level {
         if !VALID_LEVELS.iter().any(|v| v.eq_ignore_ascii_case(level)) {
             return Err(HayabusaError::InvalidMinLevel(level.clone()));
@@ -235,7 +267,7 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
     }
 
     let binary = resolve_binary()?;
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = input.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
     // Hayabusa writes JSON to a file (the CLI doesn't reliably stream
     // a clean JSON document to stdout — its progress UI mixes in).
@@ -245,19 +277,22 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
         std::process::id(),
         nanosecond_tag()
     ));
+    let output_limit =
+        byte_limit_from_env(OUTPUT_BYTES_ENV, DEFAULT_OUTPUT_BYTES, HARD_OUTPUT_BYTES);
 
     // Canonicalize the EVTX dir to an absolute path BEFORE any CWD override
     // below, so a relative `evtx_dir` can't break once we change directories.
     let evtx_abs =
-        std::fs::canonicalize(&input.evtx_dir).unwrap_or_else(|_| input.evtx_dir.clone());
+        crate::pathnorm::canonicalize(&input.evtx_dir).unwrap_or_else(|_| input.evtx_dir.clone());
 
-    let mut cmd = Command::new(&binary);
-    cmd.args(json_timeline_args(
+    let args = json_timeline_args(
         &evtx_abs,
         &output_file,
-        input.rule_set.as_deref(),
+        authorized_rules.as_deref(),
         input.min_level.as_deref(),
-    ));
+    );
+    let mut cmd = Command::new(&binary);
+    cmd.args(&args);
     // Point hayabusa at a CWD that has `rules/` (with config). Without this it
     // reads `./rules/config` from wherever the MCP launched (no rules there) and
     // fails. If no rules base is installed, run as-is and let the lane degrade
@@ -266,20 +301,40 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
         cmd.current_dir(base);
     }
 
-    let proc = cmd.output().map_err(|err| {
+    if let Err(error) = crate::tools::argsafe::guard_spawn(&binary, &args) {
+        return Err(HayabusaError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        });
+    }
+
+    let spawned = run_with_output_quota(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+        &OutputQuota::new(output_file.clone(), output_limit as u64, 1),
+    )
+    .map_err(|err| {
         // Treat ENOENT specifically as the "binary missing" path even
         // though we resolved it above — race conditions where the
         // binary disappeared between resolution and exec are rare but
         // surface this way.
-        if err.kind() == std::io::ErrorKind::NotFound {
+        if matches!(&err, RunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound)
+        {
             HayabusaError::BinaryNotFound
         } else {
             HayabusaError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             }
         }
-    })?;
+    });
+    let proc = match spawned {
+        Ok(proc) => proc,
+        Err(error) => {
+            let _ = std::fs::remove_file(&output_file);
+            return Err(error);
+        }
+    };
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -291,13 +346,11 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
         });
     }
 
-    let body = match std::fs::read_to_string(&output_file) {
+    let body = match read_bounded_output(&output_file, output_limit) {
         Ok(b) => b,
         Err(err) => {
-            return Err(HayabusaError::OutputParse(format!(
-                "could not read output {}: {err}",
-                output_file.display()
-            )));
+            let _ = std::fs::remove_file(&output_file);
+            return Err(err);
         }
     };
     // Best-effort cleanup; we don't propagate the error if remove
@@ -305,6 +358,146 @@ pub fn hayabusa_scan(input: &HayabusaInput) -> Result<HayabusaOutput, HayabusaEr
     let _ = std::fs::remove_file(&output_file);
 
     parse_alerts(&body, limit, stderr_tail)
+}
+
+fn authorize_rule_set(requested: &Path) -> Result<PathBuf, HayabusaError> {
+    let requested_metadata = std::fs::symlink_metadata(requested)
+        .map_err(|_| HayabusaError::RuleSetNotFound(PathBuf::from("<rule_set>")))?;
+    if requested_metadata.file_type().is_symlink() {
+        return Err(HayabusaError::RuleSetUnsafe("symlinks are not accepted"));
+    }
+    let canonical_requested = crate::pathnorm::canonicalize(requested)
+        .map_err(|_| HayabusaError::RuleSetUnsafe("canonicalization failed"))?;
+
+    let exact_approved = std::env::var_os("FINDEVIL_HAYABUSA_RULE_SET")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| canonical_operator_path(Path::new(&value)));
+    let rules_root = std::env::var_os("HAYABUSA_RULES_BASE")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| canonical_operator_path(&PathBuf::from(value).join("rules")));
+    let authorized = exact_approved
+        .as_ref()
+        .is_some_and(|approved| canonical_requested == *approved)
+        || rules_root.as_ref().is_some_and(|root| {
+            canonical_requested == *root || canonical_requested.starts_with(root)
+        });
+    if !authorized {
+        return Err(HayabusaError::RuleSetNotAuthorized);
+    }
+    validate_rule_inventory(&canonical_requested, &requested_metadata)?;
+    Ok(canonical_requested)
+}
+
+fn canonical_operator_path(path: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+        return None;
+    }
+    crate::pathnorm::canonicalize(path).ok()
+}
+
+fn validate_rule_inventory(root: &Path, metadata: &Metadata) -> Result<(), HayabusaError> {
+    validate_rule_metadata(metadata)?;
+    if metadata.is_file() {
+        return Ok(());
+    }
+    let mut files = 0_usize;
+    let mut entries = 0_usize;
+    let mut total_bytes = 0_u64;
+    walk_rule_directory(root, root, 0, &mut files, &mut entries, &mut total_bytes)?;
+    if files == 0 {
+        return Err(HayabusaError::RuleSetUnsafe("rule directory is empty"));
+    }
+    Ok(())
+}
+
+fn walk_rule_directory(
+    directory: &Path,
+    root: &Path,
+    depth: usize,
+    files: &mut usize,
+    entries: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), HayabusaError> {
+    if depth > MAX_RULE_DEPTH {
+        return Err(HayabusaError::RuleSetResourceLimit("directory depth"));
+    }
+    let children = std::fs::read_dir(directory)
+        .map_err(|_| HayabusaError::RuleSetUnsafe("rule directory is unreadable"))?;
+    for child in children {
+        let child = child.map_err(|_| HayabusaError::RuleSetUnsafe("invalid directory entry"))?;
+        *entries = entries.saturating_add(1);
+        if *entries > MAX_RULE_ENTRIES {
+            return Err(HayabusaError::RuleSetResourceLimit("directory entries"));
+        }
+        let file_type = child
+            .file_type()
+            .map_err(|_| HayabusaError::RuleSetUnsafe("entry type is unreadable"))?;
+        if file_type.is_symlink() {
+            return Err(HayabusaError::RuleSetUnsafe("symlinks are not accepted"));
+        }
+        let canonical = crate::pathnorm::canonicalize(child.path())
+            .map_err(|_| HayabusaError::RuleSetUnsafe("entry canonicalization failed"))?;
+        if !canonical.starts_with(root) {
+            return Err(HayabusaError::RuleSetUnsafe(
+                "entry escapes approved directory",
+            ));
+        }
+        if file_type.is_dir() {
+            walk_rule_directory(&canonical, root, depth + 1, files, entries, total_bytes)?;
+        } else if file_type.is_file() {
+            let metadata = child
+                .metadata()
+                .map_err(|_| HayabusaError::RuleSetUnsafe("file metadata is unreadable"))?;
+            validate_rule_metadata(&metadata)?;
+            *files = files.saturating_add(1);
+            if *files > MAX_RULE_FILES {
+                return Err(HayabusaError::RuleSetResourceLimit("rule files"));
+            }
+            *total_bytes = total_bytes.saturating_add(metadata.len());
+            if *total_bytes > MAX_RULE_TOTAL_BYTES {
+                return Err(HayabusaError::RuleSetResourceLimit("aggregate rule bytes"));
+            }
+        } else {
+            return Err(HayabusaError::RuleSetUnsafe("non-regular entry"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_metadata(metadata: &Metadata) -> Result<(), HayabusaError> {
+    if !(metadata.is_file() || metadata.is_dir()) {
+        return Err(HayabusaError::RuleSetUnsafe("non-regular rule path"));
+    }
+    if metadata.is_file() && metadata.len() > MAX_RULE_FILE_BYTES {
+        return Err(HayabusaError::RuleSetResourceLimit("rule file bytes"));
+    }
+    #[cfg(unix)]
+    if metadata.is_file() {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(HayabusaError::RuleSetUnsafe("hard links are not accepted"));
+        }
+    }
+    Ok(())
+}
+
+fn read_bounded_output(path: &Path, limit: usize) -> Result<String, HayabusaError> {
+    let (file, metadata) = open_stable_output_file(path)
+        .map_err(|_| HayabusaError::OutputParse("could not safely open output".to_string()))?;
+    if metadata.len() > limit as u64 {
+        return Err(HayabusaError::OutputLimit(limit));
+    }
+    let capacity = usize::try_from(metadata.len()).unwrap_or(limit).min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| HayabusaError::OutputParse("could not read output".to_string()))?;
+    if bytes.len() > limit {
+        return Err(HayabusaError::OutputLimit(limit));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| HayabusaError::OutputParse("output is not valid UTF-8".to_string()))
 }
 
 fn resolve_binary() -> Result<PathBuf, HayabusaError> {
@@ -508,6 +701,34 @@ fn nanosecond_tag() -> u128 {
 mod tests {
     use super::*;
 
+    struct RestoreEnv {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl RestoreEnv {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     fn as_strings(args: &[OsString]) -> Vec<String> {
         args.iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -623,7 +844,7 @@ mod tests {
 
     #[test]
     fn rules_base_resolves_when_env_dir_has_rules_config() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("rules").join("config")).unwrap();
         let prev = std::env::var("HAYABUSA_RULES_BASE").ok();
@@ -637,7 +858,7 @@ mod tests {
 
     #[test]
     fn rules_base_is_none_when_env_dir_lacks_rules_config() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::env_lock();
         let tmp = tempfile::tempdir().unwrap(); // exists but no rules/config
         let prev_base = std::env::var("HAYABUSA_RULES_BASE").ok();
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
@@ -658,5 +879,80 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn caller_rule_set_must_be_operator_approved_without_leaking_host_path() {
+        let _guard = crate::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("private-host-rules");
+        std::fs::create_dir(&rules).unwrap();
+        std::fs::write(rules.join("one.yml"), "title: test\n").unwrap();
+        let _exact = RestoreEnv::remove("FINDEVIL_HAYABUSA_RULE_SET");
+        let _base = RestoreEnv::remove("HAYABUSA_RULES_BASE");
+
+        let error = authorize_rule_set(&rules).unwrap_err();
+        assert!(matches!(error, HayabusaError::RuleSetNotAuthorized));
+        assert!(!error.to_string().contains("private-host-rules"));
+    }
+
+    #[test]
+    fn rules_base_authorizes_only_confined_regular_inventory() {
+        let _guard = crate::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_root = tmp.path().join("rules");
+        let nested = rules_root.join("sigma");
+        std::fs::create_dir_all(&nested).unwrap();
+        let rule = nested.join("one.yml");
+        std::fs::write(&rule, "title: test\n").unwrap();
+        let _base = RestoreEnv::set("HAYABUSA_RULES_BASE", tmp.path());
+        let _exact = RestoreEnv::remove("FINDEVIL_HAYABUSA_RULE_SET");
+
+        assert_eq!(
+            authorize_rule_set(&nested).unwrap(),
+            crate::pathnorm::canonicalize(&nested).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rule_inventory_rejects_symlink_and_oversized_file() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = crate::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_root = tmp.path().join("rules");
+        std::fs::create_dir(&rules_root).unwrap();
+        let outside = tmp.path().join("outside.yml");
+        std::fs::write(&outside, "title: outside\n").unwrap();
+        symlink(&outside, rules_root.join("escape.yml")).unwrap();
+        let _base = RestoreEnv::set("HAYABUSA_RULES_BASE", tmp.path());
+        let _exact = RestoreEnv::remove("FINDEVIL_HAYABUSA_RULE_SET");
+        assert!(matches!(
+            authorize_rule_set(&rules_root),
+            Err(HayabusaError::RuleSetUnsafe("symlinks are not accepted"))
+        ));
+
+        std::fs::remove_file(rules_root.join("escape.yml")).unwrap();
+        let huge = rules_root.join("huge.yml");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_RULE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            authorize_rule_set(&huge),
+            Err(HayabusaError::RuleSetResourceLimit("rule file bytes"))
+        ));
+    }
+
+    #[test]
+    fn bounded_output_refuses_oversized_or_symlinked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("out.json");
+        std::fs::write(&output, vec![b'x'; 65]).unwrap();
+        assert!(matches!(
+            read_bounded_output(&output, 64),
+            Err(HayabusaError::OutputLimit(64))
+        ));
     }
 }

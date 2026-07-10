@@ -10,8 +10,9 @@ Three tiers, each independently testable and composable:
     n) inclusion proofs that ``verify_manifest`` (this module's
     own ``verify_manifest`` re-export, also exposed via the
     ``manifest_verify`` MCP tool in ``services/agent_mcp``) replays.
-  * ``signer``   — Ed25519/Sigstore/stub signer tiers over the
-    JCS-canonicalized manifest body. Ed25519 verifies offline by
+  * ``signer``   — Ed25519/Sigstore/stub signer tiers over the VERDICT
+    canonical JSON v1 manifest body. Ed25519 verifies offline against an
+    externally trusted public-key fingerprint by
     default; Sigstore is the identity + transparency-log tier; stub is
     an explicit dev placeholder.
 

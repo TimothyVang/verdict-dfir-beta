@@ -1,6 +1,10 @@
 {
   "_comment": "Machine-readable benchmark corpus manifest (benchmark-plan-2026-06-30 Phase 1). Consolidates the fixture URLs/hashes from scripts/fetch-fixtures.sh and the per-case metadata from goldens/<name>/expected-findings.json + docs/DATASET.md into one manifest consumed by scripts/benchmark. Recall floor and expected findings live in goldens/<name>/expected-findings.json (not duplicated here to avoid drift). Evidence is NEVER committed: local cases resolve to a path already present under evidence/; large/gated images stage via <env_url>/<env_sha256> env vars through scripts/fetch-fixtures.sh. sha256 null = recorded on first pull (fixtures/sha256sums.txt); a gated big image should be pinned via its <env_sha256>. runnable_local:true means the evidence parses on the host with no SIFT microVM.",
   "schema_version": 1,
+  "held_out_program": {
+    "status": "none_yet",
+    "note": "No committed golden in this corpus is validation_class=held-out. Public-documented cases (NIST, CTFs with walkthroughs) carry a training-data contamination caveat; synthetic cases do not. A future held-out program must set validation_class explicitly to held-out and keep evidence private \u2014 do not claim held-out recall from this file until that exists."
+  },
   "cases": [
     {
       "name": "nist-hacking-case",
@@ -16,7 +20,10 @@
       "note": "Raw .dd parses locally (no SIFT). SCHARDT is in the golden set; treat a strong score as regression signal, not blind generalization.",
       "mechanism_coverage": {
         "nhc-003": "Deleted-email / free-space feature recovery (nhc-003, 'Outlook PST / free space carve') is MECHANISM-SCOREABLE via bulk_extract + bulk_extract_deleted_email_candidates (requires co-located intrusion+plan on email-like feature rows). CONTENT PROBE: scripts/nhc003-absence-check over bulk_extractor email.txt/find.txt. On SCHARDT.dd full-image email probe (m17/m18): STATUS=ABSENT \u2014 zero co-located intrusion+plan email-like rows (subjects are MSN welcome / spam / newsgroups; no PST). Honest ceiling remains 10/14 = 71% until a different image supplies recoverable content. Do not invent a SCHARDT true positive."
-      }
+      },
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "nitroba",
@@ -29,7 +36,10 @@
       "sha256": null,
       "license": "Digital Corpora - freely redistributable for research/education",
       "tier": "green",
-      "note": "Attribution turns on a Gmail session cookie in the live pcap; a correct run must parse the capture."
+      "note": "Attribution turns on a Gmail session cookie in the live pcap; a correct run must parse the capture.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "evtx-attack-samples",
@@ -42,7 +52,10 @@
       "sha256": null,
       "license": "VERDICT-authored answer key; raw EVTX provenance must be verified before redistributing the fixtures",
       "tier": "amber",
-      "note": "Local-only EVTX attack-sample folder; raw fixtures not redistributed."
+      "note": "Local-only EVTX attack-sample folder; raw fixtures not redistributed.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Treat as public-documented default per LIMITATIONS.md when no held-out label is present."
     },
     {
       "name": "security-log-cleared",
@@ -55,7 +68,10 @@
       "sha256": null,
       "license": "VERDICT-authored answer key; raw EVTX provenance TBD before redistribution",
       "tier": "amber",
-      "note": "Single Security EID 1102 log-clear EVTX."
+      "note": "Single Security EID 1102 log-clear EVTX.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Treat as public-documented default per LIMITATIONS.md when no held-out label is present."
     },
     {
       "name": "win-lateral-movement",
@@ -68,7 +84,10 @@
       "sha256": null,
       "license": "VERDICT-authored answer key; raw EVTX provenance TBD before redistribution",
       "tier": "amber",
-      "note": "EVTX-only, so single-artifact-class: honest top-line verdict is INDETERMINATE unless corroborated."
+      "note": "EVTX-only, so single-artifact-class: honest top-line verdict is INDETERMINATE unless corroborated.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Treat as public-documented default per LIMITATIONS.md when no held-out label is present."
     },
     {
       "name": "wmi-execution",
@@ -81,7 +100,10 @@
       "sha256": null,
       "license": "VERDICT-authored answer key; raw EVTX provenance TBD before redistribution",
       "tier": "amber",
-      "note": "EVTX-only single-artifact-class; verdict INDETERMINATE unless corroborated."
+      "note": "EVTX-only single-artifact-class; verdict INDETERMINATE unless corroborated.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Treat as public-documented default per LIMITATIONS.md when no held-out label is present."
     },
     {
       "name": "service-install-spoolfool",
@@ -94,7 +116,10 @@
       "sha256": null,
       "license": "VERDICT-authored answer key; raw EVTX provenance TBD before redistribution",
       "tier": "amber",
-      "note": "EVTX-only single-artifact-class; verdict INDETERMINATE unless corroborated."
+      "note": "EVTX-only single-artifact-class; verdict INDETERMINATE unless corroborated.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Treat as public-documented default per LIMITATIONS.md when no held-out label is present."
     },
     {
       "name": "synthetic-benign",
@@ -107,7 +132,9 @@
       "sha256": null,
       "license": "MIT (generation script)",
       "tier": "green",
-      "note": "Negative control: zero findings, verdict NO_EVIL. Stage via scripts/fetch-fixtures.sh."
+      "note": "Negative control: zero findings, verdict NO_EVIL. Stage via scripts/fetch-fixtures.sh.",
+      "validation_class": "synthetic",
+      "corpus_identity": "synthetic"
     },
     {
       "name": "synthetic-decoy",
@@ -120,7 +147,9 @@
       "sha256": null,
       "license": "MIT (generation script)",
       "tier": "green",
-      "note": "Decoy / false-positive control: 0 planted bait asserted. Stage via scripts/fetch-fixtures.sh."
+      "note": "Decoy / false-positive control: 0 planted bait asserted. Stage via scripts/fetch-fixtures.sh.",
+      "validation_class": "synthetic",
+      "corpus_identity": "synthetic"
     },
     {
       "name": "nist-data-leakage",
@@ -134,7 +163,10 @@
       "sha256": null,
       "license": "Public domain (17 USC 105)",
       "tier": "amber",
-      "note": "Disk image; inner-volume mount needs SIFT (--sift)."
+      "note": "Disk image; inner-volume mount needs SIFT (--sift).",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "m57-jean",
@@ -148,7 +180,10 @@
       "sha256": null,
       "license": "Digital Corpora - freely redistributable for research/education",
       "tier": "amber",
-      "note": "Disk image; SIFT recommended for inner-volume parity."
+      "note": "Disk image; SIFT recommended for inner-volume parity.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "dfrws-2008-linux",
@@ -161,7 +196,10 @@
       "sha256": null,
       "license": "DFRWS Forensic Challenge - public for research/education",
       "tier": "amber",
-      "note": "Linux memory+disk+network fusion case; pinned by git commit ref."
+      "note": "Linux memory+disk+network fusion case; pinned by git commit ref.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "volatility-cridex",
@@ -175,7 +213,10 @@
       "sha256": null,
       "license": "Volatility Foundation sample - CC-BY (attribution required)",
       "tier": "red",
-      "note": "Memory image; canonical .vmem URL is dead - set CRIDEX_URL to a live mirror."
+      "note": "Memory image; canonical .vmem URL is dead - set CRIDEX_URL to a live mirror.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "otrf-apt3-mordor",
@@ -188,7 +229,10 @@
       "sha256": null,
       "license": "MIT License (OTRF Security-Datasets)",
       "tier": "amber",
-      "note": "APT3 emulation host EVTX/Sysmon; pinned by git ref."
+      "note": "APT3 emulation host EVTX/Sysmon; pinned by git ref.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     },
     {
       "name": "szechuan",
@@ -203,7 +247,10 @@
       "sha256": null,
       "license": "DFIR Madness - free for education (redistribute URL + hash, not the image)",
       "tier": "amber",
-      "note": "DFIR Madness Case 001: disk+memory+pcap across 2 hosts (~16GB), full public answer key. The best-fit multi-class fusion benchmark for VERDICT's corroboration-first design. Golden goldens/szechuan/expected-findings.json IS AUTHORED from the answer key (7 findings across log/network/disk/memory), but the case is HELD-OUT: runnable_local=false because it needs SIFT for the disk half and a ~16GB staged download, so VERDICT has not yet scored it. min_recall_percent in the golden is a placeholder floor to recalibrate after the first real scripts/benchmark run."
+      "note": "DFIR Madness Case 001: disk+memory+pcap across 2 hosts (~16GB), full public answer key. The best-fit multi-class fusion benchmark for VERDICT's corroboration-first design. Golden goldens/szechuan/expected-findings.json IS AUTHORED from the answer key (7 findings across log/network/disk/memory), but the case is HELD-OUT: runnable_local=false because it needs SIFT for the disk half and a ~16GB staged download, so VERDICT has not yet scored it. min_recall_percent in the golden is a placeholder floor to recalibrate after the first real scripts/benchmark run.",
+      "validation_class": "public-documented",
+      "corpus_identity": "public-documented",
+      "contamination_caveat": "Public writeups/walkthroughs may contaminate LLM training data; treat recall as a regression floor, not blind generalization."
     }
   ]
 }

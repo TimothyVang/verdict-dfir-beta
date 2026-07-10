@@ -18,6 +18,11 @@
 # Path-agnostic: REPO is derived from this file's location, so it works from any
 # CWD and any machine.
 
+# Case material, memory, ledgers, and signing state are private to the operator.
+# This is inherited by every MCP/parser child and also protects SQLite WAL/SHM
+# sidecars and atomic temporary files created after this launcher returns.
+umask 077
+
 # Resolve the repo root from this script's own path (scripts/lib/ -> repo root).
 _PE_SELF="${BASH_SOURCE[0]}"
 PROJECT_ROOT="$(cd "$(dirname "${_PE_SELF}")/../.." && pwd)"
@@ -27,8 +32,10 @@ export PROJECT_ROOT
 PROJECT_LOCAL="${PROJECT_LOCAL:-${PROJECT_ROOT}/.project-local}"
 export PROJECT_LOCAL
 
-# Create the subtree up front so every consumer can assume the dirs exist.
-mkdir -p \
+# Create and migrate the subtree owner-only. Refuse an exact symlink instead of
+# chmod-following it into an attacker-selected location.
+for private_dir in \
+  "${PROJECT_LOCAL}" \
   "${PROJECT_LOCAL}/tmp" \
   "${PROJECT_LOCAL}/share" \
   "${PROJECT_LOCAL}/state" \
@@ -36,7 +43,14 @@ mkdir -p \
   "${PROJECT_LOCAL}/findevil" \
   "${PROJECT_LOCAL}/npm" \
   "${PROJECT_LOCAL}/ms-playwright" \
-  "${PROJECT_LOCAL}/puppeteer" 2>/dev/null || true
+  "${PROJECT_LOCAL}/puppeteer"; do
+  if [[ -L "${private_dir}" ]]; then
+    printf 'project-env: private runtime directory is a symlink: %s\n' "${private_dir}" >&2
+    return 1
+  fi
+  mkdir -p -- "${private_dir}" || return 1
+  chmod 0700 -- "${private_dir}" || return 1
+done
 
 # --- Generic POSIX/XDG escape hatches (cover most third-party tools) ---
 # std::env::temp_dir() (Rust), tempfile/mkdtemp (Python), and most CLI tools
@@ -51,6 +65,11 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${PROJECT_LOCAL}/cache}"
 # (else $HOME/.findevil). Pinning it keeps cases, extracts, and memory.sqlite
 # inside the project.
 export FINDEVIL_HOME="${FINDEVIL_HOME:-${PROJECT_LOCAL}/findevil}"
+# Keep the default local custody key inside the project containment tree. The
+# evidence-facing Rust parser never receives or mounts this path.
+export FINDEVIL_SIGNING_KEY="${FINDEVIL_SIGNING_KEY:-${FINDEVIL_HOME}/signing.key}"
+export FINDEVIL_MEMORY_STORE="${FINDEVIL_MEMORY_STORE:-${FINDEVIL_HOME}/memory/memory.sqlite}"
+export FINDEVIL_EXPERT_MISS_LEDGER="${FINDEVIL_EXPERT_MISS_LEDGER:-${XDG_STATE_HOME}/findevil/expert_misses.jsonl}"
 
 # --- Hayabusa rules base (Rust hayabusa_scan resolves under $XDG_DATA_HOME) ---
 export HAYABUSA_RULES_BASE="${HAYABUSA_RULES_BASE:-${XDG_DATA_HOME}/hayabusa-mcp}"
@@ -69,10 +88,18 @@ export PUPPETEER_CACHE_DIR="${PUPPETEER_CACHE_DIR:-${PROJECT_LOCAL}/puppeteer}"
 # ~/.cargo, ~/.rustup, ~/.cache/uv, ~/.local/share/pnpm stay intact for other
 # projects. Each honours ${VAR:-default} so it's still overridable.
 TOOLCHAIN="${PROJECT_LOCAL}/toolchain"
-mkdir -p \
+for private_dir in \
+  "${TOOLCHAIN}" \
   "${TOOLCHAIN}/cargo" "${TOOLCHAIN}/rustup" \
   "${TOOLCHAIN}/uv-cache" "${TOOLCHAIN}/uv-python" \
-  "${TOOLCHAIN}/pnpm-store" 2>/dev/null || true
+  "${TOOLCHAIN}/pnpm-store"; do
+  if [[ -L "${private_dir}" ]]; then
+    printf 'project-env: private toolchain directory is a symlink: %s\n' "${private_dir}" >&2
+    return 1
+  fi
+  mkdir -p -- "${private_dir}" || return 1
+  chmod 0700 -- "${private_dir}" || return 1
+done
 # Rust: CARGO_HOME holds the registry/git crate cache; RUSTUP_HOME holds the
 # toolchains. The rustup proxy binaries on PATH read RUSTUP_HOME at runtime.
 export CARGO_HOME="${CARGO_HOME:-${TOOLCHAIN}/cargo}"

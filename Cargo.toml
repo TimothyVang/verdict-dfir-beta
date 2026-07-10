@@ -10,17 +10,15 @@ members = [
     "services/mcp",
 ]
 
-# Pinned toolchain is Rust 1.88 (see rust-toolchain.toml + docker/l1-devbase.Dockerfile).
+# Pinned toolchain is Rust 1.91 (see rust-toolchain.toml + container builders).
 # Spec #2 §16 says 1.83; the bump is documented in CLAUDE.md
 # "Spec/code divergences (code wins)" #1.
 
 [workspace.package]
 edition = "2021"
-# Rust 1.88 — bumped from the 1.83 spec pin to accommodate
-# transitive deps (clap_builder 4.6, etc.) that now require
-# edition-2024 stabilization (Rust ≥1.85). rust-toolchain.toml
-# is the authoritative pin.
-rust-version = "1.88"
+# Rust 1.91 is required by the advisory-cleared YARA-X 1.19 /
+# Wasmtime 43 dependency line. rust-toolchain.toml is authoritative.
+rust-version = "1.91"
 license = "Apache-2.0"
 repository = "https://github.com/"
 

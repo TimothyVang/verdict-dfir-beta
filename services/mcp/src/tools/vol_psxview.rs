@@ -3,15 +3,23 @@
 //! `psxview` cross-references several process-enumeration methods. It is the
 //! natural follow-up when `vol_pslist` and `vol_psscan` diverge, because it
 //! shows which process views can see each recovered process object.
+//!
+//! Volatility invocation: `<vol> --offline -f <memory> -r json -q windows.psxview`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const TIMEOUT_ENV: &str = "FINDEVIL_VOL_TIMEOUT_SECS";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +78,12 @@ pub enum VolPsxviewError {
     #[error("volatility exited {exit_code}: {stderr}")]
     SubprocessFailed { exit_code: i32, stderr: String },
 
+    #[error("volatility exceeded its {seconds} s time budget and was killed")]
+    Timeout { seconds: u64 },
+
+    #[error("volatility {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit { stream: String, limit: usize },
+
     #[error("could not parse volatility JSON output: {0}")]
     OutputParse(String),
 }
@@ -87,23 +101,17 @@ pub fn vol_psxview(input: &VolPsxviewInput) -> Result<VolPsxviewOutput, VolPsxvi
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
 
     let mut cmd = Command::new(&binary);
-    cmd.arg("-f")
-        .arg(&input.memory_path)
-        .arg("-r")
-        .arg("json")
-        .arg("-q")
-        .arg("windows.psxview");
+    cmd.args(crate::tools::vol_run::build_vol_args(
+        &input.memory_path,
+        "windows.psxview",
+        None,
+    ));
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            VolPsxviewError::BinaryNotFound
-        } else {
-            VolPsxviewError::SubprocessFailed {
-                exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
-            }
-        }
-    })?;
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(map_run_error)?;
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -121,6 +129,45 @@ pub fn vol_psxview(input: &VolPsxviewInput) -> Result<VolPsxviewOutput, VolPsxvi
         limit,
         stderr_tail,
     )
+}
+
+fn map_run_error(error: RunError) -> VolPsxviewError {
+    match error {
+        RunError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            VolPsxviewError::BinaryNotFound
+        }
+        RunError::Timeout(duration) => VolPsxviewError::Timeout {
+            seconds: duration.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => VolPsxviewError::OutputLimit {
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::Spawn(error) => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("spawn failed: {error}"),
+        },
+        RunError::Io(error) => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("io error: {error}"),
+        },
+        RunError::PipeStillOpen { streams } => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => VolPsxviewError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "volatility output reader thread panicked".to_string(),
+        },
+    }
 }
 
 fn resolve_binary() -> Result<PathBuf, VolPsxviewError> {

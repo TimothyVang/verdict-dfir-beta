@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from findevil_agent.crypto.audit_log import AuditLog
 from findevil_agent.memory.store import MemoryStore
@@ -14,15 +15,22 @@ from findevil_agent_mcp.tools._base import ToolSpec
 class MemoryRecallInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    store_path: str = Field(..., description="Absolute path to memory.sqlite.")
-    query: str = Field(..., min_length=1, description="FTS5 query string.")
-    kind: str | None = Field(
+    store_path: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Absolute path to memory.sqlite.",
+    )
+    query: str = Field(..., min_length=1, max_length=4096, description="FTS5 query string.")
+    kind: Literal["ioc", "hash", "ttp", "hostname", "finding_summary"] | None = Field(
         default=None,
         description="Optional filter: 'ioc'|'hash'|'ttp'|'hostname'|'finding_summary'.",
     )
     limit: int = Field(default=10, ge=1, le=100)
     audit_log_path: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=4096,
         description=(
             "Optional absolute path to the case audit.jsonl. When set, a "
             "'memory_recall' record is appended so the run records THAT recall "

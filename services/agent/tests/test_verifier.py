@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from findevil_agent.events import AssertedValue, Finding
 from findevil_agent.mcp_client import MockMcpClient
+from findevil_agent.resource_limits import SemanticInputLimitError
 from findevil_agent.verifier import (
     downgrade_confidence,
     reverify_finding,
@@ -321,6 +324,12 @@ class TestEntailmentCheck:
         f = self._finding("CONFIRMED", [AssertedValue(path="run_count", expected="8", match="int")])
         action, _ = reverify_finding(f, mcp=mcp, tool_call_index=self._index_for(payload))
         assert action.action == "approved"
+
+
+def test_verify_batch_rejects_oversized_finding_collection_before_replay() -> None:
+    findings = [_make_finding(finding_id=f"f-{index}") for index in range(101)]
+    with pytest.raises(SemanticInputLimitError, match="findings exceeds limit 100"):
+        verify_findings(findings, mcp=MockMcpClient(), tool_call_index={})
 
     def test_inferred_finding_with_absent_value_is_downgraded(self) -> None:
         payload = {"run_count": 3}

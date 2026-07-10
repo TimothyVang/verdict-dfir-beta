@@ -31,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -205,6 +206,85 @@ def _scan_for_bad_invocation(p: Path) -> list[str]:
     return findings
 
 
+def _check_find_evil_egress_ack() -> tuple[bool, str]:
+    """The interactive wrapper must require and privately export consent."""
+    with tempfile.TemporaryDirectory(prefix="verdict-launcher-smoke-") as raw_temp:
+        temp = Path(raw_temp)
+        fake_claude = temp / "claude"
+        fake_claude.write_text(
+            "#!/bin/sh\n"
+            "printf 'ACK=%s\\n' \"${FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS-}\"\n"
+            "printf 'ARGS=%s\\n' \"$*\"\n",
+            encoding="utf-8",
+        )
+        fake_claude.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{temp}{os.pathsep}{os.environ.get('PATH', os.defpath)}",
+        }
+        denied = subprocess.run(
+            ["bash", str(SCRIPTS_DIR / "find-evil")],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if denied.returncode == 0 or "acknowledge-evidence-egress" not in denied.stderr:
+            return (
+                False,
+                "interactive wrapper did not fail closed without explicit consent",
+            )
+        allowed = subprocess.run(
+            [
+                "bash",
+                str(SCRIPTS_DIR / "find-evil"),
+                "--acknowledge-evidence-egress",
+                "--resume",
+            ],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if allowed.returncode != 0:
+            return False, f"acknowledged wrapper failed: {allowed.stderr.strip()}"
+        if "ACK=1" not in allowed.stdout or "ARGS=--resume" not in allowed.stdout:
+            return (
+                False,
+                "consent was not privately exported or was forwarded as a Claude arg",
+            )
+    return True, ""
+
+
+def _check_sift_egress_ack_contract() -> tuple[bool, str]:
+    text = (SCRIPTS_DIR / "find-evil-sift").read_text(encoding="utf-8")
+    required = (
+        "--acknowledge-evidence-egress",
+        "FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1",
+    )
+    missing = [value for value in required if value not in text]
+    if missing:
+        return False, f"SIFT interactive launcher lacks consent gate: {missing}"
+    return True, ""
+
+
+def _check_post_verdict_egress_contract() -> tuple[bool, str]:
+    text = (SCRIPTS_DIR / "verdict").read_text(encoding="utf-8")
+    required = (
+        "--acknowledge-post-verdict-egress",
+        "POST_VERDICT_EGRESS_ACK=0",
+        'if [[ "${POST_VERDICT_EGRESS_ACK}" == "1"',
+    )
+    missing = [value for value in required if value not in text]
+    if missing:
+        return False, f"post-verdict automation is not explicit opt-in: {missing}"
+    return True, ""
+
+
 def main() -> int:
     print("=" * 60)
     print("Find Evil! - launcher-smoke")
@@ -243,6 +323,27 @@ def main() -> int:
         if not bad_inv:
             print(f"{OK} {rel} - no `claude .` (positional arg) invocations")
 
+    egress_ok, egress_error = _check_find_evil_egress_ack()
+    if egress_ok:
+        print(
+            f"{OK} scripts/find-evil - parsed-evidence egress requires explicit consent"
+        )
+    else:
+        print(f"{FAIL} scripts/find-evil - {egress_error}")
+        failed += 1
+    sift_egress_ok, sift_egress_error = _check_sift_egress_ack_contract()
+    if sift_egress_ok:
+        print(f"{OK} scripts/find-evil-sift - parsed-evidence egress requires consent")
+    else:
+        print(f"{FAIL} scripts/find-evil-sift - {sift_egress_error}")
+        failed += 1
+    post_egress_ok, post_egress_error = _check_post_verdict_egress_contract()
+    if post_egress_ok:
+        print(f"{OK} scripts/verdict - post-verdict network workflows require consent")
+    else:
+        print(f"{FAIL} scripts/verdict - {post_egress_error}")
+        failed += 1
+
     print()
     print("=" * 60)
     if failed:
@@ -251,10 +352,10 @@ def main() -> int:
         print("the canonical pattern (cd to repo, command -v claude check,")
         print("exec claude with no positional args).")
         return 1
-    total_assertions = len(launchers) * 3
+    total_assertions = len(launchers) * 3 + 3
     print(
         f"OK - all {total_assertions} launcher assertions pass "
-        f"({len(launchers)} launchers x 3 checks)."
+        f"({len(launchers)} launchers x 3 static checks + 3 consent checks)."
     )
     print("=" * 60)
     return 0

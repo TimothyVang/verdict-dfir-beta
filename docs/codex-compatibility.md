@@ -2,7 +2,7 @@
 
 Status: ACTIVE
 
-This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official SANS judge/demo path is the one-shot `scripts/verdict <evidence>` launcher or an interactive Claude Code session (`claude` / `scripts/find-evil`) for manual exploration.
+This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official SANS judge/demo path is the zero-LLM one-shot `scripts/verdict <evidence>` launcher or a consent-gated interactive Claude Code session (`scripts/find-evil --acknowledge-evidence-egress`) for manual exploration.
 
 Codex compatibility means: Codex can read the same repo instructions and, if its MCP client supports stdio servers, launch the same two narrow product MCP servers. It does not mean adding broad external MCPs.
 
@@ -12,14 +12,14 @@ Codex compatibility means: Codex can read the same repo instructions and, if its
 
 | Server | Purpose | Expected tools |
 |---|---|---:|
-| `findevil-mcp` | Rust DFIR tool surface over evidence and forensic artifacts | 32 |
-| `findevil-agent-mcp` | Python audit, manifest, verifier, ACH, memory, ACP, and expert-feedback support tools | 13 |
+| `findevil-mcp` | Rust DFIR tool surface over evidence and forensic artifacts | 43 |
+| `findevil-agent-mcp` | Python audit, manifest, verifier, ACH, memory, ACP, and expert-feedback support tools | 14 |
 
-Expected total: 46 product tools. The other four registered servers are non-product operator conveniences.
+Expected total: 57 product tools. The other four registered servers are non-product operator conveniences.
 
 These are the only product-default MCP servers — the only two in the audit chain. `.mcp.json` *also* registers four **non-product** servers (`n8n-mcp`, `playwright`, `puppeteer`, and `qmd` dev-memory recall) for post-verdict automation, browser tasks, and memory; they touch no evidence and emit no Findings, so seeing six entries in `.mcp.json` is expected, not a misconfiguration (full inventory: [`reference/mcp-and-tools.md`](reference/mcp-and-tools.md)). Do not add generic filesystem, Docker, Kubernetes, GitHub, fetch, or shell MCPs as defaults.
 
-The Protocol SIFT gateway (`teamdfir/protocol-sift`) is a welcome common base that installs independently via `protocol-sift install` on the same SIFT VM. It is **not** a product-default MCP for Find Evil!: its broad shell-backed surface (200+ tools, `execute_shell`) is architecturally distinct from our 45-typed-tool product surface. If Protocol SIFT is installed, both gateways coexist under separate MCP server names; neither requires nor conflicts with the other. See [`docs/architecture.md#relationship-to-protocol-sift`](architecture.md#relationship-to-protocol-sift).
+The Protocol SIFT gateway (`teamdfir/protocol-sift`) is a welcome common base that installs independently via `protocol-sift install` on the same SIFT VM. It is **not** a product-default MCP for Find Evil!: its broad shell-backed surface (200+ tools, `execute_shell`) is architecturally distinct from our 57-typed-tool product surface. If Protocol SIFT is installed, both gateways coexist under separate MCP server names; neither requires nor conflicts with the other. See [`docs/architecture.md#relationship-to-protocol-sift`](architecture.md#relationship-to-protocol-sift).
 
 ## Local Codex MCP Config
 

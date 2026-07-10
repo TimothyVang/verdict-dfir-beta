@@ -22,16 +22,68 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::tools::disk::case_dir;
+use crate::tools::disk::{
+    admit_case_mount, create_case_mount_leaf, hash_bound_derived_artifact,
+    register_vss_mount_resource, DiskError, MountKind, SessionResource,
+};
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
 
 /// Cap on surfaced shadow stores so a pathological listing cannot bloat output.
 const MAX_STORES: usize = 256;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const HARD_TIMEOUT: Duration = Duration::from_secs(3_600);
+const TIMEOUT_ENV: &str = "FINDEVIL_VSS_TIMEOUT_SECS";
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct VssMountCleanup {
+    mount_point: PathBuf,
+    mount_attempted: bool,
+    armed: bool,
+}
+
+impl VssMountCleanup {
+    const fn new(mount_point: PathBuf) -> Self {
+        Self {
+            mount_point,
+            mount_attempted: false,
+            armed: true,
+        }
+    }
+
+    const fn record_attempt(&mut self) {
+        self.mount_attempted = true;
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for VssMountCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.mount_attempted {
+            cleanup_vss_mount(&self.mount_point);
+        }
+        let _ = std::fs::remove_dir(&self.mount_point);
+    }
+}
+
+fn cleanup_vss_mount(mount_point: &Path) {
+    let umount = std::env::var("FINDEVIL_UMOUNT_BIN").unwrap_or_else(|_| "umount".to_string());
+    let mut cleanup = Command::new(umount);
+    cleanup.arg(mount_point);
+    let _ = run_with_timeout(cleanup, CLEANUP_TIMEOUT);
+}
 
 fn vshadowinfo_bin() -> String {
     std::env::var("FINDEVIL_VSHADOWINFO_BIN").unwrap_or_else(|_| "vshadowinfo".to_string())
@@ -82,7 +134,8 @@ pub struct VssMountInput {
     /// Path to the raw volume image or mounted volume device holding the shadow
     /// store.
     pub image_path: PathBuf,
-    /// Optional mount point; defaults under the case directory.
+    /// Reserved for wire compatibility. Product calls must omit this field;
+    /// the server creates a fresh leaf under the current Case.
     #[serde(default)]
     pub mount_point: Option<PathBuf>,
 }
@@ -115,6 +168,12 @@ pub enum VssError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("caller-selected VSS mount points are forbidden: {0}")]
+    UnsafeMountPoint(PathBuf),
+    #[error("could not register VSS mount in the case session ledger: {0}")]
+    Ledger(#[source] DiskError),
+    #[error("VSS subprocess resource failure: {0}")]
+    Subprocess(String),
 }
 
 /// Enumerate the Volume Shadow Copies in `image_path`. Degrades to
@@ -126,12 +185,14 @@ pub fn vss_list(input: &VssListInput) -> Result<VssListOutput, VssError> {
     if !input.image_path.exists() {
         return Err(VssError::ImageNotFound(input.image_path.clone()));
     }
-    let output = match Command::new(vshadowinfo_bin())
-        .arg(&input.image_path)
-        .output()
-    {
+    let mut command = Command::new(vshadowinfo_bin());
+    command.arg(&input.image_path);
+    let output = match run_with_timeout(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    ) {
         Ok(out) => out,
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(VssListOutput {
                 vshadowinfo_available: false,
                 has_shadow_store: false,
@@ -139,14 +200,7 @@ pub fn vss_list(input: &VssListInput) -> Result<VssListOutput, VssError> {
                 stores: Vec::new(),
             });
         }
-        Err(_) => {
-            return Ok(VssListOutput {
-                vshadowinfo_available: false,
-                has_shadow_store: false,
-                store_count: 0,
-                stores: Vec::new(),
-            });
-        }
+        Err(error) => return Err(VssError::Subprocess(error.to_string())),
     };
     // vshadowinfo exits non-zero on a volume with no shadow store; that is a
     // valid "no snapshots" answer, not a tool failure.
@@ -205,16 +259,20 @@ pub fn vss_mount(input: &VssMountInput) -> Result<VssMountOutput, VssError> {
     if !input.image_path.exists() {
         return Err(VssError::ImageNotFound(input.image_path.clone()));
     }
-    let case = case_dir(&input.case_id).map_err(|e| VssError::Case(e.to_string()))?;
+    if let Some(requested) = &input.mount_point {
+        return Err(VssError::UnsafeMountPoint(requested.clone()));
+    }
+    let canonical_image = crate::pathnorm::canonicalize(&input.image_path)
+        .map_err(|_| VssError::ImageNotFound(input.image_path.clone()))?;
+    let admission = admit_case_mount(&input.case_id, MountKind::Vss, &canonical_image)
+        .map_err(VssError::Ledger)?;
+    if let Some(resource) = admission.existing() {
+        return reused_vss_mount_output(resource);
+    }
     let mount_id = format!("vss-mount-{}", Uuid::new_v4());
-    let mount_point = input
-        .mount_point
-        .clone()
-        .unwrap_or_else(|| case.join("mounts").join(&mount_id));
-    std::fs::create_dir_all(&mount_point).map_err(|source| VssError::MountPoint {
-        path: mount_point.clone(),
-        source,
-    })?;
+    let mount_point =
+        create_case_mount_leaf(admission.case_dir(), &mount_id).map_err(VssError::Ledger)?;
+    let mut cleanup = VssMountCleanup::new(mount_point.clone());
 
     let bin = vshadowmount_bin();
     let command = vec![
@@ -223,41 +281,82 @@ pub fn vss_mount(input: &VssMountInput) -> Result<VssMountOutput, VssError> {
         mount_point.to_string_lossy().to_string(),
     ];
 
-    let spawn = Command::new(&bin)
-        .arg(&input.image_path)
-        .arg(&mount_point)
-        .output();
-    match spawn {
-        Ok(out) if out.status.success() => {
-            let shadow_store_paths = collect_vss_files(&mount_point);
-            Ok(VssMountOutput {
+    let mut mount_command = Command::new(&bin);
+    mount_command.arg(&input.image_path).arg(&mount_point);
+    cleanup.record_attempt();
+    let spawn = run_with_timeout(
+        mount_command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    );
+    let (vshadowmount_available, shadow_store_paths) = match spawn {
+        Ok(out) if out.status.success() => (true, collect_vss_files(&mount_point)),
+        Ok(_) => {
+            return Ok(VssMountOutput {
                 vshadowmount_available: true,
                 mount_id,
-                status: "mounted".to_string(),
+                status: "unavailable".to_string(),
                 mount_point,
-                shadow_store_paths,
+                shadow_store_paths: Vec::new(),
                 command,
             })
         }
-        Ok(_) => Ok(VssMountOutput {
-            // vshadowmount ran but could not mount (e.g. no shadow store): report
-            // unavailable data rather than a hard error so the pipeline pivots.
-            vshadowmount_available: true,
-            mount_id,
-            status: "unavailable".to_string(),
-            mount_point,
-            shadow_store_paths: Vec::new(),
-            command,
-        }),
-        Err(_) => Ok(VssMountOutput {
-            vshadowmount_available: false,
-            mount_id,
-            status: "unavailable".to_string(),
-            mount_point,
-            shadow_store_paths: Vec::new(),
-            command,
-        }),
-    }
+        Err(RunError::Spawn(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VssMountOutput {
+                vshadowmount_available: false,
+                mount_id,
+                status: "unavailable".to_string(),
+                mount_point,
+                shadow_store_paths: Vec::new(),
+                command,
+            })
+        }
+        Err(error) => return Err(VssError::Subprocess(error.to_string())),
+    };
+    let ledger_artifacts = shadow_store_paths
+        .iter()
+        .map(|path| {
+            hash_bound_derived_artifact(&input.case_id, "vss_snapshot", &canonical_image, path)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(VssError::Ledger)?;
+    register_vss_mount_resource(
+        &admission,
+        &mount_id,
+        &canonical_image,
+        &mount_point,
+        "mounted",
+        &command,
+        &ledger_artifacts,
+    )
+    .map_err(VssError::Ledger)?;
+    cleanup.disarm();
+    Ok(VssMountOutput {
+        vshadowmount_available,
+        mount_id,
+        status: "mounted".to_string(),
+        mount_point,
+        shadow_store_paths,
+        command,
+    })
+}
+
+fn reused_vss_mount_output(resource: &SessionResource) -> Result<VssMountOutput, VssError> {
+    let mount_point = resource
+        .mount_point
+        .clone()
+        .ok_or_else(|| VssError::Ledger(DiskError::MountNotMounted(resource.id.clone())))?;
+    Ok(VssMountOutput {
+        vshadowmount_available: true,
+        mount_id: resource.id.clone(),
+        status: resource.status.clone(),
+        mount_point,
+        shadow_store_paths: resource
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.extracted_path.clone())
+            .collect(),
+        command: resource.command.clone(),
+    })
 }
 
 /// The `vssN` snapshot files libvshadow exposes under the mount point, sorted.
@@ -330,5 +429,125 @@ Store: 2
     fn clean_label_value_strips_colon_and_whitespace() {
         assert_eq!(clean_label_value("\t\t: value here"), "value here");
         assert_eq!(clean_label_value(": x"), "x");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repeated_vss_mount_reuses_one_active_resource_and_one_subprocess() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _env_guard = crate::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let case_id = "vss-reuse-case";
+        std::fs::create_dir_all(tmp.path().join("cases").join(case_id)).expect("case");
+        let image = tmp.path().join("volume.dd");
+        std::fs::write(&image, b"volume").expect("image");
+        let calls = tmp.path().join("calls.log");
+        let fake = tmp.path().join("vshadowmount");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf 'called\\n' >> '{}'\nprintf 'snapshot' > \"$2/vss1\"\n",
+                calls.display()
+            ),
+        )
+        .expect("fake binary");
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_bin = std::env::var_os("FINDEVIL_VSHADOWMOUNT_BIN");
+        std::env::set_var("FINDEVIL_HOME", tmp.path());
+        std::env::set_var("FINDEVIL_VSHADOWMOUNT_BIN", &fake);
+
+        let input = VssMountInput {
+            case_id: case_id.to_string(),
+            image_path: image,
+            mount_point: None,
+        };
+        let first = vss_mount(&input).expect("first mount");
+        let second = vss_mount(&input).expect("reused mount");
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_bin {
+            Some(value) => std::env::set_var("FINDEVIL_VSHADOWMOUNT_BIN", value),
+            None => std::env::remove_var("FINDEVIL_VSHADOWMOUNT_BIN"),
+        }
+
+        assert_eq!(second.mount_id, first.mount_id);
+        assert_eq!(second.mount_point, first.mount_point);
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unavailable_vss_mount_removes_the_fresh_leaf_and_writes_no_resource() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _env_guard = crate::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let case_id = "vss-unavailable-case";
+        let case = tmp.path().join("cases").join(case_id);
+        std::fs::create_dir_all(&case).expect("case");
+        let image = tmp.path().join("volume.dd");
+        std::fs::write(&image, b"volume").expect("image");
+        let fake = tmp.path().join("vshadowmount-fail");
+        std::fs::write(&fake, "#!/bin/sh\nexit 2\n").expect("fake binary");
+        let cleanup_calls = tmp.path().join("cleanup-calls.log");
+        let fake_umount = tmp.path().join("umount");
+        std::fs::write(
+            &fake_umount,
+            format!(
+                "#!/bin/sh\nprintf 'cleanup\\n' >> '{}'\n",
+                cleanup_calls.display()
+            ),
+        )
+        .expect("fake umount");
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let mut permissions = std::fs::metadata(&fake_umount).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_umount, permissions).unwrap();
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_bin = std::env::var_os("FINDEVIL_VSHADOWMOUNT_BIN");
+        let previous_umount = std::env::var_os("FINDEVIL_UMOUNT_BIN");
+        std::env::set_var("FINDEVIL_HOME", tmp.path());
+        std::env::set_var("FINDEVIL_VSHADOWMOUNT_BIN", &fake);
+        std::env::set_var("FINDEVIL_UMOUNT_BIN", &fake_umount);
+
+        let output = vss_mount(&VssMountInput {
+            case_id: case_id.to_string(),
+            image_path: image,
+            mount_point: None,
+        })
+        .expect("unavailable is a typed degrade");
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_bin {
+            Some(value) => std::env::set_var("FINDEVIL_VSHADOWMOUNT_BIN", value),
+            None => std::env::remove_var("FINDEVIL_VSHADOWMOUNT_BIN"),
+        }
+        match previous_umount {
+            Some(value) => std::env::set_var("FINDEVIL_UMOUNT_BIN", value),
+            None => std::env::remove_var("FINDEVIL_UMOUNT_BIN"),
+        }
+
+        assert_eq!(output.status, "unavailable");
+        assert!(!output.mount_point.exists());
+        assert!(!case.join("session_resources.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(cleanup_calls)
+                .expect("bounded cleanup subprocess ran")
+                .lines()
+                .count(),
+            1
+        );
     }
 }

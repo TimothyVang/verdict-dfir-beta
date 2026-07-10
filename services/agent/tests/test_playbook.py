@@ -44,6 +44,10 @@ class TestDetectEvidenceType:
         ("forensic.aff", "disk"),
         # velociraptor zip
         ("collection.zip", "velociraptor"),
+        # standalone browser databases
+        ("History", "browser"),
+        ("Cookies", "browser"),
+        ("places.sqlite", "browser"),
         # unknown
         ("readme.txt", "unknown"),
         ("amcache.hve", "unknown"),  # registry hive — classified by classify_artifact_path
@@ -115,9 +119,13 @@ class TestClassifyArtifactPath:
                 "thumbcache_parse",
             ),
             ("malware.exe", "yara_target", "yara_scan"),
-            ("collection.zip", "velociraptor", "vel_collect"),
+            ("collection.zip", "velociraptor", None),
             ("History", "browser_db", "browser_history"),
+            ("Archived History", "browser_db", "browser_history"),
             ("places.sqlite", "browser_db", "browser_history"),
+            ("Cookies", "browser_db", "browser_history"),
+            ("Web Data", "browser_db", "browser_history"),
+            ("Login Data", "browser_db", "browser_history"),
             ("Archived History.sqlite", "browser_db", "browser_history"),
             ("readme.txt", "unknown", None),
         ],
@@ -148,6 +156,7 @@ class TestToolSequences:
             "velociraptor",
             "extracted_disk",
             "directory",
+            "browser",
             "unknown",
         }
         assert required.issubset(set(TOOL_SEQUENCES.keys()))
@@ -161,6 +170,9 @@ class TestToolSequences:
         tools = [s.tool for s in TOOL_SEQUENCES["disk"]]
         assert "mft_timeline" in tools
         assert "registry_query" in tools
+
+    def test_browser_sequence_is_narrow(self) -> None:
+        assert [step.tool for step in TOOL_SEQUENCES["browser"]] == ["browser_history"]
 
     def test_playbook_steps_are_frozen(self) -> None:
         step = TOOL_SEQUENCES["evtx"][0]

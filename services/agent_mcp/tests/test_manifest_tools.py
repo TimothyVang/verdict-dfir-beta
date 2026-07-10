@@ -49,6 +49,34 @@ class TestManifestFinalize:
         assert result.signature_cert_fingerprint is not None
         assert len(result.signature_cert_fingerprint) == 64
 
+    async def test_refuses_to_sign_a_tampered_audit_chain(
+        self, seeded_audit_log: Path, tmp_path: Path
+    ) -> None:
+        lines = seeded_audit_log.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        first["payload"]["tool"] = "tampered-after-audit-verify"
+        lines[0] = json.dumps(first, sort_keys=True, separators=(",", ":"))
+        # newline="\n" disables the text-mode CRLF translation Windows would
+        # otherwise apply; a trailing "\r" on each record makes the audit log
+        # non-canonical, which would trip the canonical-form check before the
+        # intended prev_hash break.
+        seeded_audit_log.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        out_path = tmp_path / "run.manifest.json"
+
+        with pytest.raises(Exception, match="prev_hash break"):
+            await FINALIZE_SPEC.handler(
+                ManifestFinalizeInput(
+                    case_id="case-tampered-chain",
+                    run_id="run-tampered-chain",
+                    started_at="2026-04-25T00:00:00Z",
+                    audit_log_path=str(seeded_audit_log),
+                    output_path=str(out_path),
+                    signer="stub",
+                )
+            )
+
+        assert not out_path.exists()
+
     async def test_extra_metadata_round_trips(self, seeded_audit_log: Path, tmp_path: Path) -> None:
         out_path = tmp_path / "run.manifest.json"
         await FINALIZE_SPEC.handler(
@@ -65,6 +93,48 @@ class TestManifestFinalize:
         loaded = json.loads(out_path.read_text(encoding="utf-8"))
         assert loaded["extra"]["model"] == "claude-opus"
         assert loaded["extra"]["image_hash"] == "deadbeef" * 8
+
+    async def test_anchor_request_is_committed_before_signing(
+        self,
+        seeded_audit_log: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import findevil_agent_mcp.tools.manifest_finalize as finalize_module
+
+        monkeypatch.setenv("FINDEVIL_REKOR_ENABLE", "1")
+        monkeypatch.setattr(finalize_module, "require_rekor_enabled", lambda: None)
+        monkeypatch.setattr(
+            finalize_module,
+            "anchor_merkle_root",
+            lambda root: {
+                "kind": "none",
+                "anchored": False,
+                "subject": {"merkle_root_sha256": root},
+                "fallback_reason": "rekor unavailable",
+            },
+        )
+        out_path = tmp_path / "run.manifest.json"
+
+        result = await FINALIZE_SPEC.handler(
+            ManifestFinalizeInput(
+                case_id="case-anchor-request",
+                run_id="run-anchor-request",
+                started_at="2026-04-25T00:00:00Z",
+                audit_log_path=str(seeded_audit_log),
+                output_path=str(out_path),
+                signer="stub",
+                anchor_transparency=True,
+            )
+        )
+        loaded = json.loads(out_path.read_text(encoding="utf-8"))
+
+        assert loaded["transparency_anchor_requested"] is True
+        assert result.transparency_requested is True
+        assert result.transparency_anchored is False
+        verified = await VERIFY_SPEC.handler(ManifestVerifyInput(manifest_path=str(out_path)))
+        assert verified.transparency_ok is False
+        assert verified.overall is False
 
 
 class TestEd25519Tier:
@@ -85,7 +155,12 @@ class TestEd25519Tier:
         )
         assert result.signer_effective == "ed25519"
         assert result.fallback_reason is None
-        verify = await VERIFY_SPEC.handler(ManifestVerifyInput(manifest_path=str(out_path)))
+        verify = await VERIFY_SPEC.handler(
+            ManifestVerifyInput(
+                manifest_path=str(out_path),
+                expected_ed25519_fingerprint=result.signature_cert_fingerprint,
+            )
+        )
         assert verify.overall is True
         assert verify.signature_kind == "ed25519"
         # The genuine offline cryptographic pass — not a presence check.
@@ -132,12 +207,34 @@ class TestEd25519Tier:
         assert result.signer_effective == "stub"
         assert result.fallback_reason
 
+    async def test_reserved_custody_refuses_signer_degradation(
+        self, seeded_audit_log: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        not_a_dir = tmp_path / "not-a-dir"
+        not_a_dir.write_text("blocking file", encoding="utf-8")
+        monkeypatch.setenv("FINDEVIL_SIGNING_KEY", str(not_a_dir / "signing.key"))
+        monkeypatch.setenv("FINDEVIL_CUSTODY_BOUNDARY", "reserved_case")
+        out_path = tmp_path / "run.manifest.json"
+
+        with pytest.raises(RuntimeError, match="refusing to write a weaker manifest"):
+            await FINALIZE_SPEC.handler(
+                ManifestFinalizeInput(
+                    case_id="case-reserved",
+                    run_id="run-reserved",
+                    started_at="2026-04-25T00:00:00Z",
+                    audit_log_path=str(seeded_audit_log),
+                    output_path=str(out_path),
+                    signer="ed25519",
+                )
+            )
+        assert not out_path.exists()
+
 
 class TestManifestVerify:
     def test_tool_description_names_current_signature_tiers(self) -> None:
         description = VERIFY_SPEC.description
         assert "ed25519/sigstore/stub" in description
-        assert "offline-verified Ed25519 signature" in description
+        assert "external trusted fingerprint" in description
         assert "sigstore/stub bundle" not in description
 
     async def test_clean_manifest_verifies(self, seeded_audit_log: Path, tmp_path: Path) -> None:

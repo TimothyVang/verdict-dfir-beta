@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -30,28 +30,42 @@ def _single_leaf_root(body: bytes) -> str:
     return hashlib.sha256(b"\x00" + body).hexdigest()
 
 
-def _fake_entry(merkle_root_hex: str):
-    """A fake Rekor ``LogEntry`` whose single-leaf inclusion proof genuinely
-    verifies offline. Returns ``(entry, body_b64)`` like ``_submit_to_rekor``."""
+def _fake_bundle(merkle_root_hex: str) -> tuple[str, str]:
+    """A Sigstore v4-shaped Bundle with a genuine one-leaf inclusion proof."""
     body = _statement_body(merkle_root_hex)
     body_b64 = base64.b64encode(body).decode("ascii")
     root_hex = _single_leaf_root(body)
-    proof = SimpleNamespace(
-        checkpoint="rekor.sigstore.dev - 000\n1\n<root>\n",
-        hashes=[],
-        log_index=0,
-        root_hash=root_hex,
-        tree_size=1,
-    )
-    entry = SimpleNamespace(
-        uuid="deadbeefcafef00d",
-        body=body_b64,
-        integrated_time=1_700_000_000,
-        log_id="c0ffee",
-        log_index=0,
-        inclusion_proof=proof,
-    )
-    return entry, body_b64
+    bundle = {
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {
+            "certificate": {"rawBytes": base64.b64encode(b"certificate").decode("ascii")},
+            "tlogEntries": [
+                {
+                    "logIndex": "0",
+                    "logId": {"keyId": base64.b64encode(bytes.fromhex("c0ffee")).decode("ascii")},
+                    "kindVersion": {"kind": "dsse", "version": "0.0.1"},
+                    "integratedTime": "1700000000",
+                    "inclusionPromise": {
+                        "signedEntryTimestamp": base64.b64encode(b"set").decode("ascii")
+                    },
+                    "inclusionProof": {
+                        "checkpoint": {"envelope": "rekor.sigstore.dev - 000\n1\n<root>\n"},
+                        "hashes": [],
+                        "logIndex": "0",
+                        "rootHash": base64.b64encode(bytes.fromhex(root_hex)).decode("ascii"),
+                        "treeSize": "1",
+                    },
+                    "canonicalizedBody": body_b64,
+                }
+            ],
+        },
+        "dsseEnvelope": {
+            "payload": base64.b64encode(b"payload").decode("ascii"),
+            "payloadType": "application/vnd.in-toto+json",
+            "signatures": [{"keyid": "", "sig": base64.b64encode(b"sig").decode("ascii")}],
+        },
+    }
+    return json.dumps(bundle, separators=(",", ":")), body_b64
 
 
 class TestOptInGate:
@@ -75,8 +89,8 @@ class TestOptInGate:
 
 class TestAnchorMerkleRoot:
     def test_rekor_block_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        entry, body_b64 = _fake_entry(_ROOT)
-        monkeypatch.setattr(anchor, "_submit_to_rekor", lambda root: (entry, body_b64))
+        bundle_json, body_b64 = _fake_bundle(_ROOT)
+        monkeypatch.setattr(anchor, "_submit_to_rekor", lambda root: bundle_json)
 
         block = anchor.anchor_merkle_root(_ROOT)
 
@@ -87,9 +101,11 @@ class TestAnchorMerkleRoot:
         assert block["statement_type"] == "https://in-toto.io/Statement/v1"
         assert block["predicate_type"].endswith("/audit-merkle-root/v1")
         rekor = block["rekor"]
-        assert rekor["entry_uuid"] == "deadbeefcafef00d"
+        assert rekor["entry_uuid"] is None
+        assert rekor["log_id"] == "c0ffee"
         assert rekor["log_index"] == 0
         assert rekor["body"] == body_b64
+        assert base64.b64decode(rekor["bundle_b64"]).decode("utf-8") == bundle_json
         ip = rekor["inclusion_proof"]
         assert ip["tree_size"] == 1
         assert ip["root_hash"] == _single_leaf_root(_statement_body(_ROOT))
@@ -115,10 +131,14 @@ class TestAnchorMerkleRoot:
 
         assert block is not None
         assert block["kind"] == "rfc3161"
-        assert block["anchored"] is True
+        # The public TSA token is retained as an analyst side-signal, but it is
+        # not authenticated without a pinned TSA certificate chain.
+        assert block["anchored"] is False
         assert block["rekor"] is None
         assert block["tsa"]["tsr_b64"] == canned_tsr
         assert block["tsa"]["kind"] == "rfc3161"
+        assert block["tsa"]["authenticated"] is False
+        assert block["tsa"]["token_sha256"] == hashlib.sha256(b"fake-rfc3161-token").hexdigest()
         assert "rekor anchoring failed" in block["fallback_reason"]
 
     def test_no_tsa_fallback_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -156,8 +176,18 @@ class TestAnchorMerkleRoot:
 
 class TestVerifyAnchor:
     def _good_block(self, monkeypatch: pytest.MonkeyPatch, root: str = _ROOT) -> dict:
-        entry, body_b64 = _fake_entry(root)
-        monkeypatch.setattr(anchor, "_submit_to_rekor", lambda r: (entry, body_b64))
+        bundle_json, _ = _fake_bundle(root)
+        monkeypatch.setattr(anchor, "_submit_to_rekor", lambda r: bundle_json)
+        monkeypatch.setenv("FINDEVIL_SIGSTORE_EXPECTED_IDENTITY", "release@example.test")
+        monkeypatch.setenv("FINDEVIL_SIGSTORE_EXPECTED_ISSUER", "https://issuer.example.test")
+        monkeypatch.setattr(
+            anchor,
+            "_verify_sigstore_dsse",
+            lambda bundle, identity, issuer: (
+                "application/vnd.in-toto+json",
+                _statement_body(root),
+            ),
+        )
         block = anchor.anchor_merkle_root(root)
         assert block is not None
         return block
@@ -173,20 +203,84 @@ class TestVerifyAnchor:
         assert result is not True
         assert "subject digest" in str(result)
 
-    def test_rejects_corrupted_inclusion_proof(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_rejects_corrupted_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         block = self._good_block(monkeypatch)
-        # Flip the declared root_hash so the inclusion proof no longer chains.
-        block["rekor"]["inclusion_proof"]["root_hash"] = "ff" * 32
+        block["rekor"]["bundle_b64"] = base64.b64encode(b'{"forged":true}').decode()
+        monkeypatch.setattr(
+            anchor,
+            "_verify_sigstore_dsse",
+            lambda bundle, identity, issuer: (_ for _ in ()).throw(ValueError("bad checkpoint")),
+        )
         result = anchor.verify_anchor(block, _ROOT)
         assert result is not True
-        assert "inclusion proof did not verify" in str(result)
+        assert "Sigstore bundle did not verify" in str(result)
+        assert "checkpoint" in str(result)
 
-    def test_rejects_missing_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_rejects_missing_full_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         block = self._good_block(monkeypatch)
-        block["rekor"]["body"] = None
+        block["rekor"]["bundle_b64"] = None
         result = anchor.verify_anchor(block, _ROOT)
         assert result is not True
-        assert "missing entry body" in str(result)
+        assert "missing full Sigstore bundle" in str(result)
+
+    def test_rejects_unrelated_signed_statement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = self._good_block(monkeypatch)
+        monkeypatch.setattr(
+            anchor,
+            "_verify_sigstore_dsse",
+            lambda bundle, identity, issuer: (
+                "application/vnd.in-toto+json",
+                _statement_body("cd" * 32),
+            ),
+        )
+
+        result = anchor.verify_anchor(block, _ROOT)
+
+        assert result is not True
+        assert "does not match the manifest" in str(result)
+
+    def test_rejects_tampered_display_timestamp(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = self._good_block(monkeypatch)
+        block["rekor"]["integrated_time"] = 42
+
+        result = anchor.verify_anchor(block, _ROOT)
+
+        assert result is not True
+        assert "mirrored integrated_time" in str(result)
+
+    def test_rejects_without_exact_identity_and_issuer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = self._good_block(monkeypatch)
+        monkeypatch.delenv("FINDEVIL_SIGSTORE_EXPECTED_IDENTITY", raising=False)
+        monkeypatch.delenv("FINDEVIL_SIGSTORE_EXPECTED_ISSUER", raising=False)
+
+        result = anchor.verify_anchor(block, _ROOT)
+
+        assert result is not True
+        assert "exact expected Sigstore identity and issuer" in str(result)
+
+    def test_tsa_imprint_match_is_not_misreported_as_authenticated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        token = base64.b64encode(b"syntactically-valid-tsr").decode("ascii")
+        block = {
+            "kind": "rfc3161",
+            "anchored": False,
+            "subject": {"merkle_root_sha256": _ROOT},
+            "tsa": {"tsr_b64": token, "authenticated": False},
+        }
+        monkeypatch.setattr(anchor, "_openssl_available", lambda: True)
+        monkeypatch.setattr(
+            anchor,
+            "_run_openssl",
+            lambda args: f"Message data:\n    {_ROOT}\n",
+        )
+
+        result = anchor.verify_anchor(block, _ROOT)
+
+        assert result is not True
+        assert "certificate chain was not pinned or verified" in str(result)
 
     def test_none_kind_block_reports_reason(self) -> None:
         block = anchor.anchor_merkle_root("not-a-sha256")

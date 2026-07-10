@@ -32,13 +32,11 @@ matplotlib                   # report figures in scripts/render_report.py (host-
 #   -> Sigma engine over EVTX (hayabusa_scan). On PATH or set $HAYABUSA_BIN.
 # Chainsaw (binary)                       https://github.com/WithSecureLabs/chainsaw/releases
 #   -> EVTX / Sigma triage.
-# Velociraptor (binary)                   https://github.com/Velocidex/velociraptor/releases
-#   -> artifact collection (vel_collect).
 # YARA-X                                  bundled in the Rust crate — no separate download.
 
 # --- toolchains (scripts/install.sh installs Rust + Python automatically) ------
 # Claude Code CLI                         https://docs.anthropic.com/en/docs/claude-code/install
-# Rust 1.88 (rustup)                      https://rustup.rs   (pinned in rust-toolchain.toml)
+# Rust 1.91 (rustup)                      https://rustup.rs   (pinned in rust-toolchain.toml)
 # uv (Python 3.11)                        https://docs.astral.sh/uv/getting-started/installation/
 # Node 20 + pnpm                          https://nodejs.org   (apps/web dashboard)
 # Docker                                  https://docs.docker.com/get-docker/  (L1 sandbox; optional n8n)

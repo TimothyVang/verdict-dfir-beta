@@ -19,11 +19,16 @@ as a conclusion or as execution proof. A lead never satisfies the
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from findevil_agent.ai_signatures import (
     CONFIDENCE_TIER,
     DEFAULT_LIMIT,
     DEFAULT_PREVIEW_CHARS,
     LEAD_DISCLAIMER,
+    MAX_AGGREGATE_SCAN_BYTES,
+    MAX_INLINE_CHARS,
+    MAX_PATHS,
     MAX_PREVIEW_CHARS,
     known_categories,
     scan_sources,
@@ -39,26 +44,30 @@ class FindAiSignaturesInput(BaseModel):
     case_id: str = Field(
         ...,
         min_length=1,
+        max_length=128,
         description="Case ID from a prior case_open call, for audit correlation.",
     )
     text: str | None = Field(
         default=None,
+        max_length=MAX_INLINE_CHARS,
         description=(
             "Inline text to scan (e.g. a recovered script, log slice, or note "
             "body). Scanned under the source label '<inline>'. At least one of "
             "'text' or 'paths' must be provided."
         ),
     )
-    paths: list[str] = Field(
+    paths: list[Annotated[str, Field(min_length=1, max_length=4_096)]] = Field(
         default_factory=list,
+        max_length=MAX_PATHS,
         description=(
             "Absolute paths to text artifacts to read (open-for-read only) and "
             "scan. A path that cannot be read is reported in 'read_errors' and "
             "skipped; the scan still completes."
         ),
     )
-    categories: list[str] | None = Field(
+    categories: list[Annotated[str, Field(min_length=1, max_length=128)]] | None = Field(
         default=None,
+        max_length=len(known_categories()),
         description=(
             "Optional filter restricting which signature categories are "
             "evaluated. Omit to evaluate every category. Unknown categories are "
@@ -87,6 +96,8 @@ class FindAiSignaturesInput(BaseModel):
     @model_validator(mode="after")
     def _validate_categories(self) -> FindAiSignaturesInput:
         if self.categories is not None:
+            if len(self.categories) != len(set(self.categories)):
+                raise ValueError("signature categories must be unique")
             allowed = set(known_categories())
             unknown = sorted(set(self.categories) - allowed)
             if unknown:
@@ -124,9 +135,15 @@ class FindAiSignaturesOutput(BaseModel):
     matches: list[AiSignatureMatch]
     sources_scanned: int
     chars_scanned: int
+    bytes_scanned: int
+    byte_limit: int
+    paths_requested: int
+    paths_considered: int
+    sources_skipped: int
     signatures_evaluated: int
     read_errors: list[str]
     truncated: bool
+    truncation_reason: str | None
 
 
 async def _handle(inp: BaseModel) -> FindAiSignaturesOutput:
@@ -155,9 +172,15 @@ async def _handle(inp: BaseModel) -> FindAiSignaturesOutput:
         matches=matches,
         sources_scanned=scan.sources_scanned,
         chars_scanned=scan.chars_scanned,
+        bytes_scanned=scan.bytes_scanned,
+        byte_limit=scan.byte_limit,
+        paths_requested=scan.paths_requested,
+        paths_considered=scan.paths_considered,
+        sources_skipped=scan.sources_skipped,
         signatures_evaluated=scan.signatures_evaluated,
         read_errors=list(scan.read_errors),
         truncated=scan.truncated,
+        truncation_reason=scan.truncation_reason,
     )
 
 
@@ -182,7 +205,8 @@ SPEC = ToolSpec(
         "signature alone never satisfies the >=2-artifact-class execution gate; "
         "corroborate with an independent artifact class before raising confidence. "
         "Pass 'categories' to scope the scan; a file that cannot be read is "
-        "reported in 'read_errors' and skipped."
+        "reported in 'read_errors' and skipped. Inputs are bounded to 64 paths, "
+        f"{MAX_AGGREGATE_SCAN_BYTES} aggregate bytes, and de-duplicated categories."
     ),
     input_model=FindAiSignaturesInput,
     output_model=FindAiSignaturesOutput,

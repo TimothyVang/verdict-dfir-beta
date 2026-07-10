@@ -29,35 +29,48 @@ same SHA-256 (chain of custody) but a fresh case_id and fresh manifest.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, deque
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import codecs
+import contextlib
 import csv
+import heapq
 import hashlib
 import ipaddress
 import json
-import os
-import codecs
 import math
+import os
 import re
+import secrets
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections import Counter, deque
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from queue import Empty, Queue
-from typing import Any
+from queue import Empty, Full, Queue
+from typing import Any, NamedTuple
 
 try:
     from findevil_agent.playbook import (
         MEMORY_EXTS as _PLAYBOOK_MEMORY_EXTS,
+    )
+    from findevil_agent.playbook import (
         RAW_DISK_EXTS as _PLAYBOOK_RAW_DISK_EXTS,
+    )
+    from findevil_agent.playbook import (
         REGISTRY_HIVE_NAMES as _PLAYBOOK_REGISTRY_HIVE_NAMES,
+    )
+    from findevil_agent.playbook import (
         classify_artifact_path as _playbook_classify,
+    )
+    from findevil_agent.playbook import (
         detect_evidence_type as _playbook_detect,
     )
 
@@ -353,12 +366,18 @@ def mem_store_path() -> str:
     Precedence: FINDEVIL_MEMORY_STORE, else <case_home>/memory/memory.sqlite where
     case_home is FINDEVIL_HOME, else $HOME/$USERPROFILE + '.findevil'.
     """
+    if not LOCAL_MODE and not DOCKER_MODE:
+        sift_override = os.environ.get("FINDEVIL_SIFT_MEMORY_STORE", "").strip()
+        if sift_override:
+            return sift_override
     override = os.environ.get("FINDEVIL_MEMORY_STORE", "").strip()
     if override:
         return override
     case_home = os.environ.get("FINDEVIL_HOME", "").strip()
     if case_home:
         base = Path(case_home)
+    elif not LOCAL_MODE and not DOCKER_MODE:
+        base = Path(GUEST_REPO) / ".project-local" / "state"
     else:
         home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
         base = (Path(home) if home else Path.home()) / ".findevil"
@@ -371,12 +390,17 @@ def mem_store_path() -> str:
 
 # Docker-container backend (the container analog of SIFT). Toggled by
 # FIND_EVIL_DOCKER=1 (set by scripts/verdict --docker). Selects the docker-exec
-# MCP transport + container paths exactly the way FIND_EVIL_LOCAL selects the
-# host-stdio transport. The repo is bind-mounted read-write at /workspace and
-# evidence read-only at /evidence, so the guest repo defaults to /workspace and
-# the case dir the container writes to IS a host path via the bind mount.
+# Rust MCP transport + container paths exactly the way FIND_EVIL_LOCAL selects
+# host stdio. `/workspace` is only a compatibility namespace for exact parser
+# binds and private staging; signed case output and Python custody stay on host.
+# Evidence is read-only at `/evidence`.
 DOCKER_MODE = os.environ.get("FIND_EVIL_DOCKER") == "1"
 DOCKER_CONTAINER = os.environ.get("FIND_EVIL_DOCKER_CONTAINER", "findevil-dfir")
+
+
+def _is_native_windows() -> bool:
+    return os.name == "nt"
+
 
 GUEST_IP = os.environ.get("FIND_EVIL_GUEST_IP", "192.168.197.143")
 GUEST_USER = os.environ.get("FIND_EVIL_GUEST_USER", "sansforensics")
@@ -644,50 +668,378 @@ RUST_TOOL_ENV = {
         "FIND_EVIL_GUEST_MOUNT_BIN", "/home/sansforensics/sudo-mount"
     ),
 }
-MEMORY_YARA_RULES = os.environ.get("FIND_EVIL_MEMORY_YARA_RULES")
-DISK_YARA_RULES = os.environ.get("FIND_EVIL_DISK_YARA_RULES")
-PY_LAUNCHER = (
-    " ".join(f"{key}={shlex.quote(value)}" for key, value in RUST_TOOL_ENV.items())
-    + f" exec {RUST_BIN_Q}"
+BROWSER_CASE_BINDING_ENV = "FINDEVIL_BROWSER_CASE_BINDING"
+CASE_OPEN_BINDING_ENV = "FINDEVIL_CASE_OPEN_BINDING"
+CONTROLLER_CAPABILITY_ENV = "FINDEVIL_CONTROLLER_CAPABILITY"
+OUTPUT_ROUTE_ENV = "FINDEVIL_OUTPUT_ROUTE"
+PARSED_EVIDENCE_ACK_ENV = "FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS"
+_LOCAL_AGENT_PROVIDERS = frozenset({"local", "dgx"})
+_CLOUD_AGENT_PROVIDERS = frozenset({"anthropic", "claude_cli", "openai", "openrouter"})
+ARTIFACT_CASE_BINDING_MAX_BYTES = 512 * 1024
+CUSTODY_RESERVATION_ENV_NAMES = (
+    "FINDEVIL_CUSTODY_BOUNDARY",
+    "FINDEVIL_ACTIVE_CASE_DIR",
+    "FINDEVIL_ACTIVE_CASE_ID",
+    "FINDEVIL_ACTIVE_RUN_ID",
+    "FINDEVIL_ACTIVE_STARTED_AT",
+    "FINDEVIL_ACTIVE_SIGNER",
 )
-RUST_REPLAY_COMMAND = [
-    "env",
-    *(f"{key}={value}" for key, value in RUST_TOOL_ENV.items()),
-    RUST_BIN,
-]
+PARSER_RESOURCE_ENV_NAMES = (
+    "FINDEVIL_BROWSER_DB_MAX_BYTES",
+    "FINDEVIL_BROWSER_FIELD_MAX_BYTES",
+    "FINDEVIL_BROWSER_SQLITE_MAX_OPS",
+    "FINDEVIL_BROWSER_OUTPUT_MAX_BYTES",
+    "FINDEVIL_BROWSER_SQLITE_HEAP_MAX_BYTES",
+    "FINDEVIL_BROWSER_SCHEMA_MAX_ENTRIES",
+    "FINDEVIL_FLS_TIMEOUT_SECONDS",
+    "FINDEVIL_ICAT_TIMEOUT_SECONDS",
+    "FINDEVIL_MMLS_TIMEOUT_SECONDS",
+)
+SIGSTORE_VERIFICATION_ENV_NAMES = (
+    "FINDEVIL_SIGSTORE_EXPECTED_IDENTITY",
+    "FINDEVIL_SIGSTORE_EXPECTED_ISSUER",
+)
+PARSER_PATH_POLICY_ENV_NAMES = (
+    "FIND_EVIL_MEMORY_YARA_RULES",
+    "FIND_EVIL_DISK_YARA_RULES",
+    "FINDEVIL_YARA_RULES_ROOT",
+    "FINDEVIL_HAYABUSA_RULE_SET",
+)
+MEMORY_YARA_RULES = os.environ.get("FIND_EVIL_MEMORY_YARA_RULES")
+
+
+def _active_browser_case_env() -> dict[str, str]:
+    """Return the current directory-case binding for child MCP processes."""
+    value = os.environ.get(BROWSER_CASE_BINDING_ENV, "").strip()
+    return {BROWSER_CASE_BINDING_ENV: value} if value else {}
+
+
+def _active_case_open_env() -> dict[str, str]:
+    value = os.environ.get(CASE_OPEN_BINDING_ENV, "").strip()
+    return {CASE_OPEN_BINDING_ENV: value} if value else {}
+
+
+def _active_custody_env() -> dict[str, str]:
+    return {
+        name: value
+        for name in CUSTODY_RESERVATION_ENV_NAMES
+        if (value := os.environ.get(name, "").strip())
+    }
+
+
+def _active_controller_capability_env() -> dict[str, str]:
+    value = os.environ.get(CONTROLLER_CAPABILITY_ENV, "").strip()
+    return {CONTROLLER_CAPABILITY_ENV: value} if value else {}
+
+
+def _active_parser_path_policy_env() -> dict[str, str]:
+    return {
+        name: value
+        for name in PARSER_PATH_POLICY_ENV_NAMES
+        if (value := os.environ.get(name, "").strip())
+    }
+
+
+def parser_output_route_env(
+    *,
+    agent_mode: bool,
+    agent_provider: str | None,
+    acknowledged: bool,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Select the only evidence-output authority inherited by MCP children.
+
+    The deterministic engine and reviewed on-prem providers consume parsed
+    evidence locally. Known cloud providers receive authority only from the
+    explicit CLI acknowledgment. Unknown providers get no authority even when
+    the acknowledgment flag is present; their provider factory will reject
+    them later, and the MCP boundary remains fail-closed in the meantime.
+    """
+    source = os.environ if environment is None else environment
+    if not agent_mode:
+        return {OUTPUT_ROUTE_ENV: "local_controller"}
+    provider = agent_provider or source.get("FINDEVIL_AGENT_PROVIDER") or "anthropic"
+    provider = provider.strip().lower()
+    if provider in _LOCAL_AGENT_PROVIDERS:
+        return {OUTPUT_ROUTE_ENV: "local_dgx"}
+    if provider in _CLOUD_AGENT_PROVIDERS and acknowledged:
+        return {PARSED_EVIDENCE_ACK_ENV: "1"}
+    return {}
+
+
+def _active_parser_privacy_env() -> dict[str, str]:
+    return {
+        name: value
+        for name in (OUTPUT_ROUTE_ENV, PARSED_EVIDENCE_ACK_ENV)
+        if (value := os.environ.get(name, "").strip())
+    }
+
+
+def _parser_mcp_env() -> dict[str, str]:
+    """Case binding and operator-reviewed parser ceilings for MCP/replay."""
+    resource_env = {
+        name: value
+        for name in PARSER_RESOURCE_ENV_NAMES
+        if (value := os.environ.get(name, "").strip())
+    }
+    return {
+        **_active_browser_case_env(),
+        **_active_case_open_env(),
+        **_active_parser_path_policy_env(),
+        **_active_parser_privacy_env(),
+        **resource_env,
+    }
+
+
+def _sigstore_verification_env() -> dict[str, str]:
+    return {
+        name: value
+        for name in SIGSTORE_VERIFICATION_ENV_NAMES
+        if (value := os.environ.get(name, "").strip())
+    }
+
+
+def _default_disk_yara_rules() -> str | None:
+    """Prefer operator override, else a repo-bundled evidence-agnostic ruleset."""
+    env = os.environ.get("FIND_EVIL_DISK_YARA_RULES")
+    if env and Path(env).is_file():
+        if DOCKER_MODE:
+            try:
+                relative = Path(env).resolve().relative_to(REPO_ROOT.resolve())
+            except ValueError:
+                return env
+            return f"{GUEST_REPO}/{relative.as_posix()}"
+        return env
+    # scripts/ -> repo root -> assets/yara/disk-triage.yar
+    bundled = (
+        Path(__file__).resolve().parent.parent / "assets" / "yara" / "disk-triage.yar"
+    )
+    if bundled.is_file():
+        if DOCKER_MODE or os.environ.get("FIND_EVIL_LOCAL") != "1":
+            return f"{GUEST_REPO}/assets/yara/disk-triage.yar"
+        return str(bundled)
+    return None
+
+
+DISK_YARA_RULES = _default_disk_yara_rules()
+if DISK_YARA_RULES:
+    # Rust authorizes model-supplied rules_path only against an operator/launcher
+    # policy variable. Export the bundled default too; a Python-only variable is
+    # not an authorization boundary and would safely disable every YARA call.
+    os.environ.setdefault("FIND_EVIL_DISK_YARA_RULES", DISK_YARA_RULES)
+
+
+def disk_yara_whole_mount_enabled(env: dict[str, str] | None = None) -> bool:
+    """Opt-in whole-mount recursive YARA beyond extracted yara-targets.
+
+    Default off: large mounts are perf-sensitive. Set
+    ``FIND_EVIL_DISK_YARA_WHOLE_MOUNT=1`` (or true/yes/on) to enable after
+    ``disk_mount`` while the mount root is still live.
+    """
+    source = env if env is not None else os.environ
+    raw = str(source.get("FIND_EVIL_DISK_YARA_WHOLE_MOUNT", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def disk_yara_whole_mount_timeout_s(env: dict[str, str] | None = None) -> float:
+    """Timeout for a single whole-mount recursive ``yara_scan`` call."""
+    source = env if env is not None else os.environ
+    raw = str(source.get("FIND_EVIL_DISK_YARA_WHOLE_MOUNT_TIMEOUT", "")).strip()
+    if not raw:
+        return 1800.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1800.0
+    return max(60.0, min(value, 14400.0))
+
+
+def disk_yara_whole_mount_limit(env: dict[str, str] | None = None) -> int:
+    """Match cap for whole-mount recursive YARA (keeps MCP output bounded)."""
+    source = env if env is not None else os.environ
+    raw = str(source.get("FIND_EVIL_DISK_YARA_WHOLE_MOUNT_LIMIT", "")).strip()
+    if not raw:
+        return 500
+    try:
+        value = int(raw)
+    except ValueError:
+        return 500
+    return max(1, min(value, 5000))
+
+
+def _default_tool_timeout() -> float:
+    """Operator-overridable default MCP tool-call timeout (seconds).
+
+    Per-call timeouts still win when the engine passes an explicit value.
+    Bounds keep a typo from hanging forever or instantly failing every tool.
+    """
+    raw = os.environ.get("FIND_EVIL_TOOL_TIMEOUT", "").strip()
+    if not raw:
+        return 600.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 600.0
+    return max(30.0, min(value, 7200.0))
+
+
+DEFAULT_TOOL_TIMEOUT = _default_tool_timeout()
+MCP_STDOUT_FRAME_MAX_BYTES = 64 * 1024 * 1024
+MCP_STDERR_LINE_MAX_BYTES = 64 * 1024
+MCP_STDERR_RETAIN_MAX_BYTES = 4096
+MCP_PROCESS_REAP_TIMEOUT_S = 1.0
+MCP_READER_JOIN_TIMEOUT_S = 0.5
+SHELL_STDOUT_MAX_BYTES = 64 * 1024 * 1024
+SHELL_STDERR_MAX_BYTES = 4 * 1024 * 1024
+SHELL_DRAIN_JOIN_TIMEOUT_S = 0.5
+
+
+def _read_binary_stdio_line(stream: Any, limit: int) -> bytes:
+    """Read at most ``limit`` wire bytes from a subprocess pipe.
+
+    Production ``Popen`` streams are text wrappers for write-side
+    compatibility, but reading their raw ``buffer`` avoids a decoded-character
+    limit that UTF-8 could exceed by up to four times. Lightweight test doubles
+    may only expose a text ``readline``; encoding that fixture preserves the
+    byte-counting behavior without weakening the production path.
+    """
+    wire_stream = getattr(stream, "buffer", stream)
+    line = wire_stream.readline(limit)
+    if isinstance(line, bytes):
+        return line
+    if isinstance(line, str):
+        return line.encode("utf-8")
+    raise TypeError(f"stdio readline returned {type(line).__name__}, expected bytes")
+
+
+def _mcp_process_group_options() -> dict[str, Any]:
+    if os.name == "posix":
+        return {"start_new_session": True}
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {}
+
+
+def _terminate_mcp_process_tree(proc: Any) -> None:
+    pid = getattr(proc, "pid", None)
+    if os.name == "posix" and isinstance(pid, int):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    elif os.name == "nt" and isinstance(pid, int):
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=MCP_PROCESS_REAP_TIMEOUT_S,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+        if ctrl_break is not None:
+            with contextlib.suppress(OSError):
+                proc.send_signal(ctrl_break)
+    with contextlib.suppress(AttributeError, OSError):
+        proc.kill()
+
+
+def _reap_mcp_process(proc: Any) -> None:
+    try:
+        proc.wait(timeout=MCP_PROCESS_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(AttributeError, OSError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=MCP_PROCESS_REAP_TIMEOUT_S)
+
+
+def _sift_rust_launcher() -> str:
+    env = {**RUST_TOOL_ENV, **_parser_mcp_env()}
+    return (
+        " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
+        + f" exec {RUST_BIN_Q}"
+    )
+
+
 EXPERT_MISSES_PATH = Path(
     os.environ.get(
         "FINDEVIL_EXPERT_MISS_LEDGER",
         str(REPO_ROOT / "state" / "expert_misses.jsonl"),
     )
 )
-PY_MCP_LAUNCHER = (
-    f"cd {AGENT_MCP_DIR_Q} && exec "
-    "/home/sansforensics/.local/bin/uv run python -m findevil_agent_mcp.server"
-)
+
+
+def _sift_expert_miss_ledger_path() -> str:
+    return os.environ.get(
+        "FINDEVIL_SIFT_EXPERT_MISS_LEDGER",
+        f"{GUEST_REPO}/.project-local/state/expert_misses.jsonl",
+    ).strip()
+
+
+def _sift_py_launcher() -> str:
+    assignments = " ".join(
+        f"{key}={shlex.quote(value)}"
+        for key, value in {
+            **RUST_TOOL_ENV,
+            **_parser_mcp_env(),
+            **_sigstore_verification_env(),
+            **_active_custody_env(),
+            **_active_controller_capability_env(),
+            "FINDEVIL_MEMORY_STORE": mem_store_path(),
+            "FINDEVIL_EXPERT_MISS_LEDGER": _sift_expert_miss_ledger_path(),
+        }.items()
+    )
+    prefix = f"{assignments} " if assignments else ""
+    return (
+        f"cd {AGENT_MCP_DIR_Q} && {prefix}exec "
+        "/home/sansforensics/.local/bin/uv run python -m findevil_agent_mcp.server"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Docker-container backend argv (the container analog of the SIFT ssh args).
-# Both servers run INSIDE the container over `docker exec -i` (stdio JSON-RPC —
-# the same pipe `ssh -T` gives SIFT). Mirrors .mcp.json.docker verbatim: the
-# Rust binary is launched directly (tool env — HAYABUSA_BIN, TSHARK_BIN, … — is
-# baked into the image, so no host/guest tool-path prefix), and the Python MCP
-# runs with its working dir set to services/agent_mcp under uv.
+# The evidence-facing Rust server runs inside the container over docker-exec.
+# Python custody/signing stays on the host under a fixed launcher; its verifier
+# replays Rust calls through the same container without sharing signing state.
 # ---------------------------------------------------------------------------
 DOCKER_RUST_ARGV = ["docker", "exec", "-i", DOCKER_CONTAINER, RUST_BIN]
 DOCKER_PY_ARGV = [
-    "docker",
-    "exec",
-    "-i",
-    "-w",
-    f"{GUEST_REPO}/services/agent_mcp",
-    DOCKER_CONTAINER,
-    "uv",
-    "run",
-    "python",
-    "-m",
-    "findevil_agent_mcp.server",
+    "bash",
+    str(REPO_ROOT / "scripts" / "run-mcp-python-docker.sh"),
 ]
+
+
+def _docker_mcp_env_options() -> list[str]:
+    return [
+        item
+        for key, value in _parser_mcp_env().items()
+        for item in ("-e", f"{key}={value}")
+    ]
+
+
+def docker_rust_argv() -> list[str]:
+    """Build docker-exec argv with the active case binding, if any."""
+    return [
+        "docker",
+        "exec",
+        "-i",
+        *_docker_mcp_env_options(),
+        DOCKER_CONTAINER,
+        RUST_BIN,
+    ]
+
+
+def docker_py_argv() -> list[str]:
+    """Fixed host custody launcher used by the Docker backend."""
+    return list(DOCKER_PY_ARGV)
+
 
 # ---------------------------------------------------------------------------
 # Local mode (no SIFT VM): run both MCP servers on the host over stdio.
@@ -703,12 +1055,127 @@ LOCAL_AGENT_MCP_DIR = str(REPO_ROOT / "services" / "agent_mcp")
 LOCAL_RUNS_DIR = REPO_ROOT / "tmp" / "auto-runs"
 
 
+_LOCAL_CHILD_BASE_ENV_NAMES = (
+    "HOME",
+    "USER",
+    "USERPROFILE",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "FINDEVIL_HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+)
+_LOCAL_RUST_ENV_NAMES = (
+    "AUSEARCH_BIN",
+    "CHAINSAW_BIN",
+    "EWF_MOUNT_BIN",
+    "EZTOOLS_DIR",
+    "HAYABUSA_BIN",
+    "HAYABUSA_RULES_BASE",
+    "INDXPARSE_BIN",
+    "JOURNALCTL_BIN",
+    "LAST_BIN",
+    "MAC_APT",
+    "NFDUMP_BIN",
+    "PLASO_DIR",
+    "SURICATA_BIN",
+    "TSHARK_BIN",
+    "VELOCIRAPTOR_BIN",
+    "VOLATILITY_BIN",
+    "FINDEVIL_BULK_EXTRACTOR_BIN",
+    "FINDEVIL_BULK_KEYWORD_FILE",
+    "FINDEVIL_ESEDBEXPORT_BIN",
+    "FINDEVIL_FLS_BIN",
+    "FINDEVIL_HASHSET_DIR",
+    "FINDEVIL_HASHSET_MAX_SETS",
+    "FINDEVIL_HASHSET_MAX_FILE_BYTES",
+    "FINDEVIL_HASHSET_MAX_TOTAL_BYTES",
+    "FINDEVIL_HASHSET_MAX_LINE_BYTES",
+    "FINDEVIL_HASHSET_SQLITE_MAX_OPS",
+    "FINDEVIL_HASHSET_SQLITE_MAX_FIELD_BYTES",
+    "FINDEVIL_HASHSET_SQLITE_HEAP_MAX_BYTES",
+    "FINDEVIL_AUSEARCH_TIMEOUT_SECS",
+    "FINDEVIL_JOURNALCTL_TIMEOUT_SECS",
+    "FINDEVIL_LOGIN_ACCOUNTING_TIMEOUT_SECS",
+    "FINDEVIL_NFDUMP_TIMEOUT_SECS",
+    "FINDEVIL_INDX_TIMEOUT_SECS",
+    "FINDEVIL_EZ_PARSE_TIMEOUT_SECS",
+    "FINDEVIL_SURICATA_TIMEOUT_SECS",
+    "FINDEVIL_PST_TIMEOUT_SECS",
+    "FINDEVIL_SRUM_TIMEOUT_SECS",
+    "FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS",
+    "FINDEVIL_HAYABUSA_TIMEOUT_SECS",
+    "FINDEVIL_HAYABUSA_OUTPUT_MAX_BYTES",
+    "FINDEVIL_VSS_TIMEOUT_SECS",
+    "FINDEVIL_MAC_TRIAGE_TIMEOUT_SECS",
+    "FINDEVIL_ICAT_BIN",
+    "FINDEVIL_INJECTION_LEDGER",
+    "FINDEVIL_MMLS_BIN",
+    "FINDEVIL_MOUNT_BIN",
+    "FINDEVIL_PFFEXPORT_BIN",
+    "FINDEVIL_UMOUNT_BIN",
+    "FINDEVIL_VSHADOWINFO_BIN",
+    "FINDEVIL_VSHADOWMOUNT_BIN",
+)
+_LOCAL_PYTHON_ENV_NAMES = (
+    "FINDEVIL_ALLOW_STUB_SIGNER",
+    "FINDEVIL_EXPERT_MISS_LEDGER",
+    "FINDEVIL_INJECTION_LEDGER",
+    "FINDEVIL_LOG_LEVEL",
+    "FINDEVIL_MEMORY_STORE",
+    "FINDEVIL_MISS_GH_ENABLED",
+    "FINDEVIL_MISS_GH_REDACT",
+    "FINDEVIL_SIGNER",
+    "FINDEVIL_SIGNING_KEY",
+    "FINDEVIL_SIGSTORE_EXPECTED_IDENTITY",
+    "FINDEVIL_SIGSTORE_EXPECTED_ISSUER",
+    "SIGSTORE_ID_TOKEN",
+    "FIND_EVIL_REQUIRE_ARTIFACT_REBIND",
+    "FIND_EVIL_REQUIRE_ASSERTED_VALUES",
+    "FIND_EVIL_REQUIRE_BENIGN_EVIDENCE",
+    "FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS",
+    "FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS_FINDING",
+    "FIND_EVIL_REQUIRE_EXPECTATION",
+    "FIND_EVIL_REQUIRE_FP_SUPPRESSORS",
+    "FIND_EVIL_REQUIRE_TOOL_CALL_ID",
+    "FIND_EVIL_REQUIRE_WHY_NOT_HIGHER",
+    *CUSTODY_RESERVATION_ENV_NAMES,
+    CONTROLLER_CAPABILITY_ENV,
+)
+
+
+def _selected_child_env(names: tuple[str, ...]) -> dict[str, str]:
+    """Copy only reviewed runtime variables into an MCP child process.
+
+    Provider/cloud credentials are intentionally absent. The Python custody
+    server keeps its explicit signing inputs, but its verifier child applies a
+    narrower allow-list again before spawning any Rust parser.
+    """
+    selected = {
+        name: value for name in names if (value := os.environ.get(name, "").strip())
+    }
+    selected.setdefault("PATH", os.environ.get("PATH") or os.defpath)
+    selected.setdefault("HOME", os.environ.get("HOME") or str(Path.home()))
+    selected.setdefault("LANG", os.environ.get("LANG") or "C.UTF-8")
+    return selected
+
+
 def _local_rust_env() -> dict[str, str]:
     """Resolve host DFIR binaries the way the Rust server does: honor an
     explicit ``$<TOOL>_BIN`` else fall back to PATH. Only emit a var when the
     binary actually resolves — a missing tool degrades to a clean
     ``BinaryNotFound`` the engine pivots on, never a bogus path."""
-    env: dict[str, str] = {}
+    env = _selected_child_env(_LOCAL_CHILD_BASE_ENV_NAMES + _LOCAL_RUST_ENV_NAMES)
     for var, name in (
         ("VOLATILITY_BIN", "vol"),
         ("HAYABUSA_BIN", "hayabusa"),
@@ -717,42 +1184,61 @@ def _local_rust_env() -> dict[str, str]:
         resolved = os.environ.get(var) or shutil.which(name)
         if resolved:
             env[var] = resolved
+    env.update(_parser_mcp_env())
     return env
 
 
-def _local_rust_command() -> str:
-    prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in _local_rust_env().items())
-    return (f"{prefix} " if prefix else "") + f"exec {shlex.quote(LOCAL_RUST_BIN)}"
+def _local_py_env() -> dict[str, str]:
+    env = _selected_child_env(_LOCAL_CHILD_BASE_ENV_NAMES + _LOCAL_PYTHON_ENV_NAMES)
+    env.update(_parser_mcp_env())
+    return env
 
 
-def _local_py_command() -> str:
-    uv = shutil.which("uv") or "uv"
-    return (
-        f"cd {shlex.quote(LOCAL_AGENT_MCP_DIR)} && "
-        f"exec {shlex.quote(uv)} run python -m findevil_agent_mcp.server"
+def _docker_py_env() -> dict[str, str]:
+    """Host custody env plus a fixed, non-secret Docker replay route."""
+    env = _local_py_env()
+    env.update(
+        {
+            "FINDEVIL_REPLAY_TRANSPORT": "docker",
+            "FINDEVIL_REPLAY_DOCKER_CONTAINER": DOCKER_CONTAINER,
+        }
     )
+    for name in (
+        "FINDEVIL_CUSTODY_BOUNDARY",
+        "FINDEVIL_ACTIVE_CASE_DIR",
+        "FINDEVIL_ACTIVE_CASE_ID",
+        "FINDEVIL_ACTIVE_RUN_ID",
+        "FINDEVIL_ACTIVE_STARTED_AT",
+        "FINDEVIL_ACTIVE_SIGNER",
+    ):
+        if value := os.environ.get(name, "").strip():
+            env[name] = value
+    for name in (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+    ):
+        if value := os.environ.get(name, "").strip():
+            env[name] = value
+    return env
 
 
-def rust_replay_command() -> list[str]:
-    """The argv the Python MCP uses to re-spawn the Rust server for verifier
-    replay. Mode-aware: host binary + host env locally, guest paths in VM
-    mode (the immutable ``RUST_REPLAY_COMMAND``)."""
-    if LOCAL_MODE:
-        return [
-            "env",
-            *(f"{k}={v}" for k, v in _local_rust_env().items()),
-            LOCAL_RUST_BIN,
-        ]
-    if DOCKER_MODE:
-        # Runs INSIDE the container (the Python MCP is in the container), so the
-        # replay argv is just the container binary. Tool env (HAYABUSA_BIN,
-        # TSHARK_BIN, ewfexport, …) is baked into the image and inherited by the
-        # re-spawned process — no host/guest sansforensics tool-path prefix,
-        # which would point at paths that do not exist in the container. A
-        # verify_finding replay re-runs this argv and must reproduce the same
-        # output_sha256, so it has to resolve the SAME tools as the live run.
-        return [RUST_BIN]
-    return RUST_REPLAY_COMMAND
+def _local_rust_command() -> list[str]:
+    return [LOCAL_RUST_BIN]
+
+
+def _local_py_command() -> list[str]:
+    uv = shutil.which("uv") or "uv"
+    return [
+        uv,
+        "run",
+        "--frozen",
+        "--no-sync",
+        "python",
+        "-m",
+        "findevil_agent_mcp.server",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +1275,7 @@ class SshMcpClient:
                 text=True,
                 encoding="utf-8",
                 bufsize=1,
+                **_mcp_process_group_options(),
             )
         except FileNotFoundError as exc:
             self.proc = None
@@ -806,11 +1293,17 @@ class SshMcpClient:
         self._lock = threading.Lock()
         self._waiters: dict[int, Queue[dict[str, Any] | None]] = {}
         self._closed = self.proc is None
-        # Keep the last N stderr lines for diagnostics without unbounded growth.
-        self._stderr_tail: deque[str] = deque(maxlen=400)
+        self._closing = False
+        # Keep a compact diagnostic tail. Per-line and aggregate limits prevent
+        # a hostile parser from converting the deadlock-prevention drain into a
+        # host-memory exhaustion path.
+        self._stderr_tail: deque[str] = deque(maxlen=200)
+        self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         if self.proc is None:
             return  # spawn failed — behave as an already-closed server
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self._reader_thread.start()
         # Drain stderr continuously. The server's stderr is a PIPE; if nothing
         # reads it, a verbose tool (e.g. registry_query parsing a 100 MB SOFTWARE
         # hive) fills the 64 KB pipe buffer, the server blocks on write(stderr),
@@ -818,49 +1311,181 @@ class SshMcpClient:
         # investigation deadlocks (the reader waits on a response that never
         # comes). Draining stderr in its own thread keeps the pipe empty so the
         # server never blocks. See the rocba-cdrive.e01 registry-phase hang.
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
 
     def _drain_stderr(self) -> None:
         if self.proc.stderr is None:
             return
+        discarding_oversize_line = False
         try:
-            for line in iter(self.proc.stderr.readline, ""):
-                self._stderr_tail.append(line.rstrip("\n"))
+            while True:
+                line = _read_binary_stdio_line(
+                    self.proc.stderr, MCP_STDERR_LINE_MAX_BYTES + 1
+                )
+                if line == b"":
+                    return
+                terminated = line.endswith(b"\n")
+                if discarding_oversize_line:
+                    if terminated:
+                        discarding_oversize_line = False
+                    continue
+                if len(line) > MCP_STDERR_LINE_MAX_BYTES:
+                    retained = line[:MCP_STDERR_RETAIN_MAX_BYTES].rstrip(b"\r\n")
+                    retained_text = retained.decode("utf-8", errors="replace")
+                    self._stderr_tail.append(f"{retained_text} [truncated]")
+                    discarding_oversize_line = not terminated
+                    continue
+                retained = line[:MCP_STDERR_RETAIN_MAX_BYTES].rstrip(b"\r\n")
+                retained_text = retained.decode("utf-8", errors="replace")
+                if len(line.rstrip(b"\r\n")) > MCP_STDERR_RETAIN_MAX_BYTES:
+                    retained_text = f"{retained_text} [truncated]"
+                self._stderr_tail.append(retained_text)
         except (ValueError, OSError):
             # Pipe closed underneath us during shutdown — nothing to drain.
             return
 
-    def _reader(self) -> None:
-        for line in iter(self.proc.stdout.readline, ""):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                env = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            msg_id = env.get("id")
-            if msg_id is None:
-                continue  # notification / non-response line — no waiter to route to
-            with self._lock:
-                waiter = self._waiters.get(msg_id)
-            if waiter is not None:
-                waiter.put(env)
-        # stdout closed: wake every blocked caller so none hangs forever.
+    def _fail_transport(self, reason: str) -> bool:
+        message = f"{self.label}: {reason}"
         with self._lock:
+            if self._closing:
+                return False
+            if self._closed and self._spawn_error:
+                return False
             self._closed = True
+            self._spawn_error = message
             waiters = list(self._waiters.values())
+        _terminate_mcp_process_tree(self.proc)
+        _reap_mcp_process(self.proc)
         for waiter in waiters:
-            waiter.put(None)
+            with contextlib.suppress(Full):
+                waiter.put_nowait(None)
+        self._join_reader_threads()
+        self._close_transport_streams()
+        return True
+
+    def _on_call_timeout(self, method: str, timeout: float) -> None:
+        self._fail_transport(f"{method} timed out after {timeout:.0f}s")
+
+    def _join_reader_threads(self) -> None:
+        deadline = time.monotonic() + MCP_READER_JOIN_TIMEOUT_S
+        current = threading.current_thread()
+        for thread in (self._reader_thread, self._stderr_thread):
+            if thread is None or thread is current or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _close_transport_streams(self) -> None:
+        streams = (
+            (self.proc.stdin, None),
+            (self.proc.stdout, self._reader_thread),
+            (self.proc.stderr, self._stderr_thread),
+        )
+        for stream, reader in streams:
+            if stream is None or stream.closed:
+                continue
+            if reader is not None and reader.is_alive():
+                continue
+            with contextlib.suppress(OSError):
+                stream.close()
+
+    def _reader(self) -> None:
+        try:
+            while True:
+                line = _read_binary_stdio_line(
+                    self.proc.stdout, MCP_STDOUT_FRAME_MAX_BYTES + 1
+                )
+                if line == b"":
+                    self._fail_transport("server closed stdout")
+                    return
+                if len(line) > MCP_STDOUT_FRAME_MAX_BYTES:
+                    self._fail_transport(
+                        "JSON-RPC response exceeded the 64 MiB frame limit"
+                    )
+                    return
+                if not line.endswith(b"\n"):
+                    self._fail_transport(
+                        "server emitted an unterminated JSON-RPC frame"
+                    )
+                    return
+                try:
+                    line_text = line.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._fail_transport("server emitted invalid UTF-8 on stdout")
+                    return
+                line_text = line_text.strip()
+                if not line_text:
+                    continue
+                try:
+                    env = json.loads(line_text)
+                except (json.JSONDecodeError, RecursionError):
+                    self._fail_transport("server emitted a malformed JSON-RPC response")
+                    return
+                if not isinstance(env, dict):
+                    self._fail_transport(
+                        "server emitted a non-object JSON-RPC envelope"
+                    )
+                    return
+                if env.get("jsonrpc") != "2.0":
+                    self._fail_transport("server emitted an invalid JSON-RPC version")
+                    return
+                if "id" not in env:
+                    if not isinstance(env.get("method"), str):
+                        self._fail_transport(
+                            "server emitted an invalid JSON-RPC notification"
+                        )
+                        return
+                    continue  # notification / non-response line — no waiter to route to
+                msg_id = env["id"]
+                if isinstance(msg_id, bool) or not isinstance(msg_id, int):
+                    self._fail_transport(
+                        "server emitted an invalid JSON-RPC response id"
+                    )
+                    return
+                has_result = "result" in env
+                has_error = "error" in env
+                if has_result == has_error:
+                    self._fail_transport(
+                        "server response must contain exactly one result or error"
+                    )
+                    return
+                if has_error and not isinstance(env["error"], dict):
+                    self._fail_transport(
+                        "server emitted an invalid JSON-RPC error object"
+                    )
+                    return
+                if has_result and not isinstance(env["result"], dict):
+                    self._fail_transport(
+                        "server emitted an invalid JSON-RPC result object"
+                    )
+                    return
+                with self._lock:
+                    waiter = self._waiters.get(msg_id)
+                if waiter is not None:
+                    try:
+                        waiter.put_nowait(env)
+                    except Full:
+                        self._fail_transport(
+                            "server emitted a duplicate JSON-RPC response id"
+                        )
+                        return
+        except (ValueError, OSError) as exc:
+            self._fail_transport(f"stdout read failed: {exc}")
 
     def call(
-        self, method: str, params: dict[str, Any] | None = None, timeout: float = 600.0
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
+        if timeout is None:
+            timeout = DEFAULT_TOOL_TIMEOUT
         waiter: Queue[dict[str, Any] | None] = Queue(maxsize=1)
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         # Hold the lock only across id assignment + the write so concurrent
         # callers can't interleave bytes on the wire or reuse an id; release it
         # before blocking on the response so calls actually run in parallel.
+        write_error: OSError | None = None
         with self._lock:
             if self._closed:
                 raise RuntimeError(
@@ -875,12 +1500,16 @@ class SshMcpClient:
                 self.proc.stdin.flush()
             except OSError as exc:
                 self._waiters.pop(i, None)
-                raise RuntimeError(
-                    f"{self.label} {method}: server stdin closed"
-                ) from exc
+                write_error = exc
+        if write_error is not None:
+            self._fail_transport(f"{method} failed because server stdin closed")
+            raise RuntimeError(
+                f"{self.label} {method}: server stdin closed"
+            ) from write_error
         try:
             env = waiter.get(timeout=timeout)
         except Empty as exc:
+            self._on_call_timeout(method, timeout)
             raise RuntimeError(
                 f"{self.label} {method}: timed out after {timeout:.0f}s"
             ) from exc
@@ -888,77 +1517,114 @@ class SshMcpClient:
             with self._lock:
                 self._waiters.pop(i, None)
         if env is None:
-            raise RuntimeError(f"{self.label}: server closed stdout")
-        if "error" in env:
             raise RuntimeError(
-                f"{self.label} {method}: {env['error'].get('message', env['error'])}"
+                self._spawn_error or f"{self.label}: server closed stdout"
             )
-        return env.get("result", {})
+        if "error" in env:
+            error = env["error"]
+            if not isinstance(error, dict):
+                self._fail_transport("server emitted an invalid JSON-RPC error object")
+                raise RuntimeError(
+                    self._spawn_error or f"{self.label}: invalid response"
+                )
+            raise RuntimeError(f"{self.label} {method}: {error.get('message', error)}")
+        result = env.get("result")
+        if not isinstance(result, dict):
+            self._fail_transport("server emitted an invalid JSON-RPC result object")
+            raise RuntimeError(self._spawn_error or f"{self.label}: invalid response")
+        return result
 
     def call_tool(
-        self, name: str, args: dict[str, Any], timeout: float = 600.0
+        self, name: str, args: dict[str, Any], timeout: float | None = None
     ) -> dict[str, Any]:
+        if timeout is None:
+            timeout = DEFAULT_TOOL_TIMEOUT
         try:
             result = self.call(
                 "tools/call", {"name": name, "arguments": args}, timeout=timeout
             )
         except RuntimeError as e:
             return {"_error": {"message": str(e)}}
+
+        if "_meta" in result and not isinstance(result["_meta"], dict):
+            return self._fail_malformed_tool_response(name, "_meta is not an object")
+        content = result.get("content")
+        if not isinstance(content, list) or not content:
+            return self._fail_malformed_tool_response(
+                name, "content is not a non-empty list"
+            )
+        first = content[0]
+        if not isinstance(first, dict):
+            return self._fail_malformed_tool_response(
+                name, "content[0] is not an object"
+            )
+        text = first.get("text")
+        if not isinstance(text, str):
+            return self._fail_malformed_tool_response(
+                name, "content[0].text is not a string"
+            )
         try:
-            text = result["content"][0]["text"]
             body = json.loads(text)
-            if isinstance(body, dict):
-                # The Python agent MCP reports a handler exception as a top-level
-                # {"error": {"kind": "...", "message": "..."}} envelope (with
-                # isError=false), NOT the {"_error": ...} shape every caller in
-                # this engine checks for. Without this normalization a tool that
-                # raised (e.g. verify_finding hitting a Finding ValidationError)
-                # is silently read as a success with missing fields — the verifier
-                # then rejects every finding with "no reason" and the real error
-                # is lost. Surface it as _error so existing checks catch it.
-                err = body.get("error")
-                if isinstance(err, dict) and "message" in err:
-                    return {
-                        "_error": {
-                            "message": err.get("message"),
-                            "kind": err.get("kind"),
-                        }
-                    }
-                body["_mcp_output_sha256"] = hashlib.sha256(
-                    text.encode("utf-8")
-                ).hexdigest()
-            return body
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            return {"_error": {"message": f"malformed tool response: {e}: {result!r}"}}
+        except (json.JSONDecodeError, RecursionError) as exc:
+            return self._fail_malformed_tool_response(
+                name, f"content[0].text is not valid JSON: {exc}"
+            )
+        if not isinstance(body, dict):
+            return self._fail_malformed_tool_response(
+                name, "content[0].text JSON is not an object"
+            )
+        # The Python agent MCP reports a handler exception as a top-level
+        # {"error": {"kind": "...", "message": "..."}} envelope (with
+        # isError=false), NOT the {"_error": ...} shape every caller in
+        # this engine checks for. Normalize it so existing checks catch it.
+        err = body.get("error")
+        if isinstance(err, dict) and "message" in err:
+            return {
+                "_error": {
+                    "message": err.get("message"),
+                    "kind": err.get("kind"),
+                }
+            }
+        body["_mcp_output_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return body
+
+    def _fail_malformed_tool_response(self, name: str, reason: str) -> dict[str, Any]:
+        detail = f"malformed tool response for {name}: {reason}"
+        self._fail_transport(detail)
+        return {"_error": {"message": self._spawn_error or f"{self.label}: {detail}"}}
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         if self.proc is None:
             return  # spawn failed — nothing to notify
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        write_error: OSError | None = None
         with self._lock:
-            self.proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
+                self.proc.stdin.flush()
+            except OSError as exc:
+                write_error = exc
+        if write_error is not None:
+            self._fail_transport(f"{method} failed because server stdin closed")
+            raise RuntimeError(
+                f"{self.label} {method}: server stdin closed"
+            ) from write_error
 
     def close(self) -> None:
         if self.proc is None:
             return  # spawn failed — no process to tear down
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            self._closed = True
         if self.proc.stdin and not self.proc.stdin.closed:
-            try:
+            with contextlib.suppress(OSError):
                 self.proc.stdin.close()
-            except OSError:
-                pass
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        # Close the stdout/stderr pipes too so their fds and the reader/drain
-        # threads' file objects don't leak across a long run's many clients.
-        for stream in (self.proc.stdout, self.proc.stderr):
-            if stream and not stream.closed:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
+        _terminate_mcp_process_tree(self.proc)
+        _reap_mcp_process(self.proc)
+        self._join_reader_threads()
+        self._close_transport_streams()
 
 
 class StdioMcpClient(SshMcpClient):
@@ -966,16 +1632,31 @@ class StdioMcpClient(SshMcpClient):
     ``bash -lc <command>`` instead of tunnelling through ssh. Reuses
     SshMcpClient's JSON-RPC framing / reader thread verbatim."""
 
-    def __init__(self, local_command: str, label: str) -> None:
+    def __init__(
+        self,
+        local_command: str | list[str],
+        label: str,
+        *,
+        cwd: str | Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.label = label
+        argv = (
+            ["bash", "-lc", local_command]
+            if isinstance(local_command, str)
+            else list(local_command)
+        )
         self.proc = subprocess.Popen(
-            ["bash", "-lc", local_command],
+            argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
             text=True,
             encoding="utf-8",
             bufsize=1,
+            **_mcp_process_group_options(),
         )
         self._wire()
 
@@ -988,8 +1669,10 @@ class DockerMcpClient(SshMcpClient):
     exec -i`` in place of ``ssh -i key GUEST``). Takes the full docker argv
     (see DOCKER_RUST_ARGV / DOCKER_PY_ARGV) so it mirrors .mcp.json.docker.
 
-    Decodes with ``errors="replace"`` — the one deliberate departure from the
-    ssh/local spawn — to keep the stderr-drain thread ALIVE. This closes a
+    Configures its text wrappers with ``errors="replace"`` — the one deliberate
+    departure from the ssh/local spawn — so the stderr drain can replace stray
+    non-UTF-8 diagnostics and stay ALIVE. JSON-RPC stdout bypasses the text
+    wrapper, is bounded as raw bytes, and is then decoded strictly. This closes a
     docker-only deadlock on large responses: ``docker exec`` demultiplexes the
     container's stdout and stderr with a single ``stdcopy`` goroutine, so once
     the client-side stderr pipe fills the demux blocks and STOPS delivering
@@ -999,17 +1682,18 @@ class DockerMcpClient(SshMcpClient):
     utf-8 a single non-utf-8 byte from a container tool (cargo/uv/tshark
     progress, a raw filename) raised ``UnicodeDecodeError`` (a ``ValueError``,
     which its ``except`` swallowed) and killed the drain — after which stderr
-    backs up and the demux stalls. ``errors="replace"`` maps that stray byte to
-    U+FFFD instead of raising, so the drain never dies and stdout keeps flowing.
-    ssh/local keep strict decode: their stdout/stderr are independent kernel
-    pipes, so a full stderr does not stall stdout there. Custody is unaffected:
-    a valid JSON-RPC response is valid utf-8, so replacement never touches it
-    and the ``verify_finding`` replay reproduces the same ``output_sha256`` —
-    only genuinely corrupt bytes (which would fail ``json.loads`` anyway) differ.
+    backs up and the demux stalls. ``errors="replace"`` maps that stray stderr
+    byte to U+FFFD instead of raising, so the drain never dies and stdout keeps
+    flowing. The shared stderr drain uses replacement on every backend so a
+    diagnostic byte can never kill it and later fill the pipe. Custody is
+    unaffected because invalid UTF-8 on JSON-RPC stdout fails the transport
+    before parsing on every backend.
     """
 
     def __init__(self, docker_argv: list[str], label: str) -> None:
         self.label = label
+        self._docker_cleanup_lock = threading.Lock()
+        self._docker_runtime_removed = False
         try:
             self.proc = subprocess.Popen(
                 docker_argv,
@@ -1020,6 +1704,7 @@ class DockerMcpClient(SshMcpClient):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **_mcp_process_group_options(),
             )
         except FileNotFoundError as exc:
             # No docker client on this host — behave as an already-closed server
@@ -1029,25 +1714,59 @@ class DockerMcpClient(SshMcpClient):
             self._spawn_error = f"{label}: cannot spawn docker exec: {exc}"
         self._wire()
 
+    def _fail_transport(self, reason: str) -> bool:
+        failed = super()._fail_transport(reason)
+        if not failed:
+            return False
+        with self._docker_cleanup_lock:
+            if self._docker_runtime_removed:
+                return True
+            self._docker_runtime_removed = True
+        _terminate_docker_runtime_after_bridge_failure("transport failure")
+        # Removing the runtime may be what finally closes a pipe inherited by
+        # a container descendant. Give the readers one bounded second chance
+        # to reach EOF, then close only streams they no longer own.
+        self._join_reader_threads()
+        self._close_transport_streams()
+        return True
+
+    def _on_call_timeout(self, method: str, timeout: float) -> None:
+        self._fail_transport(f"{method} timed out after {timeout:.0f}s")
+
 
 def make_rust_client() -> SshMcpClient:
     """Spawn a findevil-mcp (Rust DFIR) client for the active transport:
     host stdio (local), docker exec (container), or ssh (SIFT VM)."""
     if LOCAL_MODE:
-        return StdioMcpClient(_local_rust_command(), "rust-mcp")
+        return StdioMcpClient(
+            _local_rust_command(),
+            "rust-mcp",
+            cwd=REPO_ROOT,
+            env=_local_rust_env(),
+        )
     if DOCKER_MODE:
-        return DockerMcpClient(DOCKER_RUST_ARGV, "rust-mcp")
-    return SshMcpClient(PY_LAUNCHER, "rust-mcp")
+        return DockerMcpClient(docker_rust_argv(), "rust-mcp")
+    return SshMcpClient(_sift_rust_launcher(), "rust-mcp")
 
 
 def make_py_client() -> SshMcpClient:
     """Spawn a findevil-agent-mcp (Python custody/crypto) client for the active
     transport: host stdio (local), docker exec (container), or ssh (SIFT VM)."""
     if LOCAL_MODE:
-        return StdioMcpClient(_local_py_command(), "py-mcp")
+        return StdioMcpClient(
+            _local_py_command(),
+            "py-mcp",
+            cwd=LOCAL_AGENT_MCP_DIR,
+            env=_local_py_env(),
+        )
     if DOCKER_MODE:
-        return DockerMcpClient(DOCKER_PY_ARGV, "py-mcp")
-    return SshMcpClient(PY_MCP_LAUNCHER, "py-mcp")
+        return StdioMcpClient(
+            docker_py_argv(),
+            "py-mcp",
+            cwd=REPO_ROOT,
+            env=_docker_py_env(),
+        )
+    return SshMcpClient(_sift_py_launcher(), "py-mcp")
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1793,11 @@ EXTRACTED_DISK_CLASSES = {
     "browser_db",
     "amcache",
     "srum",
+    "bits",
+    "wmi_repository",
+    "email",
+    "setupapi_log",
+    "image_exif",
     "lnk",
     "jumplist",
     "scheduled_task",
@@ -1083,6 +1807,7 @@ EXTRACTED_DISK_CLASSES = {
     "ie_history",
     "thumbnail",
 }
+BROWSER_INVENTORY_CLASSES = frozenset({"browser_history", "browser_db"})
 YARA_TARGET_EXTS = (
     ".bat",
     ".cmd",
@@ -1161,8 +1886,62 @@ SUSPICIOUS_PREFETCH_TOOL_HINTS = (
     ("MIRC", "mIRC client that can support IRC-based communications", "T1204.002"),
     ("LOOKATLAN", "Look@LAN network discovery tool", "T1046"),
 )
-MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = int(
-    os.environ.get("FINDEVIL_VELOCIRAPTOR_ZIP_MAX_MEMBER_BYTES", str(512 * 1024 * 1024))
+HARD_MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = 512 * 1024 * 1024
+HARD_MAX_VELOCIRAPTOR_ZIP_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+HARD_MAX_VELOCIRAPTOR_ZIP_RATIO = 1000
+HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS = 100_000
+HARD_MAX_VELOCIRAPTOR_ZIP_CENTRAL_DIRECTORY_BYTES = 128 * 1024 * 1024
+HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_BYTES = 128 * 1024 * 1024 * 1024
+VELOCIRAPTOR_ZIP_MEMBER_NAME_MAX_BYTES = 2048
+VELOCIRAPTOR_ZIP_MEMBER_MAX_COMPONENTS = 64
+VELOCIRAPTOR_ZIP_MEMBER_COMPONENT_MAX_BYTES = 255
+
+
+def _bounded_int_environment(
+    name: str, default: int, *, minimum: int, maximum: int
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_MEMBER_BYTES",
+    HARD_MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES,
+)
+MAX_VELOCIRAPTOR_ZIP_TOTAL_BYTES = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_TOTAL_BYTES",
+    2 * 1024 * 1024 * 1024,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_TOTAL_BYTES,
+)
+MAX_VELOCIRAPTOR_ZIP_RATIO = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_RATIO",
+    200,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_RATIO,
+)
+MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_ARCHIVE_MEMBERS",
+    HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS,
+)
+MAX_VELOCIRAPTOR_ZIP_CENTRAL_DIRECTORY_BYTES = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_CENTRAL_DIRECTORY_BYTES",
+    64 * 1024 * 1024,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_CENTRAL_DIRECTORY_BYTES,
+)
+MAX_VELOCIRAPTOR_ZIP_ARCHIVE_BYTES = _bounded_int_environment(
+    "FINDEVIL_VELOCIRAPTOR_ZIP_MAX_ARCHIVE_BYTES",
+    64 * 1024 * 1024 * 1024,
+    minimum=1,
+    maximum=HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_BYTES,
 )
 REGISTRY_HIVE_NAMES = (
     _PLAYBOOK_REGISTRY_HIVE_NAMES
@@ -1181,7 +1960,7 @@ REGISTRY_HIVE_NAMES = (
 
 
 def detect_evidence_type(path: str) -> str:
-    """Returns one of: directory, memory, evtx, disk, network, cloud, velociraptor, unknown."""
+    """Return the coarse lane for a local or transport-visible evidence path."""
     try:
         if Path(path).is_dir():
             return "directory"
@@ -1207,6 +1986,15 @@ def detect_evidence_type(path: str) -> str:
         return "disk"
     if p.endswith(".zip"):
         return "velociraptor"
+    if p in {
+        "history",
+        "archived history",
+        "places.sqlite",
+        "web data",
+        "cookies",
+        "login data",
+    } or p.endswith(".sqlite"):
+        return "browser"
     return "unknown"
 
 
@@ -1323,7 +2111,34 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
         return {
             "artifact_class": "srum",
             "evidence_type": "extracted_disk",
-            "parser_tool": None,
+            "parser_tool": "srum_parse",
+        }
+    if lower_name in {"qmgr0.dat", "qmgr1.dat", "qmgr.db"} and (
+        "network/downloader" in lower_path
+        or "microsoft/network/downloader" in lower_path
+    ):
+        return {
+            "artifact_class": "bits",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "bits_parse",
+        }
+    if lower_name == "objects.data" and "wbem/repository" in lower_path:
+        return {
+            "artifact_class": "wmi_repository",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "wmi_persist_parse",
+        }
+    if lower_name.endswith((".eml", ".mbox")):
+        return {
+            "artifact_class": "email",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "email_parse",
+        }
+    if lower_name.endswith((".pst", ".ost")):
+        return {
+            "artifact_class": "email",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "pst_parse",
         }
     if (
         lower_name in {"$j", "$usnjrnl", "usnjrnl", "usnjrnl.j"}
@@ -1380,6 +2195,7 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
         }
     if lower_name in {
         "history",
+        "archived history",
         "places.sqlite",
         "web data",
         "cookies",
@@ -1411,9 +2227,25 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
 
 def _safe_zip_member_path(member_name: str) -> str | None:
     normalized = member_name.replace("\\", "/")
+    if (
+        "\x00" in normalized
+        or len(normalized.encode("utf-8", errors="surrogatepass"))
+        > VELOCIRAPTOR_ZIP_MEMBER_NAME_MAX_BYTES
+    ):
+        return None
     posix = PurePosixPath(normalized)
     parts = [part for part in posix.parts if part not in {"", "."}]
-    if not parts or posix.is_absolute() or ".." in parts:
+    if (
+        not parts
+        or len(parts) > VELOCIRAPTOR_ZIP_MEMBER_MAX_COMPONENTS
+        or posix.is_absolute()
+        or ".." in parts
+        or any(
+            len(part.encode("utf-8", errors="surrogatepass"))
+            > VELOCIRAPTOR_ZIP_MEMBER_COMPONENT_MAX_BYTES
+            for part in parts
+        )
+    ):
         return None
     if re.match(r"^[A-Za-z]:$", parts[0]):
         return None
@@ -1445,14 +2277,83 @@ def extract_velociraptor_zip_artifacts(
     zip_path: str,
     output_dir: str,
     *,
+    expected_sha256: str,
     limit: int = 500,
     max_member_bytes: int = MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES,
+    max_total_bytes: int = MAX_VELOCIRAPTOR_ZIP_TOTAL_BYTES,
+    max_compression_ratio: int = MAX_VELOCIRAPTOR_ZIP_RATIO,
+    max_archive_members: int = MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS,
+    max_central_directory_bytes: int = MAX_VELOCIRAPTOR_ZIP_CENTRAL_DIRECTORY_BYTES,
+    max_archive_bytes: int = MAX_VELOCIRAPTOR_ZIP_ARCHIVE_BYTES,
 ) -> dict[str, Any]:
     """Extract supported artifacts from a Velociraptor collection zip inside SIFT."""
+    expected_sha256 = str(expected_sha256).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError(
+            "expected_sha256 must be a lowercase-compatible SHA-256 digest"
+        )
+    limit = max(1, min(int(limit), 500))
+    max_member_bytes = max(
+        1,
+        min(int(max_member_bytes), HARD_MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES),
+    )
+    max_total_bytes = max(
+        1,
+        min(int(max_total_bytes), HARD_MAX_VELOCIRAPTOR_ZIP_TOTAL_BYTES),
+    )
+    max_compression_ratio = max(
+        1,
+        min(int(max_compression_ratio), HARD_MAX_VELOCIRAPTOR_ZIP_RATIO),
+    )
+    max_archive_members = max(
+        1,
+        min(
+            int(max_archive_members),
+            HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_MEMBERS,
+        ),
+    )
+    max_central_directory_bytes = max(
+        1,
+        min(
+            int(max_central_directory_bytes),
+            HARD_MAX_VELOCIRAPTOR_ZIP_CENTRAL_DIRECTORY_BYTES,
+        ),
+    )
+    max_archive_bytes = max(
+        1,
+        min(int(max_archive_bytes), HARD_MAX_VELOCIRAPTOR_ZIP_ARCHIVE_BYTES),
+    )
+
+    def cleanup_partial_staging() -> None:
+        target = Path(output_dir)
+        if LOCAL_MODE:
+            resolved = target.resolve(strict=False)
+            if resolved != Path(resolved.anchor):
+                shutil.rmtree(resolved, ignore_errors=True)
+            return
+        cleanup_script = r"""
+import shutil
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+if not target.is_absolute() or target == Path(target.anchor):
+    raise SystemExit(2)
+shutil.rmtree(target, ignore_errors=True)
+"""
+        command = (
+            f"python3 - {shlex.quote(output_dir)} <<'PY'\n" f"{cleanup_script}\nPY"
+        )
+        try:
+            ssh_run(command, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     remote_script = r"""
 import hashlib
 import json
 import re
+import shutil
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -1461,6 +2362,18 @@ zip_path = Path(sys.argv[1])
 output_dir = Path(sys.argv[2])
 limit = int(sys.argv[3])
 max_member_bytes = int(sys.argv[4])
+max_total_bytes = int(sys.argv[5])
+max_compression_ratio = int(sys.argv[6])
+max_archive_members = int(sys.argv[7])
+max_central_directory_bytes = int(sys.argv[8])
+max_archive_bytes = int(sys.argv[9])
+max_member_name_bytes = int(sys.argv[10])
+max_member_components = int(sys.argv[11])
+max_member_component_bytes = int(sys.argv[12])
+expected_sha256 = sys.argv[13].strip().lower()
+
+if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+    raise ValueError("expected_sha256 must be a SHA-256 digest")
 
 MEMORY_EXTS = (".mem", ".raw", ".vmem", ".dmp", ".img", ".lime")
 RAW_DISK_EXTS = (".e01", ".dd", ".aff", ".aff4", ".001")
@@ -1483,9 +2396,17 @@ REGISTRY_HIVE_NAMES = {
 
 def safe_zip_member_path(member_name):
     normalized = member_name.replace("\\", "/")
+    if "\x00" in normalized or len(normalized.encode("utf-8", errors="surrogatepass")) > max_member_name_bytes:
+        return None
     posix = PurePosixPath(normalized)
     parts = [part for part in posix.parts if part not in {"", "."}]
-    if not parts or posix.is_absolute() or ".." in parts:
+    if (
+        not parts
+        or len(parts) > max_member_components
+        or posix.is_absolute()
+        or ".." in parts
+        or any(len(part.encode("utf-8", errors="surrogatepass")) > max_member_component_bytes for part in parts)
+    ):
         return None
     if re.match(r"^[A-Za-z]:$", parts[0]):
         return None
@@ -1533,7 +2454,7 @@ def classify_artifact_path(path):
         return {"artifact_class": "ie_history", "evidence_type": "extracted_disk", "parser_tool": "plaso_parse"}
     if lower_name == "thumbs.db" or lower_name.endswith(".thumbcache") or (lower_name.startswith(("thumbcache_", "iconcache_")) and lower_name.endswith(".db")):
         return {"artifact_class": "thumbnail", "evidence_type": "extracted_disk", "parser_tool": "thumbcache_parse"}
-    if lower_name in {"history", "places.sqlite", "web data", "cookies", "login data"} or lower_name.endswith(".sqlite"):
+    if lower_name in {"history", "archived history", "places.sqlite", "web data", "cookies", "login data"} or lower_name.endswith(".sqlite"):
         return {"artifact_class": "browser_db", "evidence_type": "extracted_disk", "parser_tool": "browser_history"}
     if lower_name.endswith(YARA_TARGET_EXTS):
         return {"artifact_class": "yara_target", "evidence_type": "extracted_disk", "parser_tool": "yara_scan"}
@@ -1544,96 +2465,677 @@ unsupported_count = 0
 unsupported_samples = []
 skipped_unsafe = 0
 skipped_oversize = 0
+skipped_ratio = 0
+aggregate_limit_hit = False
+total_extracted_bytes = 0
 truncated = False
+archive_size_bytes = zip_path.stat().st_size
+archive_sha256_before = ""
+archive_sha256_after = ""
+archive_member_count = 0
+eocd_member_count = 0
+central_directory_member_count = 0
+central_directory_bytes = 0
+archive_member_limit_hit = False
+central_directory_limit_hit = False
+archive_size_limit_hit = archive_size_bytes > max_archive_bytes
+limit_reasons = []
+
+def result():
+    return {
+        "zip_path": str(zip_path),
+        "output_dir": str(output_dir),
+        "entries": entries,
+        "entry_count": len(entries),
+        "unsupported_count": unsupported_count,
+        "unsupported_samples": unsupported_samples,
+        "skipped_unsafe": skipped_unsafe,
+        "skipped_oversize": skipped_oversize,
+        "skipped_ratio": skipped_ratio,
+        "aggregate_limit_hit": aggregate_limit_hit,
+        "total_extracted_bytes": total_extracted_bytes,
+        "truncated": truncated,
+        "limit_reasons": limit_reasons,
+        "limit": limit,
+        "max_member_bytes": max_member_bytes,
+        "max_total_bytes": max_total_bytes,
+        "max_compression_ratio": max_compression_ratio,
+        "archive_size_bytes": archive_size_bytes,
+        "expected_archive_sha256": expected_sha256,
+        "archive_sha256_before": archive_sha256_before,
+        "archive_sha256_after": archive_sha256_after,
+        "max_archive_bytes": max_archive_bytes,
+        "archive_size_limit_hit": archive_size_limit_hit,
+        "archive_member_count": archive_member_count,
+        "eocd_member_count": eocd_member_count,
+        "central_directory_member_count": central_directory_member_count,
+        "max_archive_members": max_archive_members,
+        "archive_member_limit_hit": archive_member_limit_hit,
+        "central_directory_bytes": central_directory_bytes,
+        "max_central_directory_bytes": max_central_directory_bytes,
+        "central_directory_limit_hit": central_directory_limit_hit,
+    }
+
+if archive_size_limit_hit:
+    truncated = True
+    limit_reasons.append("archive_bytes")
+    shutil.rmtree(output_dir, ignore_errors=True)
+    print(json.dumps(result(), separators=(",", ":"), sort_keys=True))
+    raise SystemExit(0)
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+archive_sha256_before = sha256_path(zip_path)
+if archive_sha256_before != expected_sha256:
+    raise zipfile.BadZipFile(
+        "archive SHA-256 does not match the custody-bound intake digest"
+    )
+
+# ZipFile eagerly materializes the complete central directory. Inspect only the
+# bounded EOCD/ZIP64 tail first so hostile member cardinality cannot allocate an
+# unbounded ZipInfo list before the safety policy runs.
+with zip_path.open("rb") as archive:
+    end_record = zipfile._EndRecData(archive)
+    if end_record is None:
+        raise zipfile.BadZipFile("end of central directory record not found")
+    eocd_member_count = int(end_record[zipfile._ECD_ENTRIES_TOTAL])
+    archive_member_count = eocd_member_count
+    central_directory_bytes = int(end_record[zipfile._ECD_SIZE])
+    central_directory_end = int(end_record[zipfile._ECD_LOCATION])
+    central_directory_start = central_directory_end - central_directory_bytes
+    if (
+        archive_member_count < 0
+        or central_directory_bytes < 0
+        or central_directory_start < 0
+        or central_directory_end > archive_size_bytes
+    ):
+        raise zipfile.BadZipFile("invalid central directory metadata")
+    archive_member_limit_hit = archive_member_count > max_archive_members
+    central_directory_limit_hit = central_directory_bytes > max_central_directory_bytes
+    if archive_member_limit_hit:
+        limit_reasons.append("archive_member_count")
+    if central_directory_limit_hit:
+        limit_reasons.append("central_directory_bytes")
+    if archive_member_limit_hit or central_directory_limit_hit:
+        truncated = True
+        shutil.rmtree(output_dir, ignore_errors=True)
+        print(json.dumps(result(), separators=(",", ":"), sort_keys=True))
+        raise SystemExit(0)
+
+    # EOCD counts are attacker-controlled and ZipFile ignores them while eagerly
+    # building ZipInfo objects. Stream the already byte-bounded central directory
+    # first, counting fixed headers without retaining member names or metadata.
+    archive.seek(central_directory_start)
+    consumed_directory_bytes = 0
+    while consumed_directory_bytes < central_directory_bytes:
+        remaining_directory_bytes = central_directory_bytes - consumed_directory_bytes
+        if remaining_directory_bytes < zipfile.sizeCentralDir:
+            raise zipfile.BadZipFile("truncated central directory record")
+        header = archive.read(zipfile.sizeCentralDir)
+        if len(header) != zipfile.sizeCentralDir:
+            raise zipfile.BadZipFile("truncated central directory")
+        if header[:4] != zipfile.stringCentralDir:
+            raise zipfile.BadZipFile("invalid central directory signature")
+        variable_bytes = (
+            int.from_bytes(header[28:30], "little")
+            + int.from_bytes(header[30:32], "little")
+            + int.from_bytes(header[32:34], "little")
+        )
+        record_bytes = zipfile.sizeCentralDir + variable_bytes
+        if record_bytes > remaining_directory_bytes:
+            raise zipfile.BadZipFile("central directory record exceeds declared size")
+        archive.seek(variable_bytes, 1)
+        consumed_directory_bytes += record_bytes
+        central_directory_member_count += 1
+        if central_directory_member_count > max_archive_members:
+            archive_member_count = central_directory_member_count
+            archive_member_limit_hit = True
+            limit_reasons.append("archive_member_count")
+            truncated = True
+            shutil.rmtree(output_dir, ignore_errors=True)
+            print(json.dumps(result(), separators=(",", ":"), sort_keys=True))
+            raise SystemExit(0)
+
+    archive_member_count = central_directory_member_count
+    if central_directory_member_count != eocd_member_count:
+        raise zipfile.BadZipFile("central directory entry count disagrees with EOCD")
+
 output_dir.mkdir(parents=True, exist_ok=True)
 output_real = output_dir.resolve()
+try:
+    with zipfile.ZipFile(zip_path) as zf:
+        if len(zf.filelist) != archive_member_count:
+            raise zipfile.BadZipFile("central directory entry count changed")
+        for idx, info in enumerate(zf.filelist):
+            if len(entries) >= limit:
+                truncated = True
+                limit_reasons.append("supported_artifact_count")
+                break
+            if info.is_dir():
+                continue
+            member = safe_zip_member_path(info.filename)
+            if member is None:
+                skipped_unsafe += 1
+                truncated = True
+                if "unsafe_member_path" not in limit_reasons:
+                    limit_reasons.append("unsafe_member_path")
+                continue
+            classification = classify_artifact_path(member)
+            artifact_class = classification["artifact_class"]
+            if artifact_class not in SUPPORTED_CLASSES:
+                unsupported_count += 1
+                if len(unsupported_samples) < 20:
+                    unsupported_samples.append(member)
+                continue
+            if info.file_size > max_member_bytes:
+                skipped_oversize += 1
+                truncated = True
+                if "member_bytes" not in limit_reasons:
+                    limit_reasons.append("member_bytes")
+                continue
+            if info.file_size > 0 and (
+                info.compress_size <= 0
+                or info.file_size > info.compress_size * max_compression_ratio
+            ):
+                skipped_ratio += 1
+                truncated = True
+                if "compression_ratio" not in limit_reasons:
+                    limit_reasons.append("compression_ratio")
+                continue
+            if total_extracted_bytes + info.file_size > max_total_bytes:
+                aggregate_limit_hit = True
+                truncated = True
+                limit_reasons.append("aggregate_bytes")
+                break
+            target = output_dir / f"{idx:05d}" / member
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target_real = target.resolve(strict=False)
+            try:
+                target_real.relative_to(output_real)
+            except ValueError:
+                skipped_unsafe += 1
+                continue
+            h = hashlib.sha256()
+            size = 0
+            member_limit_hit = False
+            total_limit_hit = False
+            with zf.open(info, "r") as src, target.open("wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    if size + len(chunk) > max_member_bytes:
+                        member_limit_hit = True
+                        break
+                    if total_extracted_bytes + size + len(chunk) > max_total_bytes:
+                        total_limit_hit = True
+                        break
+                    size += len(chunk)
+                    h.update(chunk)
+                    dst.write(chunk)
+            if member_limit_hit or total_limit_hit:
+                target.unlink(missing_ok=True)
+                truncated = True
+                if member_limit_hit:
+                    skipped_oversize += 1
+                    if "member_bytes" not in limit_reasons:
+                        limit_reasons.append("member_bytes")
+                    continue
+                aggregate_limit_hit = True
+                limit_reasons.append("aggregate_bytes")
+                break
+            total_extracted_bytes += size
+            entries.append({
+                "path": str(target),
+                "canonical_path": str(target.resolve()),
+                "source_container_path": str(zip_path),
+                "source_container_type": "velociraptor_zip",
+                "zip_member_path": member,
+                **classification,
+                "sha256": h.hexdigest(),
+                "size_bytes": size,
+                "compressed_size_bytes": info.compress_size,
+                "symlink_status": "zip_member",
+                "custody_status": "extracted_from_velociraptor_zip",
+            })
+except Exception:
+    shutil.rmtree(output_dir, ignore_errors=True)
+    raise
 
-with zipfile.ZipFile(zip_path) as zf:
-    for idx, info in enumerate(zf.infolist()):
-        if len(entries) >= limit:
-            truncated = True
-            break
-        if info.is_dir():
-            continue
-        member = safe_zip_member_path(info.filename)
-        if member is None:
-            skipped_unsafe += 1
-            continue
-        classification = classify_artifact_path(member)
-        artifact_class = classification["artifact_class"]
-        if artifact_class not in SUPPORTED_CLASSES:
-            unsupported_count += 1
-            if len(unsupported_samples) < 20:
-                unsupported_samples.append(member)
-            continue
-        if info.file_size > max_member_bytes:
-            skipped_oversize += 1
-            continue
-        target = output_dir / f"{idx:05d}" / member
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target_real = target.resolve(strict=False)
-        try:
-            target_real.relative_to(output_real)
-        except ValueError:
-            skipped_unsafe += 1
-            continue
-        h = hashlib.sha256()
-        size = 0
-        with zf.open(info, "r") as src, target.open("wb") as dst:
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                h.update(chunk)
-                dst.write(chunk)
-        entries.append({
-            "path": str(target),
-            "canonical_path": str(target.resolve()),
-            "source_container_path": str(zip_path),
-            "source_container_type": "velociraptor_zip",
-            "zip_member_path": member,
-            **classification,
-            "sha256": h.hexdigest(),
-            "size_bytes": size,
-            "compressed_size_bytes": info.compress_size,
-            "symlink_status": "zip_member",
-            "custody_status": "extracted_from_velociraptor_zip",
-        })
+archive_sha256_after = sha256_path(zip_path)
+if archive_sha256_after != expected_sha256 or archive_sha256_after != archive_sha256_before:
+    shutil.rmtree(output_dir, ignore_errors=True)
+    raise zipfile.BadZipFile(
+        "archive SHA-256 changed during extraction or no longer matches intake"
+    )
 
-print(json.dumps({
-    "zip_path": str(zip_path),
-    "output_dir": str(output_dir),
-    "entries": entries,
-    "entry_count": len(entries),
-    "unsupported_count": unsupported_count,
-    "unsupported_samples": unsupported_samples,
-    "skipped_unsafe": skipped_unsafe,
-    "skipped_oversize": skipped_oversize,
-    "truncated": truncated,
-    "limit": limit,
-    "max_member_bytes": max_member_bytes,
-}, separators=(",", ":"), sort_keys=True))
+print(json.dumps(result(), separators=(",", ":"), sort_keys=True))
 """
     cmd = (
+        "/usr/bin/timeout --kill-after=5s 1790s "
         f"python3 - {shlex.quote(zip_path)} {shlex.quote(output_dir)} "
-        f"{int(limit)} {int(max_member_bytes)} <<'PY'\n{remote_script}\nPY"
+        f"{limit} {max_member_bytes} {max_total_bytes} "
+        f"{max_compression_ratio} {max_archive_members} "
+        f"{max_central_directory_bytes} {max_archive_bytes} "
+        f"{VELOCIRAPTOR_ZIP_MEMBER_NAME_MAX_BYTES} "
+        f"{VELOCIRAPTOR_ZIP_MEMBER_MAX_COMPONENTS} "
+        f"{VELOCIRAPTOR_ZIP_MEMBER_COMPONENT_MAX_BYTES} "
+        f"{shlex.quote(expected_sha256)} "
+        f"<<'PY'\n{remote_script}\nPY"
     )
-    code, stdout, stderr = ssh_run(cmd, timeout=1800)
+    try:
+        code, stdout, stderr = ssh_run(cmd, timeout=1800)
+    except subprocess.TimeoutExpired as exc:
+        cleanup_partial_staging()
+        raise RuntimeError(
+            "Velociraptor zip extraction timed out after 1800 seconds; "
+            "partial staging was removed"
+        ) from exc
+    except OSError as exc:
+        cleanup_partial_staging()
+        raise RuntimeError(f"Velociraptor zip extraction failed: {exc}") from exc
+    if code == 124:
+        cleanup_partial_staging()
+        raise RuntimeError(
+            "Velociraptor zip extraction timed out after 1790 seconds; "
+            "the remote process was killed and partial staging was removed"
+        )
     if code != 0:
+        cleanup_partial_staging()
         raise RuntimeError(
             "Velociraptor zip extraction failed: "
             + (stderr.strip() or stdout.strip())[:500]
         )
-    return json.loads(stdout)
+    try:
+        parsed = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        cleanup_partial_staging()
+        raise RuntimeError(
+            "Velociraptor zip extraction failed: invalid bounded JSON response"
+        ) from exc
+    if not isinstance(parsed, dict):
+        cleanup_partial_staging()
+        raise RuntimeError(
+            "Velociraptor zip extraction failed: response was not an object"
+        )
+    return parsed
 
 
-def sha256_file_local(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def velociraptor_empty_extraction_limitation(*, truncated: bool) -> str:
+    """Describe an empty staged result without confusing limits with absence."""
+    if truncated:
+        return (
+            "No supported artifacts were extracted before the Velociraptor zip "
+            "safety limit; archive contents remain unexamined."
+        )
+    return (
+        "Velociraptor zip contained no supported EVTX/Prefetch/Registry/MFT/USN/"
+        "memory/network artifacts for typed parsing."
+    )
+
+
+class EvidenceReadRaceError(ValueError):
+    """A supposedly immutable evidence path changed during a bounded read."""
+
+
+def _metadata_snapshot(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    mtime_ns = getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1_000_000_000))
+    ctime_ns = getattr(metadata, "st_ctime_ns", int(metadata.st_ctime * 1_000_000_000))
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        mtime_ns,
+        ctime_ns,
+    )
+
+
+def _open_bound_regular_file(
+    path: Path, *, expected_metadata: os.stat_result | None = None
+) -> tuple[int, os.stat_result]:
+    expected = expected_metadata if expected_metadata is not None else path.lstat()
+    if (
+        stat.S_ISLNK(expected.st_mode)
+        or not stat.S_ISREG(expected.st_mode)
+        or expected.st_nlink != 1
+    ):
+        raise EvidenceReadRaceError(
+            "evidence path is no longer a single-link regular file"
+        )
+    flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_BINARY", "O_NOFOLLOW"):
+        flags |= int(getattr(os, flag_name, 0))
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceReadRaceError("evidence path changed before open") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _metadata_snapshot(opened) != _metadata_snapshot(expected)
+        ):
+            raise EvidenceReadRaceError(
+                "opened evidence inode does not match the validated path"
+            )
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_bound_read(
+    descriptor: int, before: os.stat_result, *, bytes_read: int
+) -> None:
+    after = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or _metadata_snapshot(after) != _metadata_snapshot(before)
+        or bytes_read != before.st_size
+    ):
+        raise EvidenceReadRaceError("evidence inode changed during read")
+
+
+def sha256_file_local(
+    path: Path, *, expected_metadata: os.stat_result | None = None
+) -> str:
+    descriptor, before = _open_bound_regular_file(
+        path, expected_metadata=expected_metadata
+    )
+    digest = hashlib.sha256()
+    bytes_read = 0
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            digest.update(chunk)
+        _verify_bound_read(descriptor, before, bytes_read=bytes_read)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def copy_regular_file_bounded(
+    source: Path,
+    destination: Path,
+    *,
+    expected_metadata: os.stat_result,
+    max_bytes: int,
+) -> int:
+    """Copy one identity-bound evidence file into private derived staging."""
+    source_fd, source_before = _open_bound_regular_file(
+        source, expected_metadata=expected_metadata
+    )
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for flag_name in ("O_CLOEXEC", "O_BINARY", "O_NOFOLLOW"):
+        destination_flags |= int(getattr(os, flag_name, 0))
+    destination_fd: int | None = None
+    destination_created = False
+    copied = 0
+    try:
+        if source_before.st_size > max_bytes:
+            raise ValueError(f"evidence file exceeds copy limit ({max_bytes} bytes)")
+        destination_fd = os.open(destination, destination_flags, 0o600)
+        destination_created = True
+        while True:
+            chunk = os.read(source_fd, min(1024 * 1024, max_bytes - copied + 1))
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > max_bytes:
+                raise ValueError(
+                    f"evidence file exceeds copy limit ({max_bytes} bytes)"
+                )
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("short write while staging evidence")
+                view = view[written:]
+        _verify_bound_read(source_fd, source_before, bytes_read=copied)
+        os.fsync(destination_fd)
+        return copied
+    except BaseException:
+        if destination_fd is not None:
+            os.close(destination_fd)
+            destination_fd = None
+        if destination_created:
+            with contextlib.suppress(OSError):
+                destination.unlink()
+        raise
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+def _single_link_regular(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"evidence source is unavailable: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("evidence source must be a regular non-symlink file")
+    if os.name != "nt" and metadata.st_nlink != 1:
+        raise ValueError("evidence source must not be hard-linked")
+    current = Path(path.anchor)
+    for part in path.absolute().parts[1:-1]:
+        current /= part
+        try:
+            component = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"cannot inspect evidence path component: {exc}") from exc
+        if stat.S_ISLNK(component.st_mode):
+            raise ValueError("evidence source path contains a symlink component")
+    return metadata
+
+
+def _local_ewf_segments(first: Path) -> list[Path]:
+    """Mirror Rust split-EWF discovery for the pre-registration reservation."""
+    match = re.fullmatch(r"(?i)(e|ex)([0-9]+)", first.suffix.lstrip("."))
+    if match is None or int(match.group(2)) != 1:
+        return [first]
+    prefix = match.group(1)
+    stem = first.stem
+    numbered: dict[int, Path] = {}
+    try:
+        siblings = list(first.parent.iterdir())
+    except OSError as exc:
+        raise ValueError(f"cannot enumerate split EWF segments: {exc}") from exc
+    for sibling in siblings:
+        if sibling.stem != stem:
+            continue
+        candidate = re.fullmatch(r"(?i)(e|ex)([0-9]+)", sibling.suffix.lstrip("."))
+        if candidate is None or candidate.group(1).casefold() != prefix.casefold():
+            continue
+        number = int(candidate.group(2))
+        if number == 0:
+            continue
+        _single_link_regular(sibling)
+        if number in numbered and numbered[number] != sibling:
+            raise ValueError("duplicate split EWF segment number")
+        numbered[number] = sibling
+    numbered.setdefault(1, first)
+    maximum = max(numbered)
+    for number in range(1, maximum + 1):
+        if number not in numbered:
+            raise ValueError("missing split EWF segment before a visible later segment")
+    return [
+        first if number == 1 else numbered[number] for number in range(1, maximum + 1)
+    ]
+
+
+def single_evidence_registration(image_path: str | Path) -> tuple[str, str]:
+    """Hash-pin a local single-file/split-EWF source before ``case_open``.
+
+    Returns the compact launcher reservation JSON plus the SHA-256 of the
+    concatenated evidence stream that ``case_open.expected_sha256`` must match.
+    """
+    first = Path(image_path)
+    _single_link_regular(first)
+    segments = _local_ewf_segments(first)
+    artifacts: list[dict[str, str]] = []
+    combined = hashlib.sha256()
+    for segment in segments:
+        _single_link_regular(segment)
+        canonical = segment.resolve(strict=True)
+        per_file = hashlib.sha256()
+        with segment.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                per_file.update(chunk)
+                combined.update(chunk)
+        artifacts.append({"path": str(canonical), "sha256": per_file.hexdigest()})
+    binding = json.dumps(
+        {"artifacts": artifacts}, separators=(",", ":"), sort_keys=True
+    )
+    if len(binding.encode("utf-8")) > ARTIFACT_CASE_BINDING_MAX_BYTES:
+        raise ValueError("single evidence registration exceeds the binding byte limit")
+    return binding, combined.hexdigest()
+
+
+def remote_single_evidence_registration(image_path: str) -> tuple[str, str]:
+    """Hash-pin a SIFT/Docker single source in its own filesystem namespace."""
+    script = r"""
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+first = Path(sys.argv[1])
+
+def checked(path):
+    meta = path.lstat()
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
+        raise ValueError("evidence source must be a regular non-symlink file")
+    if os.name != "nt" and meta.st_nlink != 1:
+        raise ValueError("evidence source must not be hard-linked")
+    current = Path(path.anchor)
+    for part in path.absolute().parts[1:-1]:
+        current /= part
+        if stat.S_ISLNK(current.lstat().st_mode):
+            raise ValueError("evidence source path contains a symlink component")
+
+checked(first)
+match = re.fullmatch(r"(?i)(e|ex)([0-9]+)", first.suffix.lstrip("."))
+segments = [first]
+if match is not None and int(match.group(2)) == 1:
+    prefix = match.group(1)
+    numbered = {}
+    for sibling in first.parent.iterdir():
+        if sibling.stem != first.stem:
+            continue
+        candidate = re.fullmatch(r"(?i)(e|ex)([0-9]+)", sibling.suffix.lstrip("."))
+        if candidate is None or candidate.group(1).casefold() != prefix.casefold():
+            continue
+        number = int(candidate.group(2))
+        if number == 0:
+            continue
+        checked(sibling)
+        if number in numbered and numbered[number] != sibling:
+            raise ValueError("duplicate split EWF segment number")
+        numbered[number] = sibling
+    numbered.setdefault(1, first)
+    maximum = max(numbered)
+    missing = [number for number in range(1, maximum + 1) if number not in numbered]
+    if missing:
+        raise ValueError("missing split EWF segment before a visible later segment")
+    segments = [first if number == 1 else numbered[number] for number in range(1, maximum + 1)]
+
+combined = hashlib.sha256()
+artifacts = []
+for segment in segments:
+    checked(segment)
+    per_file = hashlib.sha256()
+    with segment.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            per_file.update(chunk)
+            combined.update(chunk)
+    artifacts.append({"path": str(segment.resolve(strict=True)), "sha256": per_file.hexdigest()})
+print(json.dumps({"artifacts": artifacts, "expected_sha256": combined.hexdigest()}, separators=(",", ":"), sort_keys=True))
+"""
+    command = f"python3 - {shlex.quote(image_path)} <<'PY'\n{script}\nPY"
+    code, stdout, stderr = ssh_run(command, timeout=1800)
+    if code != 0:
+        raise ValueError(
+            "remote evidence registration failed: "
+            + (stderr.strip() or stdout.strip())[:300]
+        )
+    try:
+        result = json.loads(stdout)
+        expected = str(result.pop("expected_sha256"))
+        binding = json.dumps(result, separators=(",", ":"), sort_keys=True)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("remote evidence registration returned invalid JSON") from exc
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("remote evidence registration returned an invalid SHA-256")
+    if len(binding.encode("utf-8")) > ARTIFACT_CASE_BINDING_MAX_BYTES:
+        raise ValueError("single evidence registration exceeds the binding byte limit")
+    return binding, expected
+
+
+def ewf_has_sibling_segments(path: Path) -> bool:
+    """True when ``path`` is a first EWF segment and a later sibling is present.
+
+    ``case_open`` hashes every contiguous segment (E01+E02+…); directory
+    inventory hashes only the file it listed. Passing the single-file hash as
+    ``expected_sha256`` for multi-segment sets fails case_open with
+    ImageHashMismatch and leaves the disk custody-only. Detect siblings by the
+    same stem + E0N/Ex0N-style extension family as the Rust segment walker.
+    """
+    suffix = path.suffix.lstrip(".")
+    if len(suffix) < 3 or not suffix[-2:].isdigit() or int(suffix[-2:]) != 1:
+        return False
+    prefix = suffix[:-2]
+    parent = path.parent
+    stem = path.stem
+    if not parent.is_dir():
+        return False
+    try:
+        siblings = list(parent.iterdir())
+    except OSError:
+        return False
+    for sibling in siblings:
+        if not sibling.is_file():
+            continue
+        if sibling.stem.casefold() != stem.casefold():
+            continue
+        s_suffix = sibling.suffix.lstrip(".")
+        if len(s_suffix) < 3 or not s_suffix[-2:].isdigit():
+            continue
+        if s_suffix[:-2].casefold() != prefix.casefold():
+            continue
+        if int(s_suffix[-2:]) > 1:
+            return True
+    return False
+
+
+def inventory_sha256_for_case_open(
+    image_path: str | Path, inventory_sha256: str | None
+) -> str | None:
+    """Return a custody hash safe to pass as case_open ``expected_sha256``.
+
+    Multi-segment EWF inventory entries carry the first-segment file hash only;
+    case_open streams every segment. Skip the check rather than force a
+    mismatch (and a silent custody-only disk lane).
+    """
+    if not inventory_sha256:
+        return None
+    path = Path(image_path)
+    if ewf_has_sibling_segments(path):
+        return None
+    return str(inventory_sha256)
 
 
 # Known-volatile/transient files VERDICT writes into a run/case directory: the
@@ -1653,6 +3155,362 @@ def is_volatile_run_file(name: str) -> bool:
     VOLATILE_EXCLUDE). Matched by basename so it never depends on run-dir layout.
     """
     return name in VOLATILE_EXCLUDE
+
+
+EVIDENCE_WALK_MAX_ENTRIES_VISITED = 20_000
+EVIDENCE_WALK_MAX_DEPTH = 64
+EVIDENCE_WALK_MAX_PATH_BYTES = 4_096
+EVIDENCE_WALK_MAX_DIRECTORY_ENTRIES = 4_096
+
+
+class EvidenceWalkLimits(NamedTuple):
+    """Hard ceilings for any host-side traversal of untrusted evidence."""
+
+    max_entries_visited: int = EVIDENCE_WALK_MAX_ENTRIES_VISITED
+    max_depth: int = EVIDENCE_WALK_MAX_DEPTH
+    max_path_bytes: int = EVIDENCE_WALK_MAX_PATH_BYTES
+    max_directory_entries: int = EVIDENCE_WALK_MAX_DIRECTORY_ENTRIES
+
+    def validate(self) -> None:
+        for name, value, hard_maximum in (
+            (
+                "max_entries_visited",
+                self.max_entries_visited,
+                EVIDENCE_WALK_MAX_ENTRIES_VISITED,
+            ),
+            ("max_depth", self.max_depth, EVIDENCE_WALK_MAX_DEPTH),
+            ("max_path_bytes", self.max_path_bytes, EVIDENCE_WALK_MAX_PATH_BYTES),
+            (
+                "max_directory_entries",
+                self.max_directory_entries,
+                EVIDENCE_WALK_MAX_DIRECTORY_ENTRIES,
+            ),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            if value > hard_maximum:
+                raise ValueError(f"{name} exceeds hard maximum {hard_maximum}")
+
+
+DEFAULT_EVIDENCE_WALK_LIMITS = EvidenceWalkLimits()
+DBX_EVIDENCE_WALK_LIMITS = EvidenceWalkLimits()
+DBX_FILE_LIMIT = 300
+DBX_FILE_MAX_BYTES = 256 * 1024 * 1024
+DBX_TOTAL_MAX_BYTES = 1024 * 1024 * 1024
+
+
+class BoundedWalkEntry(NamedTuple):
+    path: Path
+    kind: str
+    metadata: os.stat_result | None = None
+
+
+class _PendingWalkEntry(NamedTuple):
+    path: Path
+    depth: int
+    metadata: os.stat_result | None
+    read_error: bool = False
+
+
+class BoundedEvidenceWalk:
+    """Globally ordered, no-follow traversal with finite hostile-tree work.
+
+    A directory is snapshotted only when its complete entry list fits within
+    the per-directory and remaining global budgets. Over-limit directories are
+    rejected as a whole, so output never depends on an arbitrary ``scandir``
+    prefix. A heap merges those bounded snapshots into the former global
+    ``pathlib`` lexical order for ordinary trees without materializing the
+    entire tree.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        limits: EvidenceWalkLimits = DEFAULT_EVIDENCE_WALK_LIMITS,
+        expected_root_metadata: os.stat_result | None = None,
+    ) -> None:
+        limits.validate()
+        self.root = Path(root)
+        self.limits = limits
+        if expected_root_metadata is None:
+            try:
+                expected_root_metadata = self.root.lstat()
+            except OSError:
+                pass
+        self._expected_root_metadata = expected_root_metadata
+        self.entries_visited = 0
+        self._truncation_reasons: set[str] = set()
+        self._pending: list[tuple[Path, int, _PendingWalkEntry]] = []
+        self._sequence = 0
+        self._started = False
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self._truncation_reasons)
+
+    @property
+    def truncation_reasons(self) -> tuple[str, ...]:
+        return tuple(sorted(self._truncation_reasons))
+
+    def __iter__(self):
+        if self._started:
+            raise RuntimeError("bounded evidence walks are single-use")
+        self._started = True
+        return self._walk()
+
+    def _reject(self, path: Path, kind: str, reason: str) -> BoundedWalkEntry:
+        self._truncation_reasons.add(reason)
+        return BoundedWalkEntry(path=path, kind=kind)
+
+    def _push(self, pending: _PendingWalkEntry) -> None:
+        self._sequence += 1
+        heapq.heappush(
+            self._pending,
+            (pending.path, self._sequence, pending),
+        )
+
+    def _queue_directory(
+        self,
+        directory: Path,
+        *,
+        child_depth: int,
+        expected_metadata: os.stat_result,
+    ) -> BoundedWalkEntry | None:
+        remaining = self.limits.max_entries_visited - self.entries_visited
+        if remaining <= 0:
+            return self._reject(
+                directory,
+                "rejected_entries_visited_limit",
+                "entries_visited_limit",
+            )
+        accepted_limit = min(self.limits.max_directory_entries, remaining)
+        snapshot: list[_PendingWalkEntry] = []
+        exhausted = False
+        overflow = False
+        directory_fd: int | None = None
+        fallback_metadata: os.stat_result | None = None
+        try:
+            if stat.S_ISLNK(expected_metadata.st_mode) or not stat.S_ISDIR(
+                expected_metadata.st_mode
+            ):
+                return self._reject(
+                    directory,
+                    "rejected_directory_identity",
+                    "directory_identity",
+                )
+            fd_scandir = bool(
+                os.name == "posix"
+                and getattr(os, "O_DIRECTORY", 0)
+                and getattr(os, "O_NOFOLLOW", 0)
+            )
+            if fd_scandir:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                flags |= int(getattr(os, "O_CLOEXEC", 0))
+                directory_fd = os.open(directory, flags)
+                opened = os.fstat(directory_fd)
+                if not stat.S_ISDIR(opened.st_mode) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (expected_metadata.st_dev, expected_metadata.st_ino):
+                    return self._reject(
+                        directory,
+                        "rejected_directory_identity",
+                        "directory_identity",
+                    )
+                scan_target: str | Path | int = directory_fd
+            else:
+                fallback_metadata = directory.lstat()
+                if (
+                    stat.S_ISLNK(fallback_metadata.st_mode)
+                    or not stat.S_ISDIR(fallback_metadata.st_mode)
+                    or (fallback_metadata.st_dev, fallback_metadata.st_ino)
+                    != (expected_metadata.st_dev, expected_metadata.st_ino)
+                ):
+                    return self._reject(
+                        directory,
+                        "rejected_directory_identity",
+                        "directory_identity",
+                    )
+                scan_target = directory
+            with os.scandir(scan_target) as iterator:
+                for index in range(accepted_limit + 1):
+                    try:
+                        dir_entry = next(iterator)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    if index == accepted_limit:
+                        overflow = True
+                        break
+                    self.entries_visited += 1
+                    try:
+                        metadata = dir_entry.stat(follow_symlinks=False)
+                        read_error = False
+                    except OSError:
+                        metadata = None
+                        read_error = True
+                    snapshot.append(
+                        _PendingWalkEntry(
+                            path=directory / dir_entry.name,
+                            depth=child_depth,
+                            metadata=metadata,
+                            read_error=read_error,
+                        )
+                    )
+        except OSError:
+            try:
+                current = directory.lstat()
+                identity_changed = (
+                    stat.S_ISLNK(current.st_mode)
+                    or not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino)
+                    != (expected_metadata.st_dev, expected_metadata.st_ino)
+                )
+            except OSError:
+                identity_changed = True
+            return self._reject(
+                directory,
+                (
+                    "rejected_directory_identity"
+                    if identity_changed
+                    else "rejected_unreadable_directory"
+                ),
+                "directory_identity" if identity_changed else "unreadable_directory",
+            )
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+        if not fd_scandir and fallback_metadata is not None:
+            try:
+                after = directory.lstat()
+            except OSError:
+                after = None
+            if (
+                after is None
+                or stat.S_ISLNK(after.st_mode)
+                or not stat.S_ISDIR(after.st_mode)
+                or (after.st_dev, after.st_ino)
+                != (fallback_metadata.st_dev, fallback_metadata.st_ino)
+            ):
+                return self._reject(
+                    directory,
+                    "rejected_directory_identity",
+                    "directory_identity",
+                )
+        if overflow and accepted_limit == self.limits.max_directory_entries:
+            return self._reject(
+                directory,
+                "rejected_directory_entry_limit",
+                "directory_entry_limit",
+            )
+        if overflow or not exhausted:
+            return self._reject(
+                directory,
+                "rejected_entries_visited_limit",
+                "entries_visited_limit",
+            )
+        for pending in snapshot:
+            self._push(pending)
+        return None
+
+    def _walk(self):
+        try:
+            root_metadata = self.root.lstat()
+        except OSError:
+            yield self._reject(
+                self.root,
+                "rejected_unreadable",
+                "unreadable_path",
+            )
+            return
+        expected_root = self._expected_root_metadata
+        if expected_root is None or (
+            stat.S_IFMT(root_metadata.st_mode) != stat.S_IFMT(expected_root.st_mode)
+            or (root_metadata.st_dev, root_metadata.st_ino)
+            != (expected_root.st_dev, expected_root.st_ino)
+            or (
+                stat.S_ISREG(root_metadata.st_mode)
+                and _metadata_snapshot(root_metadata)
+                != _metadata_snapshot(expected_root)
+            )
+        ):
+            yield self._reject(
+                self.root,
+                "rejected_root_identity",
+                "root_identity",
+            )
+            return
+        if len(os.fsencode(self.root)) > self.limits.max_path_bytes:
+            yield self._reject(
+                self.root,
+                "rejected_path_length",
+                "path_length_limit",
+            )
+            return
+        if stat.S_ISLNK(root_metadata.st_mode):
+            yield BoundedWalkEntry(self.root, "rejected_symlink", root_metadata)
+            return
+        if stat.S_ISREG(root_metadata.st_mode):
+            yield BoundedWalkEntry(self.root, "file", root_metadata)
+            return
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            yield BoundedWalkEntry(self.root, "other", root_metadata)
+            return
+
+        seen_directories = {(root_metadata.st_dev, root_metadata.st_ino)}
+        rejection = self._queue_directory(
+            self.root,
+            child_depth=1,
+            expected_metadata=root_metadata,
+        )
+        if rejection is not None:
+            yield rejection
+            return
+
+        while self._pending:
+            _, _, pending = heapq.heappop(self._pending)
+            path = pending.path
+            if len(os.fsencode(path)) > self.limits.max_path_bytes:
+                yield self._reject(
+                    path,
+                    "rejected_path_length",
+                    "path_length_limit",
+                )
+                continue
+            if pending.read_error or pending.metadata is None:
+                yield self._reject(path, "rejected_unreadable", "unreadable_path")
+                continue
+            metadata = pending.metadata
+            if stat.S_ISLNK(metadata.st_mode):
+                yield BoundedWalkEntry(path, "rejected_symlink", metadata)
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                if pending.depth >= self.limits.max_depth:
+                    yield self._reject(
+                        path,
+                        "rejected_depth_limit",
+                        "depth_limit",
+                    )
+                    continue
+                identity = (metadata.st_dev, metadata.st_ino)
+                if identity in seen_directories:
+                    yield self._reject(path, "rejected_loop", "directory_loop")
+                    continue
+                seen_directories.add(identity)
+                rejection = self._queue_directory(
+                    path,
+                    child_depth=pending.depth + 1,
+                    expected_metadata=metadata,
+                )
+                if rejection is not None:
+                    yield rejection
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                yield BoundedWalkEntry(path, "file", metadata)
+            else:
+                yield BoundedWalkEntry(path, "other", metadata)
 
 
 def _inventory_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1751,48 +3609,102 @@ def finalize_evidence_inventory(
     return inventory
 
 
+def _walk_rejection_inventory_entry(entry: BoundedWalkEntry) -> dict[str, Any]:
+    return {
+        "path": str(entry.path),
+        "canonical_path": None,
+        "artifact_class": "unknown",
+        "evidence_type": "unknown",
+        "parser_tool": None,
+        "sha256": None,
+        "size_bytes": 0,
+        "symlink_status": (
+            "rejected" if entry.kind == "rejected_symlink" else "not_symlink"
+        ),
+        "custody_status": entry.kind,
+    }
+
+
 def build_local_evidence_inventory(
-    root: str | Path, *, limit: int = 500
+    root: str | Path,
+    *,
+    limit: int = 500,
+    walk_limits: EvidenceWalkLimits = DEFAULT_EVIDENCE_WALK_LIMITS,
 ) -> dict[str, Any]:
     """Build a safe local inventory used by policy smokes and offline reports."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("inventory limit must be a positive integer")
     root_path = Path(root)
+    root_metadata = root_path.lstat()
     root_real = root_path.resolve(strict=True)
+    root_is_directory = stat.S_ISDIR(root_metadata.st_mode)
     entries: list[dict[str, Any]] = []
     truncated = False
+    walker = BoundedEvidenceWalk(
+        root_path,
+        limits=walk_limits,
+        expected_root_metadata=root_metadata,
+    )
 
-    candidates = [root_path] if root_path.is_file() else sorted(root_path.rglob("*"))
-    for path in candidates:
+    for candidate in walker:
         if len(entries) >= limit:
             truncated = True
             break
+        path = candidate.path
         # Skip VERDICT's own transient run-dir files discovered during a
         # directory walk so a liveness rewrite cannot perturb inventory_sha256
         # (re-verification stays stable). Only applied to walked children, never
         # to an explicitly-named root file (see is_volatile_run_file).
-        if root_path.is_dir() and is_volatile_run_file(path.name):
+        if root_is_directory and path != root_path and is_volatile_run_file(path.name):
             continue
         display_path = str(path)
-        if path.is_symlink():
+        if candidate.kind.startswith("rejected_"):
+            entries.append(_walk_rejection_inventory_entry(candidate))
+            continue
+        if candidate.kind != "file":
+            continue
+        metadata = candidate.metadata
+        if metadata is None:
             entries.append(
-                {
-                    "path": display_path,
-                    "canonical_path": None,
-                    "artifact_class": "unknown",
-                    "evidence_type": "unknown",
-                    "parser_tool": None,
-                    "sha256": None,
-                    "size_bytes": 0,
-                    "symlink_status": "rejected",
-                    "custody_status": "rejected_symlink",
-                }
+                _walk_rejection_inventory_entry(
+                    BoundedWalkEntry(path, "rejected_changed_during_read")
+                )
             )
+            truncated = True
             continue
-        if not path.is_file():
+        try:
+            current_metadata = path.lstat()
+            if stat.S_ISLNK(current_metadata.st_mode):
+                entries.append(
+                    _walk_rejection_inventory_entry(
+                        BoundedWalkEntry(path, "rejected_symlink")
+                    )
+                )
+                continue
+            if (
+                not stat.S_ISREG(current_metadata.st_mode)
+                or _metadata_snapshot(current_metadata) != _metadata_snapshot(metadata)
+                or current_metadata.st_nlink != metadata.st_nlink
+            ):
+                entries.append(
+                    _walk_rejection_inventory_entry(
+                        BoundedWalkEntry(path, "rejected_changed_during_read")
+                    )
+                )
+                truncated = True
+                continue
+            real = path.resolve(strict=True)
+        except OSError:
+            entries.append(
+                _walk_rejection_inventory_entry(
+                    BoundedWalkEntry(path, "rejected_unreadable")
+                )
+            )
+            truncated = True
             continue
-        real = path.resolve(strict=True)
         if (
             real != root_real
-            and root_path.is_dir()
+            and root_is_directory
             and not real.is_relative_to(root_real)
         ):
             entries.append(
@@ -1809,62 +3721,289 @@ def build_local_evidence_inventory(
                 }
             )
             continue
+        if metadata.st_nlink != 1:
+            entries.append(
+                {
+                    "path": display_path,
+                    "canonical_path": str(real),
+                    "artifact_class": "unknown",
+                    "evidence_type": "unknown",
+                    "parser_tool": None,
+                    "sha256": None,
+                    "size_bytes": metadata.st_size,
+                    "symlink_status": "not_symlink",
+                    "custody_status": "rejected_hardlink",
+                }
+            )
+            continue
         classification = classify_artifact_path(display_path)
+        try:
+            digest = sha256_file_local(path, expected_metadata=metadata)
+        except (OSError, EvidenceReadRaceError):
+            entries.append(
+                _walk_rejection_inventory_entry(
+                    BoundedWalkEntry(path, "rejected_changed_during_read")
+                )
+            )
+            truncated = True
+            continue
         entries.append(
             {
                 "path": display_path,
                 "canonical_path": str(real),
                 **classification,
-                "sha256": sha256_file_local(path),
-                "size_bytes": path.stat().st_size,
+                "sha256": digest,
+                "size_bytes": metadata.st_size,
                 "symlink_status": "not_symlink",
                 "custody_status": "custody_registered",
             }
         )
 
+    truncated = truncated or walker.truncated
+
     return finalize_evidence_inventory(
         str(root_path),
         str(root_real),
-        root_path.is_dir(),
+        root_is_directory,
         entries,
         limit=limit,
         truncated=truncated,
     )
 
 
-def build_remote_evidence_inventory(root: str, *, limit: int = 500) -> dict[str, Any]:
+def build_remote_evidence_inventory(
+    root: str,
+    *,
+    limit: int = 500,
+    walk_limits: EvidenceWalkLimits = DEFAULT_EVIDENCE_WALK_LIMITS,
+) -> dict[str, Any]:
     """Build a read-only file inventory for a path inside the SIFT VM."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("inventory limit must be a positive integer")
+    walk_limits.validate()
     remote_script = r"""
+import heapq
 import hashlib
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 limit = int(sys.argv[2])
+max_entries_visited = int(sys.argv[3])
+max_depth = int(sys.argv[4])
+max_path_bytes = int(sys.argv[5])
+max_directory_entries = int(sys.argv[6])
+root_metadata = root.lstat()
 root_real = root.resolve(strict=True)
+root_is_directory = stat.S_ISDIR(root_metadata.st_mode)
 entries = []
 truncated = False
-candidates = [root] if root.is_file() else sorted(root.rglob("*"))
-for path in candidates:
-    if len(entries) >= limit:
+entries_visited = 0
+pending = []
+sequence = 0
+seen_directories = set()
+
+def rejection(path, custody_status):
+    return {
+        "path": str(path),
+        "canonical_path": None,
+        "sha256": None,
+        "size_bytes": 0,
+        "symlink_status": (
+            "rejected" if custody_status == "rejected_symlink" else "not_symlink"
+        ),
+        "custody_status": custody_status,
+    }
+
+def metadata_snapshot(metadata):
+    mtime_ns = getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1000000000))
+    ctime_ns = getattr(metadata, "st_ctime_ns", int(metadata.st_ctime * 1000000000))
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        mtime_ns,
+        ctime_ns,
+    )
+
+def open_bound_regular(path, expected):
+    if (
+        stat.S_ISLNK(expected.st_mode)
+        or not stat.S_ISREG(expected.st_mode)
+        or expected.st_nlink != 1
+    ):
+        raise ValueError("path is no longer a single-link regular file")
+    flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_BINARY", "O_NOFOLLOW"):
+        flags |= int(getattr(os, flag_name, 0))
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or metadata_snapshot(opened) != metadata_snapshot(expected)
+        ):
+            raise ValueError("opened inode differs from validated path")
+        return descriptor, opened
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+def verify_bound_read(descriptor, before, bytes_read):
+    after = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or metadata_snapshot(after) != metadata_snapshot(before)
+        or bytes_read != before.st_size
+    ):
+        raise ValueError("evidence inode changed during read")
+
+root_current_metadata = root.lstat()
+root_identity_matches = (
+    stat.S_IFMT(root_current_metadata.st_mode) == stat.S_IFMT(root_metadata.st_mode)
+    and (root_current_metadata.st_dev, root_current_metadata.st_ino)
+    == (root_metadata.st_dev, root_metadata.st_ino)
+    and (
+        not stat.S_ISREG(root_metadata.st_mode)
+        or metadata_snapshot(root_current_metadata) == metadata_snapshot(root_metadata)
+    )
+)
+
+def queue_directory(directory, child_depth, expected):
+    global entries_visited, sequence, truncated
+    remaining = max_entries_visited - entries_visited
+    if remaining <= 0:
         truncated = True
-        break
+        return rejection(directory, "rejected_entries_visited_limit")
+    accepted_limit = min(max_directory_entries, remaining)
+    snapshot = []
+    exhausted = False
+    overflow = False
+    directory_fd = None
+    fallback_metadata = None
+    try:
+        if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+            truncated = True
+            return rejection(directory, "rejected_directory_identity")
+        fd_scandir = bool(
+            os.name == "posix"
+            and getattr(os, "O_DIRECTORY", 0)
+            and getattr(os, "O_NOFOLLOW", 0)
+        )
+        if fd_scandir:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            flags |= int(getattr(os, "O_CLOEXEC", 0))
+            directory_fd = os.open(directory, flags)
+            opened = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (expected.st_dev, expected.st_ino)
+            ):
+                truncated = True
+                return rejection(directory, "rejected_directory_identity")
+            scan_target = directory_fd
+        else:
+            fallback_metadata = directory.lstat()
+            if (
+                stat.S_ISLNK(fallback_metadata.st_mode)
+                or not stat.S_ISDIR(fallback_metadata.st_mode)
+                or (fallback_metadata.st_dev, fallback_metadata.st_ino)
+                != (expected.st_dev, expected.st_ino)
+            ):
+                truncated = True
+                return rejection(directory, "rejected_directory_identity")
+            scan_target = directory
+        with os.scandir(scan_target) as iterator:
+            for index in range(accepted_limit + 1):
+                try:
+                    dir_entry = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                if index == accepted_limit:
+                    overflow = True
+                    break
+                entries_visited += 1
+                try:
+                    metadata = dir_entry.stat(follow_symlinks=False)
+                    item = (directory / dir_entry.name, child_depth, metadata, False)
+                except OSError:
+                    item = (directory / dir_entry.name, child_depth, None, True)
+                snapshot.append(item)
+    except OSError:
+        truncated = True
+        try:
+            current = directory.lstat()
+            identity_changed = (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (expected.st_dev, expected.st_ino)
+            )
+        except OSError:
+            identity_changed = True
+        return rejection(
+            directory,
+            (
+                "rejected_directory_identity"
+                if identity_changed
+                else "rejected_unreadable_directory"
+            ),
+        )
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+    if not fd_scandir and fallback_metadata is not None:
+        try:
+            after = directory.lstat()
+        except OSError:
+            after = None
+        if (
+            after is None
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or (after.st_dev, after.st_ino)
+            != (fallback_metadata.st_dev, fallback_metadata.st_ino)
+        ):
+            truncated = True
+            return rejection(directory, "rejected_directory_identity")
+    if overflow and accepted_limit == max_directory_entries:
+        truncated = True
+        return rejection(directory, "rejected_directory_entry_limit")
+    if overflow or not exhausted:
+        truncated = True
+        return rejection(directory, "rejected_entries_visited_limit")
+    for item in snapshot:
+        sequence += 1
+        heapq.heappush(pending, (item[0], sequence, item))
+    return None
+
+def append_file(path, expected):
+    global truncated
     display_path = str(path)
-    if path.is_symlink():
-        entries.append({
-            "path": display_path,
-            "canonical_path": None,
-            "sha256": None,
-            "size_bytes": 0,
-            "symlink_status": "rejected",
-            "custody_status": "rejected_symlink",
-        })
-        continue
-    if not path.is_file():
-        continue
-    real = path.resolve(strict=True)
-    if root.is_dir():
+    try:
+        current = path.lstat()
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or metadata_snapshot(current) != metadata_snapshot(expected)
+            or current.st_nlink != expected.st_nlink
+        ):
+            truncated = True
+            entries.append(rejection(path, "rejected_changed_during_read"))
+            return
+        real = path.resolve(strict=True)
+    except OSError:
+        truncated = True
+        entries.append(rejection(path, "rejected_unreadable"))
+        return
+    if root_is_directory:
         try:
             real.relative_to(root_real)
         except ValueError:
@@ -1876,29 +4015,111 @@ for path in candidates:
                 "symlink_status": "outside_root",
                 "custody_status": "rejected_outside_root",
             })
-            continue
+            return
+    if expected.st_nlink != 1:
+        entries.append({
+            "path": display_path,
+            "canonical_path": str(real),
+            "sha256": None,
+            "size_bytes": expected.st_size,
+            "symlink_status": "not_symlink",
+            "custody_status": "rejected_hardlink",
+        })
+        return
+    descriptor = None
     h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+    bytes_read = 0
+    try:
+        descriptor, before = open_bound_regular(path, expected)
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
             h.update(chunk)
+        verify_bound_read(descriptor, before, bytes_read)
+    except (OSError, ValueError):
+        truncated = True
+        entries.append(rejection(path, "rejected_changed_during_read"))
+        return
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     entries.append({
         "path": display_path,
         "canonical_path": str(real),
         "sha256": h.hexdigest(),
-        "size_bytes": path.stat().st_size,
+        "size_bytes": expected.st_size,
         "symlink_status": "not_symlink",
         "custody_status": "custody_registered",
     })
+
+if not root_identity_matches:
+    truncated = True
+    entries.append(rejection(root, "rejected_root_identity"))
+elif len(os.fsencode(root)) > max_path_bytes:
+    truncated = True
+    entries.append(rejection(root, "rejected_path_length"))
+elif stat.S_ISLNK(root_metadata.st_mode):
+    entries.append(rejection(root, "rejected_symlink"))
+elif stat.S_ISREG(root_metadata.st_mode):
+    append_file(root, root_metadata)
+elif root_is_directory:
+    seen_directories.add((root_metadata.st_dev, root_metadata.st_ino))
+    rejected_root = queue_directory(root, 1, root_metadata)
+    if rejected_root is not None:
+        entries.append(rejected_root)
+
+while pending:
+    if len(entries) >= limit:
+        truncated = True
+        break
+    _, _, item = heapq.heappop(pending)
+    path, depth, metadata, read_error = item
+    if len(os.fsencode(path)) > max_path_bytes:
+        truncated = True
+        entries.append(rejection(path, "rejected_path_length"))
+        continue
+    if read_error or metadata is None:
+        truncated = True
+        entries.append(rejection(path, "rejected_unreadable"))
+        continue
+    mode = metadata.st_mode
+    if stat.S_ISLNK(mode):
+        entries.append(rejection(path, "rejected_symlink"))
+        continue
+    if stat.S_ISDIR(mode):
+        if depth >= max_depth:
+            truncated = True
+            entries.append(rejection(path, "rejected_depth_limit"))
+            continue
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in seen_directories:
+            truncated = True
+            entries.append(rejection(path, "rejected_loop"))
+            continue
+        seen_directories.add(identity)
+        rejected_directory = queue_directory(path, depth + 1, metadata)
+        if rejected_directory is not None:
+            entries.append(rejected_directory)
+        continue
+    if stat.S_ISREG(mode):
+        append_file(path, metadata)
 print(json.dumps({
     "root_path": str(root),
     "canonical_root": str(root_real),
-    "root_is_directory": root.is_dir(),
+    "root_is_directory": root_is_directory,
     "limit": limit,
     "truncated": truncated,
     "entries": entries,
 }, separators=(",", ":"), sort_keys=True))
 """
-    cmd = f"python3 - {shlex.quote(root)} {int(limit)} <<'PY'\n{remote_script}\nPY"
+    cmd = (
+        f"python3 - {shlex.quote(root)} {int(limit)} "
+        f"{walk_limits.max_entries_visited} {walk_limits.max_depth} "
+        f"{walk_limits.max_path_bytes} {walk_limits.max_directory_entries} "
+        f"<<'PY'\n{remote_script}\nPY"
+    )
     code, stdout, stderr = ssh_run(cmd, timeout=600)
     if code != 0:
         raise RuntimeError(
@@ -1929,30 +4150,176 @@ def inventory_supported_entries(inventory: dict[str, Any]) -> list[dict[str, Any
 # ---------------------------------------------------------------------------
 
 
+def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
+    _terminate_mcp_process_tree(proc)
+
+
+def _run_bounded_capture(
+    argv: list[str],
+    *,
+    timeout: int,
+    stdout_max_bytes: int = SHELL_STDOUT_MAX_BYTES,
+    stderr_max_bytes: int = SHELL_STDERR_MAX_BYTES,
+) -> tuple[int, str, str]:
+    """Run a helper without allowing either captured pipe to grow unbounded."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **_mcp_process_group_options(),
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    overflows: list[str] = []
+    overflow_lock = threading.Lock()
+
+    def drain(name: str, stream: Any, limit: int) -> None:
+        try:
+            read_chunk = getattr(stream, "read1", stream.read)
+            while True:
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    return
+                remaining = max(0, limit - len(buffers[name]))
+                if remaining:
+                    buffers[name].extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    with overflow_lock:
+                        if not overflows:
+                            overflows.append(name)
+                    _terminate_process_group(proc)
+        finally:
+            # The drain owns its pipe. If an escaped descendant keeps the pipe
+            # open, no other thread may safely close the locked BufferedReader;
+            # the drain closes it itself once EOF eventually arrives.
+            with contextlib.suppress(OSError):
+                stream.close()
+
+    threads = [
+        (
+            "stdout",
+            proc.stdout,
+            threading.Thread(
+                target=drain,
+                args=("stdout", proc.stdout, stdout_max_bytes),
+                daemon=True,
+            ),
+        ),
+        (
+            "stderr",
+            proc.stderr,
+            threading.Thread(
+                target=drain,
+                args=("stderr", proc.stderr, stderr_max_bytes),
+                daemon=True,
+            ),
+        ),
+    ]
+    for _name, _stream, thread in threads:
+        thread.start()
+
+    def finish_drains() -> list[str]:
+        deadline = time.monotonic() + SHELL_DRAIN_JOIN_TIMEOUT_S
+        for _name, _stream, thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        live = [name for name, _stream, thread in threads if thread.is_alive()]
+        for _name, stream, thread in threads:
+            if not thread.is_alive() and not stream.closed:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        return live
+
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(proc)
+        _reap_mcp_process(proc)
+        finish_drains()
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=bytes(buffers["stdout"]),
+            stderr=bytes(buffers["stderr"]),
+        ) from exc
+    live_drains = finish_drains()
+    stdout = bytes(buffers["stdout"]).decode("utf-8", errors="replace")
+    stderr = bytes(buffers["stderr"]).decode("utf-8", errors="replace")
+    if overflows:
+        limit = stdout_max_bytes if overflows[0] == "stdout" else stderr_max_bytes
+        detail = f"bounded capture: {overflows[0]} exceeded {limit} bytes"
+        stderr = f"{stderr.rstrip()}\n{detail}\n" if stderr else f"{detail}\n"
+        return 125, stdout, stderr
+    if live_drains:
+        pipes = ", ".join(live_drains)
+        detail = f"bounded capture: {pipes} pipe remained open after leader exit"
+        stderr = f"{stderr.rstrip()}\n{detail}\n" if stderr else f"{detail}\n"
+        return 125, stdout, stderr
+    return returncode, stdout, stderr
+
+
+def _terminate_docker_runtime_after_bridge_failure(reason: str) -> None:
+    print(
+        f"  SECURITY: removing {DOCKER_CONTAINER} after bounded Docker bridge {reason}",
+        file=sys.stderr,
+    )
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            ["docker", "rm", "-f", DOCKER_CONTAINER],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+
+
 def ssh_run(remote_command: str, timeout: int = 600) -> tuple[int, str, str]:
     if LOCAL_MODE:
         # Local mode: the host IS the analysis box. Every command this
         # orchestrator issues is plain POSIX, so run it locally.
-        r = subprocess.run(
-            ["bash", "-lc", remote_command],
-            capture_output=True,
-            text=True,
+        return _run_bounded_capture(
+            ["bash", "--noprofile", "--norc", "-c", remote_command],
             timeout=timeout,
         )
-        return r.returncode, r.stdout, r.stderr
     if DOCKER_MODE:
         # Docker mode: the container IS the analysis box. Run the same POSIX
-        # guest command inside it — `docker exec -i <ctr> bash -lc <cmd>` is the
-        # container analog of `ssh GUEST <cmd>`. Case-dir mkdir/test/cat land on
-        # /workspace, which is the host repo via the read-write bind mount.
-        r = subprocess.run(
-            ["docker", "exec", "-i", DOCKER_CONTAINER, "bash", "-lc", remote_command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return r.returncode, r.stdout, r.stderr
-    r = subprocess.run(
+        # guest command inside it. A fixed PATH plus profile-free bash prevents
+        # parser-writable HOME state from changing later helper behavior. The
+        # in-container timeout remains effective if the Docker client disconnects.
+        try:
+            result = _run_bounded_capture(
+                [
+                    "docker",
+                    "exec",
+                    DOCKER_CONTAINER,
+                    "/usr/bin/env",
+                    "-u",
+                    "BASH_ENV",
+                    "-u",
+                    "ENV",
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "/usr/bin/timeout",
+                    "--kill-after=2s",
+                    f"{max(1, int(timeout))}s",
+                    "/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    remote_command,
+                ],
+                timeout=timeout + 5,
+            )
+        except subprocess.TimeoutExpired:
+            _terminate_docker_runtime_after_bridge_failure("timeout")
+            raise
+        if result[0] in {124, 125}:
+            _terminate_docker_runtime_after_bridge_failure(
+                "timeout" if result[0] == 124 else "output overflow"
+            )
+        return result
+    return _run_bounded_capture(
         [
             "ssh",
             "-i",
@@ -1963,11 +4330,8 @@ def ssh_run(remote_command: str, timeout: int = 600) -> tuple[int, str, str]:
             f"{GUEST_USER}@{GUEST_IP}",
             remote_command,
         ],
-        capture_output=True,
-        text=True,
         timeout=timeout,
     )
-    return r.returncode, r.stdout, r.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -2290,6 +4654,80 @@ _USBSTOR_SERIAL_RE = re.compile(
     r"\\enum\\usbstor\\disk&ven_(?P<ven>[^&\\]*)&prod_(?P<prod>[^&\\]*)[^\\]*\\(?P<serial>[^\\]+)$",
     re.IGNORECASE,
 )
+
+
+# setupapi.dev.log section header for a USB mass-storage install event, e.g.
+# >>>  [Device Install (Hardware initiated) - USBSTOR\Disk&Ven_SanDisk&Prod_...]
+# or older: >>>  [2004/08/26 12:00:00.000  ...] USB\VID_...
+_SETUPAPI_SECTION_RE = re.compile(
+    r"^>>>\s*\[(?P<header>[^\]]+)\]",
+    re.IGNORECASE,
+)
+_SETUPAPI_USB_TELL_RE = re.compile(
+    r"(USBSTOR|USB\\VID_|USB\\ROOT_HUB|SWD\\WPDBUSENUM)",
+    re.IGNORECASE,
+)
+# Timestamp lines inside a section: ">>>  Section start 2004/08/26 12:00:00.000"
+_SETUPAPI_TS_RE = re.compile(
+    r"Section start\s+(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})",
+    re.IGNORECASE,
+)
+# Cap parsed USB events so a noisy log cannot flood findings.
+_SETUPAPI_USB_CAP = 40
+
+
+def setupapi_usb_candidates(
+    text: str, *, source_path: str = ""
+) -> list[dict[str, Any]]:
+    """Parse setupapi.dev.log / setupapi.app.log for USB device install events.
+
+    Pure function. USBSTOR registry keys can be empty on some images while
+    setupapi still records device install timestamps — a useful secondary
+    source for removable-media history. Returns HYPOTHESIS-grade candidates
+    only; device install is normal on most hosts.
+    """
+    if not text:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current_header: str | None = None
+    current_ts: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m_sec = _SETUPAPI_SECTION_RE.match(line)
+        if m_sec:
+            current_header = m_sec.group("header").strip()
+            current_ts = None
+            continue
+        m_ts = _SETUPAPI_TS_RE.search(line)
+        if m_ts:
+            current_ts = m_ts.group("ts").replace("/", "-").replace(" ", "T") + "Z"
+            continue
+        if current_header is None:
+            continue
+        blob = f"{current_header} {line}"
+        if not _SETUPAPI_USB_TELL_RE.search(blob):
+            continue
+        # Prefer the section header as the device identity surface.
+        device = current_header
+        key = device.lower()[:240]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "kind": "setupapi_usb",
+                "device": device[:300],
+                "install_time_iso": current_ts,
+                "source_path": source_path,
+                "sample_line": line[:200],
+            }
+        )
+        if len(out) >= _SETUPAPI_USB_CAP:
+            break
+    return out
 
 
 def registry_usb_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3257,8 +5695,8 @@ def bulk_extract_deleted_email_candidates(
     """Return free-space email-recovery candidates from ``bulk_extract`` output.
 
     ``bulk_extract`` scans the raw image, including unallocated/free-space bytes.
-    A generic carved email row is too weak for nhc-003: it may be allocated or
-    unrelated. Emit only when the recovered email-like rows themselves contain
+    A generic carved email row is too weak to support a deleted-mail claim: it may
+    be allocated or unrelated. Emit only when the recovered email-like rows contain
     broad attack-planning vocabulary. The vocabulary is evidence-agnostic and the
     resulting finding stays a HYPOTHESIS, because a raw feature row confirms bytes
     were present, not authorship, intent, or deletion state by itself.
@@ -3824,6 +6262,401 @@ def _decoded_row_label(row: dict[str, Any]) -> str:
     )
 
 
+BROWSER_LANE_LIMIT = 20
+_CANONICAL_BROWSER_DATABASE_NAMES = frozenset(
+    {
+        "history",
+        "history.sqlite",
+        "archived history",
+        "archived history.sqlite",
+        "cookies",
+        "cookies.sqlite",
+        "web data",
+        "web data.sqlite",
+        "login data",
+        "login data.sqlite",
+        "places.sqlite",
+    }
+)
+_BROWSER_TIMELINE_RECORD_TYPES = (
+    "visit",
+    "download",
+    "cookie_metadata",
+    "autofill_metadata",
+    "login_metadata",
+)
+_BROWSER_RECORD_ID_FIELDS: dict[str, tuple[str, ...]] = {
+    "visit": (
+        "url_id",
+        "url",
+        "title",
+        "last_visit_time_iso",
+        "visit_count",
+    ),
+    "download": (
+        "download_id",
+        "source_url",
+        "final_url",
+        "target_path",
+        "current_path",
+        "referrer_url",
+        "start_time_iso",
+        "end_time_iso",
+        "received_bytes",
+        "total_bytes",
+        "state",
+        "danger_type",
+        "interrupt_reason",
+        "opened",
+    ),
+    "cookie_metadata": (
+        "host",
+        "name",
+        "path",
+        "top_frame_site_key",
+        "creation_time_iso",
+        "last_access_time_iso",
+        "last_update_time_iso",
+        "expires_time_iso",
+        "is_secure",
+        "is_http_only",
+        "is_persistent",
+        "has_expires",
+        "same_site",
+        "priority",
+        "source_scheme",
+        "source_port",
+        "source_type",
+        "has_cross_site_ancestor",
+    ),
+    "autofill_metadata": (
+        "field_name",
+        "stored_value_count",
+        "use_count",
+        "created_time_iso",
+        "last_used_time_iso",
+    ),
+    "login_metadata": (
+        "login_id",
+        "origin_url",
+        "action_url",
+        "username_element",
+        "username",
+        "signon_realm",
+        "created_time_iso",
+        "last_used_time_iso",
+        "password_modified_time_iso",
+        "times_used",
+        "blacklisted_by_user",
+        "scheme",
+        "password_type",
+        "display_name",
+        "icon_url",
+        "federation_url",
+    ),
+}
+
+
+def browser_entry_path(entry: dict[str, Any]) -> str:
+    """Return a CWD-independent path from a custody inventory entry."""
+    return str(entry.get("canonical_path") or entry.get("path") or "")
+
+
+def prioritize_browser_entries(
+    entries: list[dict[str, Any]], *, limit: int = BROWSER_LANE_LIMIT
+) -> tuple[list[dict[str, Any]], int]:
+    """Select browser databases deterministically without crowding out known names."""
+
+    def sort_key(entry: dict[str, Any]) -> tuple[int, str, str]:
+        path = browser_entry_path(entry).replace("\\", "/")
+        name = PurePosixPath(path).name.casefold()
+        return (
+            0 if name in _CANONICAL_BROWSER_DATABASE_NAMES else 1,
+            path.casefold(),
+            path,
+        )
+
+    ordered = sorted(entries or [], key=sort_key)
+    bounded_limit = max(0, limit)
+    selected = ordered[:bounded_limit]
+    return selected, len(ordered) - len(selected)
+
+
+def browser_case_binding(inventory: dict[str, Any]) -> str:
+    """Serialize the exact case/path/hash allow-list used by parser lanes.
+
+    This is process configuration, not caller input: every live Rust client,
+    parallel fan-out process, and verifier replay inherits the same compact
+    binding before it can expose an evidence-reading tool over MCP. The legacy
+    function/env name is retained for transport compatibility.
+    """
+    candidates = [
+        entry
+        for entry in inventory_supported_entries(inventory)
+        if isinstance(entry.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", str(entry["sha256"]))
+        and browser_entry_path(entry)
+    ]
+    selected = sorted(
+        candidates,
+        key=lambda entry: (
+            browser_entry_path(entry).casefold(),
+            browser_entry_path(entry),
+            str(entry["sha256"]).lower(),
+        ),
+    )
+    binding = {
+        "case_id": str(inventory.get("parent_case_id") or ""),
+        "artifacts": [
+            {
+                "path": browser_entry_path(entry),
+                "sha256": str(entry["sha256"]).lower(),
+            }
+            for entry in selected
+        ],
+    }
+    encoded = json.dumps(binding, separators=(",", ":"), sort_keys=True)
+    encoded_bytes = len(encoded.encode("utf-8"))
+    if encoded_bytes > ARTIFACT_CASE_BINDING_MAX_BYTES:
+        raise RuntimeError(
+            "custody artifact binding exceeds the 512 KiB parser-environment "
+            f"ceiling ({encoded_bytes} bytes); narrow the case before parsing"
+        )
+    return encoded
+
+
+def _browser_record_type(row: dict[str, Any]) -> str:
+    """Return a stable tag, including compatibility with visit-only servers."""
+    record_type = row.get("record_type")
+    if isinstance(record_type, str) and record_type:
+        return record_type
+    if row.get("url") is not None:
+        return "visit"
+    return "unknown"
+
+
+def _browser_record_id(row: dict[str, Any], history_path: str) -> str:
+    """Hash only an explicit metadata allow-list; secret payloads never participate."""
+    record_type = _browser_record_type(row)
+    identity = {
+        "history_path": history_path,
+        "record_type": record_type,
+        "fields": {
+            key: row.get(key)
+            for key in _BROWSER_RECORD_ID_FIELDS.get(record_type, ())
+            if key in row
+        },
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def sample_browser_timeline_rows(
+    rows: list[Any], *, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Sample each supported browser record type before filling remaining slots."""
+    bounded_limit = max(0, limit)
+    if bounded_limit == 0:
+        return []
+    eligible = [
+        (index, row)
+        for index, row in enumerate(rows or [])
+        if isinstance(row, dict)
+        and _browser_record_type(row) in _BROWSER_TIMELINE_RECORD_TYPES
+    ]
+    selected_indexes: list[int] = []
+    for record_type in _BROWSER_TIMELINE_RECORD_TYPES:
+        match = next(
+            (
+                index
+                for index, row in eligible
+                if _browser_record_type(row) == record_type
+            ),
+            None,
+        )
+        if match is not None:
+            selected_indexes.append(match)
+        if len(selected_indexes) == bounded_limit:
+            break
+    selected_set = set(selected_indexes)
+    for index, _row in eligible:
+        if len(selected_indexes) == bounded_limit:
+            break
+        if index not in selected_set:
+            selected_indexes.append(index)
+            selected_set.add(index)
+    rows_by_index = dict(eligible)
+    return [rows_by_index[index] for index in selected_indexes]
+
+
+def browser_artifact_audit_summary(
+    output: dict[str, Any], artifact_path: str, error: str | None = None
+) -> dict[str, Any]:
+    """Build a compact custody summary without copying browser row payloads."""
+    raw_rows = output.get("rows")
+    rows = raw_rows if isinstance(raw_rows, list) else []
+    counts = Counter(_browser_record_type(row) for row in rows if isinstance(row, dict))
+    return {
+        "artifact_path": artifact_path,
+        "schema_version": output.get("schema_version"),
+        "browser_family": output.get("browser_family"),
+        "artifact_kind": output.get("artifact_kind"),
+        "rows_seen": output.get("rows_seen", len(rows)),
+        "rows_returned": len(rows),
+        "truncated": bool(output.get("truncated", False)),
+        "record_type_counts": dict(sorted(counts.items())),
+        **({"error": error} if error else {}),
+    }
+
+
+def _browser_timeline_event(
+    record_type: str,
+    timestamp: Any,
+    summary: str,
+    history_path: str,
+    details: dict[str, Any],
+) -> dict[str, Any] | None:
+    timestamp_text = str(timestamp or "").strip()
+    if not timestamp_text:
+        return None
+    return {
+        "ts": timestamp_text,
+        "summary": summary,
+        "metadata": {
+            "record_type": record_type,
+            "history_path": history_path,
+            **details,
+        },
+    }
+
+
+def _browser_visit_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    url = str(row.get("url") or "")
+    return _browser_timeline_event(
+        "visit",
+        row.get("last_visit_time_iso"),
+        f"browser visit: {url[:80]}",
+        history_path,
+        {"url_id": row.get("url_id"), "visit_count": row.get("visit_count")},
+    )
+
+
+def _browser_download_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    label = str(
+        row.get("final_url")
+        or row.get("source_url")
+        or row.get("target_path")
+        or row.get("current_path")
+        or ""
+    )
+    return _browser_timeline_event(
+        "download",
+        row.get("start_time_iso") or row.get("end_time_iso"),
+        f"browser download: {label[:80]}",
+        history_path,
+        {
+            key: row.get(key)
+            for key in (
+                "download_id",
+                "target_path",
+                "total_bytes",
+                "state",
+                "danger_type",
+                "interrupt_reason",
+                "opened",
+            )
+        },
+    )
+
+
+def _browser_cookie_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    host = str(row.get("host") or "")
+    return _browser_timeline_event(
+        "cookie_metadata",
+        row.get("last_access_time_iso")
+        or row.get("last_update_time_iso")
+        or row.get("creation_time_iso"),
+        f"browser cookie metadata: {host[:80]}",
+        history_path,
+        {
+            "host": row.get("host"),
+            "name": row.get("name"),
+            "cookie_path": row.get("path"),
+            "is_secure": row.get("is_secure"),
+            "is_http_only": row.get("is_http_only"),
+        },
+    )
+
+
+def _browser_autofill_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    field_name = str(row.get("field_name") or "")
+    return _browser_timeline_event(
+        "autofill_metadata",
+        row.get("last_used_time_iso") or row.get("created_time_iso"),
+        f"browser autofill metadata: {field_name[:80]}",
+        history_path,
+        {
+            key: row.get(key)
+            for key in ("field_name", "stored_value_count", "use_count")
+        },
+    )
+
+
+def _browser_login_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    realm = str(row.get("signon_realm") or row.get("origin_url") or "")
+    return _browser_timeline_event(
+        "login_metadata",
+        row.get("last_used_time_iso") or row.get("created_time_iso"),
+        f"browser login metadata: {realm[:80]}",
+        history_path,
+        {
+            key: row.get(key)
+            for key in (
+                "login_id",
+                "origin_url",
+                "signon_realm",
+                "times_used",
+                "blacklisted_by_user",
+            )
+        },
+    )
+
+
+def browser_timeline_projection(
+    row: dict[str, Any], history_path: str
+) -> dict[str, Any] | None:
+    """Project one browser row onto an allow-listed, honest timeline event."""
+    projector = {
+        "visit": _browser_visit_projection,
+        "download": _browser_download_projection,
+        "cookie_metadata": _browser_cookie_projection,
+        "autofill_metadata": _browser_autofill_projection,
+        "login_metadata": _browser_login_projection,
+    }.get(_browser_record_type(row))
+    event = projector(row, history_path) if projector is not None else None
+    if event is None:
+        return None
+    return {
+        **event,
+        "metadata": {
+            **event["metadata"],
+            "browser_record_id": _browser_record_id(row, history_path),
+        },
+    }
+
+
 CONFIDENCE_RANK = {"HYPOTHESIS": 1, "INFERRED": 2, "CONFIRMED": 3}
 EXPERT_RULES_PATH = (
     Path(__file__).resolve().parent.parent / "agent-config" / "expert-rules.json"
@@ -3935,6 +6768,7 @@ TOOL_ARTIFACT_CLASSES = {
     "prefetch_parse": "prefetch",
     "pst_parse": "disk/filesystem",
     "registry_query": "registry",
+    "setupapi_parse": "disk/filesystem",
     "srum_parse": "disk/filesystem",
     "suricata_eve": "network",
     "vss_list": "disk/filesystem",
@@ -3979,6 +6813,7 @@ APPLICABLE_TOOLS_BY_CLASS: dict[str, frozenset[str]] = {
             "yara_scan",
         }
     ),
+    "browser_history": frozenset({"browser_history"}),
     "network": frozenset(
         {
             "pcap_triage",
@@ -4044,8 +6879,9 @@ ATTACK_COVERAGE_TARGETS: tuple[dict[str, Any], ...] = (
         "technique_id": "T1105",
         "technique_name": "Ingress Tool Transfer",
         "tactic": "Command and Control",
-        "artifact_classes": ("disk/filesystem", "network"),
+        "artifact_classes": ("browser_history", "disk/filesystem", "network"),
         "tool_names": (
+            "browser_history",
             "mft_timeline",
             "usnjrnl_query",
             "yara_scan",
@@ -4621,6 +7457,7 @@ def build_lane_plan_message(
     velociraptor: int,
     raw_disk: int,
     cloud: int = 0,
+    browser: int = 0,
 ) -> str:
     """Supervisor lane-plan rationale for the audit chain.
 
@@ -4638,6 +7475,10 @@ def build_lane_plan_message(
     if extracted:
         lanes.append(
             f"{extracted} extracted disk artifact(s) (prefetch/registry/MFT triage)"
+        )
+    if browser:
+        lanes.append(
+            f"{browser} browser database(s) (visits/downloads/account-store metadata)"
         )
     if network:
         lanes.append(f"{network} network capture(s) (pcap/zeek triage)")
@@ -4692,6 +7533,12 @@ def build_attack_coverage(
 ) -> dict[str, Any]:
     """Summarize ATT&CK-relevant coverage from actual typed-tool output."""
     tools_run = {tc.get("tool") for tc in tool_calls if tc.get("tool")}
+    browser_download_observed = any(
+        tc.get("tool") == "browser_history"
+        and _int_metric((tc.get("record_type_counts") or {}).get("download")) > 0
+        for tc in tool_calls
+        if isinstance(tc, dict) and isinstance(tc.get("record_type_counts") or {}, dict)
+    )
     checks = case_completeness.get("checks", [])
     available_classes = {c.get("artifact_class") for c in checks if c.get("available")}
     touched_classes = {c.get("artifact_class") for c in checks if c.get("touched")}
@@ -4709,7 +7556,14 @@ def build_attack_coverage(
     for target in ATTACK_COVERAGE_TARGETS:
         target_tools = set(target["tool_names"])
         target_classes = set(target["artifact_classes"])
-        observed_tools = sorted(target_tools & tools_run)
+        target_observed_tools = target_tools & tools_run
+        # browser_history is a multi-artifact parser. Cookie/autofill/login
+        # metadata must not claim Ingress Tool Transfer coverage merely because
+        # the same tool name parsed it; T1105 is covered only when the typed
+        # output actually contained at least one download record.
+        if target["technique_id"] == "T1105" and not browser_download_observed:
+            target_observed_tools = target_observed_tools - {"browser_history"}
+        observed_tools = sorted(target_observed_tools)
         observed_classes = sorted(target_classes & touched_classes)
         technique = target["technique_id"]
         confidence = finding_confidence.get(technique)
@@ -4721,7 +7575,10 @@ def build_attack_coverage(
             gap = "limited coverage — not proof of absence"
         elif target_classes & available_classes:
             status = "available_not_examined"
-            gap = "required evidence class was available but no target tool ran"
+            gap = (
+                "required evidence class was available but no target-relevant "
+                "typed output was observed"
+            )
         else:
             status = "blind_spot"
             missing = sorted(target_classes - touched_classes)
@@ -5156,8 +8013,8 @@ def build_coverage_reverse_audits(
                 "not proof of no evil."
                 if is_clearance
                 else "Artifact class(es) the evidence contains were never examined "
-                "by an applicable typed tool; coverage gap recorded as a named "
-                "limitation."
+                "by an applicable typed tool; coverage gap recorded as a report-QA "
+                "warning."
             ),
             [f"available_but_uninvoked={uninvoked}"],
         )
@@ -5601,12 +8458,15 @@ def build_attck_practitioner_coverage(
 
 def _source_record_ref(event: dict[str, Any], fallback_index: int) -> str:
     details = event.get("details") if isinstance(event.get("details"), dict) else {}
+    source = event.get("source") or "timeline"
+    browser_record_id = details.get("browser_record_id")
+    if isinstance(browser_record_id, str) and browser_record_id:
+        return f"{source}:browser_record_id={browser_record_id}"
     parts = []
     for key in ("record_id", "event_id", "pid", "image_name", "path", "offset"):
         value = details.get(key)
         if value not in (None, ""):
             parts.append(f"{key}={value}")
-    source = event.get("source") or "timeline"
     return f"{source}:{';'.join(parts) if parts else fallback_index}"
 
 
@@ -7939,16 +10799,20 @@ def build_executive_attack_story(
                 "The run produced no reportable findings in the evidence it examined. "
                 "This is scoped coverage, not environment-wide assurance."
             )
-        else:
-            headline = "Triage leads only — no confirmed evil in this evidence"
-            customer_summary = (
-                "The run produced limited or hypothesis-level signals. Treat this as a "
-                "direction for further collection, not a conclusion."
+            assessment = (
+                "No reportable Finding was produced from the artifact classes examined. "
+                "This statement is limited to the coverage recorded below."
             )
-        assessment = (
-            "No confirmed malicious activity in the examined evidence. See the "
-            "unknowns below for what could not be assessed and how to extend coverage."
-        )
+        else:
+            headline = "No reportable findings; coverage remains incomplete"
+            customer_summary = (
+                "The examined artifacts produced no reportable Finding. Coverage gaps "
+                "keep the verdict INDETERMINATE; no broader conclusion is supported."
+            )
+            assessment = (
+                "No reportable Finding was produced from the artifact classes examined. "
+                "See the unknowns below for unexamined classes and recovery steps."
+            )
     else:
         where = f" on {host}" if host else ""
         who = f" under the account {actor}" if actor else ""
@@ -8015,7 +10879,13 @@ def build_executive_attack_story(
             f"{_cap_first(f_profile.get('action', 'activity'))}{loc}{acct} "
             f"({conf}, {technique}, cited by {tcid})."
         )
-    if not can_say:
+    if not can_say and not indexed_findings:
+        examined = ", ".join(touched) if touched else "the supplied evidence"
+        can_say.append(
+            f"Typed tools examined {examined} and produced no reportable Finding; "
+            "the coverage record, not an absence claim, defines this result."
+        )
+    elif not can_say:
         can_say.append(
             "The run produced only triage-level leads; read each cited tool call in "
             "the findings detail before acting."
@@ -8069,7 +10939,11 @@ def build_executive_attack_story(
         "assessment": assessment,
         "certainty": certainty,
         "verdict": verdict,
-        "verdict_meaning": "Use the verdict as a triage priority, then read each Finding confidence and citation before acting.",
+        "verdict_meaning": (
+            "Read the coverage and limitations before acting; no reportable Finding was produced."
+            if not indexed_findings
+            else "Use the verdict as a triage priority, then read each Finding confidence and citation before acting."
+        ),
         "confidence_posture": distribution,
         "evidence_scope": {
             "evidence_path": evidence_path,
@@ -8570,7 +11444,7 @@ def _disk_summary_template() -> dict[str, Any]:
         "tool_summaries": {},
         "timeline_event_count": 0,
         "analysis_constraints": [
-            "Raw disk case_open is custody-only; only mounted or extracted artifacts support disk-content observations.",
+            "If a raw-disk source is supplied, case_open alone is custody-only; only mounted or extracted artifacts support disk-content observations.",
             "Prefetch run counts are execution leads and still require a second artifact class before execution claims are upgraded.",
             "YARA matches on disk files are triage leads unless corroborated with file-system, process, registry, event-log, or network context.",
             "Every promoted Finding must cite a tool_call_id and pass verifier replay before judge consumption.",
@@ -8788,13 +11662,21 @@ def build_next_actions(
         )
 
     disk = checks_by_class.get("disk/filesystem", {})
-    if not disk.get("touched"):
+    if disk.get("available") and not disk.get("touched"):
         add(
             "P2",
             "Use read-only SIFT disk workflow to extract Prefetch, Registry, MFT, USN Journal, and YARA targets before parsing them with typed tools.",
-            "Execution and persistence claims need disk-backed corroboration; memory-only observations are not enough for final execution claims.",
+            "Disk evidence is available but has not been parsed deeply enough for execution or persistence conclusions.",
             ["disk_gap"],
             "ewfmount read-only mount, Sleuth Kit file extraction, Prefetch, Amcache/ShimCache, Run keys, services, scheduled tasks, MFT/USN entries",
+        )
+    elif not disk.get("touched"):
+        add(
+            "P2",
+            "Collect disk triage artifacts for execution and persistence corroboration.",
+            "No disk/filesystem artifact class was supplied or parsed in this run.",
+            ["disk_gap"],
+            "Prefetch, Amcache/ShimCache, Registry run keys/services/tasks, MFT, and USN Journal",
         )
     elif disk.get("touched"):
         add(
@@ -9579,24 +12461,38 @@ class Investigation:
         self._rust_factory: Callable[[], SshMcpClient] | None = None
         # The launcher can pin the case_id so it can deep-link the dashboard to
         # the case dir BEFORE the run starts (live watching). Else a fresh uuid.
-        self.case_id = case_id or f"auto-{uuid.uuid4()}"
+        if case_id is not None and (
+            not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}", case_id)
+            or case_id in {".", ".."}
+        ):
+            raise ValueError(
+                "case_id must be 1-128 safe filename characters and may not begin with '-'"
+            )
+        self.case_id = case_id if case_id is not None else f"auto-{uuid.uuid4()}"
         self.run_id = f"auto-{int(time.time())}"
         self.started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if LOCAL_MODE:
             self.case_dir = str(LOCAL_RUNS_DIR / self.case_id)
+            self.parser_case_dir = self.case_dir
         elif DOCKER_MODE:
-            # /workspace is the repo bind-mounted read-write, so the container's
-            # case dir IS the host dir REPO_ROOT/tmp/auto-runs/<case> — the exact
-            # path fetch_artifacts_to_host resolves on the host. The in-container
-            # MCP servers write audit.jsonl / run.manifest.json straight there,
-            # so the host reads them with no copy step.
-            self.case_dir = f"{GUEST_REPO}/tmp/auto-runs/{self.case_id}"
+            # Custody/audit/report output is host-only. The same logical case has
+            # a separate parser staging namespace in the container; native tools
+            # cannot read signing keys or rewrite signed case material.
+            self.case_dir = str(LOCAL_RUNS_DIR / self.case_id)
+            self.parser_case_dir = f"{GUEST_REPO}/tmp/auto-runs/{self.case_id}"
         else:
             self.case_dir = f"{GUEST_REPO}/tmp/{self.case_id}"
+            self.parser_case_dir = self.case_dir
         self.audit_path = f"{self.case_dir}/audit.jsonl"
         self.manifest_path = f"{self.case_dir}/run.manifest.json"
         self.verdict_path = f"{self.case_dir}/verdict.json"
         self.local_artifacts: dict[str, str] = {}
+        # Created with the trusted Investigation object, never supplied by the
+        # model. `run()` rotates it immediately before spawning the Python MCP;
+        # initializing here also keeps direct method-level controller tests on
+        # the same authenticated call shape.
+        self.controller_capability = secrets.token_hex(32)
+        self.case_open_expected_sha256: dict[str, str] = {}
         self.tool_calls: list[dict[str, Any]] = []
         self.timeline_events: list[dict[str, Any]] = []
         # Execution corroboration: finding_id -> [supporting tool_call_ids]. A
@@ -9697,6 +12593,14 @@ class Investigation:
         self.tcid_counter += 1
         return f"tc-{self.tcid_counter:03d}"
 
+    def _controller_args(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{64}", self.controller_capability):
+            raise RuntimeError("private controller capability is unavailable")
+        return {
+            **arguments,
+            "_controller_capability": self.controller_capability,
+        }
+
     def _finding_id_for(
         self, base: str, artifact_path: str, *, force_suffix: bool = False
     ) -> str:
@@ -9708,11 +12612,13 @@ class Investigation:
     def _audit(self, py: SshMcpClient, kind: str, payload: dict[str, Any]) -> None:
         py.call_tool(
             "audit_append",
-            {
-                "path": self.audit_path,
-                "kind": kind,
-                "payload": payload,
-            },
+            self._controller_args(
+                {
+                    "path": self.audit_path,
+                    "kind": kind,
+                    "payload": payload,
+                }
+            ),
         )
         # Optional demo pacing: FIND_EVIL_PACE=<seconds> spaces audit appends so
         # the live dashboard's stage rail / timeline build visibly even when the
@@ -10069,6 +12975,98 @@ class Investigation:
             else rust.call_tool(tool, args)
         )
 
+    def _reserve_custody_case_dir(self) -> None:
+        """Create or verify the launcher's private case reservation.
+
+        The Python MCP is a signing/writing authority, so every transport gets
+        an exact case directory and ownership marker before that server starts.
+        An existing markerless directory is never adopted: doing so would let a
+        caller redirect audit/manifest writes into arbitrary pre-existing data.
+        """
+        if _is_native_windows():
+            raise RuntimeError(
+                "native Windows custody is disabled until private DACLs and an "
+                "interprocess audit lock can be verified; run VERDICT in WSL2 or Docker"
+            )
+        marker_name = ".verdict-case-marker"
+        if LOCAL_MODE or DOCKER_MODE:
+            root = Path(LOCAL_RUNS_DIR)
+            root.mkdir(parents=True, exist_ok=True)
+            case_dir = Path(self.case_dir)
+            try:
+                if case_dir.parent.resolve(strict=True) != root.resolve(strict=True):
+                    raise RuntimeError(
+                        "reserved case directory is outside the case root"
+                    )
+            except OSError as exc:
+                raise RuntimeError(f"cannot resolve reserved case root: {exc}") from exc
+
+            current = Path(case_dir.anchor)
+            for part in case_dir.parts[1:]:
+                current /= part
+                try:
+                    metadata = os.lstat(current)
+                except FileNotFoundError:
+                    break
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise RuntimeError(
+                        f"reserved case directory contains a symlink: {current}"
+                    )
+
+            if os.path.lexists(case_dir):
+                metadata = os.lstat(case_dir)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise RuntimeError("reserved case path is not a real directory")
+                marker = case_dir / marker_name
+                try:
+                    marker_metadata = os.lstat(marker)
+                except FileNotFoundError:
+                    raise RuntimeError(
+                        "existing case directory lacks the launcher ownership marker"
+                    ) from None
+                if (
+                    not stat.S_ISREG(marker_metadata.st_mode)
+                    or marker_metadata.st_nlink != 1
+                ):
+                    raise RuntimeError(
+                        "case ownership marker is not a private regular file"
+                    )
+                return
+
+            case_dir.mkdir(mode=0o700)
+            marker = case_dir / marker_name
+            with marker.open("xb"):
+                pass
+            if os.name != "nt":
+                case_dir.chmod(0o700)
+                marker.chmod(0o600)
+            return
+
+        case_q = shlex.quote(self.case_dir)
+        parent_q = shlex.quote(str(PurePosixPath(self.case_dir).parent))
+        marker_q = shlex.quote(f"{self.case_dir}/{marker_name}")
+        reserve = f"""
+set -eu
+umask 077
+mkdir -p -- {parent_q}
+if [ -L {case_q} ]; then
+  exit 73
+elif [ -e {case_q} ]; then
+  [ -d {case_q} ] && [ ! -L {marker_q} ] && [ -f {marker_q} ] || exit 73
+else
+  mkdir -- {case_q}
+  chmod 0700 -- {case_q}
+  (set -C; : > {marker_q})
+  chmod 0600 -- {marker_q}
+fi
+""".strip()
+        code, _stdout, stderr = ssh_run(reserve, timeout=30)
+        if code != 0:
+            raise RuntimeError(
+                "could not reserve private SIFT custody case directory "
+                f"(exit {code}): {stderr.strip()[:300]}"
+            )
+
     def _heartbeat(self, stage: str | None = None, **extra: Any) -> None:
         """Best-effort liveness write to ``<case_dir>/status.json``.
 
@@ -10336,7 +13334,14 @@ class Investigation:
         memory_available = evidence_type == "memory" or "memory" in inventory_classes
         evtx_available = evidence_type == "evtx" or "evtx" in inventory_classes
         disk_available = evidence_type == "disk" or bool(
-            inventory_classes & ({"raw_disk", "yara_target"} | EXTRACTED_DISK_CLASSES)
+            inventory_classes
+            & (
+                ({"raw_disk", "yara_target"} | EXTRACTED_DISK_CLASSES)
+                - BROWSER_INVENTORY_CLASSES
+            )
+        )
+        browser_available = evidence_type == "browser" or bool(
+            inventory_classes & BROWSER_INVENTORY_CLASSES
         )
         network_available = evidence_type == "network" or bool(
             inventory_classes & NETWORK_CLASSES
@@ -10407,6 +13412,15 @@ class Investigation:
                 else "no disk image supplied; execution/persistence corroboration is limited",
             },
             {
+                "artifact_class": "browser_history",
+                "available": browser_available,
+                "touched": "browser_history" in tools_run,
+                "tools": sorted(tools_run & {"browser_history"}),
+                "confidence_impact": "browser visit, download, and account-store metadata available"
+                if browser_available
+                else "no supported browser database supplied",
+            },
+            {
                 "artifact_class": "network",
                 "available": network_available,
                 "touched": bool(
@@ -10450,14 +13464,124 @@ class Investigation:
         code, _, _ = ssh_run(f"test -d {shlex.quote(self.evidence)}", timeout=10)
         return code == 0
 
-    def case_open_directory(self, py: SshMcpClient) -> None:
-        print("\n=== case inventory ===")
-        ssh_run(f"mkdir -p {shlex.quote(self.case_dir)}")
-        if Path(self.evidence).is_dir():
+    def _prepare_directory_inventory(self) -> dict[str, Any]:
+        """Build custody inventory before MCP spawn so its hash binding is inherited."""
+        if self.evidence_inventory is not None:
+            return self.evidence_inventory
+        # The evidence path belongs to the active transport namespace. A Docker
+        # or SIFT guest path (commonly ``/evidence``) can coincidentally exist on
+        # the host; consulting host Path.is_dir() would then hash unrelated host
+        # bytes and create a forged custody/browser binding. Only local mode may
+        # inventory through the host filesystem.
+        if LOCAL_MODE:
             inventory = build_local_evidence_inventory(self.evidence)
         else:
             inventory = build_remote_evidence_inventory(self.evidence)
         self.evidence_inventory = inventory
+        return inventory
+
+    def _prepare_case_open_reservation(
+        self, evidence_type: str
+    ) -> tuple[str | None, dict[str, str]]:
+        """Build the trusted pre-registration binding inherited by Rust MCP.
+
+        `case_open` cannot trust a model-selected host path to establish its
+        own authority. The launcher therefore hashes the operator-selected
+        source first. Directory cases reuse their bounded custody inventory;
+        split EWF first segments additionally get a concatenated-stream digest.
+        """
+        if evidence_type != "directory":
+            binding, expected = (
+                single_evidence_registration(self.evidence)
+                if LOCAL_MODE
+                else remote_single_evidence_registration(self.evidence)
+            )
+            return binding, {
+                self.evidence: expected,
+                str(Path(self.evidence).resolve())
+                if LOCAL_MODE
+                else self.evidence: expected,
+            }
+
+        inventory = self._prepare_directory_inventory()
+        artifacts_by_path: dict[str, str] = {}
+        expected_by_path: dict[str, str] = {}
+        for entry in inventory_supported_entries(inventory):
+            path = str(entry.get("canonical_path") or entry.get("path") or "")
+            digest = str(entry.get("sha256") or "").lower()
+            if not path or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                continue
+            previous = artifacts_by_path.get(path)
+            if previous is not None and previous != digest:
+                raise ValueError("directory intake has conflicting path hash bindings")
+            artifacts_by_path[path] = digest
+            expected_by_path[path] = digest
+            original = str(entry.get("path") or "")
+            if original:
+                expected_by_path[original] = digest
+
+        # `case_open` hashes the concatenated E01+E02+... stream, not the first
+        # inventory entry alone. Re-hash each visible first segment with the
+        # same discovery rule and merge its exact segment reservation.
+        first_ewf_paths = sorted(
+            {
+                str(entry.get("canonical_path") or entry.get("path"))
+                for entry in inventory_supported_entries(inventory)
+                if re.fullmatch(
+                    r"(?i)(e|ex)0*1",
+                    PurePosixPath(
+                        str(entry.get("canonical_path") or entry.get("path") or "")
+                    ).suffix.lstrip("."),
+                )
+            }
+        )
+        for first_path in first_ewf_paths:
+            ewf_binding, expected = (
+                single_evidence_registration(first_path)
+                if LOCAL_MODE
+                else remote_single_evidence_registration(first_path)
+            )
+            for artifact in json.loads(ewf_binding)["artifacts"]:
+                path = str(artifact["path"])
+                digest = str(artifact["sha256"])
+                previous = artifacts_by_path.get(path)
+                if previous is not None and previous != digest:
+                    raise ValueError(
+                        "split EWF binding conflicts with intake inventory"
+                    )
+                artifacts_by_path[path] = digest
+            expected_by_path[first_path] = expected
+            for entry in inventory_supported_entries(inventory):
+                canonical = str(entry.get("canonical_path") or entry.get("path") or "")
+                if canonical == first_path and entry.get("path"):
+                    expected_by_path[str(entry["path"])] = expected
+
+        artifacts = [
+            {"path": path, "sha256": digest}
+            for path, digest in sorted(artifacts_by_path.items())
+        ]
+        binding = json.dumps(
+            {"artifacts": artifacts}, separators=(",", ":"), sort_keys=True
+        )
+        if len(binding.encode("utf-8")) > ARTIFACT_CASE_BINDING_MAX_BYTES:
+            raise ValueError("case-open directory reservation exceeds the byte limit")
+        return binding, expected_by_path
+
+    def _expected_case_open_sha256(self, path: str) -> str | None:
+        expected = self.case_open_expected_sha256.get(path)
+        if expected is not None:
+            return expected
+        if LOCAL_MODE:
+            try:
+                return self.case_open_expected_sha256.get(str(Path(path).resolve()))
+            except OSError:
+                return None
+        return None
+
+    def case_open_directory(self, py: SshMcpClient) -> None:
+        print("\n=== case inventory ===")
+        ssh_run(f"mkdir -p {shlex.quote(self.parser_case_dir)}")
+        inventory = self._prepare_directory_inventory()
         total_bytes = sum(
             int(entry.get("size_bytes") or 0)
             for entry in inventory_supported_entries(inventory)
@@ -10522,8 +13646,8 @@ class Investigation:
 
     def case_open(self, rust: SshMcpClient, py: SshMcpClient) -> None:
         print("\n=== case_open ===")
-        # Make sure case dir exists in VM
-        ssh_run(f"mkdir -p {shlex.quote(self.case_dir)}")
+        # Make sure the parser-only staging dir exists in the active guest.
+        ssh_run(f"mkdir -p {shlex.quote(self.parser_case_dir)}")
         self._audit(
             py,
             "agent_message",
@@ -10542,6 +13666,10 @@ class Investigation:
             "image_path": self.evidence,
             "label": Path(self.evidence).parent.name,
         }
+        expected_sha256 = self._expected_case_open_sha256(self.evidence)
+        if expected_sha256 is None:
+            raise RuntimeError("case_open lacks a launcher-pinned expected SHA-256")
+        case_open_args["expected_sha256"] = expected_sha256
         self.handle = rust.call_tool("case_open", case_open_args)
         if "_error" in self.handle:
             raise RuntimeError(f"case_open failed: {self.handle['_error']}")
@@ -10550,7 +13678,7 @@ class Investigation:
             "case_open",
             self.handle["image_hash"],
             {
-                "case_id": self.handle["id"],
+                "case_id": self.case_id,
                 "size_bytes": self.handle["image_size_bytes"],
                 # Authoritative evidence type for the dashboard's evidence
                 # banner (UI otherwise guesses from the file extension).
@@ -11016,6 +14144,188 @@ class Investigation:
             mal or {}, separators=(",", ":")
         )
 
+    def _host_visible_evidence_path(self, container_or_host_path: str) -> str | None:
+        """Resolve a non-Docker path the host process can read for staging.
+
+        Docker paths are never translated back to host paths: doing so would
+        make the host a file-copy deputy for a compromised parser. Docker-only
+        staging stays entirely inside the parser container.
+        """
+        if not container_or_host_path:
+            return None
+        if DOCKER_MODE:
+            return None
+        direct = Path(container_or_host_path)
+        return str(direct) if direct.is_file() else None
+
+    def _hayabusa_stage_single_files(
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        paths: list[str],
+    ) -> None:
+        """Stage one or more lone .evtx files into a temp directory and Sigma-scan.
+
+        ``hayabusa_scan`` requires a directory. Staging under the case dir keeps
+        paths case-local and avoids mutating source evidence (symlink when
+        possible, copy as fallback). Docker mode never writes from the host into
+        parser-writable state; it creates symlinks entirely inside the container.
+        """
+        if DOCKER_MODE:
+            selected = [
+                str(path) for path in paths if str(path).startswith("/evidence/")
+            ]
+            if not selected:
+                return
+            stage_container = (
+                f"{self.parser_case_dir}/hayabusa-stage/batch-{uuid.uuid4().hex[:10]}"
+            )
+            commands = [
+                "set -eu",
+                "umask 077",
+                f"mkdir -p -- {shlex.quote(stage_container)}",
+            ]
+            for index, source in enumerate(selected):
+                basename = PurePosixPath(source.replace("\\", "/")).name or "event.evtx"
+                destination = f"{stage_container}/{index:04d}-{basename}"
+                commands.extend(
+                    (
+                        f"test -f {shlex.quote(source)}",
+                        f"ln -s -- {shlex.quote(source)} {shlex.quote(destination)}",
+                    )
+                )
+            code, _stdout, stderr = ssh_run(" && ".join(commands), timeout=30)
+            if code != 0:
+                self.analysis_limitations.append(
+                    f"hayabusa container-local stage failed: {stderr[:240]}"
+                )
+                return
+            self.investigate_hayabusa_dir(rust, py, stage_container)
+            return
+
+        resolved: list[tuple[str, str]] = []
+        for p in paths:
+            if not p:
+                continue
+            host_src = self._host_visible_evidence_path(p)
+            if host_src:
+                resolved.append((p, host_src))
+        if not resolved:
+            return
+        stage_host = (
+            Path(self.audit_path).parent
+            / "hayabusa-stage"
+            / f"batch-{uuid.uuid4().hex[:10]}"
+        )
+        stage_container = str(stage_host)
+        try:
+            stage_host.mkdir(parents=True, exist_ok=True)
+            for _container_src, host_src in resolved:
+                dest = stage_host / PurePosixPath(host_src.replace("\\", "/")).name
+                if dest.exists():
+                    continue
+                try:
+                    dest.symlink_to(host_src)
+                except OSError:
+                    shutil.copy2(host_src, dest)
+            self.investigate_hayabusa_dir(rust, py, stage_container)
+        except OSError as exc:
+            self.analysis_limitations.append(
+                f"hayabusa single-file stage failed: {exc}"
+            )
+
+    def _fuse_disk_memory_execution(self, py: SshMcpClient) -> None:
+        """Emit same-host disk↔memory execution corroboration leads.
+
+        Prefetch executables that also appear in pslist/psscan get a second-class
+        corroboration upgrade path; memory-only processes with no Prefetch match
+        stay HYPOTHESIS (unprefetched/manual execution lead). Pure audit-chain
+        findings — no new tool calls.
+        """
+        print("\n=== disk+memory execution fusion ===")
+        mem_names: set[str] = set()
+        mem_tcids: list[str] = []
+        for tc in self.tool_calls:
+            tool = tc.get("tool")
+            if tool not in {"vol_pslist", "vol_psscan", "vol_psxview"}:
+                continue
+            tid = str(tc.get("tool_call_id") or "")
+            if tid:
+                mem_tcids.append(tid)
+            # Recover process names from timeline events for this tool call.
+        for ev in self.timeline_events:
+            if ev.get("artifact_class") != "memory":
+                continue
+            desc = str(ev.get("description") or "")
+            # "process start: NAME pid=..."
+            if desc.startswith("process start:"):
+                part = desc.split("process start:", 1)[-1].strip()
+                name = part.split(" pid=")[0].strip().lower()
+                if name and name != "unknown":
+                    mem_names.add(PurePosixPath(name.replace("\\", "/")).name)
+
+        pf_names: dict[str, str] = {}
+        for exe_base, finding in self._prefetch_exec_findings:
+            pf_names[str(exe_base).lower()] = str(finding.get("tool_call_id") or "")
+
+        if not mem_names and not pf_names:
+            print("  fusion: no memory process names or Prefetch leads to fuse")
+            return
+
+        both = sorted(n for n in mem_names if n in pf_names)
+        mem_only = sorted(n for n in mem_names if n not in pf_names)[:15]
+        if both and mem_tcids:
+            # Upgrade matching Prefetch findings when a second class exists.
+            for exe_base, finding in self._prefetch_exec_findings:
+                if str(exe_base).lower() not in both:
+                    continue
+                pf_tcid = str(finding.get("tool_call_id") or "")
+                if not pf_tcid:
+                    continue
+                derived = list(finding.get("derived_from") or [pf_tcid])
+                for mt in mem_tcids[:2]:
+                    if mt not in derived:
+                        derived.append(mt)
+                finding["derived_from"] = derived
+                finding["confidence"] = "CONFIRMED"
+                finding["description"] = (
+                    str(finding.get("description") or "")
+                    + " Cross-class fusion: same executable name appears in memory "
+                    f"process list (tool_call {mem_tcids[0]}) — two artifact classes "
+                    "support execution."
+                )
+            print(f"  fusion: CONFIRMED upgrade for {len(both)} name(s): {both[:8]}")
+        if mem_only and mem_tcids:
+            sample = ", ".join(mem_only[:8])
+            self.findings_pool_b.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        "f-B-mem-unprefetched", mem_tcids[0]
+                    ),
+                    "tool_call_id": mem_tcids[0],
+                    "artifact_path": str(
+                        (self.evidence_inventory or {}).get("canonical_root")
+                        or self.evidence
+                        or "memory"
+                    ),
+                    "description": (
+                        f"{len(mem_only)} process image name(s) appear in memory "
+                        f"views without a matching Prefetch lead (sample: {sample}). "
+                        "This can indicate unprefetched/scripted/manual execution or "
+                        "smear/timing — HYPOTHESIS lead only until disk Prefetch/Amcache "
+                        "or EVTX process-creation corroborates."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1059",
+                    "derived_from": mem_tcids[:2],
+                }
+            )
+            print(
+                f"  fusion: HYPOTHESIS unprefetched memory processes n={len(mem_only)}"
+            )
+
     def investigate_hayabusa_dir(
         self, rust: SshMcpClient, py: SshMcpClient, evtx_dir: str
     ) -> None:
@@ -11290,8 +14600,18 @@ class Investigation:
                 "image_path": evidence_path,
                 "label": Path(evidence_path).name,
             }
-            if disk_inventory_entry and disk_inventory_entry.get("sha256"):
-                case_open_args["expected_sha256"] = str(disk_inventory_entry["sha256"])
+            expected_sha256 = self._expected_case_open_sha256(evidence_path)
+            if expected_sha256 is None and disk_inventory_entry:
+                expected_sha256 = inventory_sha256_for_case_open(
+                    evidence_path, str(disk_inventory_entry.get("sha256") or "")
+                )
+            if expected_sha256 is None:
+                self.analysis_limitations.append(
+                    "Disk child case registration lacked a launcher-pinned SHA-256; "
+                    "the disk remains custody-only."
+                )
+                return
+            case_open_args["expected_sha256"] = expected_sha256
             opened = rust.call_tool("case_open", case_open_args)
             if isinstance(opened, dict) and "_error" not in opened and opened.get("id"):
                 disk_case_id = opened["id"]
@@ -11347,6 +14667,23 @@ class Investigation:
             mount_extra["mount_id"] = mounted["mount_id"]
         if mounted.get("fs_root"):
             mount_extra["fs_root"] = mounted["fs_root"]
+        raw_partitions = mounted.get("partitions", [])
+        partitions = (
+            [
+                dict(partition)
+                for partition in raw_partitions
+                if isinstance(partition, dict)
+            ]
+            if isinstance(raw_partitions, list)
+            else []
+        )
+        mount_extra["partition_count"] = len(partitions)
+        mount_extra["partitions"] = partitions
+        partition_enumeration_error = mounted.get("partition_enumeration_error")
+        if partition_enumeration_error:
+            mount_extra["partition_enumeration_error"] = str(
+                partition_enumeration_error
+            )
         if mount_error:
             mount_extra["error"] = mount_error
         self._record_tool(
@@ -11377,7 +14714,87 @@ class Investigation:
             print(f"  disk_mount error: {mount_error[:120]}")
             return
 
+        if partition_enumeration_error:
+            limitation = (
+                "Disk partition enumeration was incomplete after the read-only "
+                "mount; one or more partitions may remain unexamined. "
+                f"disk_mount reported: {partition_enumeration_error}"
+            )
+            self.analysis_limitations.append(limitation)
+            self._audit(
+                py,
+                "agent_message",
+                {
+                    "role": "supervisor",
+                    "content": limitation,
+                    "artifact_path": evidence_path,
+                    "partition_enumeration_error": str(partition_enumeration_error),
+                },
+            )
+
+        if len(partitions) > 1:
+            unexamined_partition_count = len(partitions) - 1
+            limitation = (
+                f"disk_mount identified {len(partitions)} filesystem partitions; "
+                "automatic extraction examined only the primary partition. "
+                f"{unexamined_partition_count} additional partition(s) remain "
+                "unexamined and require separate read-only extraction."
+            )
+            self.analysis_limitations.append(limitation)
+            self._audit(
+                py,
+                "agent_message",
+                {
+                    "role": "supervisor",
+                    "content": limitation,
+                    "artifact_path": evidence_path,
+                    "partition_count": len(partitions),
+                    "partitions": partitions,
+                    "unexamined_partition_count": unexamined_partition_count,
+                },
+            )
+
         mount_id = str(mounted["mount_id"])
+        # VSS inventory (libvshadow): historical volume copies — degrades cleanly.
+        vss_args = {"case_id": disk_case_id, "image_path": evidence_path}
+        vss_out = rust.call_tool("vss_list", vss_args, timeout=600.0)
+        if isinstance(vss_out, dict):
+            vss_err = (
+                vss_out.get("_error", {}).get("message")
+                if "_error" in vss_out
+                else None
+            )
+            self._record_tool(
+                py,
+                "vss_list",
+                self._output_hash(vss_out),
+                {
+                    "artifact_path": evidence_path,
+                    "vshadowinfo_available": vss_out.get("vshadowinfo_available"),
+                    "has_shadow_store": vss_out.get("has_shadow_store"),
+                    "store_count": vss_out.get("store_count", 0),
+                    **({"error": vss_err} if vss_err else {}),
+                },
+                arguments=vss_args,
+            )
+            if vss_out.get("vshadowinfo_available") is False:
+                self.analysis_limitations.append(
+                    "vss_list: libvshadow (vshadowinfo) unavailable; Volume Shadow "
+                    "Copy enumeration skipped."
+                )
+            elif (
+                vss_out.get("has_shadow_store")
+                and int(vss_out.get("store_count") or 0) > 0
+            ):
+                print(
+                    f"  vss_list: {vss_out.get('store_count')} shadow store(s) present "
+                    "(historical volume recovery available via vss_mount)"
+                )
+            if vss_err:
+                self.analysis_limitations.append(
+                    f"vss_list failed for {evidence_path}: {vss_err}"
+                )
+
         extracted_entries: list[dict[str, Any]] = []
         try:
             extract_args = {
@@ -11394,6 +14811,22 @@ class Investigation:
                 else None
             )
             artifacts = extracted.get("artifacts", []) if not extract_error else []
+            raw_limit_reasons = extracted.get("limit_reasons", [])
+            extract_limit_reasons = (
+                [str(reason) for reason in raw_limit_reasons if str(reason).strip()]
+                if isinstance(raw_limit_reasons, list)
+                else []
+            )
+            artifacts_skipped_limit = int(extracted.get("artifacts_skipped_limit") or 0)
+            artifacts_skipped_total_limit = int(
+                extracted.get("artifacts_skipped_total_limit") or 0
+            )
+            artifacts_extraction_failed = int(
+                extracted.get("artifacts_extraction_failed") or 0
+            )
+            extract_truncated = bool(extracted.get("truncated", False))
+            listing_truncated = bool(extracted.get("listing_truncated", False))
+            listing_limit_reason = extracted.get("listing_limit_reason")
             self._record_tool(
                 py,
                 "disk_extract_artifacts",
@@ -11401,9 +14834,22 @@ class Investigation:
                 {
                     "mount_id": mount_id,
                     "artifact_count": len(artifacts),
+                    "artifact_candidates_seen": extracted.get(
+                        "artifact_candidates_seen", len(artifacts)
+                    ),
+                    "artifacts_skipped_limit": artifacts_skipped_limit,
                     "artifacts_skipped_oversize": extracted.get(
                         "artifacts_skipped_oversize", 0
                     ),
+                    "artifacts_skipped_total_limit": artifacts_skipped_total_limit,
+                    "artifacts_extraction_failed": artifacts_extraction_failed,
+                    "truncated": extract_truncated,
+                    "limit_reasons": extract_limit_reasons,
+                    "requested_limit": extracted.get("requested_limit"),
+                    "effective_limit": extracted.get("effective_limit"),
+                    "limits_clamped": extracted.get("limits_clamped", False),
+                    "listing_truncated": listing_truncated,
+                    "listing_limit_reason": listing_limit_reason,
                     "max_artifact_bytes": extracted.get("max_artifact_bytes"),
                     "deleted_entries_seen": extracted.get("deleted_entries_seen", 0),
                     "deleted_recovered": extracted.get("deleted_recovered", 0),
@@ -11423,6 +14869,50 @@ class Investigation:
                 )
                 print(f"  disk_extract_artifacts error: {extract_error[:120]}")
                 return
+            partial_extraction = bool(
+                extract_truncated
+                or listing_truncated
+                or artifacts_skipped_limit
+                or artifacts_skipped_total_limit
+                or artifacts_extraction_failed
+            )
+            if partial_extraction:
+                effective_reasons = list(extract_limit_reasons)
+                if (
+                    listing_limit_reason
+                    and str(listing_limit_reason) not in effective_reasons
+                ):
+                    effective_reasons.append(str(listing_limit_reason))
+                reason_text = (
+                    ",".join(effective_reasons) or "server_reported_truncation"
+                )
+                skipped_oversize_for_limit = int(
+                    extracted.get("artifacts_skipped_oversize") or 0
+                )
+                limitation = (
+                    "disk_extract_artifacts reported partial coverage for "
+                    f"{evidence_path}: reasons={reason_text}; "
+                    f"skipped_by_count={artifacts_skipped_limit}; "
+                    f"skipped_oversize={skipped_oversize_for_limit}; "
+                    f"skipped_by_aggregate={artifacts_skipped_total_limit}. "
+                    f"extraction_failed={artifacts_extraction_failed}. "
+                    "Additional disk candidates may remain unexamined."
+                )
+                self.analysis_limitations.append(limitation)
+                self._audit(
+                    py,
+                    "agent_message",
+                    {
+                        "role": "supervisor",
+                        "content": limitation,
+                        "artifact_path": evidence_path,
+                        "limit_reasons": effective_reasons,
+                        "artifacts_skipped_limit": artifacts_skipped_limit,
+                        "artifacts_skipped_oversize": skipped_oversize_for_limit,
+                        "artifacts_skipped_total_limit": artifacts_skipped_total_limit,
+                        "artifacts_extraction_failed": artifacts_extraction_failed,
+                    },
+                )
             skipped_oversize = int(extracted.get("artifacts_skipped_oversize") or 0)
             if skipped_oversize:
                 self.analysis_limitations.append(
@@ -11494,6 +14984,14 @@ class Investigation:
             # set; parse them off the live mount before unmount (no other product
             # tool reads .dbx).
             self.investigate_oe_dbx_stores(rust, py, mounted.get("fs_root"))
+            # Opt-in whole-mount recursive YARA (beyond extracted yara-targets).
+            # Must run while fs_root is still mounted; default-off for cost.
+            self._run_disk_yara_whole_mount(
+                rust,
+                py,
+                disk_case_id=disk_case_id,
+                fs_root=mounted.get("fs_root"),
+            )
             if not extracted_entries and not evtx_entries:
                 # No live-filesystem artifacts extracted — still run free-space
                 # feature recovery over the raw image, which is exactly the
@@ -11568,6 +15066,8 @@ class Investigation:
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedMRU",
                 r"Software\Microsoft\Windows\Shell\BagMRU",
                 r"Software\Microsoft\Windows\ShellNoRoam\BagMRU",
+                # Per-user mount-point history for removable volumes (USB drive letters).
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2",
             ]
         if name == "usrclass.dat":
             return [
@@ -12049,6 +15549,50 @@ class Investigation:
             self.findings_pool_b.append(finding)
             print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
 
+    def _emit_setupapi_usb_findings(
+        self,
+        candidates: list[dict[str, Any]],
+        log_path: str,
+        tcid: str,
+    ) -> None:
+        """Emit Pool-B HYPOTHESIS USB install leads from setupapi.dev.log text.
+
+        Secondary source when USBSTOR is empty. Device install is normal on most
+        hosts — never CONFIRMED from setupapi alone.
+        """
+        for cand in candidates:
+            if cand.get("kind") != "setupapi_usb":
+                continue
+            device = str(cand.get("device") or "usb-device")
+            safe = (
+                re.sub(r"[^a-z0-9]+", "-", device.lower()).strip("-")[:48] or "device"
+            )
+            when = cand.get("install_time_iso") or "unknown-time"
+            finding = {
+                "case_id": self.handle["id"],
+                "finding_id": self._finding_id_for(
+                    f"f-B-setupapi-usb-{safe}", log_path, force_suffix=True
+                ),
+                "tool_call_id": tcid,
+                "artifact_path": log_path,
+                "description": (
+                    "hypothesis: Windows setupapi device-install log records a USB "
+                    f"or removable-storage install event: {device} (install section "
+                    f"time {when}, source {log_path}). setupapi.dev.log survives when "
+                    "USBSTOR registry keys are sparse/empty and is a classic secondary "
+                    "source for removable-media insertion history. Install alone proves "
+                    "the device was registered with PnP — not that data was transferred."
+                ),
+                "confidence": "HYPOTHESIS",
+                "pool_origin": "B",
+                "mitre_technique": "T1052.001",
+                "derived_from": [tcid],
+            }
+            self.findings_pool_b.append(finding)
+            print(
+                f"  pool-B setupapi USB finding: {finding['finding_id']} (HYPOTHESIS)"
+            )
+
     def _emit_mft_hacking_tool_finding(
         self,
         candidates: list[dict[str, Any]],
@@ -12409,11 +15953,57 @@ class Investigation:
         """
         if not fs_root:
             return
-        try:
-            root = Path(fs_root)
-            dbx_files = sorted(root.rglob("*.dbx"))[:300] if root.exists() else []
-        except OSError:
+        if DOCKER_MODE:
+            self.analysis_limitations.append(
+                "Docker DBX live-mount enumeration was skipped because parser-returned "
+                "mount paths are never traversed by the host; extract DBX artifacts with "
+                "a typed in-container lane or use local/SIFT."
+            )
             return
+        root = Path(fs_root)
+        walker = BoundedEvidenceWalk(root, limits=DBX_EVIDENCE_WALK_LIMITS)
+        dbx_files: list[tuple[Path, os.stat_result]] = []
+        rejected_paths = 0
+        result_limit_reached = False
+        for candidate in walker:
+            if candidate.kind.startswith("rejected_"):
+                rejected_paths += 1
+                continue
+            if candidate.kind != "file" or candidate.path.suffix != ".dbx":
+                continue
+            metadata = candidate.metadata
+            if metadata is None:
+                rejected_paths += 1
+                continue
+            try:
+                current_metadata = candidate.path.lstat()
+            except OSError:
+                rejected_paths += 1
+                continue
+            if (
+                not stat.S_ISREG(current_metadata.st_mode)
+                or stat.S_ISLNK(current_metadata.st_mode)
+                or _metadata_snapshot(current_metadata) != _metadata_snapshot(metadata)
+                or current_metadata.st_nlink != metadata.st_nlink
+                or metadata.st_nlink != 1
+            ):
+                rejected_paths += 1
+                continue
+            dbx_files.append((candidate.path, metadata))
+            if len(dbx_files) >= DBX_FILE_LIMIT:
+                result_limit_reached = True
+                break
+        if walker.truncated or result_limit_reached:
+            reasons = ", ".join(walker.truncation_reasons) or "DBX result limit"
+            self.analysis_limitations.append(
+                "DBX discovery stopped at a filesystem safety limit "
+                f"({reasons}); unvisited stores remain unexamined."
+            )
+        elif rejected_paths:
+            self.analysis_limitations.append(
+                f"DBX discovery rejected {rejected_paths} symlink, loop, or "
+                "non-regular path(s); those paths were not parsed."
+            )
         if not dbx_files:
             return
         staging = Path(self.audit_path).parent / "oe_dbx_stores"
@@ -12423,13 +16013,29 @@ class Investigation:
             return
         hacking_stores: list[tuple[str, str, dict[str, Any]]] = []
         parsed_stores: list[dict[str, Any]] = []
-        for index, dbx in enumerate(dbx_files):
+        staged_bytes = 0
+        staging_rejections = 0
+        for index, (dbx, expected_metadata) in enumerate(dbx_files):
             # Persist the store outside the mount so the cited path survives unmount.
             persisted = staging / f"{index:03d}_{dbx.name}"
+            remaining_bytes = DBX_TOTAL_MAX_BYTES - staged_bytes
+            if remaining_bytes <= 0:
+                self.analysis_limitations.append(
+                    "DBX staging stopped at the aggregate byte safety limit; "
+                    "remaining stores were not parsed."
+                )
+                break
             try:
-                shutil.copyfile(dbx, persisted)
-            except OSError:
+                copied = copy_regular_file_bounded(
+                    dbx,
+                    persisted,
+                    expected_metadata=expected_metadata,
+                    max_bytes=min(DBX_FILE_MAX_BYTES, remaining_bytes),
+                )
+            except (OSError, ValueError):
+                staging_rejections += 1
                 continue
+            staged_bytes += copied
             args = {"case_id": self.handle["id"], "artifact_path": str(persisted)}
             out = rust.call_tool("oe_dbx_parse", args)
             error = out.get("_error", {}).get("message") if "_error" in out else None
@@ -12464,6 +16070,11 @@ class Investigation:
                 )
                 if out.get("hacking_newsgroups"):
                     hacking_stores.append((str(persisted), tcid, out))
+        if staging_rejections:
+            self.analysis_limitations.append(
+                f"DBX staging rejected {staging_rejections} changed, oversized, "
+                "or unreadable store(s); those stores were not parsed."
+            )
         deleted_candidates = oe_dbx_deleted_email_candidates(parsed_stores)
         print(
             f"  oe_dbx_parse: {len(dbx_files)} .dbx store(s), "
@@ -12623,9 +16234,9 @@ class Investigation:
         observed_terms = [
             str(t) for t in (primary.get("observed_terms") or []) if str(t).strip()
         ]
-        snippets = [
-            str(s) for s in (primary.get("snippets") or []) if str(s).strip()
-        ][:4]
+        snippets = [str(s) for s in (primary.get("snippets") or []) if str(s).strip()][
+            :4
+        ]
         feature_types_text = ", ".join(feature_types) if feature_types else "feature"
         terms_text = ", ".join(observed_terms) if observed_terms else "none"
         snippets_text = (
@@ -12786,6 +16397,21 @@ class Investigation:
                 )
         for evtx_dir in hayabusa_dirs[:5]:
             self.investigate_hayabusa_dir(rust, py, evtx_dir)
+        # Single-log Sigma sweep: hayabusa is directory-based; stage orphans so
+        # a lone .evtx still gets a high-level rule pass (closes PLAYBOOK gap).
+        for parent, count in list(evtx_parent_counts.items())[:20]:
+            if count >= 2 or not parent or parent == ".":
+                continue
+            self._hayabusa_stage_single_files(
+                rust,
+                py,
+                [
+                    str(e["path"])
+                    for e in evtx_entries
+                    if str(PurePosixPath(str(e["path"]).replace("\\", "/")).parent)
+                    == parent
+                ][:5],
+            )
 
     def _run_bulk_extract(
         self,
@@ -12805,10 +16431,10 @@ class Investigation:
             "case_id": disk_case_id,
             "image_path": str(image_path),
             "scanners": ["email", "ntfsusn", "ntfsmft", "winprefetch"],
-            # SCHARDT-class images can produce tens of thousands of domain rows
-            # before email/rfc822 rows in the tool's stable sort. Keep the output
-            # bounded, but high enough for recovered mail context to reach the
-            # candidate selector.
+            # Browser-heavy disk images can produce tens of thousands of domain
+            # rows before email/rfc822 rows in the tool's stable sort. Keep the
+            # output bounded, but high enough for recovered mail context to reach
+            # the candidate selector.
             "limit": 100_000,
         }
         be_out = rust.call_tool("bulk_extract", be_args, timeout=1800.0)
@@ -12848,6 +16474,133 @@ class Investigation:
             candidates = bulk_extract_deleted_email_candidates(be_out, tcid)
             self._emit_bulk_extract_deleted_email_finding(candidates)
 
+    def _run_disk_yara_whole_mount(
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        *,
+        disk_case_id: str,
+        fs_root: Any,
+    ) -> None:
+        """Recursive YARA over the live mount root when opted in.
+
+        Default disk YARA only covers files ``disk_extract_artifacts`` classified
+        as yara-targets. Whole-mount mode calls the same typed ``yara_scan`` tool
+        with ``recursive=true`` on ``fs_root`` so implants outside the extract
+        budget can still surface. Off by default; degrades to a limitation when
+        rules, mount root, or the tool are missing/timeout.
+        """
+        if not disk_yara_whole_mount_enabled():
+            return
+        print("\n=== disk YARA whole-mount (opt-in recursive) ===")
+        if not DISK_YARA_RULES:
+            self.analysis_limitations.append(
+                "FIND_EVIL_DISK_YARA_WHOLE_MOUNT set but no disk YARA rules "
+                "(FIND_EVIL_DISK_YARA_RULES / assets/yara/disk-triage.yar); skipped."
+            )
+            print("  whole-mount YARA: skipped (no rules)")
+            return
+        root = str(fs_root or "").strip()
+        if not root:
+            self.analysis_limitations.append(
+                "FIND_EVIL_DISK_YARA_WHOLE_MOUNT set but disk_mount returned no "
+                "fs_root; whole-mount recursive YARA skipped."
+            )
+            print("  whole-mount YARA: skipped (no fs_root)")
+            return
+        timeout = disk_yara_whole_mount_timeout_s()
+        limit = disk_yara_whole_mount_limit()
+        args = {
+            "case_id": disk_case_id,
+            "target_path": root,
+            "rules_path": DISK_YARA_RULES,
+            "recursive": True,
+            "limit": limit,
+        }
+        out = rust.call_tool("yara_scan", args, timeout=timeout)
+        error = out.get("_error", {}).get("message") if "_error" in out else None
+        if error:
+            self.analysis_limitations.append(
+                f"whole-mount yara_scan failed for {root}: {error}"
+            )
+            out = {
+                "_error": {"message": error},
+                "matches": [],
+                "files_scanned": 0,
+                "rules_compiled": 0,
+                "scan_errors": 0,
+            }
+        matches = out.get("matches", [])
+        if not isinstance(matches, list):
+            matches = []
+        tcid = self._record_tool(
+            py,
+            "yara_scan",
+            self._output_hash(out),
+            {
+                "artifact_path": root,
+                "rules_path": DISK_YARA_RULES,
+                "whole_mount": True,
+                "recursive": True,
+                "matches_returned": len(matches),
+                "files_scanned": out.get("files_scanned", 0),
+                "rules_compiled": out.get("rules_compiled", 0),
+                "scan_errors": out.get("scan_errors", 0),
+                "limit": limit,
+                **({"error": error} if error else {}),
+            },
+            arguments=args,
+        )
+        # Leads only — same policy as extracted-target YARA.
+        if matches and not error:
+            sample_rules = sorted(
+                {
+                    str(m.get("rule_name") or m.get("rule") or "")
+                    for m in matches[:20]
+                    if isinstance(m, dict)
+                }
+                - {""}
+            )
+            sample_files = [
+                str(m.get("file_path") or "")
+                for m in matches[:5]
+                if isinstance(m, dict) and m.get("file_path")
+            ]
+            self.findings_pool_b.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        "f-B-yara-whole-mount", root, force_suffix=True
+                    ),
+                    "tool_call_id": tcid,
+                    "artifact_path": root,
+                    "description": (
+                        f"hypothesis: whole-mount recursive YARA returned "
+                        f"{len(matches)} match(es) under mount root {root} "
+                        f"(rules={DISK_YARA_RULES}, files_scanned="
+                        f"{out.get('files_scanned', 0)}). Sample rules: "
+                        f"{', '.join(sample_rules[:8]) or 'n/a'}. Sample paths: "
+                        f"{'; '.join(sample_files) or 'n/a'}. Treat as payload "
+                        "triage leads until corroborated with execution, "
+                        "persistence, or network evidence."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1204",
+                    "derived_from": [tcid],
+                }
+            )
+            print(
+                f"  whole-mount YARA: matches={len(matches)} "
+                f"files_scanned={out.get('files_scanned', 0)}"
+            )
+        else:
+            print(
+                f"  whole-mount YARA: matches={len(matches)} "
+                f"files_scanned={out.get('files_scanned', 0)}"
+                + (f" error={error[:80]}" if error else "")
+            )
+
     def investigate_extracted_disk_artifacts(
         self,
         rust: SshMcpClient,
@@ -12855,6 +16608,7 @@ class Investigation:
         entries: list[dict[str, Any]],
         image_path: str | None = None,
         disk_case_id: str | None = None,
+        register_browser_cases: bool = False,
     ) -> None:
         print("\n=== extracted disk artifact investigation ===")
         # ADDITIVE free-space feature-recovery lane: bulk_extract scans the raw
@@ -13574,13 +17328,77 @@ class Investigation:
                         )
                 print(f"  plaso_parse/{parser_name}: {path} events={len(events)}")
 
-        browser_entries = (by_class["browser_history"] + by_class["browser_db"])[:20]
+        browser_entries, skipped_browser_entries = prioritize_browser_entries(
+            by_class["browser_history"] + by_class["browser_db"],
+            limit=BROWSER_LANE_LIMIT,
+        )
+        if skipped_browser_entries:
+            self.analysis_limitations.append(
+                "Browser artifact triage examined "
+                f"{len(browser_entries)} database(s) at the {BROWSER_LANE_LIMIT}-item "
+                f"lane cap and skipped {skipped_browser_entries} candidate(s) after "
+                "prioritizing canonical browser database names and stable paths."
+            )
+        if register_browser_cases:
+            registered_entries: list[dict[str, Any]] = []
+            for entry in browser_entries:
+                path = browser_entry_path(entry)
+                sha256 = str(entry.get("sha256") or "")
+                if not path or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+                    self.analysis_limitations.append(
+                        f"Browser artifact registration skipped {path or '<missing path>'}: "
+                        "a custody SHA-256 was unavailable."
+                    )
+                    registered_entries.append(dict(entry))
+                    continue
+                case_open_args = {
+                    "image_path": path,
+                    "expected_sha256": sha256.lower(),
+                    "label": PurePosixPath(path.replace("\\", "/")).name,
+                }
+                opened = rust.call_tool("case_open", case_open_args)
+                error = (
+                    opened.get("_error", {}).get("message")
+                    if isinstance(opened, dict) and "_error" in opened
+                    else None
+                )
+                child_case_id = opened.get("id") if isinstance(opened, dict) else None
+                self._record_tool(
+                    py,
+                    "case_open",
+                    str(opened.get("image_hash") or self._output_hash(opened))
+                    if isinstance(opened, dict)
+                    else self._hash_obj(opened),
+                    {
+                        "case_id": child_case_id,
+                        "parent_case_id": self.handle["id"],
+                        "evidence_type": "browser_db",
+                        "size_bytes": opened.get("image_size_bytes")
+                        if isinstance(opened, dict)
+                        else None,
+                        **({"error": error} if error else {}),
+                    },
+                    arguments=case_open_args,
+                )
+                if error or not child_case_id:
+                    self.analysis_limitations.append(
+                        f"Browser artifact case registration failed for {path}: "
+                        f"{error or 'invalid case_open response'}"
+                    )
+                    registered_entries.append(dict(entry))
+                else:
+                    registered_entries.append(
+                        {**entry, "browser_case_id": str(child_case_id)}
+                    )
+            browser_entries = registered_entries
         browser_specs: list[tuple[str, dict[str, Any]]] = [
             (
                 "browser_history",
                 {
-                    "case_id": self.handle["id"],
-                    "history_path": str(e["path"]),
+                    "case_id": str(
+                        e.get("browser_case_id") or disk_case_id or self.handle["id"]
+                    ),
+                    "history_path": browser_entry_path(e),
                     "limit": 500,
                 },
             )
@@ -13590,51 +17408,49 @@ class Investigation:
         for entry, (_name, args), out in zip(
             browser_entries, browser_specs, browser_outs, strict=True
         ):
-            path = str(entry["path"])
+            path = str(args["history_path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
                 self.analysis_limitations.append(
                     f"browser_history failed for {path}: {error}"
                 )
                 out = {"_error": {"message": error}, "rows": [], "rows_seen": 0}
-            rows = out.get("rows", []) or []
+            raw_browser_rows = out.get("rows")
+            rows = raw_browser_rows if isinstance(raw_browser_rows, list) else []
+            if out.get("truncated") is True:
+                self.analysis_limitations.append(
+                    f"Browser artifact {path} hit its row limit; additional records "
+                    "were not returned and scoped clearance remains limited."
+                )
+            browser_summary = browser_artifact_audit_summary(out, path, error)
             tcid = self._record_tool(
                 py,
                 "browser_history",
                 self._output_hash(out),
-                {
-                    "artifact_path": path,
-                    "browser_family": out.get("browser_family"),
-                    "rows_seen": out.get("rows_seen", 0),
-                    **({"error": error} if error else {}),
-                },
+                browser_summary,
                 arguments=args,
             )
             _merge_disk_tool_summary(
                 disk_summary,
                 "browser_history",
                 tcid,
-                {
-                    "artifact_path": path,
-                    "browser_family": out.get("browser_family"),
-                    "rows_seen": out.get("rows_seen", 0),
-                    **({"error": error} if error else {}),
-                },
+                browser_summary,
             )
-            for row in rows[:8]:
-                ts = row.get("last_visit_time_iso")
-                if ts:
-                    self._timeline_add(
-                        ts,
-                        "browser_history",
-                        "browser_history",
-                        f"browser visit: {str(row.get('url', ''))[:80]}",
-                        tcid,
-                        {"visit_count": row.get("visit_count"), "history_path": path},
-                    )
+            for row in sample_browser_timeline_rows(rows, limit=8):
+                event = browser_timeline_projection(row, path)
+                if event is None:
+                    continue
+                self._timeline_add(
+                    event["ts"],
+                    "browser_history",
+                    "browser_history",
+                    event["summary"],
+                    tcid,
+                    event["metadata"],
+                )
             print(
                 f"  browser_history: {path} family={out.get('browser_family')} "
-                f"rows={out.get('rows_seen', 0)}"
+                f"kind={out.get('artifact_kind')} rows={out.get('rows_seen', 0)}"
             )
 
         registry_calls = 0
@@ -13906,6 +17722,440 @@ class Investigation:
                 f"  thumbcache_parse: {path} entries={out.get('entries_seen', 0)} named={len(named)}"
             )
 
+        # --- Wave-A productized parsers (registered MCP tools, now auto-driven) ---
+        # SRUM / BITS / WMI / email were extracted or extractable but never called
+        # from the engine; wire them so disk Cases surface their leads under custody.
+        srum_entries = by_class.get("srum", [])[:3]
+        for entry in srum_entries:
+            path = str(entry["path"])
+            args = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool("srum_parse", args, timeout=900.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"srum_parse failed for {path}: {error}"
+                )
+            rows = out.get("rows", []) if not error else []
+            top = out.get("top_talkers", []) if not error else []
+            tcid = self._record_tool(
+                py,
+                "srum_parse",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "esedbexport_available": out.get("esedbexport_available"),
+                    "row_count": out.get("row_count", len(rows)),
+                    "top_talker_count": len(top),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "srum_parse",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "row_count": out.get("row_count", len(rows)),
+                    "esedbexport_available": out.get("esedbexport_available"),
+                    "sample_apps": [
+                        t.get("app_id") for t in top[:5] if isinstance(t, dict)
+                    ],
+                    **({"error": error} if error else {}),
+                },
+            )
+            if out.get("esedbexport_available") is False:
+                self.analysis_limitations.append(
+                    "srum_parse: esedbexport unavailable; SRUM network-usage table not decoded "
+                    "(install libesedb / esedbexport or use the DFIR container)."
+                )
+            # High-egress lead only — never a CONFIRMED exfil claim from SRUM alone.
+            if top and not error and out.get("esedbexport_available") is not False:
+                lead = top[0] if isinstance(top[0], dict) else {}
+                sent = int(lead.get("bytes_sent") or 0)
+                if (
+                    sent >= 10_000_000
+                ):  # 10 MiB threshold — general DFIR lead, not image-specific
+                    app = str(lead.get("app_id") or "unknown-app")
+                    safe = (
+                        re.sub(r"[^a-z0-9]+", "-", app.lower()).strip("-")[:40] or "app"
+                    )
+                    self.findings_pool_b.append(
+                        {
+                            "case_id": self.handle["id"],
+                            "finding_id": self._finding_id_for(
+                                f"f-B-srum-egress-{safe}", path
+                            ),
+                            "tool_call_id": tcid,
+                            "artifact_path": path,
+                            "description": (
+                                f"SRUM network-usage table records application {app!r} with "
+                                f"bytes_sent={sent} (top egress in decoded table). This is a "
+                                "data-movement volume lead only — not proof of exfiltration; "
+                                "corroborate with staging + network evidence before any exfil claim."
+                            ),
+                            "confidence": "HYPOTHESIS",
+                            "pool_origin": "B",
+                            "mitre_technique": "T1041",
+                            "derived_from": [tcid],
+                            "asserted_values": [
+                                {
+                                    "path": "top_talkers[0].bytes_sent",
+                                    "expected": str(sent),
+                                    "match": "int",
+                                }
+                            ],
+                        }
+                    )
+            print(
+                f"  srum_parse: {path} rows={out.get('row_count', 0)} "
+                f"esedbexport={out.get('esedbexport_available')}"
+            )
+
+        bits_entries = by_class.get("bits", [])[:6]
+        for entry in bits_entries:
+            path = str(entry["path"])
+            args = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool("bits_parse", args, timeout=300.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"bits_parse failed for {path}: {error}"
+                )
+            tcid = self._record_tool(
+                py,
+                "bits_parse",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "format": out.get("format"),
+                    "is_bits": out.get("is_bits"),
+                    "url_count": out.get("url_count", 0),
+                    "suspicious_url_count": out.get("suspicious_url_count", 0),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "bits_parse",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "format": out.get("format"),
+                    "url_count": out.get("url_count", 0),
+                    "suspicious_url_count": out.get("suspicious_url_count", 0),
+                    "sample_urls": (out.get("urls") or [])[:5],
+                    **({"error": error} if error else {}),
+                },
+            )
+            sus = int(out.get("suspicious_url_count") or 0)
+            if out.get("is_bits") and sus > 0 and not error:
+                urls = out.get("urls") or []
+                sample = urls[0] if urls else "url"
+                self.findings_pool_a.append(
+                    {
+                        "case_id": self.handle["id"],
+                        "finding_id": self._finding_id_for(f"f-A-bits-sus-{sus}", path),
+                        "tool_call_id": tcid,
+                        "artifact_path": path,
+                        "description": (
+                            f"BITS job-queue state ({out.get('format')}) contains "
+                            f"{sus} URL(s) matching T1197 lead heuristics (raw-IP host "
+                            f"and/or executable path extension); sample={sample!r}. "
+                            "Lead only — not proof of malicious use; corroborate with "
+                            "file creation and execution evidence."
+                        ),
+                        "confidence": "HYPOTHESIS",
+                        "pool_origin": "A",
+                        "mitre_technique": "T1197",
+                        "derived_from": [tcid],
+                        "asserted_values": [
+                            {
+                                "path": "suspicious_url_count",
+                                "expected": str(sus),
+                                "match": "int",
+                            }
+                        ],
+                    }
+                )
+            print(
+                f"  bits_parse: {path} format={out.get('format')} "
+                f"urls={out.get('url_count', 0)} sus={sus}"
+            )
+
+        wmi_entries = by_class.get("wmi_repository", [])[:3]
+        for entry in wmi_entries:
+            path = str(entry["path"])
+            args = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool("wmi_persist_parse", args, timeout=600.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"wmi_persist_parse failed for {path}: {error}"
+                )
+            tcid = self._record_tool(
+                py,
+                "wmi_persist_parse",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "is_wmi_repository": out.get("is_wmi_repository"),
+                    "persistence_pattern_present": out.get(
+                        "persistence_pattern_present"
+                    ),
+                    "filter_count": out.get("filter_count", 0),
+                    "binding_count": out.get("binding_count", 0),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "wmi_persist_parse",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "persistence_pattern_present": out.get(
+                        "persistence_pattern_present"
+                    ),
+                    "consumer_classes": out.get("consumer_classes_found") or [],
+                    "sample_commands": (out.get("command_strings") or [])[:5],
+                    **({"error": error} if error else {}),
+                },
+            )
+            if out.get("persistence_pattern_present") and not error:
+                cmds = out.get("command_strings") or []
+                sample = cmds[0] if cmds else "consumer"
+                self.findings_pool_a.append(
+                    {
+                        "case_id": self.handle["id"],
+                        "finding_id": self._finding_id_for("f-A-wmi-persist", path),
+                        "tool_call_id": tcid,
+                        "artifact_path": path,
+                        "description": (
+                            "WMI CIM repository shows the T1546.003 subscription "
+                            "pattern (event consumer + filter + binding present). "
+                            f"Sample command/script surface: {sample!r}. Lead only — "
+                            "pattern presence is not proof the subscription is active."
+                        ),
+                        "confidence": "HYPOTHESIS",
+                        "pool_origin": "A",
+                        "mitre_technique": "T1546.003",
+                        "derived_from": [tcid],
+                        "asserted_values": [
+                            {
+                                "path": "binding_count",
+                                "expected": str(int(out.get("binding_count") or 0)),
+                                "match": "int",
+                            }
+                        ],
+                    }
+                )
+            print(
+                f"  wmi_persist_parse: {path} pattern="
+                f"{out.get('persistence_pattern_present')}"
+            )
+
+        email_entries = by_class.get("email", [])[:20]
+        for entry in email_entries:
+            path = str(entry["path"])
+            leaf = PurePosixPath(path.replace("\\", "/")).name.lower()
+            if leaf.endswith((".pst", ".ost")):
+                tool_name = "pst_parse"
+            else:
+                tool_name = "email_parse"
+            args = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool(tool_name, args, timeout=600.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"{tool_name} failed for {path}: {error}"
+                )
+            msg_count = int(
+                out.get("message_count")
+                or out.get("messages_seen")
+                or len(out.get("messages") or [])
+                or 0
+            )
+            tcid = self._record_tool(
+                py,
+                tool_name,
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "message_count": msg_count,
+                    "subjects": (out.get("subjects") or [])[:10],
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                tool_name,
+                tcid,
+                {
+                    "artifact_path": path,
+                    "message_count": msg_count,
+                    "sample_subjects": (out.get("subjects") or [])[:5],
+                    **({"error": error} if error else {}),
+                },
+            )
+            print(f"  {tool_name}: {path} messages={msg_count}")
+
+        # setupapi.dev.log — secondary USB device-install history when USBSTOR
+        # is empty/sparse (typed setupapi_parse for custody-bound Findings).
+        setupapi_entries = by_class.get("setupapi_log", [])[:4]
+        for entry in setupapi_entries:
+            path = str(entry["path"])
+            args = {
+                "case_id": self.handle["id"],
+                "artifact_path": path,
+                "limit": 40,
+            }
+            out = rust.call_tool("setupapi_parse", args, timeout=300.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"setupapi_parse failed for {path}: {error}"
+                )
+            events = out.get("events") if not error else []
+            if not isinstance(events, list):
+                events = []
+            tcid = self._record_tool(
+                py,
+                "setupapi_parse",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "events_seen": out.get("events_seen", len(events)),
+                    "events_returned": len(events),
+                    "sample_devices": [
+                        e.get("device") for e in events[:10] if isinstance(e, dict)
+                    ],
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "setupapi_parse",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "events_seen": out.get("events_seen", len(events)),
+                    "events_returned": len(events),
+                    **({"error": error} if error else {}),
+                },
+            )
+            cands = [
+                {
+                    "kind": "setupapi_usb",
+                    "device": e.get("device"),
+                    "install_time_iso": e.get("install_time_iso"),
+                    "sample_line": e.get("sample_line"),
+                    "source_path": path,
+                }
+                for e in events
+                if isinstance(e, dict)
+            ]
+            if cands:
+                self._emit_setupapi_usb_findings(cands, path, tcid)
+            print(
+                f"  setupapi_parse: {path} events="
+                f"{out.get('events_seen', len(events))}"
+            )
+
+        # EXIF on extracted user-content images (GPS / camera / software leads).
+        image_entries = by_class.get("image_exif", [])[:15]
+        for entry in image_entries:
+            path = str(entry["path"])
+            args = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool("exif_parse", args, timeout=300.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(
+                    f"exif_parse failed for {path}: {error}"
+                )
+            tcid = self._record_tool(
+                py,
+                "exif_parse",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "has_exif": out.get("has_exif"),
+                    "camera_make": out.get("camera_make"),
+                    "camera_model": out.get("camera_model"),
+                    "software": out.get("software"),
+                    "gps_decimal": out.get("gps_decimal"),
+                    "field_count": out.get("field_count", 0),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "exif_parse",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "has_exif": out.get("has_exif"),
+                    "gps_decimal": out.get("gps_decimal"),
+                    "software": out.get("software"),
+                    **({"error": error} if error else {}),
+                },
+            )
+            # Only emit a lead when EXIF carries GPS or editing software —
+            # empty/metadata-less images are ubiquitous noise.
+            if (
+                not error
+                and out.get("has_exif")
+                and (out.get("gps_decimal") or out.get("software"))
+            ):
+                gps = out.get("gps_decimal")
+                soft = out.get("software") or "unknown-software"
+                cam = (
+                    " ".join(
+                        p
+                        for p in (out.get("camera_make"), out.get("camera_model"))
+                        if p
+                    )
+                    or "unknown-device"
+                )
+                gps_txt = (
+                    f"GPS≈({gps[0]:.5f},{gps[1]:.5f})"
+                    if isinstance(gps, (list, tuple)) and len(gps) == 2
+                    else "no-GPS"
+                )
+                leaf = PurePosixPath(path.replace("\\", "/")).name
+                safe = re.sub(r"[^a-z0-9]+", "-", leaf.lower()).strip("-") or "image"
+                self.findings_pool_b.append(
+                    {
+                        "case_id": self.handle["id"],
+                        "finding_id": self._finding_id_for(
+                            f"f-B-exif-{safe}", path, force_suffix=True
+                        ),
+                        "tool_call_id": tcid,
+                        "artifact_path": path,
+                        "description": (
+                            f"hypothesis: image EXIF metadata present on {leaf}: "
+                            f"device={cam}, software={soft}, {gps_txt} "
+                            f"(exif_parse). EXIF is a device/location LEAD — GPS is "
+                            "where the shot was taken, not proof of presence or intent; "
+                            "software strings may fingerprint staging tools."
+                        ),
+                        "confidence": "HYPOTHESIS",
+                        "pool_origin": "B",
+                        "mitre_technique": "T1005",
+                        "derived_from": [tcid],
+                    }
+                )
+                print(f"  pool-B EXIF finding for {path} ({gps_txt})")
+            print(
+                f"  exif_parse: {path} has_exif={out.get('has_exif')} "
+                f"fields={out.get('field_count', 0)}"
+            )
+
         disk_summary["timeline_event_count"] = len(
             [
                 event
@@ -13927,6 +18177,12 @@ class Investigation:
                     "ie_history",
                     "scheduled_task",
                     "thumbnail",
+                    "srum",
+                    "bits",
+                    "wmi_repository",
+                    "email",
+                    "setupapi_log",
+                    "image_exif",
                 }
             ]
         )
@@ -14568,6 +18824,13 @@ class Investigation:
                 )
                 out = {"_error": {"message": error}, "events": [], "events_seen": 0}
             events = out.get("events") or []
+            if not error and out.get("truncated"):
+                self.analysis_limitations.append(
+                    "cloud_audit returned partial coverage for "
+                    f"{path}: {out.get('truncation_reason') or 'resource limit'}; "
+                    f"emitted {out.get('events_emitted', len(events))} of "
+                    f"{out.get('events_seen', len(events))} parsed events."
+                )
             tcid = self._record_tool(
                 py,
                 "cloud_audit",
@@ -14576,6 +18839,13 @@ class Investigation:
                     "artifact_path": path,
                     "provider": provider,
                     "events_seen": out.get("events_seen", len(events)),
+                    "events_emitted": out.get("events_emitted", len(events)),
+                    "input_bytes_read": out.get("input_bytes_read"),
+                    "raw_bytes_seen": out.get("raw_bytes_seen"),
+                    "raw_bytes_emitted": out.get("raw_bytes_emitted"),
+                    "output_bytes": out.get("output_bytes"),
+                    "truncated": bool(out.get("truncated")),
+                    "truncation_reason": out.get("truncation_reason"),
                     **({"error": error} if error else {}),
                 },
                 arguments=args,
@@ -14585,16 +18855,61 @@ class Investigation:
             print(f"  cloud_audit: {path} provider={provider} events={len(events)}")
 
     def investigate_velociraptor_zip(
-        self, rust: SshMcpClient, py: SshMcpClient, evidence_path: str | None = None
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        evidence_path: str | None = None,
+        expected_sha256: str | None = None,
     ) -> None:
         evidence_path = evidence_path or self.evidence
         print(f"\n=== Velociraptor zip investigation: {evidence_path} ===")
-        zip_digest = hashlib.sha256(evidence_path.encode("utf-8")).hexdigest()[:12]
-        output_dir = f"{self.case_dir}/velociraptor_zip/{zip_digest}"
+        if expected_sha256 is None:
+            if not self.evidence_inventory:
+                expected_sha256 = str(self.handle.get("image_hash") or "")
+            else:
+                try:
+                    evidence_canonical = str(Path(evidence_path).resolve())
+                except OSError:
+                    evidence_canonical = evidence_path
+                expected_sha256 = next(
+                    (
+                        str(entry.get("sha256") or "")
+                        for entry in inventory_supported_entries(
+                            self.evidence_inventory
+                        )
+                        if entry.get("artifact_class") == "velociraptor"
+                        and (
+                            str(entry.get("path") or "") == evidence_path
+                            or str(entry.get("canonical_path") or "")
+                            == evidence_canonical
+                        )
+                    ),
+                    "",
+                )
+        expected_sha256 = str(expected_sha256 or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            limitation = (
+                "Velociraptor zip extraction was refused because no valid "
+                "custody-bound intake SHA-256 was available."
+            )
+            self.analysis_limitations.append(limitation)
+            self._audit(
+                py,
+                "agent_message",
+                {
+                    "role": "supervisor",
+                    "content": limitation,
+                    "artifact_path": evidence_path,
+                },
+            )
+            return
+        zip_digest = expected_sha256[:12]
+        output_dir = f"{self.parser_case_dir}/velociraptor_zip/{zip_digest}"
         try:
             extraction = extract_velociraptor_zip_artifacts(
                 evidence_path,
                 output_dir,
+                expected_sha256=expected_sha256,
                 limit=500,
             )
         except RuntimeError as exc:
@@ -14618,11 +18933,35 @@ class Investigation:
         self.velociraptor_zip_extractions.append(
             {
                 "zip_path": evidence_path,
+                "expected_archive_sha256": expected_sha256,
+                "archive_sha256_before": extraction.get("archive_sha256_before"),
+                "archive_sha256_after": extraction.get("archive_sha256_after"),
                 "entry_count": len(entries),
                 "unsupported_count": extraction.get("unsupported_count", 0),
                 "unsupported_samples": extraction.get("unsupported_samples", []),
                 "skipped_unsafe": extraction.get("skipped_unsafe", 0),
                 "skipped_oversize": extraction.get("skipped_oversize", 0),
+                "skipped_ratio": extraction.get("skipped_ratio", 0),
+                "aggregate_limit_hit": extraction.get("aggregate_limit_hit", False),
+                "total_extracted_bytes": extraction.get("total_extracted_bytes", 0),
+                "max_total_bytes": extraction.get("max_total_bytes"),
+                "archive_size_bytes": extraction.get("archive_size_bytes", 0),
+                "archive_size_limit_hit": extraction.get(
+                    "archive_size_limit_hit", False
+                ),
+                "archive_member_count": extraction.get("archive_member_count", 0),
+                "eocd_member_count": extraction.get("eocd_member_count", 0),
+                "central_directory_member_count": extraction.get(
+                    "central_directory_member_count", 0
+                ),
+                "archive_member_limit_hit": extraction.get(
+                    "archive_member_limit_hit", False
+                ),
+                "central_directory_bytes": extraction.get("central_directory_bytes", 0),
+                "central_directory_limit_hit": extraction.get(
+                    "central_directory_limit_hit", False
+                ),
+                "limit_reasons": extraction.get("limit_reasons", []),
                 "truncated": extraction.get("truncated", False),
             }
         )
@@ -14632,13 +18971,43 @@ class Investigation:
             {
                 "zip_path": evidence_path,
                 "output_dir": extraction.get("output_dir", output_dir),
+                "expected_archive_sha256": expected_sha256,
+                "archive_sha256_before": extraction.get("archive_sha256_before"),
+                "archive_sha256_after": extraction.get("archive_sha256_after"),
                 "entry_count": len(entries),
                 "unsupported_count": extraction.get("unsupported_count", 0),
                 "unsupported_samples": extraction.get("unsupported_samples", []),
                 "skipped_unsafe": extraction.get("skipped_unsafe", 0),
                 "skipped_oversize": extraction.get("skipped_oversize", 0),
+                "skipped_ratio": extraction.get("skipped_ratio", 0),
+                "aggregate_limit_hit": extraction.get("aggregate_limit_hit", False),
+                "total_extracted_bytes": extraction.get("total_extracted_bytes", 0),
                 "truncated": extraction.get("truncated", False),
+                "limit_reasons": extraction.get("limit_reasons", []),
                 "limit": extraction.get("limit", 500),
+                "max_total_bytes": extraction.get("max_total_bytes"),
+                "max_compression_ratio": extraction.get("max_compression_ratio"),
+                "archive_size_bytes": extraction.get("archive_size_bytes", 0),
+                "max_archive_bytes": extraction.get("max_archive_bytes"),
+                "archive_size_limit_hit": extraction.get(
+                    "archive_size_limit_hit", False
+                ),
+                "archive_member_count": extraction.get("archive_member_count", 0),
+                "eocd_member_count": extraction.get("eocd_member_count", 0),
+                "central_directory_member_count": extraction.get(
+                    "central_directory_member_count", 0
+                ),
+                "max_archive_members": extraction.get("max_archive_members"),
+                "archive_member_limit_hit": extraction.get(
+                    "archive_member_limit_hit", False
+                ),
+                "central_directory_bytes": extraction.get("central_directory_bytes", 0),
+                "max_central_directory_bytes": extraction.get(
+                    "max_central_directory_bytes"
+                ),
+                "central_directory_limit_hit": extraction.get(
+                    "central_directory_limit_hit", False
+                ),
             },
         )
         print(
@@ -14649,7 +19018,19 @@ class Investigation:
 
         if extraction.get("truncated"):
             self.analysis_limitations.append(
-                "Velociraptor zip extraction hit the artifact limit; scoped verdicts require rerun with a narrower collection or higher limit."
+                "Velociraptor zip extraction hit a hard safety/coverage limit; scoped verdicts require a narrower or partitioned collection."
+            )
+        if extraction.get("archive_size_limit_hit"):
+            self.analysis_limitations.append(
+                "Velociraptor zip exceeded the archive-size safety ceiling and its central directory was not opened."
+            )
+        if extraction.get("archive_member_limit_hit"):
+            self.analysis_limitations.append(
+                "Velociraptor zip exceeded the central-directory member-count ceiling before classification; contained artifacts were not examined."
+            )
+        if extraction.get("central_directory_limit_hit"):
+            self.analysis_limitations.append(
+                "Velociraptor zip central directory exceeded its byte ceiling before ZipInfo allocation; contained artifacts were not examined."
             )
         if extraction.get("skipped_unsafe"):
             self.analysis_limitations.append(
@@ -14659,9 +19040,19 @@ class Investigation:
             self.analysis_limitations.append(
                 f"Velociraptor zip skipped {extraction.get('skipped_oversize')} oversized member(s)."
             )
+        if extraction.get("skipped_ratio"):
+            self.analysis_limitations.append(
+                f"Velociraptor zip skipped {extraction.get('skipped_ratio')} member(s) above the decompression-ratio safety limit."
+            )
+        if extraction.get("aggregate_limit_hit"):
+            self.analysis_limitations.append(
+                "Velociraptor zip extraction reached the aggregate derived-data byte ceiling; later supported members were not examined."
+            )
         if not entries:
             self.analysis_limitations.append(
-                "Velociraptor zip contained no supported EVTX/Prefetch/Registry/MFT/USN/memory/network artifacts for typed parsing."
+                velociraptor_empty_extraction_limitation(
+                    truncated=bool(extraction.get("truncated"))
+                )
             )
             return
 
@@ -14700,7 +19091,12 @@ class Investigation:
         for evtx_dir in hayabusa_dirs[:5]:
             self.investigate_hayabusa_dir(rust, py, evtx_dir)
         if extracted_entries:
-            self.investigate_extracted_disk_artifacts(rust, py, extracted_entries)
+            self.investigate_extracted_disk_artifacts(
+                rust,
+                py,
+                extracted_entries,
+                register_browser_cases=True,
+            )
         if network_entries:
             self.investigate_network_artifacts(rust, py, network_entries)
         if cloud_entries:
@@ -14744,15 +19140,22 @@ class Investigation:
             entry for entry in entries if entry.get("artifact_class") == "velociraptor"
         ]
 
+        browser_entries = [
+            entry
+            for entry in extracted_entries
+            if entry.get("artifact_class") in BROWSER_INVENTORY_CLASSES
+        ]
+        disk_extracted_count = len(extracted_entries) - len(browser_entries)
         plan = build_lane_plan_message(
             memory=len(memory_entries),
             evtx=len(evtx_entries),
             hayabusa_dirs=len(hayabusa_dirs),
-            extracted=len(extracted_entries),
+            extracted=disk_extracted_count,
             network=len(network_entries),
             cloud=len(cloud_entries),
             velociraptor=len(velociraptor_entries),
             raw_disk=len(raw_disk_entries),
+            browser=len(browser_entries),
         )
         if plan:
             self._narrate(py, plan)
@@ -14772,6 +19175,17 @@ class Investigation:
             return
         for evtx_dir in hayabusa_dirs[:5]:
             self.investigate_hayabusa_dir(rust, py, evtx_dir)
+        # Single-file EVTX inventory: stage for hayabusa (dir-only tool).
+        for parent, count in list(evtx_parent_counts.items())[:20]:
+            if count >= 2 or not parent or parent == ".":
+                continue
+            singles = [
+                str(e["path"])
+                for e in evtx_entries
+                if str(PurePosixPath(str(e["path"]).replace("\\", "/")).parent)
+                == parent
+            ][:5]
+            self._hayabusa_stage_single_files(rust, py, singles)
         if self._heartbeat_abort(py):
             return
         if extracted_entries:
@@ -14787,11 +19201,20 @@ class Investigation:
         if self._heartbeat_abort(py):
             return
         for entry in velociraptor_entries[:10]:
-            self.investigate_velociraptor_zip(rust, py, str(entry["path"]))
+            self.investigate_velociraptor_zip(
+                rust,
+                py,
+                str(entry["path"]),
+                expected_sha256=str(entry.get("sha256") or ""),
+            )
         if self._heartbeat_abort(py):
             return
         for entry in raw_disk_entries:
             self.investigate_disk(rust, py, str(entry["path"]))
+        # Same-host disk+memory fusion (PLAYBOOK gap): when both lanes ran,
+        # emit corroboration / unprefetched-process leads under custody.
+        if memory_entries and (raw_disk_entries or extracted_entries):
+            self._fuse_disk_memory_execution(py)
         if not (
             memory_entries
             or evtx_entries
@@ -14921,7 +19344,6 @@ class Investigation:
         verify_args: dict[str, Any] = {
             "finding": synth,
             "tool_call_index": index,
-            "findevil_mcp_command": rust_replay_command(),
         }
         if self.force_fresh_replay:
             verify_args["force_fresh_replay"] = True
@@ -15045,7 +19467,6 @@ class Investigation:
             verify_args: dict[str, Any] = {
                 "finding": finding_for_verifier(finding),
                 "tool_call_index": index,
-                "findevil_mcp_command": rust_replay_command(),
             }
             if self.force_fresh_replay:
                 verify_args["force_fresh_replay"] = True
@@ -15123,7 +19544,6 @@ class Investigation:
                 {
                     "finding": finding_for_verifier(finding),
                     "tool_call_index": tool_call_index,
-                    "findevil_mcp_command": rust_replay_command(),
                     "force_fresh_replay": True,
                     # Re-dispatch is the second chance: persistent sha256 drift
                     # takes the terminal downgrade instead of looping.
@@ -15240,18 +19660,20 @@ class Investigation:
                 self._audit(py, "verifier_rejected_lead", rejected_lead)
             handoff = py.call_tool(
                 "pool_handoff",
-                {
-                    "audit_path": self.audit_path,
-                    "from_role": "verifier",
-                    "to_role": "judge",
-                    "correlation_id": action_finding_id,
-                    "payload": {
-                        "finding_id": action_finding_id,
-                        "action": action.get("action"),
-                        "reason": action.get("reason"),
-                        "replay_record_sha256": replay_record_sha256,
-                    },
-                },
+                self._controller_args(
+                    {
+                        "audit_path": self.audit_path,
+                        "from_role": "verifier",
+                        "to_role": "judge",
+                        "correlation_id": action_finding_id,
+                        "payload": {
+                            "finding_id": action_finding_id,
+                            "action": action.get("action"),
+                            "reason": action.get("reason"),
+                            "replay_record_sha256": replay_record_sha256,
+                        },
+                    }
+                ),
             )
             if "_error" in handoff:
                 self.analysis_limitations.append(
@@ -15391,12 +19813,14 @@ class Investigation:
                 continue
             out = py.call_tool(
                 "memory_remember",
-                {
-                    "store_path": store_path,
-                    "case_id": self.handle["id"],
-                    **payload,
-                    "audit_log_path": self.audit_path,
-                },
+                self._controller_args(
+                    {
+                        "store_path": store_path,
+                        "case_id": self.case_id,
+                        **payload,
+                        "audit_log_path": self.audit_path,
+                    }
+                ),
             )
             if isinstance(out, dict) and "_error" not in out:
                 remembered += 1
@@ -15445,13 +19869,15 @@ class Investigation:
         """
         handoff = py.call_tool(
             "pool_handoff",
-            {
-                "audit_path": self.audit_path,
-                "from_role": from_role,
-                "to_role": to_role,
-                "correlation_id": correlation_id,
-                "payload": payload,
-            },
+            self._controller_args(
+                {
+                    "audit_path": self.audit_path,
+                    "from_role": from_role,
+                    "to_role": to_role,
+                    "correlation_id": correlation_id,
+                    "payload": payload,
+                }
+            ),
         )
         if isinstance(handoff, dict) and "_error" in handoff:
             self.analysis_limitations.append(
@@ -15518,7 +19944,15 @@ class Investigation:
         replayed and gated like any other finding. HYPOTHESIS-only; a no-op unless
         the case carries BOTH memory and on-disk execution evidence.
         """
-        if not os.environ.get("FIND_EVIL_CROSS_ARTIFACT_PID"):
+        # Default-on (was FIND_EVIL_CROSS_ARTIFACT_PID opt-in). Set
+        # FIND_EVIL_CROSS_ARTIFACT_PID=0 to disable if a case floods on noise.
+        if os.environ.get("FIND_EVIL_CROSS_ARTIFACT_PID", "1") in {
+            "0",
+            "false",
+            "False",
+            "no",
+            "NO",
+        }:
             return
         mem = self._pidcheck_memory
         if not mem or not self._prefetch_exec_findings:
@@ -15911,12 +20345,16 @@ class Investigation:
         )
         signer_customer_ok = signer_effective == "sigstore"
         manifest_verified = bool((manifest_verification or {}).get("overall"))
+        manifest_signature_verified = (manifest_verification or {}).get(
+            "signature_verified"
+        ) is True
         manifest_signature_present = bool((manifest or {}).get("signature"))
         expert_approved = expert_decision == "approved"
         customer_releasable = (
             machine_qa_passed
             and signer_customer_ok
             and manifest_verified
+            and manifest_signature_verified
             and manifest_signature_present
             and expert_approved
         )
@@ -15933,6 +20371,11 @@ class Investigation:
             )
         if not manifest_verified:
             release_blockers.append("manifest_verify must pass before customer release")
+        if not manifest_signature_verified:
+            release_blockers.append(
+                "customer release requires a cryptographically verified Sigstore "
+                "bundle bound to the configured signer identity policy"
+            )
         if not manifest_signature_present:
             release_blockers.append(
                 "finalized manifest signature metadata must be present before customer release"
@@ -15952,6 +20395,7 @@ class Investigation:
             "signer_effective": signer_effective,
             "signer_customer_release_ok": signer_customer_ok,
             "manifest_verified": manifest_verified,
+            "manifest_signature_verified": manifest_signature_verified,
             "manifest_signature_present": manifest_signature_present,
             "machine_qa_passed": machine_qa_passed,
             "expert_approved": expert_approved,
@@ -16128,6 +20572,7 @@ class Investigation:
             "image_path": self.evidence,
             "model": "find-evil-auto",
             "evidence_type": detect_evidence_type(self.evidence),
+            "parser_case_id": self.handle["id"],
             "signer": self.signer,
         }
         if self.evidence_inventory:
@@ -16143,15 +20588,17 @@ class Investigation:
         extra = _relativize_repo_paths(extra, REPO_ROOT)
         mf = py.call_tool(
             "manifest_finalize",
-            {
-                "case_id": self.handle["id"],
-                "run_id": self.run_id,
-                "started_at": self.started_at,
-                "audit_log_path": self.audit_path,
-                "output_path": self.manifest_path,
-                "signer": self.signer,
-                "extra": extra,
-            },
+            self._controller_args(
+                {
+                    "case_id": self.case_id,
+                    "run_id": self.run_id,
+                    "started_at": self.started_at,
+                    "audit_log_path": self.audit_path,
+                    "output_path": self.manifest_path,
+                    "signer": self.signer,
+                    "extra": extra,
+                }
+            ),
         )
         if "_error" in mf:
             raise RuntimeError(f"manifest_finalize failed: {mf['_error']}")
@@ -16161,7 +20608,17 @@ class Investigation:
         # The MCP response is a digest of the finalize step; the full manifest
         # (with signature, finalized_at, leaves[]) is only in the on-disk file.
         # Read it back so the verdict + report have everything they need.
-        code, stdout, _ = ssh_run(f"cat {shlex.quote(self.manifest_path)}", timeout=30)
+        if DOCKER_MODE or LOCAL_MODE:
+            try:
+                stdout = Path(self.manifest_path).read_text(encoding="utf-8")
+                code = 0
+            except OSError:
+                stdout = ""
+                code = 1
+        else:
+            code, stdout, _ = ssh_run(
+                f"cat {shlex.quote(self.manifest_path)}", timeout=30
+            )
         if code == 0 and stdout.strip():
             try:
                 full = json.loads(stdout)
@@ -16174,10 +20631,24 @@ class Investigation:
                 pass
         return mf
 
-    def verify_final_manifest(self, py: SshMcpClient) -> dict[str, Any]:
+    def verify_final_manifest(
+        self, py: SshMcpClient, finalized_manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        expected_fingerprint = finalized_manifest.get("signature_cert_fingerprint")
         result = py.call_tool(
             "manifest_verify",
-            {"manifest_path": self.manifest_path, "audit_log_path": self.audit_path},
+            self._controller_args(
+                {
+                    "manifest_path": self.manifest_path,
+                    "audit_log_path": self.audit_path,
+                    **(
+                        {"expected_ed25519_fingerprint": expected_fingerprint}
+                        if finalized_manifest.get("signer_effective") == "ed25519"
+                        and isinstance(expected_fingerprint, str)
+                        else {}
+                    ),
+                }
+            ),
             timeout=600.0,
         )
         if "_error" in result:
@@ -16490,33 +20961,11 @@ class Investigation:
         verdict_obj = _relativize_repo_paths(verdict_obj, REPO_ROOT)
         verdict_json = json.dumps(verdict_obj, indent=2, sort_keys=True)
         verdict_bytes = verdict_json.encode("utf-8")
-        if LOCAL_MODE:
-            # Local mode: write straight to the host case dir.
+        if LOCAL_MODE or DOCKER_MODE:
+            # Custody output stays on the host in both local and Docker modes.
             verdict_file = Path(self.verdict_path)
             verdict_file.parent.mkdir(parents=True, exist_ok=True)
             verdict_file.write_bytes(verdict_bytes)
-        elif DOCKER_MODE:
-            # Docker mode: pipe into the container via `docker exec -i cat` — the
-            # container analog of SIFT's ssh cat. The path is /workspace/…, so it
-            # lands on the host case dir via the read-write bind mount (no quoting
-            # hell, and no separate host-path mapping needed).
-            proc = subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    "-i",
-                    DOCKER_CONTAINER,
-                    "bash",
-                    "-lc",
-                    f"cat > {shlex.quote(self.verdict_path)}",
-                ],
-                input=verdict_bytes,
-                capture_output=True,
-                timeout=30,
-            )
-            if proc.returncode != 0:
-                stderr = proc.stderr.decode("utf-8", errors="replace")
-                print(f"  WARN: failed to write verdict.json: {stderr}")
         else:
             # SIFT mode: pipe into the VM via SSH cat to avoid quoting hell.
             proc = subprocess.run(
@@ -16551,12 +21000,8 @@ class Investigation:
             local_dir.mkdir(parents=True, exist_ok=True)
             self.local_run_dir = local_dir
         elif DOCKER_MODE:
-            # Docker mode: the container case dir /workspace/tmp/auto-runs/<case>
-            # IS this host dir (REPO_ROOT/tmp/auto-runs/<case>) via the read-write
-            # bind mount. The in-container MCP wrote audit.jsonl / run.manifest.json
-            # here, and verdict.json was piped here via `docker exec cat`, so every
-            # custody file is already present — no copy step (a docker cp would be a
-            # bind-mount self-copy). Point local_dir at it directly, like LOCAL_MODE.
+            # Docker mode keeps custody/signing on the host; parser staging is a
+            # different bind under .project-local and never enters this directory.
             local_dir = (
                 Path(__file__).resolve().parent.parent
                 / "tmp"
@@ -16828,8 +21273,97 @@ class Investigation:
                 file=sys.stderr,
             )
 
-        rust = make_rust_client()
-        py = make_py_client()
+        previous_browser_binding = os.environ.get(BROWSER_CASE_BINDING_ENV)
+        previous_case_open_binding = os.environ.get(CASE_OPEN_BINDING_ENV)
+        previous_controller_capability = os.environ.get(CONTROLLER_CAPABILITY_ENV)
+        previous_output_route = os.environ.get(OUTPUT_ROUTE_ENV)
+        previous_parsed_evidence_ack = os.environ.get(PARSED_EVIDENCE_ACK_ENV)
+        previous_sift_memory_store = os.environ.get("FINDEVIL_SIFT_MEMORY_STORE")
+        previous_custody_env = {
+            name: os.environ.get(name)
+            for name in (
+                "FINDEVIL_CUSTODY_BOUNDARY",
+                "FINDEVIL_ACTIVE_CASE_DIR",
+                "FINDEVIL_ACTIVE_CASE_ID",
+                "FINDEVIL_ACTIVE_RUN_ID",
+                "FINDEVIL_ACTIVE_STARTED_AT",
+                "FINDEVIL_ACTIVE_SIGNER",
+            )
+        }
+
+        def restore_bootstrap_env() -> None:
+            for name, previous in (
+                (BROWSER_CASE_BINDING_ENV, previous_browser_binding),
+                (CASE_OPEN_BINDING_ENV, previous_case_open_binding),
+                (CONTROLLER_CAPABILITY_ENV, previous_controller_capability),
+                (OUTPUT_ROUTE_ENV, previous_output_route),
+                (PARSED_EVIDENCE_ACK_ENV, previous_parsed_evidence_ack),
+                ("FINDEVIL_SIFT_MEMORY_STORE", previous_sift_memory_store),
+            ):
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+            for name, previous in previous_custody_env.items():
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+
+        self._reserve_custody_case_dir()
+        if not LOCAL_MODE and not DOCKER_MODE:
+            os.environ.setdefault(
+                "FINDEVIL_SIFT_MEMORY_STORE",
+                f"{GUEST_REPO}/.project-local/state/memory/memory.sqlite",
+            )
+        os.environ["FINDEVIL_CUSTODY_BOUNDARY"] = "reserved_case"
+        os.environ["FINDEVIL_ACTIVE_CASE_DIR"] = self.case_dir
+        os.environ["FINDEVIL_ACTIVE_CASE_ID"] = self.case_id
+        os.environ["FINDEVIL_ACTIVE_RUN_ID"] = self.run_id
+        os.environ["FINDEVIL_ACTIVE_STARTED_AT"] = self.started_at
+        os.environ["FINDEVIL_ACTIVE_SIGNER"] = self.signer
+        self.controller_capability = secrets.token_hex(32)
+        os.environ[CONTROLLER_CAPABILITY_ENV] = self.controller_capability
+        # Never let an ambient acknowledgment silently broaden a deterministic
+        # or on-prem run. Derive one exact route from the reviewed run mode and
+        # restore the caller's environment when the MCP processes close.
+        os.environ.pop(OUTPUT_ROUTE_ENV, None)
+        os.environ.pop(PARSED_EVIDENCE_ACK_ENV, None)
+        os.environ.update(
+            parser_output_route_env(
+                agent_mode=self.agent_mode,
+                agent_provider=self.agent_provider,
+                acknowledged=self.agent_acknowledge_evidence_egress,
+            )
+        )
+        rust: SshMcpClient | None = None
+        py: SshMcpClient | None = None
+        try:
+            case_open_binding, expected_case_hashes = (
+                self._prepare_case_open_reservation(etype)
+            )
+            self.case_open_expected_sha256 = expected_case_hashes
+            if case_open_binding:
+                os.environ[CASE_OPEN_BINDING_ENV] = case_open_binding
+            else:
+                os.environ.pop(CASE_OPEN_BINDING_ENV, None)
+            if etype == "directory":
+                inventory = self._prepare_directory_inventory()
+                os.environ[BROWSER_CASE_BINDING_ENV] = browser_case_binding(inventory)
+            else:
+                os.environ.pop(BROWSER_CASE_BINDING_ENV, None)
+
+            rust = make_rust_client()
+            py = make_py_client()
+        except Exception:
+            if rust is not None:
+                rust.close()
+            if py is not None:
+                py.close()
+            restore_bootstrap_env()
+            raise
+
+        assert rust is not None and py is not None
 
         def _spawn_rust() -> SshMcpClient:
             # A fresh, initialized findevil-mcp connection for a parallel lane.
@@ -16877,6 +21411,9 @@ class Investigation:
                 self.investigate_memory(rust, py)
             elif etype == "evtx":
                 self.investigate_evtx(rust, py)
+                # hayabusa_scan is directory-based; stage the lone .evtx so
+                # single-file evidence still gets a Sigma pass (docker-aware).
+                self._hayabusa_stage_single_files(rust, py, [self.evidence])
             elif etype == "disk":
                 self.investigate_disk(rust, py)
             elif etype == "network":
@@ -16894,6 +21431,23 @@ class Investigation:
             elif etype == "cloud":
                 classification = classify_artifact_path(self.evidence)
                 self.investigate_cloud_artifacts(
+                    rust,
+                    py,
+                    [
+                        {
+                            "path": self.evidence,
+                            "artifact_class": classification["artifact_class"],
+                        }
+                    ],
+                )
+            elif etype == "browser":
+                # A standalone History/Cookies/Web Data/Login Data/
+                # places.sqlite file is already registered by case_open. Route
+                # it through the same narrow browser lane used for directory and
+                # disk-derived artifacts; the exact case path+hash authorizes
+                # browser_history without manufacturing a directory inventory.
+                classification = classify_artifact_path(self.evidence)
+                self.investigate_extracted_disk_artifacts(
                     rust,
                     py,
                     [
@@ -17002,7 +21556,7 @@ class Investigation:
 
             # Phase 3: Crypto custody
             mf = self.finalize(py, packet_attestation)
-            manifest_verification = self.verify_final_manifest(py)
+            manifest_verification = self.verify_final_manifest(py, mf)
             final_release_gate = self._build_release_gate(
                 report_metadata["report_qa"], manifest_verification, mf
             )
@@ -17052,7 +21606,8 @@ class Investigation:
                     print(f"    - {blocker}")
             if not LOCAL_MODE:
                 where = "container" if DOCKER_MODE else "VM"
-                print(f"  Inside {where:<8}: {self.case_dir}/")
+                remote_case = self.parser_case_dir if DOCKER_MODE else self.case_dir
+                print(f"  Inside {where:<8}: {remote_case}/")
             print(f"  On host (local): {local_dir}")
             self._heartbeat(
                 "complete",
@@ -17065,13 +21620,19 @@ class Investigation:
                 "packet_state": final_release_gate.get("packet_state"),
                 "customer_ready": final_release_gate.get("customer_releasable", False),
                 "manifest_verify_overall": manifest_verification.get("overall"),
+                "manifest_signature_verified": manifest_verification.get(
+                    "signature_verified"
+                ),
                 "heartbeat_terminated": self._heartbeat_terminated,
-                "case_dir_in_vm": self.case_dir,
+                "case_dir_in_vm": self.parser_case_dir
+                if DOCKER_MODE
+                else self.case_dir,
                 "local_dir": str(local_dir),
             }
         finally:
             rust.close()
             py.close()
+            restore_bootstrap_env()
 
 
 # ---------------------------------------------------------------------------
@@ -17103,42 +21664,39 @@ def preflight_check() -> None:
             sys.exit(2)
         return
     if DOCKER_MODE:
-        # Docker mode: verify the container is up and both MCP prerequisites are
-        # runnable inside it (Rust binary + agent_mcp dir + uv). One docker exec
-        # round-trip, the container analog of the SIFT ssh probe. scripts/verdict
-        # --docker brings the container up first, so a failure here means the
-        # container is down or was not built.
+        # Split trust: only the Rust parser is inside Docker. Python custody runs
+        # on the host and replays through this fixed container route.
+        missing: list[str] = []
         if not shutil.which("docker"):
+            missing.append("docker not on PATH")
+        if not Path(LOCAL_AGENT_MCP_DIR).is_dir():
+            missing.append(f"host Python agent_mcp dir missing: {LOCAL_AGENT_MCP_DIR}")
+        if not shutil.which("uv"):
+            missing.append(
+                "host uv not on PATH (fix: install uv and run bash scripts/setup)"
+            )
+        if missing:
             print(
-                "ERROR: docker-mode pre-flight failed: docker not on PATH.\n"
-                "  fix: install docker, then re-run scripts/verdict --docker.",
+                "ERROR: docker-mode pre-flight failed:\n  - " + "\n  - ".join(missing),
                 file=sys.stderr,
             )
             sys.exit(2)
-        probe = (
-            f"test -x {RUST_BIN_Q} && "
-            f"test -d {AGENT_MCP_DIR_Q} && "
-            f"command -v uv >/dev/null && "
-            f"echo ok"
-        )
+        probe = f"test -x {RUST_BIN_Q} && echo ok"
         try:
             code, _, stderr = ssh_run(probe, timeout=30)
         except subprocess.TimeoutExpired:
             code, stderr = 124, "docker exec timed out after 30s"
         if code != 0:
             print(
-                f"ERROR: cannot reach the '{DOCKER_CONTAINER}' container or one of "
-                f"the MCP server prerequisites is missing.\n\n"
-                f"Pre-flight tried: docker exec -i {DOCKER_CONTAINER} bash -lc '<probe>'\n"
+                f"ERROR: cannot reach the '{DOCKER_CONTAINER}' container or "
+                f"the Rust parser prerequisite is missing.\n\n"
+                f"Pre-flight used the fixed profile-free Docker bridge for: {probe}\n"
                 f"  exit code: {code}\n"
                 f"  stderr   : {stderr.strip()[:200]}\n\n"
-                f"Required inside the container (any one missing -> this error):\n"
-                f"  1. {RUST_BIN}                 (Rust MCP binary)\n"
-                f"  2. {GUEST_REPO}/services/agent_mcp/   (Python MCP dir)\n"
-                f"  3. uv on PATH                          (uv binary)\n\n"
+                f"Required inside the container:\n"
+                f"  1. {RUST_BIN}                 (Rust MCP binary)\n\n"
                 "Fix:\n"
-                "  - bring the container up: scripts/run-dfir-container.sh <evidence>\n"
-                "  - or run the one-shot     : scripts/verdict --docker <evidence>\n"
+                "  - run the one-shot: scripts/verdict --docker <evidence>\n"
                 "  - alt container name      : set FIND_EVIL_DOCKER_CONTAINER.",
                 file=sys.stderr,
             )
@@ -17181,7 +21739,7 @@ def preflight_check() -> None:
             f"  3. /home/sansforensics/.local/bin/uv            (uv binary)\n\n"
             "Fix:\n"
             "  - first time: run scripts/sift-vm-bootstrap.sh (one-shot ~15min)\n"
-            "  - VM down  : run scripts/find-evil-sift (auto-boots)\n"
+            "  - VM down  : run scripts/verdict --sift <evidence> after bootstrap\n"
             "  - alt host : set FIND_EVIL_GUEST_IP / FIND_EVIL_GUEST_USER /\n"
             "               FIND_EVIL_GUEST_REPO env vars before re-running.",
             file=sys.stderr,
@@ -17286,7 +21844,7 @@ def main() -> int:
         choices=("stub", "ed25519", "sigstore"),
         default="ed25519",
         help="Signer passed to manifest_finalize. ed25519 (default) is a real "
-        "local signature that verifies offline; sigstore for customer-release "
+        "local signature that verifies offline against the controller's trusted pin; sigstore for customer-release "
         "candidates (identity + transparency log); stub is dev/offline only.",
     )
     p.add_argument(
@@ -17391,9 +21949,17 @@ def main() -> int:
             )
             return 2
 
-    global LOCAL_MODE
+    global DISK_YARA_RULES, LOCAL_MODE
     if args.local or os.environ.get("FIND_EVIL_LOCAL") == "1":
         LOCAL_MODE = True
+        os.environ["FIND_EVIL_LOCAL"] = "1"
+        # Module import happens before argparse; recompute the bundled rule path
+        # in the now-authoritative local namespace for direct `--local` calls.
+        if os.environ.get("FIND_EVIL_DISK_YARA_RULES", "").startswith(f"{GUEST_REPO}/"):
+            os.environ.pop("FIND_EVIL_DISK_YARA_RULES", None)
+        DISK_YARA_RULES = _default_disk_yara_rules()
+        if DISK_YARA_RULES:
+            os.environ["FIND_EVIL_DISK_YARA_RULES"] = DISK_YARA_RULES
 
     try:
         evidence_path = resolve_evidence_path(args.evidence_path)

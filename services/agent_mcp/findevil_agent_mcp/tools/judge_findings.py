@@ -13,9 +13,11 @@ from typing import Any
 
 from findevil_agent.events import Finding, VerifierAction
 from findevil_agent.judge import JudgeBudgetExceeded, PoolStats, judge_findings
+from findevil_agent.resource_limits import MAX_FINDINGS_PER_POOL
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
+from findevil_agent_mcp.tools._input_limits import enforce_json_budget
 
 DOWNGRADED_CONFIDENCE = {
     "CONFIRMED": "INFERRED",
@@ -28,17 +30,23 @@ class JudgeFindingsInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     pool_a_findings: list[dict[str, Any]] = Field(
-        ..., description="Pool A findings as Finding-event dicts."
+        ...,
+        max_length=MAX_FINDINGS_PER_POOL,
+        description="Pool A findings as Finding-event dicts.",
     )
     pool_a_verifier_actions: list[dict[str, Any]] = Field(
         default_factory=list,
+        max_length=MAX_FINDINGS_PER_POOL,
         description="VerifierAction-event dicts for Pool A findings.",
     )
     pool_b_findings: list[dict[str, Any]] = Field(
-        ..., description="Pool B findings as Finding-event dicts."
+        ...,
+        max_length=MAX_FINDINGS_PER_POOL,
+        description="Pool B findings as Finding-event dicts.",
     )
     pool_b_verifier_actions: list[dict[str, Any]] = Field(
         default_factory=list,
+        max_length=MAX_FINDINGS_PER_POOL,
         description="VerifierAction-event dicts for Pool B findings.",
     )
     budget_seconds: float = Field(
@@ -48,6 +56,7 @@ class JudgeFindingsInput(BaseModel):
     )
     injection_affected_tool_call_ids: list[str] = Field(
         default_factory=list,
+        max_length=MAX_FINDINGS_PER_POOL * 4,
         description=(
             "tool_call_ids whose tool output was injection-neutralized at the "
             "MCP-output boundary (correlated from the injection_alerts.jsonl "
@@ -55,6 +64,11 @@ class JudgeFindingsInput(BaseModel):
             "of these is flagged needs_human_review; the merge math is unchanged."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_input_budget(cls, value: Any) -> Any:
+        return enforce_json_budget(value, label="judge_findings")
 
     @model_validator(mode="after")
     def _require_verifier_actions(self) -> JudgeFindingsInput:

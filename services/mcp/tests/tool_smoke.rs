@@ -12,7 +12,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use findevil_mcp::{
     case_open, disk_extract_artifacts, disk_mount, disk_unmount, CaseHandle, CaseOpenError,
-    CaseOpenInput, DiskExtractArtifactsInput, DiskMode, DiskMountInput, DiskUnmountInput,
+    CaseOpenInput, DiskError, DiskExtractArtifactsInput, DiskMode, DiskMountInput,
+    DiskUnmountInput,
 };
 
 /// Global lock that serializes env-var manipulation across every
@@ -230,6 +231,41 @@ fn case_open_registers_case_and_hashes_image() {
 }
 
 #[test]
+fn case_open_persists_canonical_path_for_relative_input() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let _home = HomeGuard::set(home.path());
+    let cwd = std::env::current_dir().expect("current dir");
+    let evidence_dir = tempfile::Builder::new()
+        .prefix(".case-open-relative-")
+        .tempdir_in(&cwd)
+        .expect("cwd tempdir");
+    let absolute = write_evidence_image(evidence_dir.path(), b"relative evidence");
+    let relative = absolute
+        .strip_prefix(&cwd)
+        .expect("fixture beneath cwd")
+        .to_path_buf();
+
+    let handle = case_open(&CaseOpenInput {
+        image_path: relative,
+        expected_sha256: None,
+        label: None,
+    })
+    .expect("register relative image");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(handle.case_dir.join("case.json")).expect("read case manifest"),
+    )
+    .expect("decode case manifest");
+
+    // case_open persists the path via the product's `pathnorm::canonicalize`
+    // (dunce), which drops the Windows `\\?\` verbatim prefix that std's
+    // `canonicalize` keeps; compare against the same normalization. No-op on Unix.
+    assert_eq!(
+        manifest["image_path"],
+        serde_json::json!(dunce::canonicalize(&absolute).unwrap())
+    );
+}
+
+#[test]
 fn case_open_rejects_mismatched_expected_hash() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _home = HomeGuard::set(tmp.path());
@@ -292,6 +328,23 @@ fn case_open_errors_on_missing_image() {
 }
 
 #[test]
+fn case_open_rejects_an_oversized_utf8_label_before_touching_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = CaseOpenInput {
+        image_path: tmp.path().join("missing.dd"),
+        expected_sha256: None,
+        // 65 four-byte scalar values: 260 UTF-8 bytes, despite only 65 chars.
+        label: Some("🧪".repeat(65)),
+    };
+
+    let error = case_open(&input).expect_err("oversized label must fail before evidence I/O");
+    assert!(
+        error.to_string().contains("label") && error.to_string().contains("256"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn case_open_errors_on_directory_not_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _home = HomeGuard::set(tmp.path());
@@ -342,6 +395,25 @@ fn case_open_refuses_symlinked_evidence_path() {
 }
 
 #[test]
+#[cfg(unix)]
+fn case_open_refuses_hardlinked_evidence_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = tmp.path().join("evidence.dd");
+    let alias = tmp.path().join("alias.dd");
+    fs::write(&image, b"hardlinked evidence").expect("write evidence");
+    fs::hard_link(&image, &alias).expect("create hardlink alias");
+
+    let error = case_open(&CaseOpenInput {
+        image_path: image,
+        expected_sha256: None,
+        label: None,
+    })
+    .expect_err("multi-linked evidence must be refused");
+    assert!(matches!(error, CaseOpenError::ImageNotRegular(_)));
+}
+
+#[test]
 fn case_open_hashes_match_known_vector() {
     // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -380,6 +452,94 @@ fn case_open_two_calls_produce_distinct_case_ids() {
 }
 
 #[test]
+fn disk_mount_reuses_the_active_mount_for_the_same_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"idempotent mock disk");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("mount-reuse".to_string()),
+    })
+    .expect("case_open");
+    let input = DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    };
+
+    let first = disk_mount(&input).expect("first mount");
+    let second = disk_mount(&input).expect("same source should reuse");
+
+    assert_eq!(second.mount_id, first.mount_id);
+    assert_eq!(second.mount_point, first.mount_point);
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &fs::read(handle.case_dir.join("session_resources.json")).expect("ledger"),
+    )
+    .expect("ledger JSON");
+    let active_mounts = ledger["resources"]
+        .as_array()
+        .expect("resources")
+        .iter()
+        .filter(|resource| {
+            resource["resource_type"] == "disk_mount" && resource["status"] == "mounted"
+        })
+        .count();
+    assert_eq!(active_mounts, 1);
+}
+
+#[test]
+fn disk_mount_enforces_the_combined_per_case_active_mount_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"mount quota disk");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("mount-quota".to_string()),
+    })
+    .expect("case_open");
+    let resources = (0..4)
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("vss-mount-{index}"),
+                "resource_type": "vss_mount",
+                "status": "mounted",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "image_path": tmp.path().join(format!("snapshot-{index}.dd")),
+                "mount_point": handle.case_dir.join("mounts").join(format!("vss-{index}")),
+                "fs_root": handle.case_dir.join("mounts").join(format!("vss-{index}")),
+                "parent_id": null,
+                "output_dir": null,
+                "artifacts": [],
+                "command": ["vshadowmount"],
+                "note": "pre-existing active mount"
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::write(
+        handle.case_dir.join("session_resources.json"),
+        serde_json::to_vec(&serde_json::json!({"resources": resources})).unwrap(),
+    )
+    .expect("seed ledger");
+
+    let error = disk_mount(&DiskMountInput {
+        case_id: handle.id,
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect_err("a fifth active mount must be refused before allocation");
+
+    assert!(
+        error.to_string().contains("active mount") && error.to_string().contains('4'),
+        "unexpected quota error: {error}"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -410,6 +570,7 @@ fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
     .expect("mock mount succeeds");
     assert_eq!(mounted.status, "mounted");
     assert!(mounted.ledger_path.is_file());
+    let mount_point = mounted.mount_point.clone();
 
     let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
         case_id: handle.id.clone(),
@@ -417,6 +578,7 @@ fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
         artifact_kinds: vec![],
         limit: 20,
         max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
         recover_deleted: true,
     })
     .expect("extract artifacts");
@@ -430,9 +592,14 @@ fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
     assert!(classes.contains(&"registry"), "classes={classes:?}");
     assert_eq!(extracted.artifacts_skipped_oversize, 0);
     assert_eq!(extracted.max_artifact_bytes, 1024);
+    assert_eq!(extracted.listing_entries_seen, 3);
+    assert!(extracted.listing_stdout_bytes > 0);
+    assert!(!extracted.listing_truncated);
+    assert!(extracted.listing_limit_reason.is_none());
     for artifact in &extracted.artifacts {
         assert!(artifact.extracted_path.is_file());
         assert!(artifact.extracted_path.starts_with(&extracted.output_dir));
+        assert_eq!(artifact.sha256.len(), 64);
     }
 
     let unmounted = disk_unmount(&DiskUnmountInput {
@@ -442,11 +609,197 @@ fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
     })
     .expect("mock unmount succeeds");
     assert_eq!(unmounted.status, "unmounted");
+    assert!(
+        !mount_point.exists(),
+        "successful unmount must remove its server-created leaf"
+    );
 
     let ledger_text = fs::read_to_string(handle.case_dir.join("session_resources.json")).unwrap();
     assert!(ledger_text.contains("disk_mount"));
     assert!(ledger_text.contains("disk_extract_artifacts"));
     assert!(ledger_text.contains("unmounted"));
+    let ledger: serde_json::Value = serde_json::from_str(&ledger_text).expect("ledger json");
+    let ledger_hashes = ledger["resources"]
+        .as_array()
+        .expect("resources")
+        .iter()
+        .flat_map(|resource| resource["artifacts"].as_array().into_iter().flatten())
+        .filter_map(|artifact| artifact["sha256"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ledger_hashes.len(), extracted.artifacts.len());
+    assert!(ledger_hashes.iter().all(|sha256| sha256.len() == 64));
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_reports_mixed_live_icat_success_and_failure_as_truncated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("mixed-icat".to_string()),
+    })
+    .expect("case_open ok");
+    let listing = "r/r 100:\tWindows/Prefetch/GOOD.EXE-11111111.pf\n\
+                   r/r 200:\tWindows/Prefetch/FAILED.EXE-22222222.pf\n";
+    // Inode 200 is deliberately absent: fake icat's `cat` exits nonzero.
+    let _tsk = FakeTsk::install_raw(tmp.path(), listing, &[("100", b"good".as_slice())]);
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+
+    let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
+        recover_deleted: true,
+    })
+    .expect("mixed extraction completes with honest limitation");
+
+    assert_eq!(extracted.artifacts.len(), 1);
+    assert_eq!(extracted.artifacts_extraction_failed, 1);
+    assert!(extracted.truncated);
+    assert!(extracted
+        .limit_reasons
+        .iter()
+        .any(|reason| reason == "artifact_extraction_failed"));
+}
+
+#[test]
+fn disk_mount_rejects_different_same_hash_image_for_registered_case() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let registered = tmp.path().join("registered.dd");
+    let substitute = tmp.path().join("substitute.dd");
+    fs::write(&registered, b"same bytes").expect("registered fixture");
+    fs::write(&substitute, b"same bytes").expect("substitute fixture");
+    let handle = case_open(&CaseOpenInput {
+        image_path: registered,
+        expected_sha256: None,
+        label: None,
+    })
+    .expect("case_open ok");
+
+    let err = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: substitute,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect_err("same bytes at a different path are not this Case's evidence");
+
+    assert!(matches!(
+        err,
+        DiskError::IntegrityMismatch { ref case_id } if case_id == &handle.id
+    ));
+}
+
+#[test]
+fn disk_mount_rejects_evidence_mutated_after_case_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"registered bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: None,
+    })
+    .expect("case_open ok");
+    fs::write(&image, b"mutated bytes").expect("mutate fixture after registration");
+
+    let err = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect_err("post-registration evidence mutation must be refused");
+
+    assert!(matches!(
+        err,
+        DiskError::IntegrityMismatch { ref case_id } if case_id == &handle.id
+    ));
+}
+
+#[test]
+fn disk_mount_rejects_mutated_split_ewf_segment() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let first = tmp.path().join("case.E01");
+    let second = tmp.path().join("case.E02");
+    fs::write(&first, b"first segment").expect("first segment");
+    fs::write(&second, b"second segment").expect("second segment");
+    let handle = case_open(&CaseOpenInput {
+        image_path: first.clone(),
+        expected_sha256: None,
+        label: None,
+    })
+    .expect("case_open split EWF");
+    fs::write(&second, b"substituted second segment").expect("mutate segment");
+
+    let err = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: first,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect_err("mutating any registered EWF segment must be refused");
+
+    assert!(matches!(
+        err,
+        DiskError::IntegrityMismatch { ref case_id } if case_id == &handle.id
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_revalidates_evidence_after_mount() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"registered bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: None,
+    })
+    .expect("case_open ok");
+    let _tsk = FakeTsk::install(
+        tmp.path(),
+        &[("100", "Windows/Prefetch/CMD.EXE-12345678.pf", b"pf")],
+    );
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image.clone(),
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("initial mount binds registered bytes");
+    fs::write(&image, b"mutated after mount").expect("mutate after mount");
+
+    let err = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id.clone(),
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
+        recover_deleted: true,
+    })
+    .expect_err("extract must revalidate the case evidence binding");
+
+    assert!(matches!(
+        err,
+        DiskError::IntegrityMismatch { ref case_id } if case_id == &handle.id
+    ));
 }
 
 #[test]
@@ -458,6 +811,12 @@ fn disk_extract_artifacts_passes_split_ewf_segments_to_tsk() {
     let second = tmp.path().join("case.E02");
     fs::write(&first, b"first segment bytes").unwrap();
     fs::write(&second, b"second segment bytes").unwrap();
+    // The tool canonicalizes the image path before handing it to TSK. On macOS
+    // the tempdir lives under a `/var` -> `/private/var` symlink, so compare
+    // against the canonicalized segment paths or the argv check below mismatches
+    // `/private/var...` (what TSK sees) against `/var...`. No-op on Linux.
+    let first = first.canonicalize().expect("canonicalize first segment");
+    let second = second.canonicalize().expect("canonicalize second segment");
 
     let handle = case_open(&CaseOpenInput {
         image_path: first.clone(),
@@ -488,6 +847,7 @@ fn disk_extract_artifacts_passes_split_ewf_segments_to_tsk() {
         artifact_kinds: vec![],
         limit: 20,
         max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
         recover_deleted: true,
     })
     .expect("extract artifacts");
@@ -556,6 +916,7 @@ fn disk_extract_artifacts_skips_oversized_yara_targets() {
         artifact_kinds: vec![],
         limit: 20,
         max_artifact_bytes: 8,
+        max_total_bytes: 4096,
         recover_deleted: true,
     })
     .expect("extract artifacts");
@@ -575,6 +936,123 @@ fn disk_extract_artifacts_skips_oversized_yara_targets() {
             .all(|artifact| artifact.source_path != large),
         "oversized YARA target should not be copied"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_artifacts_enforces_case_wide_aggregate_budget_across_calls() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("disk-aggregate-limit".to_string()),
+    })
+    .expect("case_open ok");
+    let _tsk = FakeTsk::install(
+        tmp.path(),
+        &[
+            ("200", "Users/Alice/AppData/Local/Temp/one.bin", b"1111"),
+            ("201", "Users/Alice/AppData/Local/Temp/two.bin", b"2222"),
+        ],
+    );
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+
+    let first = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id.clone(),
+        mount_id: mounted.mount_id.clone(),
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 16,
+        max_total_bytes: 7,
+        recover_deleted: true,
+    })
+    .expect("first bounded extract");
+    assert_eq!(first.extracted_bytes, 4);
+    assert_eq!(first.case_extracted_bytes_before, 0);
+    assert_eq!(first.case_extracted_bytes_after, 4);
+    assert_eq!(first.artifacts_skipped_total_limit, 1);
+    assert!(first.truncated);
+    assert!(first
+        .limit_reasons
+        .iter()
+        .any(|reason| reason == "aggregate_bytes"));
+    assert!(first
+        .artifacts
+        .iter()
+        .all(|artifact| artifact.size_bytes <= first.max_total_bytes));
+    assert!(first.artifacts.iter().all(|artifact| {
+        artifact.sha256.len() == 64 && artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }));
+
+    let second = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 16,
+        max_total_bytes: 7,
+        recover_deleted: true,
+    })
+    .expect("second bounded extract");
+    assert_eq!(second.case_extracted_bytes_before, 4);
+    assert_eq!(second.extracted_bytes, 0);
+    assert_eq!(second.case_extracted_bytes_after, 4);
+    assert!(second.artifacts.is_empty());
+    assert!(second.artifacts_skipped_total_limit >= 1);
+    assert!(second.truncated);
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_artifacts_accounts_for_orphaned_staging_after_a_crash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("disk-orphaned-staging".to_string()),
+    })
+    .expect("case_open ok");
+    let _tsk = FakeTsk::install(
+        tmp.path(),
+        &[("200", "Users/Alice/AppData/Local/Temp/next.bin", b"next")],
+    );
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+    let orphan_dir = handle.case_dir.join("extracted/disk/orphaned-call");
+    fs::create_dir_all(&orphan_dir).expect("orphan dir");
+    fs::write(orphan_dir.join("partial.bin"), b"123456").expect("orphan partial");
+
+    let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 16,
+        max_total_bytes: 7,
+        recover_deleted: true,
+    })
+    .expect("bounded extract after orphan");
+
+    assert_eq!(extracted.case_extracted_bytes_before, 6);
+    assert_eq!(extracted.extracted_bytes, 0);
+    assert!(extracted.artifacts.is_empty());
+    assert_eq!(extracted.artifacts_skipped_total_limit, 1);
+    assert!(extracted.truncated);
 }
 
 #[test]
@@ -622,6 +1100,7 @@ fn disk_extract_artifacts_recovers_deleted_entries_and_skips_realloc() {
         artifact_kinds: vec![],
         limit: 20,
         max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
         recover_deleted: true,
     })
     .expect("extract artifacts");
@@ -670,6 +1149,7 @@ fn disk_extract_artifacts_recovers_deleted_entries_and_skips_realloc() {
         artifact_kinds: vec![],
         limit: 20,
         max_artifact_bytes: 1024,
+        max_total_bytes: 4096,
         recover_deleted: false,
     })
     .expect("extract artifacts without recovery");

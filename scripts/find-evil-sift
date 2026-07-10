@@ -32,15 +32,32 @@ GUEST_REPO_PATH="${GUEST_REPO_PATH:-/home/sansforensics/find-evil}"
 VMRUN_WIN="/c/Program Files (x86)/VMware/VMware Workstation/vmrun.exe"
 
 RESTORE_ON_EXIT=1
+ACKNOWLEDGED=0
 for arg in "$@"; do
   case "${arg}" in
     --no-restore) RESTORE_ON_EXIT=0 ;;
+    --acknowledge-evidence-egress) ACKNOWLEDGED=1 ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: scripts/find-evil-sift --acknowledge-evidence-egress [--no-restore]
+
+Starts an interactive Claude Code session around the SIFT transport. Parsed
+evidence-derived output can enter the cloud model context. For the zero-LLM
+SIFT path, run: scripts/verdict --sift <evidence>
+EOF
+      exit 0
+      ;;
   esac
 done
 
 log()  { printf '[find-evil-sift] %s\n' "$*" >&2; }
 warn() { printf '[find-evil-sift] WARN: %s\n' "$*" >&2; }
 fail() { printf '[find-evil-sift] FAIL: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${ACKNOWLEDGED}" != "1" ]]; then
+  fail "interactive Claude analysis requires --acknowledge-evidence-egress; use scripts/verdict --sift <evidence> for the zero-LLM path"
+fi
+export FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1
 
 to_winpath() {
   local p="$1"

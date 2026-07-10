@@ -144,7 +144,7 @@ const REPORT_ORDER = 8;
  * Derive the ordered pipeline stages with monotonic status from the audit log.
  *
  * @param events       chronological audit lines (the page's accumulated stream)
- * @param reportReady  true once the signed PDF report is available
+ * @param reportReady  true once the presentation PDF report is available
  */
 export function deriveStageStates(
   events: ReadonlyArray<AuditLine>,
@@ -169,7 +169,7 @@ export function deriveStageStates(
       status = "done";
     } else if (def.order === furthest) {
       // Terminal phase reads as done once the whole run has completed
-      // (manifest signed + report ready), otherwise it's the active head.
+      // (manifest stage + presentation report ready), otherwise it's active.
       status = reportReady && def.order === REPORT_ORDER ? "done" : "active";
     } else {
       status = "idle";

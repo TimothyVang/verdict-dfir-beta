@@ -82,7 +82,6 @@ ARTIFACT_CLASS_FOR_TOOL = {
     "registry_query": "registry",
     "prefetch_parse": "prefetch",
     "yara_scan": "yara",
-    "vel_collect": "velociraptor",
 }
 
 

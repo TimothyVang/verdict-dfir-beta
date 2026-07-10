@@ -21,6 +21,7 @@ the binary is resolved from that directory instead of the repository ``target/``
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -44,10 +45,17 @@ def log(msg: str) -> None:
 
 
 class StdioClient:
-    def __init__(self, cmd: list[str]) -> None:
+    def __init__(
+        self, cmd: list[str], *, env_overrides: dict[str, str] | None = None
+    ) -> None:
         env = os.environ.copy()
+        env.update(env_overrides or {})
         # Quiet mode — keep stderr from cluttering terminal during smoke.
         env.setdefault("RUST_LOG", "warn")
+        # This subprocess returns parsed output only to this reviewed local
+        # smoke controller; make the privacy route explicit and fail closed if
+        # a future server stops recognizing it.
+        env["FINDEVIL_OUTPUT_ROUTE"] = "local_controller"
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -176,7 +184,28 @@ def main() -> int:
     print("=" * 60)
     log(f"binary: {binary}")
 
-    client = StdioClient([str(binary)])
+    workdir = REPO / "tmp" / "rust-smoke"
+    workdir.mkdir(parents=True, exist_ok=True)
+    evidence = workdir / "evidence.E01"
+    evidence.write_bytes(
+        b"FAKE EVIDENCE BYTES for the rust-mcp-smoke harness. "
+        b"Real .e01 round-trip would land in tmp/rust-smoke/."
+    )
+    case_home = workdir / "home"
+    case_home.mkdir(exist_ok=True)
+    evidence_hash = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    reservation = json.dumps(
+        {"artifacts": [{"path": str(evidence.resolve()), "sha256": evidence_hash}]},
+        separators=(",", ":"),
+    )
+
+    client = StdioClient(
+        [str(binary)],
+        env_overrides={
+            "FINDEVIL_CASE_OPEN_BINDING": reservation,
+            "FINDEVIL_HOME": str(case_home),
+        },
+    )
     try:
         # ---- 1. initialize handshake ------------------------------------
         log("initialize handshake...")
@@ -207,6 +236,7 @@ def main() -> int:
                 "disk_mount",
                 "disk_extract_artifacts",
                 "disk_unmount",
+                "bulk_extract",
                 "evtx_query",
                 "prefetch_parse",
                 "mft_timeline",
@@ -236,6 +266,7 @@ def main() -> int:
                 "thumbcache_parse",
                 "email_parse",
                 "exif_parse",
+                "setupapi_parse",
                 "bits_parse",
                 "srum_parse",
                 "pst_parse",
@@ -243,7 +274,6 @@ def main() -> int:
                 "vss_list",
                 "vss_mount",
                 "hashset_lookup",
-                "vel_collect",
                 "browser_history",
             ]
         )
@@ -271,20 +301,13 @@ def main() -> int:
 
         # ---- 3. case_open -----------------------------------------------
         log("case_open: register synthetic evidence...")
-        workdir = REPO / "tmp" / "rust-smoke"
-        workdir.mkdir(parents=True, exist_ok=True)
-        evidence = workdir / "evidence.E01"
-        evidence.write_bytes(
-            b"FAKE EVIDENCE BYTES for the rust-mcp-smoke harness. "
-            b"Real .e01 round-trip would land in tmp/rust-smoke/."
-        )
-        case_home = workdir / "home"
-        case_home.mkdir(exist_ok=True)
-        os.environ["FINDEVIL_HOME"] = str(case_home)
-
         handle = client.call_tool(
             "case_open",
-            {"image_path": str(evidence), "label": "rust-mcp-smoke"},
+            {
+                "image_path": str(evidence),
+                "expected_sha256": evidence_hash,
+                "label": "rust-mcp-smoke",
+            },
         )
         if not (
             isinstance(handle.get("id"), str)
@@ -323,53 +346,26 @@ def main() -> int:
             if substr not in resp["error"].get("message", ""):
                 fatal(f"error message missing {substr!r}: {resp}")
 
-        # ---- 4. disk_* mock path ----------------------------------------
-        log("disk_mount/extract/unmount: mock session-resource path...")
-        mount_root = workdir / "mock-mounted-disk"
-        (mount_root / "Windows" / "Prefetch").mkdir(parents=True, exist_ok=True)
-        (mount_root / "Windows" / "System32" / "config").mkdir(
-            parents=True, exist_ok=True
-        )
-        (mount_root / "$MFT").write_bytes(b"mft smoke bytes")
-        (mount_root / "Windows" / "Prefetch" / "CMD.EXE-12345678.pf").write_bytes(b"pf")
-        (mount_root / "Windows" / "System32" / "config" / "SOFTWARE").write_bytes(
-            b"hive"
-        )
-        mounted = client.call_tool(
-            "disk_mount",
+        # ---- 4. production server rejects test-only disk mocks ----------
+        log("disk_mount: test-only mock mode is rejected (-32602)...")
+        expect_error_response(
+            "tools/call",
             {
-                "case_id": handle["id"],
-                "image_path": str(evidence),
-                "mount_point": str(mount_root),
-                "mode": "mock",
+                "name": "disk_mount",
+                "arguments": {
+                    "case_id": handle["id"],
+                    "image_path": str(evidence),
+                    "mount_point": str(workdir / "mock-mounted-disk"),
+                    "mode": "mock",
+                },
             },
+            "test-only",
+            expected_code=-32602,
         )
-        if mounted.get("status") != "mounted" or not mounted.get("mount_id"):
-            fatal(f"disk_mount mock returned malformed output: {mounted}")
-        extracted = client.call_tool(
-            "disk_extract_artifacts",
-            {
-                "case_id": handle["id"],
-                "mount_id": mounted["mount_id"],
-                "limit": 20,
-            },
-        )
-        classes = {a.get("artifact_class") for a in extracted.get("artifacts", [])}
-        if not {"mft", "prefetch", "registry"}.issubset(classes):
-            fatal(f"disk_extract_artifacts missed expected classes: {extracted}")
-        unmounted = client.call_tool(
-            "disk_unmount",
-            {"case_id": handle["id"], "mount_id": mounted["mount_id"], "mode": "mock"},
-        )
-        if unmounted.get("status") != "unmounted":
-            fatal(f"disk_unmount mock returned malformed output: {unmounted}")
-        log(
-            f"  -> extracted {len(extracted.get('artifacts', []))} artifacts; "
-            "ledger updated"
-        )
+        log("  -> production boundary rejects mode=mock as expected")
 
         # ---- 5. evtx_query (error path) ---------------------------------
-        log("evtx_query: missing-file error path (-32602)...")
+        log("evtx_query: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -379,13 +375,15 @@ def main() -> int:
                     "evtx_path": str(workdir / "nope.evtx"),
                 },
             },
-            "evtx file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'evtx file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 5. prefetch_parse (error path) -----------------------------
-        log("prefetch_parse: missing-file error path (-32602)...")
+        log(
+            "prefetch_parse: unreserved missing path fails at authorization boundary..."
+        )
         expect_error_response(
             "tools/call",
             {
@@ -395,13 +393,13 @@ def main() -> int:
                     "prefetch_path": str(workdir / "nope.pf"),
                 },
             },
-            "prefetch file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'prefetch file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 6. mft_timeline (error path) -------------------------------
-        log("mft_timeline: missing-file error path (-32602)...")
+        log("mft_timeline: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -411,10 +409,10 @@ def main() -> int:
                     "mft_path": str(workdir / "nope.mft"),
                 },
             },
-            "MFT file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'MFT file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 7. mft_timeline invalid-time-filter (-32602) ---------------
         log("mft_timeline: invalid time filter (-32602)...")
@@ -437,7 +435,9 @@ def main() -> int:
         log("  -> -32602 invalid_params with 'invalid time filter' as expected")
 
         # ---- 8. registry_query (error path) -----------------------------
-        log("registry_query: missing-file error path (-32602)...")
+        log(
+            "registry_query: unreserved missing path fails at authorization boundary..."
+        )
         expect_error_response(
             "tools/call",
             {
@@ -448,13 +448,13 @@ def main() -> int:
                     "key_path": "",
                 },
             },
-            "registry hive not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'registry hive not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 9. yara_scan (error path) ----------------------------------
-        log("yara_scan: missing-target error path (-32602)...")
+        log("yara_scan: unreserved missing target fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -465,13 +465,13 @@ def main() -> int:
                     "rules_path": str(workdir / "nope.yar"),
                 },
             },
-            "YARA target not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'YARA target not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 10. usnjrnl_query (error path) -----------------------------
-        log("usnjrnl_query: missing-file error path (-32602)...")
+        log("usnjrnl_query: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -481,13 +481,13 @@ def main() -> int:
                     "usnjrnl_path": str(workdir / "nope.j"),
                 },
             },
-            "UsnJrnl file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'UsnJrnl file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 11. hayabusa_scan (error path) -----------------------------
-        log("hayabusa_scan: missing-evtx-dir error path (-32602)...")
+        log("hayabusa_scan: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -497,12 +497,12 @@ def main() -> int:
                     "evtx_dir": str(workdir / "nope-evtx-dir"),
                 },
             },
-            "evtx_dir not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'evtx_dir not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
-        log("sysmon_network_query: missing-file error path (-32602)...")
+        log("sysmon_network_query: unreserved path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -512,12 +512,12 @@ def main() -> int:
                     "evtx_path": str(workdir / "missing-sysmon.evtx"),
                 },
             },
-            "sysmon evtx file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'sysmon evtx file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
-        log("zeek_summary: missing-path error path (-32602)...")
+        log("zeek_summary: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -527,12 +527,12 @@ def main() -> int:
                     "zeek_path": str(workdir / "missing-zeek"),
                 },
             },
-            "zeek path not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'zeek path not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
-        log("pcap_triage: missing-file error path (-32602)...")
+        log("pcap_triage: unreserved missing path fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -542,13 +542,13 @@ def main() -> int:
                     "pcap_path": str(workdir / "missing.pcap"),
                 },
             },
-            "pcap file not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'pcap file not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 12. vol_pslist (error path) --------------------------------
-        log("vol_pslist: missing-image error path (-32602)...")
+        log("vol_pslist: unreserved missing image fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -558,13 +558,13 @@ def main() -> int:
                     "memory_path": str(workdir / "nope.mem"),
                 },
             },
-            "memory image not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'memory image not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 13. vol_malfind (error path) -------------------------------
-        log("vol_malfind: missing-image error path (-32602)...")
+        log("vol_malfind: unreserved missing image fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -574,13 +574,13 @@ def main() -> int:
                     "memory_path": str(workdir / "nope.mem"),
                 },
             },
-            "memory image not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'memory image not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 14a. vol_psscan (error path -32602) ------------------------
-        log("vol_psscan: missing-image error path (-32602)...")
+        log("vol_psscan: unreserved missing image fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -590,13 +590,13 @@ def main() -> int:
                     "memory_path": str(workdir / "nope.mem"),
                 },
             },
-            "memory image not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'memory image not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
         # ---- 14b. vol_psxview (error path -32602) ------------------------
-        log("vol_psxview: missing-image error path (-32602)...")
+        log("vol_psxview: unreserved missing image fails at authorization boundary...")
         expect_error_response(
             "tools/call",
             {
@@ -606,26 +606,37 @@ def main() -> int:
                     "memory_path": str(workdir / "nope.mem"),
                 },
             },
-            "memory image not found",
-            expected_code=-32602,
+            "cannot read evidence authorization path",
+            expected_code=-32603,
         )
-        log("  -> -32602 invalid_params with 'memory image not found' as expected")
+        log("  -> rejected before parser dispatch as expected")
 
-        # ---- 14c. vel_collect invalid-artifact-name (-32602) -------------
-        log("vel_collect: invalid artifact name (-32602)...")
-        expect_error_response(
-            "tools/call",
-            {
-                "name": "vel_collect",
-                "arguments": {
-                    "case_id": handle["id"],
-                    "artifact": "Has Spaces",
+        # ---- 14c. removed open-world Velociraptor trampoline --------------
+        log("vel_collect: shell/live-response trampoline stays absent (-32602)...")
+        for artifact in (
+            "Linux.Sys.BashShell",
+            "Windows.System.CmdShell",
+            "Windows.System.PowerShell",
+            "Generic.Utils.Upload",
+            "Windows.System.Kill",
+            "Generic.Network.Scan",
+            "Custom.Unknown.Artifact",
+        ):
+            expect_error_response(
+                "tools/call",
+                {
+                    "name": "vel_collect",
+                    "arguments": {
+                        "case_id": handle["id"],
+                        "artifact": artifact,
+                    },
                 },
-            },
-            "invalid artifact name",
-            expected_code=-32602,
+                "unknown tool: vel_collect",
+                expected_code=-32602,
+            )
+        log(
+            "  -> every shell/upload/kill/network/custom artifact rejected as unknown tool"
         )
-        log("  -> -32602 invalid_params with 'invalid artifact name' as expected")
 
         # ---- 15. real-evidence smoke (opt-in via --real-evidence) -------
         if args.real_evidence:

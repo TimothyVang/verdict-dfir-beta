@@ -13,8 +13,10 @@ description.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -92,11 +94,42 @@ def _read_message(reader: _LineReader, timeout_s: float = 15.0) -> dict[str, Any
             continue
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "every tool call in this smoke is reserved-custody routed, which is "
+        "fail-closed disabled on native Windows by design; POSIX / WSL2 / Docker "
+        "cover it (see test_custody_path_policy)"
+    ),
+)
 def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
     """Boot the server, complete initialize, list tools, call audit_verify."""
+    case_dir = tmp_path / "case-001"
+    case_dir.mkdir(mode=0o700)
+    marker = case_dir / ".verdict-case-marker"
+    marker.write_bytes(b"")
+    if os.name != "nt":
+        marker.chmod(0o600)
+    memory_store = tmp_path / "private" / "memory.sqlite"
+    expert_ledger = tmp_path / "private" / "expert_misses.jsonl"
     env = os.environ.copy()
     env["FINDEVIL_LOG_LEVEL"] = "WARNING"
     env["PYTHONUNBUFFERED"] = "1"
+    controller_capability = "c" * 64
+    env.update(
+        {
+            "FINDEVIL_CUSTODY_BOUNDARY": "reserved_case",
+            "FINDEVIL_ACTIVE_CASE_DIR": str(case_dir),
+            "FINDEVIL_ACTIVE_CASE_ID": "case-001",
+            "FINDEVIL_ACTIVE_RUN_ID": "run-001",
+            "FINDEVIL_ACTIVE_STARTED_AT": "2026-07-10T00:00:00Z",
+            "FINDEVIL_ACTIVE_SIGNER": "ed25519",
+            "FINDEVIL_MEMORY_STORE": str(memory_store),
+            "FINDEVIL_EXPERT_MISS_LEDGER": str(expert_ledger),
+            "FINDEVIL_CONTROLLER_CAPABILITY": controller_capability,
+            "FINDEVIL_OUTPUT_ROUTE": "local_controller",
+        }
+    )
 
     cmd = [sys.executable, "-m", "findevil_agent_mcp.server"]
     proc = subprocess.Popen(
@@ -172,7 +205,7 @@ def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
                 "method": "tools/call",
                 "params": {
                     "name": "audit_verify",
-                    "arguments": {"path": str(tmp_path / "nope.jsonl")},
+                    "arguments": {"path": str(case_dir / "audit.jsonl")},
                 },
             },
         )
@@ -182,6 +215,89 @@ def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
         assert len(content) == 1
         body = json.loads(content[0]["text"])
         assert body == {"ok": True, "record_count": 0, "error": None}
+
+        _send_line(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_append",
+                    "arguments": {
+                        "path": str(case_dir / "audit.jsonl"),
+                        "kind": "tool_call_output",
+                        "payload": {
+                            "tool_call_id": "forged",
+                            "output_hash": "f" * 64,
+                        },
+                    },
+                },
+            },
+        )
+        forged_audit = _read_message(reader)
+        forged_body = json.loads(forged_audit["result"]["content"][0]["text"])
+        assert forged_body["error"]["kind"] == "controller_authority"
+        assert not (case_dir / "audit.jsonl").exists()
+
+        evidence_db = tmp_path / "evidence.sqlite"
+        with sqlite3.connect(evidence_db) as connection:
+            connection.execute("CREATE TABLE evidence(value TEXT)")
+            connection.execute("INSERT INTO evidence VALUES ('preserve-me')")
+        before = hashlib.sha256(evidence_db.read_bytes()).hexdigest()
+        _send_line(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_remember",
+                    "arguments": {
+                        "store_path": str(evidence_db),
+                        "case_id": "case-001",
+                        "kind": "ioc",
+                        "key": "blocked.example",
+                        "value": "blocked.example",
+                        "sha256": "sha256:" + "a" * 64,
+                        "audit_log_path": str(case_dir / "audit.jsonl"),
+                        "_controller_capability": controller_capability,
+                    },
+                },
+            },
+        )
+        denied = _read_message(reader)
+        denied_body = json.loads(denied["result"]["content"][0]["text"])
+        assert denied_body["error"]["kind"] == "custody_path_policy"
+        assert hashlib.sha256(evidence_db.read_bytes()).hexdigest() == before
+        with sqlite3.connect(evidence_db) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+        assert tables == {"evidence"}
+
+        secret = tmp_path / "credentials.conf"
+        secret.write_text("token=do-not-disclose api.openai.com adjacent-secret", encoding="utf-8")
+        _send_line(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_ai_signatures",
+                    "arguments": {
+                        "case_id": "case-001",
+                        "paths": [str(secret)],
+                    },
+                },
+            },
+        )
+        denied_scan = _read_message(reader)
+        denied_scan_text = denied_scan["result"]["content"][0]["text"]
+        assert "custody_path_policy" in denied_scan_text
+        assert "do-not-disclose" not in denied_scan_text
     finally:
         if proc.stdin is not None and not proc.stdin.closed:
             proc.stdin.close()
@@ -189,3 +305,85 @@ def test_stdio_initialize_and_list_tools(tmp_path: Path) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def test_stdio_privacy_gate_allows_initialize_and_list_but_denies_tool_output(
+    tmp_path: Path,
+) -> None:
+    env = os.environ.copy()
+    env["FINDEVIL_LOG_LEVEL"] = "WARNING"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.pop("FINDEVIL_OUTPUT_ROUTE", None)
+    env.pop("FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS", None)
+    secret = "parsed-secret-must-not-cross-boundary"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "findevil_agent_mcp.server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+    )
+    reader = _LineReader(proc.stdout)
+    try:
+        _send_line(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 801,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "privacy-test", "version": "0.0.0"},
+                },
+            },
+        )
+        initialized = _read_message(reader)
+        assert "result" in initialized
+        _send_line(
+            proc,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        _send_line(
+            proc,
+            {"jsonrpc": "2.0", "id": 802, "method": "tools/list", "params": {}},
+        )
+        listed = _read_message(reader)
+        assert listed["result"]["tools"]
+
+        _send_line(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 803,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_ai_signatures",
+                    "arguments": {"case_id": "case-001", "text": secret},
+                },
+            },
+        )
+        denied = _read_message(reader)
+        denied_text = denied["result"]["content"][0]["text"]
+        denied_body = json.loads(denied_text)
+        assert denied_body["error"]["kind"] == "privacy_boundary"
+        assert set(denied_body) == {"error"}
+        assert secret not in json.dumps(denied)
+    finally:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()

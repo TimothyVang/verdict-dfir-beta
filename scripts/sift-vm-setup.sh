@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$HOME/find-evil}"
-RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.88.0}"
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.91.0}"
 
 log() { printf '[sift-vm-setup] %s\n' "$*" >&2; }
 warn() { printf '[sift-vm-setup] WARN: %s\n' "$*" >&2; }
@@ -39,7 +39,7 @@ fi
 log "running as: $(whoami) in $(pwd)"
 
 # ---------------------------------------------------------------------
-# 1. Rustup + the pinned toolchain (1.88.0 per rust-toolchain.toml).
+# 1. Rustup + the pinned toolchain (1.91.0 per rust-toolchain.toml).
 #    SIFT 2026.03.24 ships with rustc 1.75 — too old; clap_builder 4.6
 #    needs edition-2024 (Rust ≥1.85). Pull our pinned toolchain via
 #    rustup so we don't depend on the OS package version.
@@ -188,21 +188,6 @@ elif [[ -x "$HOME/.local/bin/hayabusa" ]] || command -v hayabusa >/dev/null 2>&1
     warn "  hayabusa update-rules failed (needs network; EVTX/Sigma scans return 0 alerts until rules are fetched)"
   fi
 fi
-
-# Velociraptor — not in SIFT; pull a release binary.
-VELOCIRAPTOR_VERSION="${VELOCIRAPTOR_VERSION:-0.74.6}"
-VELOCIRAPTOR_RELEASE="${VELOCIRAPTOR_RELEASE:-0.74}"
-if ! command -v velociraptor >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/velociraptor" ]]; then
-  log "  installing velociraptor ${VELOCIRAPTOR_VERSION} from release ${VELOCIRAPTOR_RELEASE}..."
-  if curl -fsSL "https://github.com/Velocidex/velociraptor/releases/download/v${VELOCIRAPTOR_RELEASE}/velociraptor-v${VELOCIRAPTOR_VERSION}-linux-amd64-musl" \
-      -o "$HOME/.local/bin/velociraptor"; then
-    chmod +x "$HOME/.local/bin/velociraptor"
-    log "    velociraptor → $HOME/.local/bin/velociraptor"
-  else
-    warn "  velociraptor download failed; the agent will get BinaryNotFound for vel_collect"
-  fi
-fi
-[[ -x "$HOME/.local/bin/velociraptor" ]] && log "  velociraptor: $HOME/.local/bin/velociraptor" || true
 
 # ---------------------------------------------------------------------
 # 7. Quick build sanity check — actually run the smoke harness once

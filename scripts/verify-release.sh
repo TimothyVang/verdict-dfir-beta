@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# scripts/verify-release.sh — one no-credential command that re-proves VERDICT's
-# safety and custody claims for a reviewer.
+# scripts/verify-release.sh — one no-credential command that re-checks VERDICT's
+# policy guardrails and committed trace integrity for a reviewer.
 #
 # A judge can run this on a fresh clone with NOTHING but Python 3 (and optionally
 # Rust) — no API key, no Claude credential, no MCP server, no network. It composes
 # the existing no-key gates plus an offline re-verification of every committed
 # audit/hash-chain trace, prints a PASS/SKIP/FAIL checklist, and exits non-zero on
-# any failure.
+# any failure. It does not authenticate a manifest signer: full Ed25519
+# verification additionally needs the trusted public-key fingerprint obtained
+# outside the case (or exact identity + issuer policy for Sigstore).
 #
 # What it proves, in order:
 #   1. Policy/custody smokes — verdict-word policy, report-QA/expert-signoff policy,
@@ -98,7 +100,7 @@ run_check "verdict-word policy (compute_verdict + detect_evidence_type)" \
 run_check "report-QA / expert-signoff / visual-evidence policy" \
     "${PYTHON} scripts/report-policy-smoke.py" \
     "${PYTHON} -c 'import matplotlib'"
-run_check "tool-surface count guard (45 product tools: 32 Rust + 13 Python)" \
+run_check "tool-surface count guard (57 product tools: 43 Rust + 14 Python)" \
     "${PYTHON} scripts/tool-count-guard.py"
 run_check "path-existence (every backtick-quoted doc path resolves)" \
     "${PYTHON} scripts/path-existence-smoke.py"

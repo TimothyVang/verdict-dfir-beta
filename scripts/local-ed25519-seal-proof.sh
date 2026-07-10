@@ -3,6 +3,8 @@
 #
 # Runs the agent_mcp manifest gates that assert:
 #   * default + explicit ed25519 finalize verifies cryptographically offline
+#     against the public-key fingerprint returned directly by the trusted
+#     finalizer call (never a fingerprint copied from the manifest under test)
 #   * signer:"stub" is coerced to ed25519 unless FINDEVIL_ALLOW_STUB_SIGNER=1
 #
 # This is NOT a live LLM seal on Spark — it is the custody-path proof that
@@ -37,6 +39,6 @@ uv run python -m pytest tests/test_manifest_tools.py \
   -k "Ed25519 or StubSigner or path_is_accepted or default_signer" \
   --tb=short
 
-echo "[seal-proof] PASS — ed25519 seals verify offline; stub is coerced by default."
+echo "[seal-proof] PASS — ed25519 seals verify against the trusted finalizer pin; stub is coerced by default."
 echo "[seal-proof] NOTE: live Spark agent-driven seal is a separate operator check."
 exit 0

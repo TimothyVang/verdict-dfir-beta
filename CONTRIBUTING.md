@@ -9,9 +9,9 @@ map of what VERDICT is, the open problems (including the hard one — keeping th
 contributors can plug in.
 
 VERDICT is a DFIR agent where **Claude Code is the engine** (Amendment A2). It is three subsystems:
-a Rust MCP server (`services/mcp/`, 32 DFIR tools), a Python MCP server
-(`services/agent_mcp/`, 13 crypto/ACH/memory tools), and a Next.js dashboard (`apps/web/`). The two
-MCP servers are standard MCP, so any MCP-capable agent can drive the tool surface — Claude Code is the
+a Rust MCP server (`services/mcp/`, 43 DFIR tools), a Python MCP server
+(`services/agent_mcp/`, 14 crypto/ACH/memory tools), and a Next.js dashboard (`apps/web/`). The 57
+product tools across the two MCP servers are standard MCP, so any MCP-capable agent can drive the tool surface — Claude Code is the
 reference agent, not the only one.
 
 ---
@@ -37,7 +37,7 @@ Install the toolchain once with `bash scripts/setup` (see [INSTALL.md](INSTALL.m
 below **are** the gates — run them locally before you open a PR; a reviewer runs the same commands
 on your branch.
 
-### Rust (`services/mcp/`) — Rust 1.88 (pinned in `rust-toolchain.toml`)
+### Rust (`services/mcp/`) — Rust 1.91 (pinned in `rust-toolchain.toml`)
 
 ```bash
 cargo fmt --all --check
@@ -82,7 +82,8 @@ All `scripts/*.sh` must pass `shellcheck` (the L0 `shellcheck` job runs it at `s
    ```
 
    It passes when `tmp/auto-runs/<case-id>/verdict.json` carries a real Verdict, every Finding cites
-   a `tool_call_id`, and `manifest_verify.json` reports `overall: true`. An honest `INDETERMINATE`
+   a `tool_call_id`, and `manifest_verify.json` reports `overall: true` plus
+   `signature_verified: true` for the default Ed25519 tier under its trusted pin. An honest `INDETERMINATE`
    on thin evidence is a PASS. Full matrix: [docs/live-test-matrix.md](docs/live-test-matrix.md).
 
 New behavior follows **TDD**: write the failing test (RED), implement (GREEN), refactor. See

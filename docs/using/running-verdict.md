@@ -13,7 +13,7 @@ MCP pipeline → open the live dashboard at the Case → signed Verdict + report
 
 The Verdict word is always one of **`SUSPICIOUS`** / **`INDETERMINATE`** / **`NO_EVIL`** (see
 [`../verdict-semantics.md`](../verdict-semantics.md)). Every Finding cites a `tool_call_id` from
-the 48 audit-chained product tools (34 Rust + 14 Python) — the only surface sealed into the
+the 57 audit-chained product tools (43 Rust + 14 Python) — the only surface sealed into the
 manifest. `.mcp.json` registers 6 servers total; 4 are non-product
 (`n8n-mcp`, `playwright`, `puppeteer`, plus the `qmd` dev-memory recall server) — full table in
 [`../reference/mcp-and-tools.md`](../reference/mcp-and-tools.md).
@@ -26,15 +26,16 @@ In a Claude Code session (`claude` in the repo), type **`/verdict <evidence>`** 
 the supported pipeline with no flags:
 
 1. **Bootstraps** (`scripts/verdict-setup.sh`): builds/checks the MCP servers via `install.sh` if
-   missing, optionally brings up n8n when enabled or already available, and prepares the SANS SIFT VM
-   when the gated OVA and implemented VMware path are available.
+   missing and prepares the SANS SIFT VM when the gated OVA and implemented VMware path are
+   available. Optional n8n/grounding actions remain off even if a service is reachable.
 2. **Auto-selects `--sift`** when the VM is reachable, so supported disk images can mount/extract
    inside the SIFT environment. Local mode can parse supported disk artifacts when Sleuth Kit/libewf
    prerequisites are present; otherwise it falls back with a clear custody-only warning.
-3. **Runs the parallel investigation** to a signed Verdict, then attempts optional n8n
-   finding-to-action + grounding workflows (host-side, post-verdict — never in the audit chain), and
-   opens the dashboard + report.
-4. **Reports** the Verdict + confidence, the finding / tool-call counts, `manifest_verify.overall`,
+3. **Runs the parallel investigation** to a signed Verdict and opens the dashboard + report. Only
+   an explicit `--acknowledge-post-verdict-egress` also authorizes optional n8n finding-to-action +
+   grounding workflows (host-side, post-verdict — never in the audit chain).
+4. **Reports** the Verdict + confidence, the finding / tool-call counts,
+   `manifest_verify.overall` + `signature_verified`,
    and the status of every optional host-side workflow (`reachable`, `recorded`, `skipped`, or
    `unreachable`) without treating sidecar reachability as audit-chain evidence.
 
@@ -46,8 +47,9 @@ available; host-local mode remains useful but has narrower disk-content coverage
 > carries the full toolchain (`docker/dfir.Dockerfile`); `tshark`, Sleuth Kit, libewf, Volatility,
 > Hayabusa-with-rules, and the rest are pinned and verified by the image `HEALTHCHECK`, so nothing is
 > silently missing, and evidence bind-mounts at native disk speed instead of over the VM's hgfs share.
-> Bring it up with `scripts/run-dfir-container.sh <evidence>` and activate it with
-> `cp .mcp.json.docker .mcp.json`. See [docker-backend.md](docker-backend.md).
+> Run it with `scripts/verdict --docker <evidence>`. The launcher reserves the
+> host-only custody case, starts the capability-free Rust parser container, and
+> activates the split-trust MCP transport. See [docker-backend.md](docker-backend.md).
 
 > The skill is loaded at session start. If you just pulled it (e.g. after a merge), start a fresh
 > `claude` session so `/verdict` is registered. To force serial or local, the skill honors the same
@@ -66,8 +68,11 @@ Every flag the launcher actually parses:
 | Flag | Effect |
 |---|---|
 | `<evidence>` (positional) | Path to the Observable. Omit it to use the newest non-placeholder entry already in `evidence/`. |
-| `--sift` | Run the DFIR tools inside the SANS SIFT VM over SSH (default: tools on the local host). This is the recommended parity path for raw disk image content extraction; local mode can also parse supported disk artifacts when Sleuth Kit/libewf prerequisites are present, but otherwise records custody-only limitations. The post-verdict n8n automation + grounding can run in `--sift` mode too (host-side, after the case dir syncs back). Requires a one-time `bash scripts/sift-vm-bootstrap.sh`; set `FIND_EVIL_GUEST_IP` if the VM's IP changed. |
-| `--docker` | Run the DFIR tools inside the `findevil-dfir` container — the container analog of `--sift` and mutually exclusive with it. Brings the container up via `scripts/run-dfir-container.sh` (build/pull the image, mount evidence read-only at `/evidence`, build the MCP in-container), skips the host build, swaps in the docker MCP transport (`.mcp.json.docker`), and hands off the in-container `/evidence` path. Single-host; the container is left running (tear down with `scripts/run-dfir-container.sh --down`). See `docs/using/docker-backend.md`. |
+| `--docker` | Explicitly select the production default: evidence-facing Rust tools run inside a case-scoped `findevil-dfir` container while Python custody/signing remains host-only. Mutually exclusive with `--local`/`--sift`. The launcher selects an existing local or digest-pinned image, fetches locked Rust dependencies in an allow-listed builder, detaches all builder networks before offline compilation, then mounts exact evidence read-only in a networkless, capability-free runtime. The container and transient build/runtime state are removed automatically on exit. Single-host; compressed `.E01` requires an acknowledged local/SIFT run or conversion to raw. See `docs/using/docker-backend.md`. |
+| `--local` | Use host-native parsers as the current user. This reduced-isolation development/compatibility mode requires `--acknowledge-reduced-isolation`; parser compromise could reach host custody/signing state. |
+| `--sift` | Run the DFIR tools inside the SANS SIFT VM over SSH. Required for `mac_triage` and supported for `--fleet`, but parser and custody services share the guest trust domain, so it requires `--acknowledge-reduced-isolation`. With the separate post-verdict egress acknowledgment, n8n automation + grounding can run host-side after the case syncs back. Requires a one-time `bash scripts/sift-vm-bootstrap.sh`; set `FIND_EVIL_GUEST_IP` if the VM's IP changed. |
+| `--acknowledge-reduced-isolation` | Required with `--local` or `--sift`; explicitly accepts the same-OS-user/trust-domain parser boundary. It is rejected with the Docker backend. |
+| `--acknowledge-post-verdict-egress` | Explicitly authorize optional host-side n8n/grounding network actions after the signed case finishes. Default is off regardless of service reachability. These actions never enter the evidence or audit chain. |
 | `--fleet` | Whole multi-host case in ONE command: per-host investigations → cross-host correlation → `FLEET_REPORT`. **Auto-detected** when `<evidence>` is a folder with `hosts/` or `disks/` (the whole-case layout). Resumable: re-run the same command and completed hosts are skipped. Combine with `--sift` to run the per-host stage inside the SIFT VM (`fleet_investigate.py`). See `docs/using/fleet-analysis.md`. |
 | `--watch` | No path? Block until a file **or** a case folder is dropped into `evidence/`, debounced until the copy finishes, then go. |
 | `--no-dashboard` | Do not auto-open the web dashboard. |
@@ -83,9 +88,9 @@ Unrecognized `-*` flags (anything not in the table) are forwarded to the engine 
 engine-only flags like `--no-report`, `--signer sigstore`, or `--force-fresh-replay` work
 without an explicit pass-through. To be unambiguous, put them after `--`.
 
-Local mode (the default, no `--sift`) is what most operators run; it pins a fresh
-`case_id`, writes straight to `tmp/auto-runs/<case-id>/`, and opens the dashboard **live**
-before the engine starts so you watch the audit chain land stage by stage.
+Docker is the no-flag production default. An explicitly acknowledged local run pins a fresh
+`case_id`, writes straight to `tmp/auto-runs/<case-id>/`, and opens the dashboard **live** before
+the engine starts so you watch the audit chain land stage by stage.
 
 ---
 
@@ -94,8 +99,11 @@ before the engine starts so you watch the audit chain land stage by stage.
 Give it a path; walk away. Best for a known Observable.
 
 ```bash
-# Local host (default):
+# Split-trust Docker (default):
 scripts/verdict evidence/DE_1102_security_log_cleared.evtx
+
+# Explicit reduced-isolation host parser fallback:
+scripts/verdict --local --acknowledge-reduced-isolation evidence/DE_1102_security_log_cleared.evtx
 
 # Skip the browser, run unattended (CI / scripted):
 scripts/verdict evidence/case.E01 --no-dashboard --unattended
@@ -130,8 +138,15 @@ Open Claude Code in the repo and run the investigation by hand. Same typed tools
 chain, but you steer each stage.
 
 ```bash
-claude            # or: scripts/find-evil
+scripts/find-evil --acknowledge-evidence-egress
+# or, equivalently:
+FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1 claude
 ```
+
+Interactive cloud analysis is opt-in because parsed rows, filenames, hashes,
+and custody metadata can enter the model context. Raw source files remain
+behind the typed MCP boundary. Run `scripts/verdict <evidence>` directly in a
+terminal for the default zero-LLM local path.
 
 Then prompt:
 
@@ -173,12 +188,19 @@ In local mode the launcher opens the dashboard **before** the engine runs so you
 Case build in real time:
 
 - It checks `http://localhost:3000`; if nothing is listening it starts the Next.js dev server
-  (`pnpm --filter @findevil/web dev`, logs to `/tmp/verdict-dashboard.log`, ~10s) with
+  (`pnpm --filter @findevil/web dev`, logs to `/tmp/verdict-dashboard.log`, ~10s), explicitly
+  bound to `127.0.0.1`, with
   `FINDEVIL_REPO_ROOT` and `FINDEVIL_DASHBOARD_EXTRA_ROOTS` set so the API accepts the Case path.
-- It opens `http://localhost:3000/?case=<url-encoded case dir>` via `xdg-open`.
+- It opens an owner-private bootstrap file via `xdg-open`; that file performs a
+  one-time POST exchange and redirects to a random `verdict-<nonce>.localhost`
+  host. The token is never placed in process arguments or the browser URL.
 - `--no-dashboard` skips all of this and prints the Case path instead.
 
-If the dev server is slow to come up, open `http://localhost:3000/?case=<case dir>` manually.
+If the dev server is slow to come up, inspect `/tmp/verdict-dashboard.log` and
+rerun the launcher. Bare Case URLs are intentionally unauthenticated-disabled.
+The dashboard API serves local audit and report content and is intentionally
+unauthenticated because it is loopback-only. Do not bind it to `0.0.0.0`; an
+intentional remote deployment requires authentication, authorization, and TLS.
 
 ---
 
@@ -191,8 +213,8 @@ it is synced back to the host after the run):
 tmp/auto-runs/auto-<uuid>/
 ├── verdict.json              the evidence-bound Verdict + Findings (each cites a tool_call_id + confidence tier)
 ├── coverage_manifest.json    explicit available/attempted/parsed/failed/unsupported/not-supplied coverage sidecar
-├── run.manifest.json         Merkle root over canonical tool outputs + signature metadata — verifiable offline
-├── manifest_verify.json      offline verification result; check overall == true
+├── run.manifest.json         Merkle root + signature metadata; verify with external signer policy
+├── manifest_verify.json      offline verification result; check overall + signature_verified == true
 ├── audit.jsonl               append-only, hash-chained log of every tool call and Finding (prev_hash per record)
 ├── REPORT.md / .html / .pdf  analyst report: figures, Findings, ATT&CK coverage, timeline, next actions
 ├── expert_signoff.json       expert-signoff packet / status for customer-release candidates
@@ -207,8 +229,8 @@ One line on the load-bearing four:
 |---|---|
 | `verdict.json` | THE answer: the Verdict word, the Findings list, ATT&CK/practitioner coverage, evidence cards, source bibliography, next analyst actions. |
 | `coverage_manifest.json` | The anti-overclaim scope record: for each artifact class, whether it was available, attempted, parsed, failed, unsupported, not supplied, and how many records/rows/errors were observed. |
-| `run.manifest.json` | The signed manifest — Merkle root + signature metadata. The thing a third party verifies offline. |
-| `manifest_verify.json` | The verification result. A passing live test requires `overall: true`. |
+| `run.manifest.json` | The signed manifest — Merkle root + signature metadata. A third party verifies it offline using signer trust obtained outside the case. |
+| `manifest_verify.json` | The verification result. A passing signed live test requires `overall: true` and `signature_verified: true` under trusted signer policy. |
 | `audit.jsonl` | The hash-chained chain of custody; every `tool_call_id` a Finding cites resolves to a line here. |
 
 The `--run-summary <path>` file is a separate machine-readable pointer (it carries `run_id`,
@@ -218,7 +240,8 @@ written wherever you point it; if you omit the flag the launcher still writes on
 `tmp/verdict-last-run.json`.
 
 A run is a **live test**: confirm `verdict.json` carries a real Verdict whose Findings cite
-`tool_call_id`s, and `manifest_verify.json` reports `overall: true`. An honest
+`tool_call_id`s, and `manifest_verify.json` reports `overall: true` plus authenticated
+`signature_verified: true`. An honest
 `INDETERMINATE` on a custody-only disk is a PASS — see [`../verdict-semantics.md`](../verdict-semantics.md).
 
 ### Attack-flow visualizer (`tmp/auto-runs/<case-id>/attack-flow/`)
@@ -262,8 +285,8 @@ Hypothesis) and processes linked to a Finding are called out. Best-viewed paths:
 | `scripts/verdict` | **Canonical.** The one operator command — preflight, build, investigate, dashboard, signed Verdict. |
 | `scripts/find-evil-run`, `scripts/find-evil-live` | Deprecated shims kept for muscle memory; they route into `verdict`. |
 | `scripts/find_evil_auto.py` (`find-evil-auto`) | The internal headless engine `verdict` drives. Call it directly only for engine-only flags or debugging. |
-| `scripts/find-evil-sift` | The SIFT helper invoked under `--sift`; not a separate operator workflow. |
-| `claude` / `scripts/find-evil` | Interactive Claude Code session for Flow C (`investigate <path>`). |
+| `scripts/find-evil-sift --acknowledge-evidence-egress` | Consent-gated interactive SIFT helper; not a separate one-shot product workflow. |
+| `scripts/find-evil --acknowledge-evidence-egress` | Consent-gated interactive Claude Code session for Flow C (`investigate <path>`). |
 
 Prefer `scripts/verdict` unless you have a specific reason not to. Toolchain prerequisites are
 in [`../reference/dependencies.md`](../reference/dependencies.md); the full tool surface is in

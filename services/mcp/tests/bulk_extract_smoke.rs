@@ -40,10 +40,13 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-const KEYS: [&str; 3] = [
+const KEYS: [&str; 6] = [
     "FINDEVIL_HOME",
     "FINDEVIL_BULK_EXTRACTOR_BIN",
     "FINDEVIL_BULK_KEYWORD_FILE",
+    "FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS",
+    "FINDEVIL_SUBPROCESS_STDOUT_MAX_BYTES",
+    "FINDEVIL_SUBPROCESS_STDERR_MAX_BYTES",
 ];
 
 #[allow(clippy::used_underscore_binding)]
@@ -156,9 +159,10 @@ fn bulk_extract_rejects_traversal_case_id() {
     let input = sample_input("../../foo", image);
     let err = bulk_extract(&input).unwrap_err();
     assert!(matches!(err, BulkExtractError::InvalidCaseId(_)));
-    // Rejected before any filesystem mutation: no case sandbox was created at
-    // all. (Avoid a `..`-suffixed path check — Windows normalizes `cases/..`
-    // to an existing dir lexically, unlike POSIX stat, giving a false failure.)
+    // Nothing was created outside the sandbox: the case_id was rejected before
+    // any directory was joined or created, so the `cases` tree must not exist.
+    // (Do not probe `cases/..` — Windows normalizes it lexically to `home`,
+    // which always exists, whereas Unix stat fails on the missing component.)
     assert!(!home.join("cases").exists());
 }
 
@@ -248,7 +252,130 @@ fn bulk_extract_rejects_missing_keyword_file() {
     let mut input = sample_input(case_id, image);
     input.keyword_file = Some(tmp.path().join("no-such-keywords.txt"));
     let err = bulk_extract(&input).unwrap_err();
-    assert!(matches!(err, BulkExtractError::KeywordFileNotFound(_)));
+    assert!(matches!(err, BulkExtractError::KeywordFileNotAuthorized(_)));
+}
+
+#[test]
+fn bulk_extract_caps_find_regex_count_entry_and_total_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let image = write_image(tmp.path(), "image.dd");
+
+    let mut count = sample_input("case", image.clone());
+    count.find_regexes = vec!["x".to_string(); 1_001];
+    assert!(matches!(
+        bulk_extract(&count),
+        Err(BulkExtractError::RegexLimit {
+            limit_kind: "count",
+            ..
+        })
+    ));
+
+    let mut entry = sample_input("case", image.clone());
+    entry.find_regexes = vec!["x".repeat(4 * 1024 + 1)];
+    assert!(matches!(
+        bulk_extract(&entry),
+        Err(BulkExtractError::RegexLimit {
+            limit_kind: "entry_bytes",
+            ..
+        })
+    ));
+
+    let mut total = sample_input("case", image);
+    total.find_regexes = vec!["x".repeat(4 * 1024); 300];
+    assert!(matches!(
+        bulk_extract(&total),
+        Err(BulkExtractError::RegexLimit {
+            limit_kind: "total_bytes",
+            ..
+        })
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn bulk_extract_withholds_native_regex_diagnostics() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let case_id = "stderr-case";
+    make_case(&home, case_id);
+    let image = write_image(tmp.path(), "image.dd");
+    let binary = tmp.path().join("fake-bulk-extractor");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo test-version; exit 0; fi\necho 'TOP_SECRET_NATIVE_REGEX diagnostic' >&2\nexit 2\n",
+    )
+    .expect("fake binary");
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+    let _guard = EnvGuard::set(&home, &binary);
+    let mut input = sample_input(case_id, image);
+    input.find_regexes = vec!["TOP_SECRET_NATIVE_REGEX".to_string()];
+
+    let error = bulk_extract(&input).expect_err("fake binary exits nonzero");
+    let message = error.to_string();
+    assert!(matches!(error, BulkExtractError::SubprocessFailed { .. }));
+    assert!(!message.contains("TOP_SECRET_NATIVE_REGEX"));
+    assert!(message.contains("diagnostics withheld"));
+}
+
+#[test]
+#[cfg(unix)]
+fn bulk_extract_times_out_through_the_shared_runner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let case_id = "timeout-case";
+    make_case(&home, case_id);
+    let image = write_image(tmp.path(), "image.dd");
+    let binary = tmp.path().join("slow-bulk-extractor");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo test-version; exit 0; fi\nsleep 5\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+    let _guard = EnvGuard::set(&home, &binary);
+    std::env::set_var("FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS", "1");
+
+    let started = std::time::Instant::now();
+    let error = bulk_extract(&sample_input(case_id, image)).unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert!(matches!(error, BulkExtractError::SubprocessFailed { .. }));
+    assert!(error.to_string().contains("time budget"));
+}
+
+#[test]
+#[cfg(unix)]
+fn bulk_extract_aborts_when_stdout_exceeds_capture_cap() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let case_id = "stdout-cap-case";
+    make_case(&home, case_id);
+    let image = write_image(tmp.path(), "image.dd");
+    let binary = tmp.path().join("noisy-bulk-extractor");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo test-version; exit 0; fi\nhead -c 4096 /dev/zero\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+    let _guard = EnvGuard::set(&home, &binary);
+    std::env::set_var("FINDEVIL_SUBPROCESS_STDOUT_MAX_BYTES", "128");
+
+    let error = bulk_extract(&sample_input(case_id, image)).unwrap_err();
+    assert!(matches!(error, BulkExtractError::SubprocessFailed { .. }));
+    assert!(error.to_string().contains("stdout"));
+    assert!(error.to_string().contains("128 byte capture limit"));
 }
 
 // --- determinism helpers ---------------------------------------------------
@@ -401,7 +528,7 @@ fn bulk_extract_input_rejects_unknown_scanner() {
 const SYNTH_CARVE_MARKER: &str = "VERDICT_SYNTH_CARVE_MARKER_nhc003_v1";
 
 /// Build a small raw image (256 KiB of zeros) with [`SYNTH_CARVE_MARKER`] at
-/// offset 100_000 so free-space / whole-image scanners can recover it.
+/// offset `100_000` so free-space / whole-image scanners can recover it.
 fn write_synthetic_carve_image(dir: &Path) -> PathBuf {
     let p = dir.join("synth_carve.dd");
     let mut buf = vec![0u8; 256 * 1024];
@@ -470,5 +597,8 @@ fn bulk_extract_recovers_synthetic_marker_when_binary_present() {
     let a = serde_json::to_string(&out).unwrap();
     let out2 = bulk_extract(&input).expect("second run");
     let b = serde_json::to_string(&out2).unwrap();
-    assert_eq!(a, b, "synthetic carve output must be deterministic for custody replay");
+    assert_eq!(
+        a, b,
+        "synthetic carve output must be deterministic for custody replay"
+    );
 }

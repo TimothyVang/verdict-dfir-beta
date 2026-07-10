@@ -23,7 +23,7 @@ happens after the verdict is signed.
 | Where it sits in the flow | **Downstream of `verdict.json`** | n8n consumes the *output* of a finished, audited investigation (`manifest_finalize` → `verdict.json`). It never feeds the scored path. |
 | Integration surface | **`n8n-mcp` (MIT), user-scope MCP server** | Claude Code uses `n8n-mcp` to build/validate/deploy n8n workflows and trigger runs. The 45-tool product surface is untouched. |
 | Submission posture | **Optional, not bundled** | Treated like the SIFT DFIR binaries: operator wires it in; `n8n-references/` is `.gitignore`'d and never enters the Devpost zip. |
-| Where it runs | **Local host only** | The operator's own n8n instance + `n8n-mcp` run on the host. SIFT-VM mode still reaches DFIR tools over SSH; n8n stays local. |
+| Where it runs | **Loopback only** | The operator's own n8n instance binds `127.0.0.1`; SIFT-VM mode still reaches DFIR tools over SSH while n8n stays local. |
 | License | **n8n core = fair-code (Sustainable Use), `n8n-mcp`/`n8n-skills` = MIT** | n8n core is **not** OSI MIT/Apache, so it must **never** be bundled or linked into the Apache-2.0 submission. Keeping it optional/operator-run/standalone is what makes this compliant. |
 
 ---
@@ -89,17 +89,23 @@ N8N_AUTO_DOCKER=1 python3 scripts/setup-n8n.py   # starts n8n if none is up, the
 ```
 
 It ensures an owner account exists (creating one on a fresh instance, else logging in), ensures a
-REST API key exists, and deploys + activates the `findevil-finding-to-action` workflow. Credentials
-and the key are written to gitignored `tmp/n8n-credentials.txt` / `tmp/n8n-apikey.txt` (the paths
-`scripts/n8n_post.py` and the dashboard already read). Env: `N8N_BASE`, `N8N_OWNER_EMAIL`,
-`N8N_OWNER_PASSWORD`, `N8N_AUTO_DOCKER=1`. Skip from install with
+REST API key exists, and generates a 256-bit webhook capability. Credentials, API key, and webhook
+capability are written as current-user-owned mode-`0600` files under gitignored `tmp/`:
+`n8n-credentials.txt`, `n8n-apikey.txt`, and `n8n-webhook-secret.txt`. An insecure link, hardlink,
+owner, or permission mode fails closed. Env: `N8N_BASE` (literal loopback only),
+`N8N_OWNER_EMAIL`, `N8N_OWNER_PASSWORD`, `N8N_AUTO_DOCKER=1`. Skip from install with
 `FINDEVIL_SKIP_N8N=1`. The manual steps below are the fallback when you'd rather set it up by hand.
+
+The Docker bootstrap publishes `127.0.0.1:5678:5678`, drops Linux capabilities, enables
+`no-new-privileges`, and caps payload size, execution time, concurrency, memory, CPU, and PIDs.
+Every third-party image reference is immutable (`name@sha256:<digest>`); an env override is accepted
+only when it is also digest-pinned.
 
 ### 1. Run a local n8n instance (operator-owned)
 
 ```bash
 # Docker (recommended for a persistent instance):
-docker run -it --rm --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n docker.n8n.io/n8nio/n8n
+python3 scripts/setup-n8n.py  # preferred: applies the hardened, digest-pinned container policy
 # or ephemeral:  npx n8n
 ```
 
@@ -172,6 +178,12 @@ second host), that is a **new lead**, not a Finding. Re-run the typed DFIR tools
 cite a real `tool_call_id` before it becomes evidence. n8n informs where to look next; the
 product proves what happened.
 
+The historical `findevil-finding-to-action` workflow is no longer deployed. If an operator keeps
+a private replacement, `scripts/n8n_post.py` will call only a literal loopback URL, requires both
+the explicit post-verdict egress acknowledgement and the same 256-bit capability header, disables
+redirects, and caps request/response sizes and time. A missing/retired workflow is recorded as
+`automation_supported: false`; reachability is never reported as a successful action.
+
 ---
 
 ## The grounding workflow (anti-hallucination) — `findevil-grounding`
@@ -184,8 +196,8 @@ post-verdict, never-evidence posture as above.
 ```
 verdict.json ──► scripts/ground_verdict.py (host) ──► POST findevil-grounding (n8n)
                         │                                    │
-                        │                       browserless renders attack.mitre.org
-                        │                       (structured extract: name + excerpt + provenance)
+                        │                       exact-host HTTPS fetch of attack.mitre.org
+                        │                       (redirect/size bounded structured extract)
                         ▼                                    │
         grounding_research.json  ◄───── research_bundle (no LLM in n8n) ──┘
                         │
@@ -201,14 +213,20 @@ no `claude -p`). This keeps the judgment in the audited agent, not in an opaque 
 **Run it (Phase 1, keyless):**
 
 ```bash
-python3 scripts/setup-grounding-workflow.py          # self-bootstraps: findevil-net + browserless + deploy
-python3 scripts/ground_verdict.py <case-dir|case-id> # writes <case>/grounding_research.json
+python3 scripts/setup-grounding-workflow.py          # self-bootstraps loopback SearXNG + authenticated workflow
+FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS=1 \
+  python3 scripts/ground_verdict.py <case-dir|case-id> # writes <case>/grounding_research.json
 # then, in a Claude Code session: judge the bundle per agent-config/GROUNDING.md -> <case>/grounding.json
 ```
 
-**Networking.** browserless is host-bound at `127.0.0.1:3000`; n8n reaches it container-to-container
-as `http://browserless:3000` over the shared `findevil-net` network. `setup-grounding-workflow.py`
-creates the network, starts browserless on it, and attaches a running n8n container — idempotently.
+**Networking and authentication.** n8n publishes only on `127.0.0.1`; SearXNG has no host port
+at all and is reachable only over the private `findevil-net` Docker network. The webhook uses
+n8n's `httpHeaderAuth` credential with
+`X-Findevil-Grounding-Token`; `setup-grounding-workflow.py` creates that encrypted credential from
+the private capability file, and `ground_verdict.py` reads the same file and sends the header.
+Missing, short, linked, or group/world-readable capabilities are rejected. The caller accepts only
+a literal loopback webhook URL, disables redirects, caps response bytes, and preserves the separate
+`FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS=1` consent gate.
 
 **Anti-hallucination contract (locked by `scripts/grounding-smoke.py`):**
 - a real technique grounds (`found: true`, name + quoted MITRE excerpt);
@@ -243,8 +261,8 @@ quoted (`agent-config/GROUNDING.md`).
 **Enrichment runs HOST-SIDE, not in n8n.** n8n persists execution inputs in its database, so
 routing an API key through the webhook would leak the secret into n8n's execution store.
 VirusTotal/abuse.ch are plain JSON APIs (no browser needed), so the host calls them directly and
-keys never leave the gitignored files. n8n stays the **browser-rendered-research** engine (MITRE
-now, open-web search later) where the value is rendering untrusted HTML and no secret is involved.
+keys never leave the gitignored files. n8n handles only bounded, keyless MITRE/SearXNG research;
+no provider secret enters its execution store.
 
 **Keys (browser login):** `scripts/get-api-key.cjs <provider>` opens **real Google Chrome** with
 the automation fingerprints stripped (so Google SSO is not blocked), waits for the operator to
@@ -261,8 +279,10 @@ Public SERPs block headless browsers (DuckDuckGo returns an anomaly challenge, B
 unreliable redirect-wrapped results), so we run **our own search engine**: a self-hosted
 **SearXNG** container on `findevil-net` (JSON output, no upstream blocking for low-volume
 grounding; `setup-grounding-workflow.py` bootstraps it idempotently). The research node queries
-SearXNG → takes the top result URLs → renders the top hits via browserless → structured-extracts
-`{title, snippet, excerpt, url}` (scripts/styles stripped, length-capped). `ground_verdict.py`
+SearXNG → takes at most four bounded results → returns inert `{title, snippet, url}` metadata.
+Result URLs must be credential-free HTTP(S) URLs and literal/private/link-local/metadata/internal
+destinations are rejected. They are deliberately **never fetched or rendered** by the workflow,
+closing the search-result SSRF seam. `ground_verdict.py`
 seeds queries from malware families surfaced by IOC enrichment, then asserted-technique claims.
 
 Open web is the **lowest-trust** tier: inert DATA, never authoritative, never makes a claim
@@ -294,16 +314,18 @@ exploited on this host. The dashboard shows a "CVE grounding" section.
 
 ## Auto-run + headless judging
 
-`scripts/verdict` runs grounding automatically after the verdict (right after the `n8n_post.py`
-hook): when n8n is reachable it calls `ground_verdict.py` then `ground_actions.py` — **non-fatal**,
-gated on a `/healthz` check, and skippable with `FINDEVIL_SKIP_GROUNDING=1`. Because an unattended
+`scripts/verdict` runs grounding only after explicit `--acknowledge-post-verdict-egress` consent
+(right after the optional `n8n_post.py` hook): when authenticated n8n is reachable it calls
+`ground_verdict.py` then `ground_actions.py` — **non-fatal**, gated on a `/healthz` check, and
+skippable with `FINDEVIL_SKIP_GROUNDING=1`. Because an unattended
 run has no agent in the loop, `ground_verdict.py` writes a **deterministic first-pass**
 `grounding.json` (technique on MITRE → supported / not on MITRE → contradicted+flag; provider-
 flagged IOC → malicious; CVE on NVD → supported; `judged_by` says "deterministic first-pass") so
 the dashboard populates headless. It is **non-clobbering** — an existing agent-judged
 `grounding.json` is never overwritten; a Claude Code session refines the first-pass per
-`agent-config/GROUNDING.md`. `scripts/doctor.sh` reports grounding-infra readiness (n8n +
-browserless + searxng).
+`agent-config/GROUNDING.md`. `scripts/doctor.sh` reports grounding-infra readiness (authenticated
+n8n + private-network SearXNG). Browserless is intentionally absent: an arbitrary-URL rendering endpoint
+would recreate the SSRF capability this workflow removes.
 
 ---
 

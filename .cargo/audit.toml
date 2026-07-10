@@ -1,0 +1,8 @@
+# RUSTSEC-2023-0071 (Marvin) affects RSA private-key operations. VERDICT's only
+# rsa 0.9.x path is transitive through YARA-X's PE/authenticode modules, which
+# parse public keys and call signature verification; no private key, decrypt,
+# or signing operation is reachable. YARA-X 1.19 still has no fixed rsa release.
+# Keep this narrow ID exception visible; every other vulnerability remains
+# release-blocking under a plain `cargo audit`.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

@@ -51,6 +51,22 @@ def test_lane_plan_empty_when_nothing_supported() -> None:
     )
 
 
+def test_lane_plan_names_browser_databases_without_disk_parser_claims() -> None:
+    msg = fea.build_lane_plan_message(
+        memory=0,
+        evtx=0,
+        hayabusa_dirs=0,
+        extracted=0,
+        network=0,
+        velociraptor=0,
+        raw_disk=0,
+        browser=5,
+    )
+
+    assert "5 browser database" in msg.lower()
+    assert "prefetch/registry/mft" not in msg.lower()
+
+
 def test_verdict_reasoning_states_word_and_confidence_mix() -> None:
     merged = [
         {"confidence": "CONFIRMED"},

@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
 use super::zeek_summary::{zeek_summary, ZeekCount, ZeekSummaryInput, ZeekSummaryOutput};
 
 // A small cap silently truncates real captures — targeted activity (e.g. an
@@ -18,6 +20,9 @@ const DEFAULT_LIMIT: usize = 500_000;
 // Keep the per-request list bounded; dedup is by (src, host, method).
 const MAX_HTTP_REQUESTS: usize = 300;
 const MAX_URI_LEN: usize = 256;
+const TIMEOUT_ENV: &str = "FINDEVIL_PCAP_TIMEOUT_SECS";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const HARD_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +97,14 @@ pub enum PcapTriageError {
         exit_code: i32,
         stderr: String,
     },
+    #[error("{binary} exceeded its {seconds} s time budget and was killed")]
+    Timeout { binary: String, seconds: u64 },
+    #[error("{binary} {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit {
+        binary: String,
+        stream: String,
+        limit: usize,
+    },
     #[error("pcap triage output parse failed: {0}")]
     OutputParse(String),
 }
@@ -124,7 +137,8 @@ fn run_tshark(input: &PcapTriageInput) -> Result<PcapTriageOutput, PcapTriageErr
     let binary = resolve_binary("TSHARK_BIN", &["tshark", "tshark.exe"])
         .ok_or(PcapTriageError::BinaryNotFound)?;
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT).to_string();
-    let proc = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("-r")
         .arg(&input.pcap_path)
         .arg("-c")
@@ -154,19 +168,12 @@ fn run_tshark(input: &PcapTriageInput) -> Result<PcapTriageOutput, PcapTriageErr
         .arg("-e")
         .arg("http.cookie")
         .arg("-e")
-        .arg("frame.time_epoch")
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                PcapTriageError::BinaryNotFound
-            } else {
-                PcapTriageError::SubprocessFailed {
-                    binary: "tshark".to_string(),
-                    exit_code: -1,
-                    stderr: format!("spawn failed: {err}"),
-                }
-            }
-        })?;
+        .arg("frame.time_epoch");
+    let proc = run_with_timeout(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|error| map_run_error("tshark", error))?;
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
     let stdout = String::from_utf8_lossy(&proc.stdout);
     // tshark exits non-zero on a truncated final packet ("cut short in the middle
@@ -271,22 +278,21 @@ fn run_zeek(input: &PcapTriageInput) -> Result<PcapTriageOutput, PcapTriageError
     ));
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| PcapTriageError::OutputParse(format!("create temp dir: {err}")))?;
-    let proc = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .current_dir(&out_dir)
         .arg("-r")
-        .arg(&input.pcap_path)
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                PcapTriageError::BinaryNotFound
-            } else {
-                PcapTriageError::SubprocessFailed {
-                    binary: "zeek".to_string(),
-                    exit_code: -1,
-                    stderr: format!("spawn failed: {err}"),
-                }
-            }
-        })?;
+        .arg(&input.pcap_path);
+    let proc = match run_with_timeout(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return Err(map_run_error("zeek", error));
+        }
+    };
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
     if !proc.status.success() {
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -325,6 +331,53 @@ fn run_zeek(input: &PcapTriageInput) -> Result<PcapTriageOutput, PcapTriageError
         zeek: Some(summary),
         stderr_tail,
     })
+}
+
+fn map_run_error(binary: &str, error: RunError) -> PcapTriageError {
+    match error {
+        RunError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PcapTriageError::BinaryNotFound
+        }
+        RunError::Timeout(duration) => PcapTriageError::Timeout {
+            binary: binary.to_string(),
+            seconds: duration.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => PcapTriageError::OutputLimit {
+            binary: binary.to_string(),
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::Spawn(error) => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: format!("spawn failed: {error}"),
+        },
+        RunError::Io(error) => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: format!("io error: {error}"),
+        },
+        RunError::PipeStillOpen { streams } => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => PcapTriageError::SubprocessFailed {
+            binary: binary.to_string(),
+            exit_code: -1,
+            stderr: "output reader thread panicked".to_string(),
+        },
+    }
 }
 
 fn resolve_binary(env_name: &str, names: &[&str]) -> Option<PathBuf> {

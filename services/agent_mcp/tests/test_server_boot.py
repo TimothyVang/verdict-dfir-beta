@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from findevil_agent_mcp.server import (
     SERVER_NAME,
     SERVER_VERSION,
     _error_content,
     _to_text_content,
     build_server,
+    parsed_evidence_route_authorized,
 )
 from findevil_agent_mcp.tools.audit_verify import AuditVerifyOutput
 
@@ -32,6 +35,22 @@ class TestBuildServer:
         assert SERVER_VERSION
         # Semver-ish.
         assert SERVER_VERSION.count(".") == 2
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ({}, False),
+        ({"FINDEVIL_OUTPUT_ROUTE": "local_controller"}, True),
+        ({"FINDEVIL_OUTPUT_ROUTE": "local_dgx"}, True),
+        ({"FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS": "1"}, True),
+        ({"FINDEVIL_OUTPUT_ROUTE": "unknown"}, False),
+        ({"FINDEVIL_OUTPUT_ROUTE": "local"}, False),
+        ({"FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS": "true"}, False),
+    ],
+)
+def test_parsed_evidence_route_matrix(environment: dict[str, str], expected: bool) -> None:
+    assert parsed_evidence_route_authorized(environment) is expected
 
 
 class TestTextContent:

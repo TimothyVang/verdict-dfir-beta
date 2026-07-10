@@ -1,6 +1,6 @@
 ---
 name: verdict
-description: Run VERDICT DFIR end to end from Claude Code. Use when the operator says /verdict, run verdict, investigate evidence end to end, is there evil here, or wants a signed Verdict and report. The skill verifies setup, uses SIFT mode when available, falls back honestly when it is not, and reports dashboard/report paths without treating optional automation as evidence.
+description: Run VERDICT DFIR end to end from Claude Code. Use when the operator says /verdict, run verdict, investigate evidence end to end, is there evil here, or wants a signed Verdict and report. The skill verifies setup, uses the split-trust DFIR container by default, requires explicit reduced-isolation acknowledgment for SIFT/local alternatives, and reports dashboard/report paths without treating optional automation as evidence.
 ---
 
 # VERDICT DFIR
@@ -10,6 +10,7 @@ Use this skill to run the public VERDICT workflow from Claude Code. It is a guid
 ## Safety Rules
 
 - Evidence is read-only. Never mutate source evidence, mounted evidence, or original Case files.
+- A cloud-backed Claude session must not inspect evidence-derived command output or call an evidence MCP tool until the operator explicitly acknowledges parsed-evidence egress in the current session. Raw source files stay behind the typed tool boundary, but parsed rows, filenames, hashes, and custody metadata can enter the model context. Recommend `scripts/verdict <evidence>` directly in a terminal for the zero-LLM local engine; for interactive exploration launch with `scripts/find-evil --acknowledge-evidence-egress`.
 - Every Finding must cite a current-case `tool_call_id`.
 - Run `verify_finding` for each Finding and record each verifier decision with `pool_handoff` before `judge_findings` consumes the Findings.
 - `report_qa` must be audited before `manifest_finalize`; a failed or missing report QA gate blocks customer-ready output and requires expert review.
@@ -46,11 +47,20 @@ This helper builds missing MCP servers through `scripts/install.sh`, checks opti
 
 ### 3. Run The Case
 
-If `SIFT_OK=1`, run SIFT mode:
+Use the split-trust Docker default for ordinary single-host evidence:
+
+```bash
+EVIDENCE="/path/to/evidence"
+bash scripts/verdict "${EVIDENCE}"
+```
+
+Use SIFT only when the evidence needs its long-tail tooling (not merely because
+the VM is reachable), and obtain the operator's explicit reduced-isolation
+acknowledgment before adding the required flag:
 
 ```bash
 ARTIFACT="/mnt/hgfs/evidence/example.E01"
-FIND_EVIL_GUEST_IP="<ip>" bash scripts/verdict "${ARTIFACT}" --sift
+FIND_EVIL_GUEST_IP="<ip>" bash scripts/verdict "${ARTIFACT}" --sift --acknowledge-reduced-isolation
 ```
 
 For host-local evidence that is not guest-mounted, configure an explicit guest-visible case staging root instead of falling back to legacy VM evidence directories:
@@ -60,14 +70,16 @@ HOST_EVIDENCE="/path/to/evidence.E01"
 CASE_ID="auto-$(python3 -c 'import uuid; print(uuid.uuid4())')"
 FINDEVIL_SIFT_CASE_STAGING_ROOT="/home/sansforensics/find-evil/tmp/auto-runs/${CASE_ID}/staging/sift" \
 FIND_EVIL_GUEST_IP="<ip>" \
-bash scripts/verdict "${HOST_EVIDENCE}" --sift --case-id "${CASE_ID}"
+bash scripts/verdict "${HOST_EVIDENCE}" --sift --acknowledge-reduced-isolation --case-id "${CASE_ID}"
 ```
 
-If `SIFT_OK=0`, run local mode:
+The host-local backend is a development/compatibility fallback, never an
+automatic fallback when Docker or SIFT is unavailable. It likewise requires
+the operator's explicit acknowledgment:
 
 ```bash
 EVIDENCE="/path/to/evidence"
-bash scripts/verdict "${EVIDENCE}"
+bash scripts/verdict "${EVIDENCE}" --local --acknowledge-reduced-isolation
 ```
 
 In local mode, state the scope honestly: memory, EVTX, PCAP, Velociraptor collections, and extracted artifacts can still be useful; raw disk images need local Sleuth Kit/libewf support to produce parsed artifacts, and remain custody-only if mount/extract fails or yields no supported artifacts.
@@ -99,21 +111,25 @@ Only read `tmp/verdict-last-run.json` when it was explicitly requested with `--r
 Read the relevant outputs when present:
 
 - `verdict.json` - Verdict, confidence, Findings, and coverage.
-- `manifest_verify.json` - custody verification; `overall` must be `true` for a completed manifest.
+- `manifest_verify.json` - custody verification; `overall` and authenticated
+  `signature_verified` must both be `true` for a completed signed manifest.
 - `coverage_manifest.json` - artifact classes available, attempted, parsed, failed, unsupported, or not supplied.
 - `automation.json` - optional post-verdict workflow status.
 - `grounding.json` - optional post-verdict claim-grounding status.
 
 ### 5. Report One Status Block
 
-If `manifest_verify.json` is missing or `overall` is not `true`, report `RUN INCOMPLETE / CUSTODY INVALID`, do not describe the output as signed, and do not present Findings as valid until custody is fixed.
+If `manifest_verify.json` is missing, `overall` is not `true`, or an Ed25519/Sigstore
+tier lacks `signature_verified: true` under trusted external policy, report
+`RUN INCOMPLETE / CUSTODY INVALID`, do not describe the output as signed, and do
+not present Findings as valid until custody is fixed. A stub is not an authenticated signature.
 
 Otherwise use this shape:
 
 ```text
 Verdict   : <SUSPICIOUS | INDETERMINATE | NO_EVIL> (confidence <value>)
 Findings  : <N> (all Findings cite tool_call_id: <yes|no>)
-Custody   : manifest_verify.overall = true
+Custody   : manifest_verify.overall = true · signature_verified = true
 Coverage  : <short scope statement from coverage_manifest/verdict limitations>
 Automation: n8n <reachable/recorded | skipped | unavailable> -> automation.json if present
 Grounding : <claims researched | skipped | unavailable> -> grounding.json if present
@@ -135,7 +151,7 @@ Always print paths even when a browser cannot be opened.
 ## Notes
 
 - `scripts/verdict <evidence>` is the canonical one-shot product launcher.
-- `scripts/find-evil` or `claude` plus `investigate <path>` is the interactive path.
-- SIFT mode is recommended for disk images because it supplies the forensic workstation baseline for read-only mount and extraction.
+- `scripts/find-evil --acknowledge-evidence-egress` is the consent-gated interactive cloud path. Bare `claude` evidence tools fail closed unless `FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1` was explicitly set before launch.
+- Docker is the no-flag production default: a pinned, health-checked toolchain image with evidence bind-mounted read-only while custody/signing remains host-only. SIFT (`--sift`) stays supported for `mac_triage`/fleet and host-local (`--local`) for compatibility; both require `--acknowledge-reduced-isolation` and must never be selected as a silent fallback.
 - n8n and grounding are opt-in operator workflow layers. Report whether they ran, but never use them as evidence or confidence boosters.
 - A scoped `INDETERMINATE` is an honest result when coverage is thin. Do not convert it into reassurance.

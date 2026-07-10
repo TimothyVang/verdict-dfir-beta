@@ -21,7 +21,7 @@ CUSTODY BOUNDARY (the load-bearing rule)
 The audit chain and the signed manifest hash their *content*, so a path string
 inside them is a HASHED field. Editing it would break ``manifest_verify`` replay:
 
-* ``audit.jsonl`` - every line is JCS-canonicalized and hash-chained via
+* ``audit.jsonl`` - every line uses VERDICT canonical JSON v1 and is hash-chained via
   ``prev_hash``; ``verify_manifest`` re-derives ``audit_log_final_hash`` and the
   Merkle leaves from the log. A single byte changes the chain and fails
   ``audit_chain_ok``/``overall``.

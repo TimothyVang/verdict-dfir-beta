@@ -21,7 +21,6 @@ Some DFIR tools are intrinsically more FP-prone than others. The agent's tool su
 | `hayabusa_scan` | Medium — Sigma rules are tuned conservatively but still flag legit admin activity | Multi-level filter (`min_level: medium` cuts most FPs); rule hits are triage leads until corroborated |
 | `vol_pslist` | Medium — *fooled by* DKOM, paging artifacts, kernel build mismatch | Cross-reference with `vol_psscan`; divergence is itself the finding |
 | `vol_malfind` | Medium — *misses* hidden injections in DKOM-affected memory | Same — cross-reference with raw YARA scan over `.img` |
-| `vel_collect` | Varies by artifact | Velociraptor's per-artifact tuning |
 
 **Rule of thumb:** treat `pslist`/`malfind`/`yara` results as **leads** unless corroborated. Treat `evtx`/`mft`/`registry` as **facts**.
 

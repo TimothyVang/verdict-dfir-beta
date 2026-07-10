@@ -98,7 +98,14 @@ class _FakePy:
         return [kind for kind, _ in self.audits]
 
     def stage_b_calls(self) -> list[tuple[str, dict]]:
-        return [c for c in self.calls if c[0] in ("audit_append", "pool_handoff")]
+        return [
+            (
+                name,
+                {key: value for key, value in args.items() if key != "_controller_capability"},
+            )
+            for name, args in self.calls
+            if name in ("audit_append", "pool_handoff")
+        ]
 
 
 def _inv(parallel: bool = False, workers: int = 4) -> fea.Investigation:

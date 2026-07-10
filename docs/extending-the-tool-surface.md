@@ -154,7 +154,7 @@ audit chain. Verify with `uv run --directory services/agent_mcp pytest` and `ruf
 
 ## Why the narrowness is the feature
 
-32 typed Rust tools with no shell verb is not a limitation we apologize for — it is the
+43 typed Rust DFIR tools plus 14 Python custody/reasoning tools (57 product tools total), with no shell verb, is not a limitation we apologize for — it is the
 reason a judge can run `manifest_verify` and trust the result. Adding a tool that keeps
 this contract grows the surface **without** growing the attack surface, which is exactly
 the kind of contribution Protocol SIFT wants back.

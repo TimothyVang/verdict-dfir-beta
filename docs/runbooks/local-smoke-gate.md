@@ -15,7 +15,7 @@ the app actually works.
 
 | Requirement | How to install |
 |---|---|
-| Rust 1.88 | `rustup update` — `rust-toolchain.toml` pins the version |
+| Rust 1.91 | `rustup update` — `rust-toolchain.toml` pins the version |
 | `cargo build --release -p findevil-mcp` | run once before first smoke; the Rust smoke resolves the release binary |
 | `uv` | `pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | `uv sync --directory services/agent_mcp` | run once after `uv` is installed; the agent_mcp smoke spawns the Python MCP server |
@@ -116,7 +116,7 @@ it with backticks until the referenced file exists.
 ### Smoke passes locally but fails in L1 Docker
 
 Check toolchain versions. The Docker gate (`docker/l1-compose.yml`) uses Ubuntu 22.04 with
-Rust 1.88 (per `rust-toolchain.toml`) and Python 3.11. If your local toolchain diverges:
+Rust 1.91 (per `rust-toolchain.toml`) and Python 3.11. If your local toolchain diverges:
 
 ```bash
 # Rust version:

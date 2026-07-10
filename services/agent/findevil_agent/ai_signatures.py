@@ -54,6 +54,10 @@ DEFAULT_LIMIT = 500
 DEFAULT_PREVIEW_CHARS = 80
 MAX_PREVIEW_CHARS = 400
 MAX_FILE_BYTES = 8_000_000
+MAX_INLINE_CHARS = 2_000_000
+MAX_PATHS = 64
+MAX_AGGREGATE_SCAN_BYTES = 32 * 1024 * 1024
+MAX_HITS = 10_000
 
 
 @dataclass(frozen=True)
@@ -243,9 +247,15 @@ class AiSignatureScan:
     hits: tuple[AiSignatureHit, ...]
     sources_scanned: int
     chars_scanned: int
+    bytes_scanned: int
+    byte_limit: int
+    paths_requested: int
+    paths_considered: int
+    sources_skipped: int
     signatures_evaluated: int
     read_errors: tuple[str, ...]
     truncated: bool
+    truncation_reason: str | None
 
 
 def known_categories() -> tuple[str, ...]:
@@ -291,17 +301,18 @@ def scan_text(
     for sig, rx in _COMPILED:
         if categories is not None and sig.category not in categories:
             continue
-        matches = list(rx.finditer(text))
-        if not matches:
+        matches = rx.finditer(text)
+        first = next(matches, None)
+        if first is None:
             continue
-        first = matches[0]
+        occurrences = 1 + sum(1 for _ in matches)
         hits.append(
             AiSignatureHit(
                 signature_id=sig.signature_id,
                 category=sig.category,
                 description=sig.description,
                 source=source,
-                occurrences=len(matches),
+                occurrences=occurrences,
                 first_offset=first.start(),
                 preview=_make_preview(text, first.start(), first.end(), preview_chars),
             )
@@ -309,7 +320,7 @@ def scan_text(
     return hits
 
 
-def _read_text_file(path: str) -> tuple[str | None, str | None]:
+def _read_text_file(path: str, byte_limit: int) -> tuple[str | None, str | None, int, bool]:
     """Read a file as text, read-only and size-bounded.
 
     Returns ``(text, None)`` on success or ``(None, reason)`` on a handled
@@ -319,21 +330,34 @@ def _read_text_file(path: str) -> tuple[str | None, str | None]:
     """
     try:
         with open(path, "rb") as handle:
-            raw = handle.read(MAX_FILE_BYTES + 1)
+            raw = handle.read(byte_limit + 1)
     except FileNotFoundError:
-        return None, f"{path}: not found"
+        return None, f"{path}: not found", 0, False
     except IsADirectoryError:
-        return None, f"{path}: is a directory"
+        return None, f"{path}: is a directory", 0, False
     except PermissionError:
-        return None, f"{path}: permission denied"
+        return None, f"{path}: permission denied", 0, False
     except OSError as exc:
-        return None, f"{path}: unreadable ({exc.strerror or exc})"
-    exceeded = len(raw) > MAX_FILE_BYTES
-    text = raw[:MAX_FILE_BYTES].decode("utf-8", errors="replace")
+        return None, f"{path}: unreadable ({exc.strerror or exc})", 0, False
+    exceeded = len(raw) > byte_limit
+    scanned = raw[:byte_limit]
+    text = scanned.decode("utf-8", errors="replace")
     if exceeded:
         # Surface truncation as a soft error rather than silently dropping bytes.
-        return text, f"{path}: exceeded {MAX_FILE_BYTES} bytes (truncated)"
-    return text, None
+        return text, f"{path}: exceeded {byte_limit} bytes (truncated)", len(scanned), True
+    return text, None, len(scanned), False
+
+
+def _inline_prefix(text: str, byte_limit: int) -> tuple[str, int, bool]:
+    """Return a UTF-8-safe inline prefix bounded by chars and aggregate bytes."""
+    char_limited = text[:MAX_INLINE_CHARS]
+    encoded = char_limited.encode("utf-8")
+    exceeded = len(text) > MAX_INLINE_CHARS or len(encoded) > byte_limit
+    bounded = encoded[:byte_limit]
+    while bounded and (bounded[-1] & 0b1100_0000) == 0b1000_0000:
+        bounded = bounded[:-1]
+    decoded = bounded.decode("utf-8", errors="ignore")
+    return decoded, len(bounded), exceeded
 
 
 def scan_sources(
@@ -343,6 +367,7 @@ def scan_sources(
     categories: frozenset[str] | None = None,
     limit: int = DEFAULT_LIMIT,
     preview_chars: int = DEFAULT_PREVIEW_CHARS,
+    byte_limit: int | None = None,
 ) -> AiSignatureScan:
     """Scan an inline blob and/or named text artifacts (read-only).
 
@@ -352,42 +377,76 @@ def scan_sources(
     scan still completes. ``limit`` caps total hits across all sources;
     ``truncated`` is True when the cap is reached.
     """
-    capped = max(1, limit)
+    capped = max(1, min(limit, MAX_HITS))
+    scan_byte_limit = MAX_AGGREGATE_SCAN_BYTES if byte_limit is None else max(1, byte_limit)
+    bounded_paths = paths[:MAX_PATHS]
     collected: list[AiSignatureHit] = []
     read_errors: list[str] = []
     sources_scanned = 0
     chars_scanned = 0
-    truncated = False
+    bytes_scanned = 0
+    sources_skipped = max(0, len(paths) - len(bounded_paths))
+    truncated = sources_skipped > 0
+    truncation_reason: str | None = "path_limit" if truncated else None
 
-    def _absorb(blob: str, source: str) -> None:
-        nonlocal sources_scanned, chars_scanned, truncated
+    def _absorb(blob: str, source: str, source_bytes: int) -> None:
+        nonlocal sources_scanned, chars_scanned, bytes_scanned, truncated, truncation_reason
         sources_scanned += 1
         chars_scanned += len(blob)
+        bytes_scanned += source_bytes
         for hit in scan_text(
             blob, source=source, categories=categories, preview_chars=preview_chars
         ):
             if len(collected) >= capped:
                 truncated = True
+                truncation_reason = truncation_reason or "hit_limit"
                 return
             collected.append(hit)
 
     if text is not None:
-        _absorb(text, "<inline>")
+        remaining = scan_byte_limit - bytes_scanned
+        inline, inline_bytes, exceeded = _inline_prefix(text, remaining)
+        _absorb(inline, "<inline>", inline_bytes)
+        if exceeded:
+            truncated = True
+            truncation_reason = truncation_reason or "inline_limit"
 
-    for path in paths:
-        if truncated:
+    paths_considered = 0
+    for index, path in enumerate(bounded_paths):
+        if len(collected) >= capped:
+            sources_skipped += len(bounded_paths) - index
             break
-        blob, err = _read_text_file(path)
+        remaining = scan_byte_limit - bytes_scanned
+        if remaining <= 0:
+            truncated = True
+            truncation_reason = truncation_reason or "aggregate_byte_limit"
+            sources_skipped += len(bounded_paths) - index
+            break
+        paths_considered += 1
+        per_file_limit = min(MAX_FILE_BYTES, remaining)
+        blob, err, source_bytes, exceeded = _read_text_file(path, per_file_limit)
         if err is not None:
             read_errors.append(err)
         if blob is None:
             continue
-        _absorb(blob, path)
+        _absorb(blob, path, source_bytes)
+        if exceeded:
+            truncated = True
+            if per_file_limit == remaining:
+                truncation_reason = truncation_reason or "aggregate_byte_limit"
+                sources_skipped += len(bounded_paths) - index - 1
+                break
+            truncation_reason = truncation_reason or "file_byte_limit"
 
     return AiSignatureScan(
         hits=tuple(collected),
         sources_scanned=sources_scanned,
         chars_scanned=chars_scanned,
+        bytes_scanned=bytes_scanned,
+        byte_limit=scan_byte_limit,
+        paths_requested=len(paths),
+        paths_considered=paths_considered,
+        sources_skipped=sources_skipped,
         signatures_evaluated=(
             len(_SIGNATURE_TABLE)
             if categories is None
@@ -395,6 +454,7 @@ def scan_sources(
         ),
         read_errors=tuple(read_errors),
         truncated=truncated,
+        truncation_reason=truncation_reason,
     )
 
 
@@ -403,6 +463,9 @@ __all__ = [
     "DEFAULT_LIMIT",
     "DEFAULT_PREVIEW_CHARS",
     "LEAD_DISCLAIMER",
+    "MAX_AGGREGATE_SCAN_BYTES",
+    "MAX_INLINE_CHARS",
+    "MAX_PATHS",
     "AiSignature",
     "AiSignatureHit",
     "AiSignatureScan",

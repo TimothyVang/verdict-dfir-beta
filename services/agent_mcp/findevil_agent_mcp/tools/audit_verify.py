@@ -7,6 +7,7 @@ plus the first chain-break message on failure.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from findevil_agent.crypto.audit_log import AuditLog, AuditLogError
@@ -34,9 +35,11 @@ class AuditVerifyOutput(BaseModel):
 
 async def _handle(inp: BaseModel) -> AuditVerifyOutput:
     assert isinstance(inp, AuditVerifyInput)
-    log = AuditLog(Path(inp.path))
+    path = Path(os.path.abspath(Path(inp.path).expanduser()))
+    if not os.path.lexists(path):
+        return AuditVerifyOutput(ok=True, record_count=0, error=None)
     try:
-        count = log.verify()
+        count = len(AuditLog.read_verified_snapshot(path).records)
     except AuditLogError as exc:
         return AuditVerifyOutput(ok=False, record_count=0, error=str(exc))
     return AuditVerifyOutput(ok=True, record_count=count, error=None)
@@ -46,8 +49,9 @@ SPEC = ToolSpec(
     name="audit_verify",
     description=(
         "Replay an audit-log hash chain and report whether it verifies cleanly. Use this "
-        "before manifest_finalize (sanity check) and during offline replay by a third "
-        "party validating the FRE 902(14) self-authenticating evidence chain. Detects: "
+        "before manifest_finalize (sanity check) and during third-party replay. It "
+        "supports FRE 902(14) technical identification; certification and notice are "
+        "external legal steps. Detects: "
         "(1) prev_hash mismatch (tampering), (2) seq gaps (torn writes / append race), "
         "(3) non-canonical lines (a writer that didn't use canonicalize_json). "
         "Returns ok=True + record_count on success; ok=False + error string on the first "

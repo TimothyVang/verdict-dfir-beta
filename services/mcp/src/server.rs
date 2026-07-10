@@ -42,7 +42,9 @@ use sha2::{Digest, Sha256};
 use crate::tools::{
     ausearch::ausearch,
     bits_parse::bits_parse,
-    browser_history::browser_history,
+    browser_history::{
+        browser_history, browser_history_output_max_bytes, validate_browser_history_limit,
+    },
     bulk_extract::bulk_extract,
     case_open,
     cloud_audit::cloud_audit,
@@ -65,12 +67,12 @@ use crate::tools::{
     prefetch_parse::prefetch_parse,
     pst_parse::pst_parse,
     registry_query::registry_query,
+    setupapi_parse::setupapi_parse,
     srum_parse::srum_parse,
     suricata_eve::suricata_eve,
     sysmon_network_query::sysmon_network_query,
     thumbcache_parse::thumbcache_parse,
     usnjrnl_query::usnjrnl_query,
-    vel_collect::vel_collect,
     vol_malfind::vol_malfind,
     vol_pslist::vol_pslist,
     vol_psscan::vol_psscan,
@@ -82,11 +84,11 @@ use crate::tools::{
     zeek_summary::zeek_summary,
     AusearchInput, BitsParseInput, BrowserHistoryInput, BulkExtractInput, CaseOpenInput,
     CloudAuditInput, DiskExtractArtifactsInput, DiskMountInput, DiskUnmountInput, EmailParseInput,
-    EvtxQueryInput, ExifParseInput, EzParseInput, HashsetLookupInput, HayabusaInput,
-    IndxParseInput, JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput,
-    NfdumpQueryInput, OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput,
-    PstParseInput, RegistryInput, SrumParseInput, SuricataEveInput, SysmonNetworkInput,
-    ThumbcacheParseInput, UsnJrnlInput, VelCollectInput, VolMalfindInput, VolPslistInput,
+    EvtxQueryInput, ExifParseInput, EzParseInput, HashsetLookupError, HashsetLookupInput,
+    HayabusaInput, IndxParseInput, JournalctlQueryInput, LoginAccountingInput, MacTriageInput,
+    MftInput, NfdumpQueryInput, OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput,
+    PstParseInput, RegistryInput, SetupapiParseInput, SrumParseInput, SuricataEveInput,
+    SysmonNetworkInput, ThumbcacheParseInput, UsnJrnlInput, VolMalfindInput, VolPslistInput,
     VolPsscanInput, VolPsxviewInput, VolRunInput, VssListInput, VssMountInput,
     WmiPersistParseInput, YaraInput, ZeekSummaryInput,
 };
@@ -95,13 +97,51 @@ use crate::CRATE_VERSION;
 /// Counts-only injection-alert sidecar ledger. A child module of the server so
 /// it stays next to the single sanitizer chokepoint (`finalize_tool_output`)
 /// that feeds it. NOT the audit chain — see the module docs.
+mod evidence_access;
 mod injection_ledger;
+
+/// Test-only fixtures shared across the `server` module and its submodules.
+#[cfg(test)]
+mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// A temp directory whose [`path`](Self::path) is canonicalized.
+    ///
+    /// Evidence-authorization refuses any path that traverses a symlinked
+    /// directory (`reject_symlink_components`). On macOS the OS temp dir lives
+    /// behind the `/var -> /private/var` symlink, so raw `tempfile::tempdir()`
+    /// paths are rejected there while passing on Linux. Building evidence under
+    /// the canonicalized root keeps the production check strict and the tests
+    /// portable. Tests that assert symlink rejection create their own symlink
+    /// under this canonical root, so they still exercise the guard.
+    pub(in crate::server) struct CanonicalTempDir {
+        _tmp: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        pub(in crate::server) fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = crate::pathnorm::canonicalize(tmp.path()).expect("canonicalize tempdir");
+            Self { _tmp: tmp, path }
+        }
+
+        pub(in crate::server) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+}
 
 /// MCP protocol revision we speak. Hard-coded; any breaking change
 /// ships behind a code update + spec amendment, not silent drift.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 const SERVER_NAME: &str = "findevil-mcp";
+
+/// Maximum complete JSON-RPC request frame on stdin, including its newline.
+/// The response readers use the same 64 MiB wire ceiling. Reading is bounded
+/// before UTF-8 decoding so multibyte input cannot bypass the limit.
+const MCP_STDIN_FRAME_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 // JSON-RPC standard error codes (kept for reference; we use INVALID_PARAMS
 // for unknown methods/tools so the client gets actionable messages).
@@ -154,9 +194,7 @@ struct ToolAnnotations {
     /// per call so it's marked false; everything else is pure.
     idempotent: bool,
     /// True if the tool may interact with external systems (network).
-    /// Only `vel_collect` qualifies — Velociraptor's catalog
-    /// includes artifacts that hit the network. Everything else
-    /// runs against on-disk evidence only.
+    /// Product tools operate on local evidence and set this false.
     open_world: bool,
 }
 
@@ -194,32 +232,108 @@ pub fn run_stdio_server() -> std::io::Result<()> {
 ///
 /// # Errors
 /// Returns the first I/O error from reading or writing.
-pub fn run_stdio_server_with_streams<R, W>(input: R, mut output: W) -> std::io::Result<()>
+pub fn run_stdio_server_with_streams<R, W>(input: R, output: W) -> std::io::Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    run_stdio_server_with_streams_and_limit(input, output, MCP_STDIN_FRAME_MAX_BYTES)
+}
+
+fn run_stdio_server_with_streams_and_limit<R, W>(
+    input: R,
+    output: W,
+    max_frame_bytes: usize,
+) -> std::io::Result<()>
+where
+    R: Read,
+    W: Write,
+{
+    run_stdio_server_with_streams_and_limit_and_session(
+        input,
+        output,
+        max_frame_bytes,
+        evidence_access::EvidenceSession::from_launcher(),
+    )
+}
+
+fn run_stdio_server_with_streams_and_limit_and_session<R, W>(
+    input: R,
+    mut output: W,
+    max_frame_bytes: usize,
+    mut evidence_session: evidence_access::EvidenceSession,
+) -> std::io::Result<()>
 where
     R: Read,
     W: Write,
 {
     let registry = build_registry();
     let mut reader = BufReader::new(input);
-    let mut line = String::new();
+    let mut frame = Vec::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
+        let n = read_json_rpc_frame(&mut reader, &mut frame, max_frame_bytes)?;
         if n == 0 {
             // EOF — peer closed.
             break;
         }
+        let line = std::str::from_utf8(&frame).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("JSON-RPC request is not valid UTF-8: {error}"),
+            )
+        })?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(response) = dispatch(trimmed, &registry) {
+        if let Some(response) = dispatch(trimmed, &registry, &mut evidence_session) {
             writeln!(output, "{response}")?;
             output.flush()?;
         }
     }
     Ok(())
+}
+
+/// Read one newline-delimited frame while retaining at most
+/// `max_frame_bytes` bytes. An oversized or EOF-unterminated peer is a fatal
+/// transport violation: the caller returns an error and closes stdio rather
+/// than attempting to resynchronize on attacker-controlled input.
+fn read_json_rpc_frame<R: BufRead>(
+    reader: &mut R,
+    frame: &mut Vec<u8>,
+    max_frame_bytes: usize,
+) -> std::io::Result<usize> {
+    frame.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if frame.is_empty() {
+                Ok(0)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "server received an unterminated JSON-RPC request frame",
+                ))
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk_len = newline.map_or(available.len(), |position| position + 1);
+        let remaining = max_frame_bytes.saturating_sub(frame.len());
+        if chunk_len > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("JSON-RPC request exceeded the {max_frame_bytes}-byte frame limit"),
+            ));
+        }
+
+        frame.extend_from_slice(&available[..chunk_len]);
+        reader.consume(chunk_len);
+        if newline.is_some() {
+            return Ok(frame.len());
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // grows linearly as we add tools; splitting hurts clarity
@@ -232,7 +346,9 @@ fn build_registry() -> Vec<ToolEntry> {
                  (.e01, .raw, .dd, .mem) by computing its SHA-256, issuing a UUID4 case_id, and \
                  creating the case directory at $FINDEVIL_HOME/cases/<id>/. Idempotent per image \
                  hash — calling twice on the same file yields a new case_id but does not mutate \
-                 evidence. Use the returned case_id in every subsequent tool call. \
+                 evidence. The launcher must reserve the exact canonical source/segment hashes \
+                 and expected_sha256 is required over MCP; unreserved host paths are rejected. \
+                 Use the returned case_id in every subsequent tool call. \
                  ERRORS: ImageNotFound (check the path), ImageNotRegular (path is a directory; \
                  pass the file directly), ImageHashMismatch (only if expected_sha256 supplied — \
                  implies tampering or wrong file).",
@@ -250,10 +366,11 @@ fn build_registry() -> Vec<ToolEntry> {
             name: "disk_mount",
             description:
                 "Register a read-only disk mount session resource for a raw/E01 image. In auto mode, \
-                 uses fixed subprocess wrappers (ewfmount or mount -o ro,loop) on SIFT/Unix; on \
-                 Windows use mode='mock' for unit-testable behavior with an already-populated \
-                 mount_point. Writes cases/<case_id>/session_resources.json. No raw command \
-                 passthrough is exposed.",
+                 uses fixed subprocess wrappers (ewfmount or mount -o ro,loop) on SIFT/Unix and \
+                 direct read-only Sleuth Kit access when mounting is unavailable. `mode=mock` is \
+                 test-only and rejected by the MCP server. mount_point is server-managed under \
+                 the case and caller-selected paths are rejected. Writes \
+                 cases/<case_id>/session_resources.json. No raw command passthrough is exposed.",
             annotations: ToolAnnotations {
                 title: "Mount Disk Image Read-only",
                 read_only: false,
@@ -287,9 +404,9 @@ fn build_registry() -> Vec<ToolEntry> {
         ToolEntry {
             name: "disk_unmount",
             description:
-                "Unmount a disk_mount session resource using a fixed umount subprocess on \
-                 SIFT/Unix, or mode='mock' in tests/Windows. Marks the session resource \
-                 unmounted in the ledger. Never deletes original evidence.",
+                "Unmount a disk_mount or vss_mount session resource using a fixed umount subprocess on \
+                 SIFT/Unix. `mode=mock` is test-only and rejected by the MCP server. Marks the \
+                 session resource unmounted in the ledger. Never deletes original evidence.",
             annotations: ToolAnnotations {
                 title: "Unmount Disk Image",
                 read_only: false,
@@ -313,7 +430,9 @@ fn build_registry() -> Vec<ToolEntry> {
                  rfc822/url/domain recorders — accts, httplogs, gps, exif, json, net, zip, gzip, \
                  pdf, sqlite, utmp, winlnk, winprefetch, ntfsusn, ntfsmft, evtx, find). \
                  Keyword/regex hits come ONLY from find_regexes[] or an operator \
-                 keyword_file (or $FINDEVIL_BULK_KEYWORD_FILE) — never image-specific literals. \
+                 keyword_file exactly reserved by $FINDEVIL_BULK_KEYWORD_FILE; caller-selected \
+                 outside/symlink paths are rejected. find_regexes[] is bounded by count, \
+                 per-entry bytes, and total bytes. Native regex diagnostics are withheld. \
                  DETERMINISTIC for verify_finding replay: runs single-threaded (-j 1), sorts \
                  feature rows in-tool, records case-relative staged paths with per-file SHA-256, \
                  and includes the bulk_extractor version (never a wall-clock) in the hashed body. \
@@ -398,8 +517,9 @@ fn build_registry() -> Vec<ToolEntry> {
                  window. Returns entries[] (record_number, parent_record, name, full_path, \
                  is_directory, is_allocated, logical_size, plus 4 $SI + 2 $FN times), \
                  parse_errors (per-record failures swallowed), and records_seen (pre-filter). \
-                 ERRORS: MftNotFound (verify path), MftOpen (wrong magic — check the file is \
-                 a real $MFT export, not a copy of the volume root), InvalidTimeFilter \
+                 ERRORS: MftNotFound (verify path), MftOpen (wrong magic), MftMalformed \
+                 (impossible/truncated record header — check the file is a real $MFT export, \
+                 not a copy of the volume root), InvalidTimeFilter \
                  (since_iso/until_iso must be RFC 3339 / ISO-8601, e.g. 2026-04-25T00:00:00Z).",
             annotations: ToolAnnotations {
                 title: "Build NTFS MFT Timeline",
@@ -452,7 +572,8 @@ fn build_registry() -> Vec<ToolEntry> {
                  .yar/.yara format. Use AFTER case_open. \
                  target_path is a single file OR a directory; recursive=true walks all \
                  descendants (default false: top-level only). rules_path is a single rules \
-                 file OR a directory of rules — directory mode walks recursively for \
+                 file OR directory under an operator-approved immutable rules path supplied \
+                 by the launcher — arbitrary host/config paths are rejected. Directory mode walks recursively for \
                  .yar/.yara/.yarx and merges everything into one Rules instance with the \
                  file's basename as the namespace (so matches are attributable). Default \
                  limit 1000 matches across all files. \
@@ -462,9 +583,8 @@ fn build_registry() -> Vec<ToolEntry> {
                  keep responses bounded). \
                  ERRORS: TargetNotFound / RulesNotFound (verify paths), NoRulesFiles (the \
                  rules directory contains no .yar/.yara/.yarx files), RulesCompileFailed \
-                 (YARA syntax error or unsupported feature — yara-x is 99% libyara-compatible \
-                 but the 1% that diverges shows up here; the error message names the file \
-                 and line).",
+                 (YARA syntax error or unsupported feature; compiler source diagnostics are \
+                 withheld so attacker-controlled rule text cannot be reflected to the model).",
             annotations: ToolAnnotations {
                 title: "Scan with YARA Rules",
                 read_only: true,
@@ -520,7 +640,10 @@ fn build_registry() -> Vec<ToolEntry> {
                  Use AFTER case_open with evtx_dir pointing at the case's extracted \
                  EVTX directory. min_level filters Sigma severity (informational, low, \
                  medium, high, critical) — default 'low' (informational floods). \
-                 Optional rule_set overrides the default rules dir; usually omit. \
+                 Optional rule_set overrides the default rules dir; usually omit. An explicit \
+                 override must stay under HAYABUSA_RULES_BASE/rules (or exactly match \
+                 FINDEVIL_HAYABUSA_RULE_SET); outside, symlink, device, and oversized trees \
+                 are rejected. \
                  Hayabusa binary discovery: $HAYABUSA_BIN env var first, then PATH \
                  lookup. Default limit 10000 alerts. \
                  Returns alerts[] (timestamp_iso, rule, level, channel, event_id, \
@@ -887,6 +1010,25 @@ fn build_registry() -> Vec<ToolEntry> {
             handler: |args| dispatch_exif_parse(args),
         },
         ToolEntry {
+            name: "setupapi_parse",
+            description: "Parse Windows setupapi.dev.log / setupapi.app.log for USB and \
+                 removable-storage device-install section headers and section-start timestamps. \
+                 Secondary source for insertion history when USBSTOR registry keys are empty or \
+                 sparse (classic removable-media lead). Conservative: only USBSTOR / USB VID / \
+                 WPDBUSENUM sections; install alone is not data transfer. Output is sorted/ \
+                 deterministic for verify_finding replay. Use AFTER case_open / disk_extract; \
+                 artifact_path is one setupapi log. ERRORS: ArtifactNotFound, NotRegular, TooLarge.",
+            annotations: ToolAnnotations {
+                title: "Parse setupapi USB Device Install History",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<SetupapiParseInput>(),
+            handler: |args| dispatch_setupapi_parse(args),
+        },
+        ToolEntry {
             name: "bits_parse",
             description: "Parse a Windows BITS (Background Intelligent Transfer Service) state \
                  store — the legacy binary qmgr0.dat/qmgr1.dat queue, or DETECT the Win10 1709+ ESE \
@@ -999,6 +1141,8 @@ fn build_registry() -> Vec<ToolEntry> {
                  can be analyzed like any other volume and diffed against the live one \
                  (anti-forensics signal). Returns a mount_id + the exposed shadow-store paths. \
                  Read-only; degrades to vshadowmount_available=false when libvshadow is absent. \
+                 The mount point is a fresh server-managed leaf under the Case; caller-selected \
+                 mount paths are rejected. The resource is ledgered and released with disk_unmount. \
                  Use AFTER case_open; image_path holds the shadow store. ERRORS: ImageNotFound, \
                  Case (case dir unusable), MountPoint (could not create mount dir).",
             annotations: ToolAnnotations {
@@ -1304,72 +1448,35 @@ fn build_registry() -> Vec<ToolEntry> {
             handler: |args| dispatch_indx_parse(args),
         },
         ToolEntry {
-            name: "vel_collect",
-            description: "Run a Velociraptor artifact via `velociraptor artifacts collect` and \
-                 stream the resulting rows. Generic trampoline over Velociraptor's 200+ \
-                 built-in DFIR artifacts (Windows.Forensics.Prefetch, \
-                 Windows.Persistence.Services, Generic.Forensic.LocalHashes, etc.) — the \
-                 agent picks the artifact name and supplies any required parameters via \
-                 `args` (e.g. {\"device\":\"C:\"}). Apache-2.0; subprocess-only per Spec #2. \
-                 Use AFTER case_open. artifact must be a dotted-path name like \
-                 `Windows.Forensics.Prefetch` (validated up-front to keep injection out of \
-                 argv). args is an optional `key=value` map; keys must be \
-                 `[A-Za-z_][A-Za-z0-9_]*`. Default limit 10000 rows. \
-                 Velociraptor binary discovery: $VELOCIRAPTOR_BIN env var first, then PATH \
-                 lookup for `velociraptor` (single-binary release; install from \
-                 https://github.com/Velocidex/velociraptor/releases). \
-                 Returns rows[] {artifact, fields: free-form column map} + rows_seen + \
-                 stderr_tail. The fields map is intentionally unstructured — every artifact \
-                 has its own column set, and pinning a typed shape would be hostile to the \
-                 agent's flexibility. \
-                 PAIR WITH yara_scan and registry_query for live-response corroboration: \
-                 Velociraptor artifacts often surface persistence and execution evidence in \
-                 a single row whose source artifacts also exist as standalone tools — \
-                 cross-checking those tools confirms the Velociraptor row is not a parsing \
-                 artefact. \
-                 ERRORS: BinaryNotFound (install Velociraptor or set $VELOCIRAPTOR_BIN), \
-                 InvalidArtifactName (artifact name failed dotted-path validation; check \
-                 spelling against `velociraptor artifacts list`), InvalidArgName (an arg \
-                 key contained shell-meaningful characters), SubprocessFailed (Velociraptor \
-                 returned non-zero; check stderr_tail), OutputParse (stdout was neither \
-                 JSONL nor a JSON array — usually a Velociraptor version mismatch).",
-            annotations: ToolAnnotations {
-                title: "Collect Velociraptor Artifact",
-                read_only: true,
-                destructive: false,
-                idempotent: true,
-                // Some Velociraptor artifacts (e.g. uploads, network probes)
-                // do touch external systems. Conservative: mark openWorld
-                // so the agent UI can prompt before auto-approving.
-                open_world: true,
-            },
-            schema: || schema_for::<VelCollectInput>(),
-            handler: |args| dispatch_vel_collect(args),
-        },
-        ToolEntry {
             name: "browser_history",
-            description: "Read visited URLs from an offline browser-history SQLite database — \
-                 Chrome/Edge `History` (…/User Data/Default/History) or Firefox \
-                 `places.sqlite`. POOL B exfil + triage surface: a downloaded-payload URL, a \
-                 credential-phishing visit, or a C2 panel opened in a browser lands here. \
-                 Use AFTER case_open with history_path pointing at the file extracted from the \
-                 mounted image (pass the extracted copy, not a live profile). Opened READ-ONLY \
-                 + immutable, so it never writes a -wal/-journal next to the evidence. \
-                 Auto-detects the browser by schema (Chrome urls/visits vs Firefox moz_places) \
-                 and normalizes timestamps to UTC ISO-8601Z from each native epoch (Chrome \
-                 WebKit µs-since-1601, Firefox µs-since-1970). Default limit 10000, newest \
-                 last-visit first. Returns browser_family, rows[] {url, title, \
-                 last_visit_time_iso, visit_count}, rows_seen. \
-                 HONEST SCOPE: a row CONFIRMS a URL was RECORDED AS VISITED at time T (a \
-                 browser-artifact fact) — it does NOT assert execution, so a single \
-                 browser_history Finding is a legitimate CONFIRMED browser fact and never \
-                 trips the ≥2-artifact-class execution rule; intent is a separate \
-                 'hypothesis:' layer. \
-                 ERRORS: NotFound (verify path), Unreadable (not openable), ParseFailed \
-                 (corrupt DB / unexpected column shape), UnknownSchema (a valid SQLite file \
-                 that is neither a Chrome nor a Firefox history DB).",
+            description: "Read an offline browser SQLite artifact through one schema-detected, \
+                 read-only interface: Chrome/Edge `History` (visits + downloads), Firefox \
+                 `places.sqlite`, or Chromium `Cookies`, `Web Data` (autofill aggregates), and \
+                 `Login Data` (credential metadata only). Use AFTER case_open with the legacy \
+                 history_path field pointing at a completed extracted DB, never a live profile. \
+                 The MCP boundary rejects symlinks. Exact source/inventory DBs are bound to \
+                 case_id by canonical path plus SHA-256 and rechecked after parsing; typed \
+                 derived DBs require their own SHA-256 binding in the trusted case ledger. \
+                 Uncheckpointed WAL-only records are outside this call's coverage. The file is \
+                 opened READ-ONLY + immutable, so SQLite cannot write a -wal/-journal beside \
+                 evidence. Returns browser_family, artifact_kind, one globally limited rows[] \
+                 stream tagged by record_type (visit, download, cookie_metadata, \
+                 autofill_metadata, login_metadata), rows_seen, and an explicit truncated flag; \
+                 schema_version=2 explicitly identifies this mixed-row contract (v1 was \
+                 visit-only); timestamps are normalized \
+                 to UTC ISO-8601Z. Privacy boundary: cookie/encrypted values, autofill values, \
+                 password blobs, form data, and password notes are never selected or returned. \
+                 HONEST SCOPE: visits confirm browser records, downloads confirm download \
+                 metadata, and cookie/autofill/login rows confirm stored metadata. None alone \
+                 proves execution, intent, account compromise, or exfiltration. \
+                 ERRORS: NotFound (verify path), UnknownSchema (unrecognized DB), \
+                 AmbiguousSchema (multiple artifact schemas), UnsupportedSchema (required \
+                 metadata columns absent), NotAuthorized/IntegrityMismatch (re-open or correct \
+                 the current case), DatabaseTooLarge/ResourceLimit (narrow or deliberately raise \
+                 an operator ceiling), Unreadable (not openable), ParseFailed (corrupt DB or \
+                 projected column type mismatch), InvalidLimit (limit exceeds 10000).",
             annotations: ToolAnnotations {
-                title: "Read Browser History",
+                title: "Read Browser Artifacts",
                 read_only: true,
                 destructive: false,
                 idempotent: true,
@@ -1384,14 +1491,14 @@ fn build_registry() -> Vec<ToolEntry> {
                  known-bad hash sets — Autopsy-class NSRL hash flagging behind a typed \
                  read-only tool. Use AFTER case_open. hashes[] takes 1-10000 hex MD5(32)/\
                  SHA-1(40)/SHA-256(64) digests (validated, lowercased, deduplicated). \
-                 hashset_paths[] optionally names explicit set files \
-                 {path, disposition: known_good|known_bad, name?}; when empty, the tool \
-                 enumerates $FINDEVIL_HASHSET_DIR/known_good/** and known_bad/** \
+                 Caller-supplied paths are rejected; the tool only enumerates operator-controlled \
+                 $FINDEVIL_HASHSET_DIR/known_good/** and known_bad/** \
                  (.txt/.hashes text sets, .db/.sqlite/.sqlite3 SQLite sets; disposition \
                  from the subdirectory, name = file stem). A missing env var/dir degrades \
                  honestly: empty sets_loaded, every hash unknown — never an error. \
-                 Text sets (one hex hash per line, '#' comments) are STREAMED so multi-GB \
-                 NSRL exports never load into memory. SQLite sets open READ-ONLY+immutable \
+                 Text sets (one hex hash per line, '#' comments) are STREAMED under \
+                 per-line, per-file, aggregate-byte, and set-count ceilings. SQLite sets \
+                 open READ-ONLY+immutable with field-length, VM-operation, and process-heap limits \
                  (never writes -wal/-journal next to the set) and support NSRL RDS v3 \
                  (FILE table, md5/sha1/sha256 columns) and generic hashes(hash) schemas \
                  via parameterized lookups only; an unrecognized schema records an error \
@@ -1405,8 +1512,9 @@ fn build_registry() -> Vec<ToolEntry> {
                  can be stale or mislabeled); known_good means only 'present in a \
                  reference set' — NEVER proof a file is benign; unknown means only that \
                  the loaded sets did not contain the hash. \
-                 ERRORS: BadHashCount / InvalidHash (fix the hashes array — set-level \
-                 failures never error, they degrade into sets_loaded[].error).",
+                 ERRORS: BadHashCount / InvalidHash (fix the hashes array); unsafe operator \
+                 paths and resource-limit violations fail closed; set format/read failures \
+                 degrade explicitly into sets_loaded[].error.",
             annotations: ToolAnnotations {
                 title: "Look Up Hash Sets (NSRL / Known-Bad)",
                 read_only: true,
@@ -1427,7 +1535,11 @@ fn schema_for<T: schemars::JsonSchema>() -> Value {
 
 /// Parse one inbound line and produce the response line (or None for
 /// notifications, which the spec says are not replied to).
-fn dispatch(line: &str, registry: &[ToolEntry]) -> Option<String> {
+fn dispatch(
+    line: &str,
+    registry: &[ToolEntry],
+    evidence_session: &mut evidence_access::EvidenceSession,
+) -> Option<String> {
     // Parse the message envelope. Malformed JSON is itself an error
     // response with a null id (we have no id to echo).
     let msg: Value = match serde_json::from_str(line) {
@@ -1455,7 +1567,7 @@ fn dispatch(line: &str, registry: &[ToolEntry]) -> Option<String> {
             return None;
         }
         "tools/list" => Ok(handle_tools_list(registry)),
-        "tools/call" => handle_tools_call(&params, registry),
+        "tools/call" => handle_tools_call(&params, registry, evidence_session),
         "ping" => Ok(json!({})),
         other => Err(ToolError::InvalidParams(format!(
             "unknown method: {other:?}"
@@ -1503,23 +1615,37 @@ fn handle_tools_list(registry: &[ToolEntry]) -> Value {
     json!({ "tools": tools })
 }
 
-fn handle_tools_call(params: &Value, registry: &[ToolEntry]) -> Result<Value, ToolError> {
+fn handle_tools_call(
+    params: &Value,
+    registry: &[ToolEntry],
+    evidence_session: &mut evidence_access::EvidenceSession,
+) -> Result<Value, ToolError> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidParams("tools/call missing 'name'".to_string()))?;
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let entry = registry
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| ToolError::InvalidParams(format!("unknown tool: {name}")))?;
 
+    if name == "browser_history" {
+        let input: BrowserHistoryInput = parse_args(arguments.clone())?;
+        validate_browser_history_limit(&input)
+            .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+    }
+
+    let authorization =
+        evidence_access::authorize_session_tool_call(evidence_session, name, &mut arguments)
+            .map_err(|error| map_evidence_access_error(&error))?;
+
     // Guard against a panicking tool handler (e.g. a third-party hive/image
     // parser hitting an unimplemented code path on an unusual artifact) taking
     // down the whole stdio server mid-investigation. Convert the panic into a
     // clean per-call ToolError so the run continues with the remaining tools.
-    let payload =
+    let handler_result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (entry.handler)(arguments)))
             .map_err(|panic| {
                 let detail = panic
@@ -1528,8 +1654,37 @@ fn handle_tools_call(params: &Value, registry: &[ToolEntry]) -> Result<Value, To
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "tool handler panicked".to_string());
                 ToolError::Internal(format!("tool '{name}' panicked: {detail}"))
-            })??;
+            });
+    // Verify even when the handler failed or panicked.  A parser error must not
+    // mask evidence mutation, and no result is sealed until this check passes.
+    authorization
+        .verify_after()
+        .map_err(|error| map_evidence_access_error(&error))?;
+    let payload = handler_result??;
+    if name == "case_open" {
+        // A trusted launcher may reserve multiple child artifacts for a
+        // directory case, but each canonical reservation is single-use for
+        // this MCP connection. Consume only after the handler succeeded and
+        // the evidence post-check passed, so parser failures remain retryable.
+        evidence_session
+            .consume_registration(&authorization)
+            .map_err(|error| map_evidence_access_error(&error))?;
+        let case_id = payload.get("id").and_then(Value::as_str).ok_or_else(|| {
+            ToolError::Internal("case_open returned no case id to activate".to_string())
+        })?;
+        evidence_session
+            .activate_case(case_id)
+            .map_err(|error| map_evidence_access_error(&error))?;
+    }
     finalize_tool_output(name, &payload)
+}
+
+fn map_evidence_access_error(error: &evidence_access::AccessError) -> ToolError {
+    if error.is_client_error() {
+        ToolError::InvalidParams(error.to_string())
+    } else {
+        ToolError::Internal(format!("evidence authorization: {error}"))
+    }
 }
 
 /// Assemble the MCP `tools/call` result for a tool's typed output.
@@ -1545,6 +1700,11 @@ fn finalize_tool_output(name: &str, payload: &Value) -> Result<Value, ToolError>
     let (payload, sanitized) = crate::sanitize::sanitize_value(payload);
     let payload_text = serde_json::to_string(&payload)
         .map_err(|e| ToolError::Internal(format!("serialize tool output: {e}")))?;
+    if name == "browser_history" && payload_text.len() as u64 > browser_history_output_max_bytes() {
+        return Err(ToolError::InvalidParams(
+            "browser_history resource limit exceeded: sanitized output budget exceeded".to_string(),
+        ));
+    }
     let sha = sha256_hex(payload_text.as_bytes());
 
     let mut meta = json!({
@@ -1629,7 +1789,7 @@ fn dispatch_disk_extract_artifacts(args: Value) -> Result<Value, ToolError> {
 
 fn dispatch_bulk_extract(args: Value) -> Result<Value, ToolError> {
     let input: BulkExtractInput = parse_args(args)?;
-    // NotFound / NotRegular / CaseNotFound / KeywordFileNotFound / InvalidRegex
+    // NotFound / NotRegular / CaseNotFound / keyword / regex validation
     // are user-input territory → -32602 so the agent corrects the call.
     // SubprocessFailed / Io are system-state issues → -32603.
     match bulk_extract(&input) {
@@ -1643,7 +1803,9 @@ fn dispatch_bulk_extract(args: Value) -> Result<Value, ToolError> {
             | crate::tools::BulkExtractError::CaseNotFound(_)
             | crate::tools::BulkExtractError::InvalidCaseId(_)
             | crate::tools::BulkExtractError::KeywordFileNotFound(_)
-            | crate::tools::BulkExtractError::InvalidRegex { .. }),
+            | crate::tools::BulkExtractError::KeywordFileNotAuthorized(_)
+            | crate::tools::BulkExtractError::InvalidRegex { .. }
+            | crate::tools::BulkExtractError::RegexLimit { .. }),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("bulk_extract: {e}"))),
     }
@@ -1706,9 +1868,11 @@ fn dispatch_mft_timeline(args: Value) -> Result<Value, ToolError> {
         Err(crate::tools::MftError::InvalidTimeFilter { value, reason }) => Err(
             ToolError::InvalidParams(format!("invalid time filter {value:?}: {reason}")),
         ),
-        Err(e @ crate::tools::MftError::MftNotFound(_)) => {
-            Err(ToolError::InvalidParams(format!("{e}")))
-        }
+        Err(
+            e @ (crate::tools::MftError::InvalidLimit { .. }
+            | crate::tools::MftError::ResourceLimit { .. }
+            | crate::tools::MftError::MftNotFound(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("mft_timeline: {e}"))),
     }
 }
@@ -1976,6 +2140,21 @@ fn dispatch_exif_parse(args: Value) -> Result<Value, ToolError> {
     }
 }
 
+fn dispatch_setupapi_parse(args: Value) -> Result<Value, ToolError> {
+    let input: SetupapiParseInput = parse_args(args)?;
+    match setupapi_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::SetupapiParseError::ArtifactNotFound(_)
+            | crate::tools::SetupapiParseError::NotRegular(_)
+            | crate::tools::SetupapiParseError::TooLarge(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("setupapi_parse: {e}"))),
+    }
+}
+
 fn dispatch_bits_parse(args: Value) -> Result<Value, ToolError> {
     let input: BitsParseInput = parse_args(args)?;
     match bits_parse(&input) {
@@ -2051,9 +2230,11 @@ fn dispatch_vss_mount(args: Value) -> Result<Value, ToolError> {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
         }
-        Err(e @ (crate::tools::VssError::ImageNotFound(_) | crate::tools::VssError::Case(_))) => {
-            Err(ToolError::InvalidParams(format!("{e}")))
-        }
+        Err(
+            e @ (crate::tools::VssError::ImageNotFound(_)
+            | crate::tools::VssError::Case(_)
+            | crate::tools::VssError::UnsafeMountPoint(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("vss_mount: {e}"))),
     }
 }
@@ -2202,33 +2383,25 @@ fn dispatch_indx_parse(args: Value) -> Result<Value, ToolError> {
     }
 }
 
-fn dispatch_vel_collect(args: Value) -> Result<Value, ToolError> {
-    let input: VelCollectInput = parse_args(args)?;
-    // InvalidArtifactName / InvalidArgName are user-input issues; surface as -32602.
-    match vel_collect(&input) {
-        Ok(output) => {
-            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
-        }
-        Err(
-            e @ (crate::tools::VelCollectError::InvalidArtifactName(_)
-            | crate::tools::VelCollectError::InvalidArgName(_)),
-        ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vel_collect: {e}"))),
-    }
-}
-
 fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
     let input: BrowserHistoryInput = parse_args(args)?;
-    // NotFound / UnknownSchema are user-input territory (wrong path, or a file
-    // that isn't a browser history DB); surface as -32602. Unreadable/ParseFailed
-    // are corrupt-or-permission system issues → -32603.
+    validate_browser_history_limit(&input)
+        .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+    // Path/schema mismatches are user-input territory and surface as -32602.
+    // Unreadable/ParseFailed are corrupt-or-permission system issues → -32603.
     match browser_history(&input) {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
         }
         Err(
             e @ (crate::tools::BrowserHistoryError::NotFound(_)
-            | crate::tools::BrowserHistoryError::UnknownSchema(_)),
+            | crate::tools::BrowserHistoryError::NotRegular(_)
+            | crate::tools::BrowserHistoryError::InvalidLimit { .. }
+            | crate::tools::BrowserHistoryError::DatabaseTooLarge { .. }
+            | crate::tools::BrowserHistoryError::ResourceLimit(_)
+            | crate::tools::BrowserHistoryError::UnknownSchema(_)
+            | crate::tools::BrowserHistoryError::AmbiguousSchema(_)
+            | crate::tools::BrowserHistoryError::UnsupportedSchema { .. }),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("browser_history: {e}"))),
     }
@@ -2236,16 +2409,14 @@ fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
 
 fn dispatch_hashset_lookup(args: Value) -> Result<Value, ToolError> {
     let input: HashsetLookupInput = parse_args(args)?;
-    // Every HashsetLookupError variant is a user-input problem (bad hash
-    // count / non-hex hash) → -32602 so the agent fixes the hashes array.
-    // Set-level failures (missing file, unsupported schema, corrupt DB)
-    // are NOT errors — they degrade into sets_loaded[].error so a partial
-    // hash-set inventory still yields an honest result.
     match hashset_lookup(&input) {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
         }
-        Err(e) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e @ (HashsetLookupError::BadHashCount(_) | HashsetLookupError::InvalidHash { .. })) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("hashset_lookup: {e}"))),
     }
 }
 
@@ -2320,12 +2491,624 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     fn drive(input: &str) -> String {
         let mut output: Vec<u8> = Vec::new();
-        run_stdio_server_with_streams(Cursor::new(input.as_bytes()), &mut output)
-            .expect("server loop");
+        run_stdio_server_with_streams_and_limit_and_session(
+            Cursor::new(input.as_bytes()),
+            &mut output,
+            MCP_STDIN_FRAME_MAX_BYTES,
+            evidence_access::EvidenceSession::trusted_test(),
+        )
+        .expect("server loop");
         String::from_utf8(output).expect("utf-8 output")
+    }
+
+    #[test]
+    fn every_registered_tool_has_an_explicit_evidence_policy() {
+        let registry = build_registry();
+        let unmapped = registry
+            .iter()
+            .filter_map(|entry| {
+                evidence_access::tool_policy(entry.name)
+                    .is_none()
+                    .then_some(entry.name)
+            })
+            .collect::<Vec<_>>();
+        assert!(unmapped.is_empty(), "unmapped tools: {unmapped:?}");
+    }
+
+    #[test]
+    fn cloud_same_path_overwrite_is_rejected_without_sealed_output() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let path = tmp.path().join("cloudtrail.json");
+        std::fs::write(&path, br#"{"Records":[]}"#).expect("initial cloud log");
+        let initial_sha = sha256_hex(&std::fs::read(&path).expect("read cloud log"));
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_binding = std::env::var_os("FINDEVIL_BROWSER_CASE_BINDING");
+        std::env::set_var("FINDEVIL_HOME", tmp.path().join("empty-home"));
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "cloud-case",
+                "artifacts": [{"path": path, "sha256": initial_sha}],
+            }))
+            .expect("binding"),
+        );
+        std::fs::write(&path, br#"{"Records":[{"eventName":"GetObject"}]}"#)
+            .expect("overwrite cloud log at the same path");
+
+        let request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 811,
+            "method": "tools/call",
+            "params": {
+                "name": "cloud_audit",
+                "arguments": {
+                    "case_id": "cloud-case",
+                    "provider": "cloudtrail",
+                    "log_path": path,
+                }
+            }
+        }))
+        .expect("request");
+        let response: Value =
+            serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("JSON-RPC response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response.get("result").is_none());
+        let encoded = response.to_string();
+        assert!(!encoded.contains("output_sha256"));
+        assert!(!encoded.contains("_meta"));
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_binding {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_CASE_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn json_rpc_rejects_unapproved_yara_rule_paths_without_leaking_contents() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let target = tmp.path().join("target.bin");
+        std::fs::write(&target, b"target").expect("target");
+        let target_sha = sha256_hex(&std::fs::read(&target).expect("read target"));
+        let approved_dir = tmp.path().join("approved-rules");
+        std::fs::create_dir(&approved_dir).expect("approved dir");
+        let approved_rule = approved_dir.join("approved.yar");
+        std::fs::write(&approved_rule, "rule approved { condition: true }").expect("rule");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir(&home_dir).expect("home");
+        let dotenv = home_dir.join(".env");
+        std::fs::write(&dotenv, "TOP_SECRET_YARA_REPRO=never-echo").expect("dotenv");
+        let outside = tmp.path().join("outside.yar");
+        std::fs::write(&outside, "TOP_SECRET_OUTSIDE_RULE").expect("outside");
+        let symlink = tmp.path().join("approved-link.yar");
+        std::os::unix::fs::symlink(&approved_rule, &symlink).expect("rules symlink");
+
+        let keys = [
+            "FINDEVIL_HOME",
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            "FIND_EVIL_MEMORY_YARA_RULES",
+            "FIND_EVIL_DISK_YARA_RULES",
+            "FINDEVIL_YARA_RULES_ROOT",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("FINDEVIL_HOME", tmp.path().join("empty-home"));
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "yara-rpc-case",
+                "artifacts": [{"path": target, "sha256": target_sha}],
+            }))
+            .expect("binding"),
+        );
+        std::env::remove_var("FIND_EVIL_MEMORY_YARA_RULES");
+        std::env::remove_var("FIND_EVIL_DISK_YARA_RULES");
+        std::env::set_var("FINDEVIL_YARA_RULES_ROOT", &approved_dir);
+
+        for rules_path in [PathBuf::from("/etc/passwd"), dotenv, outside, symlink] {
+            let request = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 813,
+                "method": "tools/call",
+                "params": {
+                    "name": "yara_scan",
+                    "arguments": {
+                        "case_id": "yara-rpc-case",
+                        "target_path": target,
+                        "rules_path": rules_path,
+                    }
+                }
+            }))
+            .expect("request");
+            let response: Value = serde_json::from_str(drive(&format!("{request}\n")).trim())
+                .expect("JSON-RPC response");
+            assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+            assert!(response.get("result").is_none());
+            let encoded = response.to_string();
+            assert!(!encoded.contains("TOP_SECRET"));
+            assert!(!encoded.contains("never-echo"));
+            assert!(!encoded.contains("output_sha256"));
+        }
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn json_rpc_rejects_unapproved_bulk_keyword_paths_without_leaking_contents() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let image = tmp.path().join("image.dd");
+        std::fs::write(&image, b"image").expect("image");
+        let image_sha = sha256_hex(&std::fs::read(&image).expect("read image"));
+        let approved = tmp.path().join("approved-keywords.txt");
+        std::fs::write(&approved, "approved-pattern").expect("approved keyword file");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir(&home_dir).expect("home");
+        let dotenv = home_dir.join(".env");
+        std::fs::write(&dotenv, "TOP_SECRET_BULK_KEYWORD=never-echo").expect("dotenv");
+        let outside = tmp.path().join("outside-keywords.txt");
+        std::fs::write(&outside, "TOP_SECRET_OUTSIDE_KEYWORD").expect("outside");
+        let symlink = tmp.path().join("keyword-link.txt");
+        std::os::unix::fs::symlink(&approved, &symlink).expect("keyword symlink");
+
+        let keys = [
+            "FINDEVIL_HOME",
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            "FINDEVIL_BULK_KEYWORD_FILE",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("FINDEVIL_HOME", tmp.path().join("empty-home"));
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "bulk-rpc-case",
+                "artifacts": [{"path": image, "sha256": image_sha}],
+            }))
+            .expect("binding"),
+        );
+        std::env::set_var("FINDEVIL_BULK_KEYWORD_FILE", &approved);
+
+        for keyword_file in [PathBuf::from("/etc/passwd"), dotenv, outside, symlink] {
+            let request = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 815,
+                "method": "tools/call",
+                "params": {
+                    "name": "bulk_extract",
+                    "arguments": {
+                        "case_id": "bulk-rpc-case",
+                        "image_path": image,
+                        "keyword_file": keyword_file,
+                    }
+                }
+            }))
+            .expect("request");
+            let response: Value =
+                serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("response");
+            assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+            assert!(response.get("result").is_none());
+            let encoded = response.to_string();
+            assert!(!encoded.contains("TOP_SECRET"));
+            assert!(!encoded.contains("never-echo"));
+            assert!(!encoded.contains("output_sha256"));
+        }
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn json_rpc_rejects_unapproved_device_and_huge_hayabusa_rule_trees() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let evtx_dir = tmp.path().join("evtx");
+        std::fs::create_dir(&evtx_dir).expect("evtx dir");
+        let evtx = evtx_dir.join("Security.evtx");
+        std::fs::write(&evtx, b"evtx").expect("evtx");
+        let base = tmp.path().join("hayabusa-base");
+        let approved_rules = base.join("rules");
+        std::fs::create_dir_all(&approved_rules).expect("approved rules");
+        std::fs::write(approved_rules.join("approved.yml"), "title: approved").expect("rule");
+        let outside = tmp.path().join("outside-rules");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("outside.yml"), "TOP_SECRET_HAYABUSA").expect("outside rule");
+        let symlink = tmp.path().join("rules-link");
+        std::os::unix::fs::symlink(&approved_rules, &symlink).expect("rules symlink");
+        let huge = tmp.path().join("huge-rules");
+        std::fs::create_dir(&huge).expect("huge");
+        for index in 0..=500 {
+            std::fs::write(huge.join(format!("rule-{index}.yml")), "title: bounded")
+                .expect("huge rule");
+        }
+
+        let keys = [
+            "FINDEVIL_HOME",
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            "HAYABUSA_RULES_BASE",
+            "FINDEVIL_HAYABUSA_RULE_SET",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("FINDEVIL_HOME", tmp.path().join("empty-home"));
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "hayabusa-rpc-case",
+                "artifacts": [{
+                    "path": evtx,
+                    "sha256": sha256_hex(&std::fs::read(&evtx).expect("read evtx")),
+                }],
+            }))
+            .expect("binding"),
+        );
+        std::env::set_var("HAYABUSA_RULES_BASE", &base);
+        std::env::remove_var("FINDEVIL_HAYABUSA_RULE_SET");
+
+        for rule_set in [PathBuf::from("/"), PathBuf::from("/dev"), outside, symlink] {
+            let request = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 817,
+                "method": "tools/call",
+                "params": {
+                    "name": "hayabusa_scan",
+                    "arguments": {
+                        "case_id": "hayabusa-rpc-case",
+                        "evtx_dir": evtx_dir,
+                        "rule_set": rule_set,
+                    }
+                }
+            }))
+            .expect("request");
+            let response: Value =
+                serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("response");
+            assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+            assert!(response.get("result").is_none());
+            assert!(!response.to_string().contains("TOP_SECRET_HAYABUSA"));
+        }
+
+        std::env::set_var("FINDEVIL_HAYABUSA_RULE_SET", &huge);
+        let request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 818,
+            "method": "tools/call",
+            "params": {
+                "name": "hayabusa_scan",
+                "arguments": {
+                    "case_id": "hayabusa-rpc-case",
+                    "evtx_dir": evtx_dir,
+                    "rule_set": huge,
+                }
+            }
+        }))
+        .expect("huge request");
+        let response: Value =
+            serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("more than 500 files")));
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn json_rpc_denies_unreserved_case_open_of_host_file() {
+        let _env_guard = crate::env_lock();
+        let previous = std::env::var_os("FINDEVIL_CASE_OPEN_BINDING");
+        std::env::remove_var("FINDEVIL_CASE_OPEN_BINDING");
+        // Use a real, existing host file that was never reserved, so the denial
+        // is the authorization gate (NotAuthorized -> invalid-params) rather than
+        // a path-not-found read error. A Unix-only literal like `/etc/passwd`
+        // does not exist on Windows, where the missing file would surface as an
+        // internal read error (-32603) instead of the -32602 this asserts.
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let host_file = tmp.path().join("unreserved-host-file");
+        std::fs::write(&host_file, b"unreserved host evidence").expect("write host file");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 814,
+            "method": "tools/call",
+            "params": {
+                "name": "case_open",
+                "arguments": {
+                    "image_path": host_file,
+                    "expected_sha256": "0".repeat(64),
+                }
+            }
+        });
+        let response: Value = serde_json::from_str(
+            drive(&format!("{}\n", serde_json::to_string(&request).unwrap())).trim(),
+        )
+        .expect("JSON-RPC response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response.get("result").is_none());
+        assert!(!response.to_string().contains("output_sha256"));
+        match previous {
+            Some(value) => std::env::set_var("FINDEVIL_CASE_OPEN_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_CASE_OPEN_BINDING"),
+        }
+    }
+
+    #[test]
+    fn json_rpc_privacy_gate_blocks_tools_call_without_route_or_ack() {
+        let _env_guard = crate::env_lock();
+        let keys = [
+            "FINDEVIL_OUTPUT_ROUTE",
+            "FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 819,
+            "method": "tools/call",
+            "params": {
+                "name": "case_open",
+                "arguments": {
+                    "image_path": "/etc/passwd",
+                    "expected_sha256": "0".repeat(64),
+                }
+            }
+        }))
+        .expect("request");
+        let mut output = Vec::new();
+        run_stdio_server_with_streams(
+            Cursor::new(format!("{request}\n").into_bytes()),
+            &mut output,
+        )
+        .expect("server");
+        let response: Value = serde_json::from_slice(&output).expect("response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("parsed evidence egress")));
+        assert!(response.get("result").is_none());
+        assert!(!response.to_string().contains("output_sha256"));
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn json_rpc_denies_a_known_prior_case_uuid_outside_the_session() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let home = tmp.path().join("home");
+        let prior_path = tmp.path().join("prior.evtx");
+        let current_path = tmp.path().join("current.evtx");
+        std::fs::write(&prior_path, b"prior case source").expect("prior");
+        std::fs::write(&current_path, b"current case source").expect("current");
+        let keys = ["FINDEVIL_HOME", "FINDEVIL_BROWSER_CASE_BINDING"];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("FINDEVIL_HOME", &home);
+        let prior = case_open(&CaseOpenInput {
+            image_path: prior_path.clone(),
+            expected_sha256: None,
+            label: None,
+        })
+        .expect("create persistent prior case");
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "current-session-case",
+                "artifacts": [{
+                    "path": current_path,
+                    "sha256": sha256_hex(&std::fs::read(&current_path).expect("read current")),
+                }],
+            }))
+            .expect("current binding"),
+        );
+        let request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 816,
+            "method": "tools/call",
+            "params": {
+                "name": "evtx_query",
+                "arguments": {
+                    "case_id": prior.id,
+                    "evtx_path": prior_path,
+                }
+            }
+        }))
+        .expect("request");
+        let response: Value =
+            serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not active")));
+        assert!(response.get("result").is_none());
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn json_rpc_rejects_disk_mock_mount_of_unrelated_tree() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let home = tmp.path().join("home");
+        let image = tmp.path().join("bound.dd");
+        let unrelated_tree = tmp.path().join("unrelated-tree");
+        std::fs::write(&image, b"registered disk A").expect("disk image");
+        std::fs::create_dir(&unrelated_tree).expect("unrelated tree");
+        std::fs::write(unrelated_tree.join("Security.evtx"), b"tree B")
+            .expect("unrelated artifact");
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_binding = std::env::var_os("FINDEVIL_BROWSER_CASE_BINDING");
+        std::env::set_var("FINDEVIL_HOME", &home);
+        std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING");
+        let case = case_open(&CaseOpenInput {
+            image_path: image.clone(),
+            expected_sha256: None,
+            label: None,
+        })
+        .expect("register disk A");
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": case.id,
+                "artifacts": [{
+                    "path": image,
+                    "sha256": sha256_hex(&std::fs::read(&image).expect("read disk A")),
+                }],
+            }))
+            .expect("active case binding"),
+        );
+
+        let request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 812,
+            "method": "tools/call",
+            "params": {
+                "name": "disk_mount",
+                "arguments": {
+                    "case_id": case.id,
+                    "image_path": image,
+                    "mount_point": unrelated_tree,
+                    "mode": "mock",
+                }
+            }
+        }))
+        .expect("request");
+        let response: Value =
+            serde_json::from_str(drive(&format!("{request}\n")).trim()).expect("JSON-RPC response");
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("test-only")));
+        assert!(!home
+            .join("cases")
+            .join(case.id)
+            .join("session_resources.json")
+            .exists());
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_binding {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_CASE_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING"),
+        }
+    }
+
+    #[test]
+    fn stdio_accepts_request_at_exact_byte_ceiling() {
+        let request = r#"{"jsonrpc":"2.0","id":701,"method":"initialize","params":{}}"#;
+        let frame = format!("{request}\n");
+        let mut output = Vec::new();
+
+        run_stdio_server_with_streams_and_limit(
+            Cursor::new(frame.as_bytes()),
+            &mut output,
+            frame.len(),
+        )
+        .expect("an exactly bounded frame remains valid");
+
+        let response: Value = serde_json::from_slice(&output).expect("JSON-RPC response");
+        assert_eq!(response["id"], 701);
+    }
+
+    #[test]
+    fn stdio_rejects_oversized_request_without_unbounded_read() {
+        let mut output = Vec::new();
+
+        let error = run_stdio_server_with_streams_and_limit(std::io::repeat(b'x'), &mut output, 64)
+            .expect_err("an infinite unterminated peer must fail after the byte ceiling");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("frame limit"), "{error}");
+        assert!(output.is_empty(), "an invalid frame must not be dispatched");
+    }
+
+    #[test]
+    fn stdio_rejects_unterminated_request_at_eof() {
+        let request = r#"{"jsonrpc":"2.0","id":702,"method":"initialize","params":{}}"#;
+        let mut output = Vec::new();
+
+        let error = run_stdio_server_with_streams_and_limit(
+            Cursor::new(request.as_bytes()),
+            &mut output,
+            request.len() + 1,
+        )
+        .expect_err("JSON-RPC frames require a newline terminator");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unterminated"), "{error}");
+        assert!(output.is_empty(), "an invalid frame must not be dispatched");
+    }
+
+    #[test]
+    fn stdio_request_ceiling_counts_utf8_wire_bytes() {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":703,"method":"{}"}}"#,
+            "é".repeat(32)
+        );
+        let frame = format!("{request}\n");
+        let character_count = frame.chars().count();
+        assert!(frame.len() > character_count, "fixture must be multibyte");
+        let mut output = Vec::new();
+
+        let error = run_stdio_server_with_streams_and_limit(
+            Cursor::new(frame.as_bytes()),
+            &mut output,
+            character_count,
+        )
+        .expect_err("the limit applies to UTF-8 bytes, not decoded characters");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("frame limit"), "{error}");
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -2333,8 +3116,8 @@ mod tests {
         // finalize now writes a sidecar ledger; isolate its path so the write
         // lands in a tempdir (and so this test can assert the new behavior)
         // without racing other env-reading tests.
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
         let ledger = tmp.path().join("alerts.jsonl");
         let prev = std::env::var("FINDEVIL_INJECTION_LEDGER").ok();
         // SAFETY: env mutation is serialized by ENV_LOCK and restored below.
@@ -2383,6 +3166,26 @@ mod tests {
     }
 
     #[test]
+    fn browser_finalize_rejects_sanitized_payload_above_output_ceiling() {
+        let _env_guard = crate::env_lock();
+        let previous = std::env::var_os("FINDEVIL_BROWSER_OUTPUT_MAX_BYTES");
+        let payload = json!({"rows": [{"title": "[INST]".repeat(8)}]});
+        let raw_size = serde_json::to_vec(&payload).unwrap().len();
+        std::env::set_var("FINDEVIL_BROWSER_OUTPUT_MAX_BYTES", raw_size.to_string());
+
+        assert!(matches!(
+            finalize_tool_output("browser_history", &payload),
+            Err(ToolError::InvalidParams(message))
+                if message.contains("sanitized output budget exceeded")
+        ));
+
+        match previous {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_OUTPUT_MAX_BYTES", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_OUTPUT_MAX_BYTES"),
+        }
+    }
+
+    #[test]
     fn initialize_returns_protocol_version() {
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let out = drive(&format!("{req}\n"));
@@ -2405,6 +3208,7 @@ mod tests {
             "disk_mount",
             "disk_extract_artifacts",
             "disk_unmount",
+            "bulk_extract",
             "evtx_query",
             "prefetch_parse",
             "mft_timeline",
@@ -2430,11 +3234,11 @@ mod tests {
             "nfdump_query",
             "suricata_eve",
             "indx_parse",
-            "vel_collect",
             "browser_history",
             "oe_dbx_parse",
             "email_parse",
             "exif_parse",
+            "setupapi_parse",
             "bits_parse",
             "srum_parse",
             "pst_parse",
@@ -2443,7 +3247,6 @@ mod tests {
             "vss_mount",
             "hashset_lookup",
             "thumbcache_parse",
-            "bulk_extract",
         ];
         assert_eq!(names.len(), expected.len());
         for want in expected {
@@ -2480,15 +3283,44 @@ mod tests {
     }
 
     #[test]
-    fn vel_collect_is_marked_open_world() {
-        // Velociraptor artifacts can touch external systems — UI should prompt.
+    fn vel_collect_and_shell_artifacts_are_not_exposed_over_json_rpc() {
         let req = r#"{"jsonrpc":"2.0","id":100,"method":"tools/list"}"#;
         let out = drive(&format!("{req}\n"));
         let resp: Value = serde_json::from_str(out.trim()).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        let vel = tools.iter().find(|t| t["name"] == "vel_collect").unwrap();
-        assert_eq!(vel["annotations"]["openWorldHint"], true);
-        assert_eq!(vel["annotations"]["readOnlyHint"], true);
+        assert!(
+            tools.iter().all(|tool| tool["name"] != "vel_collect"),
+            "the open-world Velociraptor trampoline must not be advertised"
+        );
+
+        for artifact in [
+            "Linux.Sys.BashShell",
+            "Windows.System.CmdShell",
+            "Windows.System.PowerShell",
+            "Generic.Utils.Upload",
+            "Windows.System.Kill",
+            "Generic.Network.Scan",
+            "Custom.Unknown.Artifact",
+        ] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": {
+                    "name": "vel_collect",
+                    "arguments": {"case_id": "case", "artifact": artifact}
+                }
+            });
+            let output = drive(&format!("{request}\n"));
+            let response: Value = serde_json::from_str(output.trim()).unwrap();
+            assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS, "{artifact}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("unknown tool: vel_collect")),
+                "{artifact}: {response}"
+            );
+        }
     }
 
     #[test]
@@ -2565,23 +3397,221 @@ mod tests {
     }
 
     #[test]
+    fn browser_history_oversize_limit_is_invalid_params_on_the_wire() {
+        let req = r#"{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"browser_history","arguments":{"case_id":"limit-test","history_path":"/not-opened","limit":10001}}}"#;
+        let out = drive(&format!("{req}\n"));
+        let resp: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(resp["error"]["code"], ERR_INVALID_PARAMS);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("maximum 10000")));
+    }
+
+    #[test]
+    fn browser_history_accepts_actual_case_manifest_and_detects_hash_drift() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let home = tmp.path().join("home");
+        let path = tmp.path().join("places.sqlite");
+        let conn = rusqlite::Connection::open(&path).expect("create Firefox fixture");
+        conn.execute_batch(
+            "CREATE TABLE moz_places (
+                 id INTEGER PRIMARY KEY, url TEXT, title TEXT,
+                 visit_count INTEGER, last_visit_date INTEGER
+             );
+             INSERT INTO moz_places VALUES (
+                 1, 'https://case-bound.example', 'bound', 1, 1609459200000000
+             );",
+        )
+        .expect("seed Firefox fixture");
+        drop(conn);
+
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_binding = std::env::var_os("FINDEVIL_BROWSER_CASE_BINDING");
+        std::env::set_var("FINDEVIL_HOME", &home);
+        std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING");
+        let handle = case_open(&CaseOpenInput {
+            image_path: path.clone(),
+            expected_sha256: None,
+            label: Some("browser fixture".to_string()),
+        })
+        .expect("register browser database");
+        let args = json!({
+            "case_id": handle.id,
+            "history_path": path,
+            "limit": 10
+        });
+
+        let registry = build_registry();
+        let mut evidence_session = evidence_access::EvidenceSession::trusted_test();
+        evidence_session
+            .activate_case(&handle.id)
+            .expect("activate directly registered test case");
+        handle_tools_call(
+            &json!({"name": "browser_history", "arguments": args}),
+            &registry,
+            &mut evidence_session,
+        )
+        .expect("authorized read through the shared dispatch guard");
+
+        let conn = rusqlite::Connection::open(&path).expect("reopen Firefox fixture");
+        conn.execute(
+            "INSERT INTO moz_places VALUES (2, 'https://drift.example', 'drift', 1, 1609545600000000)",
+            [],
+        )
+        .expect("change evidence after registration");
+        drop(conn);
+        assert!(matches!(
+            handle_tools_call(
+                &json!({"name": "browser_history", "arguments": args}),
+                &registry,
+                &mut evidence_session,
+            ),
+            Err(ToolError::InvalidParams(message)) if message.contains("integrity mismatch")
+        ));
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_binding {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_CASE_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING"),
+        }
+    }
+
+    #[test]
+    fn browser_history_directory_binding_requires_case_path_and_hash_match() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let home = tmp.path().join("empty-home");
+        let path = tmp.path().join("History");
+        let conn = rusqlite::Connection::open(&path).expect("create Chromium fixture");
+        conn.execute_batch(
+            "CREATE TABLE urls (
+                 id INTEGER PRIMARY KEY, url TEXT, title TEXT,
+                 visit_count INTEGER, last_visit_time INTEGER
+             );
+             CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);",
+        )
+        .expect("seed Chromium fixture");
+        drop(conn);
+        let digest = sha256_hex(&std::fs::read(&path).expect("read fixture"));
+
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_binding = std::env::var_os("FINDEVIL_BROWSER_CASE_BINDING");
+        let previous_max_bytes = std::env::var_os("FINDEVIL_BROWSER_DB_MAX_BYTES");
+        std::env::set_var("FINDEVIL_HOME", &home);
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "dir-deadbeef",
+                "artifacts": [{"path": path, "sha256": digest}]
+            }))
+            .expect("serialize binding"),
+        );
+        let args = json!({
+            "case_id": "dir-deadbeef",
+            "history_path": path,
+            "limit": 10
+        });
+        let registry = build_registry();
+        let mut evidence_session = evidence_access::EvidenceSession::trusted_test();
+        assert!(handle_tools_call(
+            &json!({"name": "browser_history", "arguments": args}),
+            &registry,
+            &mut evidence_session,
+        )
+        .is_ok());
+
+        std::env::set_var("FINDEVIL_BROWSER_DB_MAX_BYTES", "1");
+        std::env::set_var(
+            "FINDEVIL_BROWSER_CASE_BINDING",
+            serde_json::to_string(&json!({
+                "case_id": "dir-deadbeef",
+                "artifacts": [{"path": path, "sha256": digest}]
+            }))
+            .expect("serialize deliberately wrong binding"),
+        );
+        let oversized = json!({
+            "case_id": "dir-deadbeef",
+            "history_path": path,
+            "limit": 10
+        });
+        assert!(matches!(
+            handle_tools_call(
+                &json!({"name": "browser_history", "arguments": oversized}),
+                &registry,
+                &mut evidence_session,
+            ),
+            Err(ToolError::InvalidParams(message)) if message.contains("exceeds maximum")
+        ));
+        match &previous_max_bytes {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_DB_MAX_BYTES", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_DB_MAX_BYTES"),
+        }
+
+        let wrong_case = json!({
+            "case_id": "dir-wrong",
+            "history_path": path,
+            "limit": 10
+        });
+        assert!(matches!(
+            handle_tools_call(
+                &json!({"name": "browser_history", "arguments": wrong_case}),
+                &registry,
+                &mut evidence_session,
+            ),
+            Err(ToolError::InvalidParams(message)) if message.contains("not active")
+        ));
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_binding {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_CASE_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_CASE_BINDING"),
+        }
+        match previous_max_bytes {
+            Some(value) => std::env::set_var("FINDEVIL_BROWSER_DB_MAX_BYTES", value),
+            None => std::env::remove_var("FINDEVIL_BROWSER_DB_MAX_BYTES"),
+        }
+    }
+
+    #[test]
     fn case_open_against_real_file_succeeds() {
-        let _env_guard = crate::ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
         let img = tmp.path().join("evidence.E01");
         std::fs::write(&img, b"fake evidence bytes for hashing").unwrap();
+        let expected_sha = sha256_hex(&std::fs::read(&img).expect("read evidence"));
         let home = tmp.path().join("home");
+        std::fs::create_dir(&home).expect("pre-create FINDEVIL_HOME");
         let prev_findevil = std::env::var("FINDEVIL_HOME").ok();
+        let prev_registration = std::env::var_os("FINDEVIL_CASE_OPEN_BINDING");
         std::env::set_var("FINDEVIL_HOME", &home);
+        std::env::set_var(
+            "FINDEVIL_CASE_OPEN_BINDING",
+            serde_json::to_string(&json!({
+                "artifacts": [{"path": img, "sha256": expected_sha}],
+            }))
+            .expect("registration binding"),
+        );
 
         let req = format!(
-            r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"case_open","arguments":{{"image_path":{img:?}}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"case_open","arguments":{{"image_path":{img:?},"expected_sha256":{expected_sha:?}}}}}}}"#,
             img = img.to_string_lossy().replace('\\', "\\\\"),
+            expected_sha = expected_sha,
         );
         let out = drive(&format!("{req}\n"));
         match prev_findevil {
             Some(v) => std::env::set_var("FINDEVIL_HOME", v),
             None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match prev_registration {
+            Some(value) => std::env::set_var("FINDEVIL_CASE_OPEN_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_CASE_OPEN_BINDING"),
         }
 
         let resp: Value = serde_json::from_str(out.trim()).expect(&out);
@@ -2602,5 +3632,92 @@ mod tests {
                 .len(),
             64
         );
+    }
+
+    #[test]
+    fn case_open_reservations_are_single_use_per_canonical_artifact() {
+        let _env_guard = crate::env_lock();
+        let tmp = crate::server::test_support::CanonicalTempDir::new();
+        let first = tmp.path().join("first.evtx");
+        let second = tmp.path().join("second.evtx");
+        std::fs::write(&first, b"first reserved artifact").expect("first artifact");
+        std::fs::write(&second, b"second reserved artifact").expect("second artifact");
+        let first_sha = sha256_hex(&std::fs::read(&first).expect("read first"));
+        let second_sha = sha256_hex(&std::fs::read(&second).expect("read second"));
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).expect("home");
+        let previous_home = std::env::var_os("FINDEVIL_HOME");
+        let previous_binding = std::env::var_os("FINDEVIL_CASE_OPEN_BINDING");
+        std::env::set_var("FINDEVIL_HOME", &home);
+        std::env::set_var(
+            "FINDEVIL_CASE_OPEN_BINDING",
+            serde_json::to_string(&json!({
+                "artifacts": [
+                    {"path": first, "sha256": first_sha},
+                    {"path": second, "sha256": second_sha},
+                ],
+            }))
+            .expect("registration binding"),
+        );
+
+        let request = |id: u64, path: &std::path::Path, expected_sha256: &str| {
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "case_open",
+                    "arguments": {
+                        "image_path": path,
+                        "expected_sha256": expected_sha256,
+                    }
+                }
+            }))
+            .expect("request")
+        };
+        let input = [
+            request(901, &first, &first_sha),
+            request(902, &second, &second_sha),
+            request(903, &first, &first_sha),
+            request(904, &second, &second_sha),
+        ]
+        .join("\n")
+            + "\n";
+        let output = drive(&input);
+
+        match previous_home {
+            Some(value) => std::env::set_var("FINDEVIL_HOME", value),
+            None => std::env::remove_var("FINDEVIL_HOME"),
+        }
+        match previous_binding {
+            Some(value) => std::env::set_var("FINDEVIL_CASE_OPEN_BINDING", value),
+            None => std::env::remove_var("FINDEVIL_CASE_OPEN_BINDING"),
+        }
+
+        let responses = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("response"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 4, "{responses:?}");
+        assert!(responses[0]["result"].is_object(), "{:?}", responses[0]);
+        assert!(responses[1]["result"].is_object(), "{:?}", responses[1]);
+        for response in &responses[2..] {
+            assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS, "{response}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("already been registered")),
+                "{response}"
+            );
+            assert!(response.get("result").is_none(), "{response}");
+            assert!(
+                !response.to_string().contains("output_sha256"),
+                "{response}"
+            );
+        }
+        let case_count = std::fs::read_dir(home.join("cases"))
+            .expect("cases")
+            .count();
+        assert_eq!(case_count, 2, "replays must not create more case dirs");
     }
 }

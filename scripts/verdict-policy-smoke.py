@@ -79,6 +79,7 @@ def main() -> int:
     build_indicators = fea.build_indicators
     build_event_narratives = fea.build_event_narratives
     build_executive_attack_story = fea.build_executive_attack_story
+    customer_visible_report_text = fea.customer_visible_report_text
     build_expert_doctrine = fea.build_expert_doctrine
     build_expert_miss_summary = fea.build_expert_miss_summary
     build_report_qa_signoff = fea.build_report_qa_signoff
@@ -420,6 +421,13 @@ def main() -> int:
                         "stderr_tail": "",
                         "note": "mock mount for policy smoke",
                     }
+                if name == "vss_list":
+                    return {
+                        "vshadowinfo_available": True,
+                        "has_shadow_store": False,
+                        "store_count": 0,
+                        "stores": [],
+                    }
                 if name == "disk_extract_artifacts":
                     fs_root = root
                     artifacts = [
@@ -476,6 +484,20 @@ def main() -> int:
                     }
                 if name == "registry_query":
                     return {"entries": [], "keys_visited": 0, "parse_errors": 0}
+                if name == "bulk_extract":
+                    # Degrade shape: bulk_extractor absent. This policy test asserts
+                    # verdict/evidence-type behaviour, not free-space carving, and the
+                    # engine emits no candidates when the scanner is unavailable.
+                    return {
+                        "bulk_extractor_available": False,
+                        "engine_version": "unknown",
+                        "scanners_requested": [],
+                        "features": [],
+                        "features_seen": 0,
+                        "staged_files": [],
+                        "stderr_tail": "",
+                        "note": "bulk_extractor not installed",
+                    }
                 raise AssertionError(f"unexpected tool {name}")
 
         fake_extracted_rust = FakeExtractedRust()
@@ -550,6 +572,7 @@ def main() -> int:
             zip_path: str,
             output_dir: str,
             *,
+            expected_sha256: str,
             limit: int = 500,
             max_member_bytes: int = 0,
         ) -> dict[str, Any]:
@@ -557,6 +580,9 @@ def main() -> int:
             pf = root / "CMD.EXE-1234.pf"
             return {
                 "zip_path": zip_path,
+                "expected_archive_sha256": expected_sha256,
+                "archive_sha256_before": expected_sha256,
+                "archive_sha256_after": expected_sha256,
                 "entries": [
                     {
                         "path": str(pf),
@@ -2004,6 +2030,61 @@ def main() -> int:
             print(f"         actual  : {actual!r}")
             failures += 1
 
+    indeterminate_rules = load_expert_rules()
+    indeterminate_qa = build_report_qa_signoff(
+        [],
+        [{"tool": "evtx_query", "tool_call_id": "tc-evtx"}],
+        "INDETERMINATE",
+        narr_completeness,
+        {"blind_spot_count": 3, "targets": []},
+        {"events": []},
+        [],
+        indeterminate_rules,
+    )
+    indeterminate_story = build_executive_attack_story(
+        [],
+        "INDETERMINATE",
+        {"events": []},
+        narr_completeness,
+        {"blind_spot_count": 3, "targets": []},
+        indeterminate_qa,
+        [],
+        [],
+        "/evidence",
+    )
+    indeterminate_visible = customer_visible_report_text(
+        indeterminate_story, [], [], [], []
+    )
+    indeterminate_qa = build_report_qa_signoff(
+        [],
+        [{"tool": "evtx_query", "tool_call_id": "tc-evtx"}],
+        "INDETERMINATE",
+        narr_completeness,
+        {"blind_spot_count": 3, "targets": []},
+        {"events": []},
+        [],
+        indeterminate_rules,
+        customer_visible_text=indeterminate_visible,
+    )
+    process_checks += 1
+    safe_indeterminate_copy = next(
+        (
+            check.get("status")
+            for check in indeterminate_qa.get("checks", [])
+            if check.get("check_id") == "no_forbidden_unqualified_language"
+        ),
+        None,
+    )
+    ok = safe_indeterminate_copy == "PASS"
+    print(
+        f"  [{'OK  ' if ok else 'FAIL'}] narrative: "
+        "zero-finding INDETERMINATE copy passes forbidden-language QA"
+    )
+    if not ok:
+        print("         expected: 'PASS'")
+        print(f"         actual  : {safe_indeterminate_copy!r}")
+        failures += 1
+
     timeline_events = [
         {
             "ts": "2026-05-04T00:00:00Z",
@@ -2169,8 +2250,8 @@ def main() -> int:
     sigstore_release_gate = sigstore_inv._build_release_gate(approved_qa)  # noqa: SLF001
     sigstore_verified_release_gate = sigstore_inv._build_release_gate(  # noqa: SLF001
         approved_qa,
-        {"overall": True},
-        {"signature": {"payload_sha256": "f" * 64}},
+        {"overall": True, "signature_verified": True},
+        {"signature": {"payload_sha256": "f" * 64, "kind": "sigstore"}},
     )
     stub_inv = fea.Investigation(
         "memory.img", unattended=True, with_report=False, signer="stub"
@@ -2287,12 +2368,17 @@ def main() -> int:
 
     verify_inv = fea.Investigation("memory.img", unattended=True, with_report=False)
     verify_client = FakeManifestVerifyClient({"overall": True})
-    verify_result = verify_inv.verify_final_manifest(verify_client)
+    finalized_manifest = {
+        "signer_effective": "ed25519",
+        "signature_cert_fingerprint": "a" * 64,
+    }
+    verify_result = verify_inv.verify_final_manifest(verify_client, finalized_manifest)
     verify_error_inv = fea.Investigation(
         "memory.img", unattended=True, with_report=False
     )
     verify_error_result = verify_error_inv.verify_final_manifest(
-        FakeManifestVerifyClient({"_error": {"message": "manifest broken"}})
+        FakeManifestVerifyClient({"_error": {"message": "manifest broken"}}),
+        finalized_manifest,
     )
     qa_kinds = [record["kind"] for record in qa_audit_client.records]
     finding_approved_payloads = [
@@ -2883,6 +2969,13 @@ def main() -> int:
             "post-finalize manifest verification calls manifest_verify",
             verify_client.calls[0][0] if verify_client.calls else None,
             "manifest_verify",
+        ),
+        (
+            "post-finalize Ed25519 verification carries trusted signer pin",
+            verify_client.calls[0][1].get("expected_ed25519_fingerprint")
+            if verify_client.calls
+            else None,
+            "a" * 64,
         ),
         (
             "post-finalize manifest verification stores pass status",

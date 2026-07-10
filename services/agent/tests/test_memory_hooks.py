@@ -130,6 +130,29 @@ class TestRememberHelpers:
         f = _finding(confidence="CONFIRMED", mitre_technique=None, finding_id="f-xyz")
         assert fea.mem_remember_payload(f)["key"] == "f-xyz"
 
+    def test_remember_write_uses_launcher_case_id_not_parser_handle(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class _Py:
+            @staticmethod
+            def call_tool(name: str, arguments: dict) -> dict:
+                calls.append((name, arguments))
+                return {"case_id": arguments["case_id"]}
+
+        investigation = object.__new__(fea.Investigation)
+        investigation.case_id = "launcher-case"
+        investigation.handle = {"id": "parser-case"}
+        investigation.audit_path = "/case/audit.jsonl"
+        investigation.controller_capability = "a" * 64
+        investigation._memory_store_path = lambda: "/private/memory.sqlite"
+
+        investigation._remember_confirmed(_Py(), [_finding()])
+
+        assert calls[0][0] == "memory_remember"
+        assert calls[0][1]["case_id"] == "launcher-case"
+        assert calls[0][1]["audit_log_path"] == "/case/audit.jsonl"
+        assert calls[0][1]["_controller_capability"] == "a" * 64
+
 
 class TestStorePath:
     def test_explicit_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:

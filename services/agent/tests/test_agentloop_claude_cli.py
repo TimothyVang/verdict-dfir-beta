@@ -13,8 +13,12 @@ prompt building and response parsing are tested with no process spawn.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from findevil_agent.agentloop.claude_cli import (
     ClaudeCliProvider,
+    _default_cli_runner,
     build_cli_prompt,
     parse_cli_result,
 )
@@ -109,3 +113,54 @@ def test_provider_uses_injected_runner() -> None:
     assert resp.stop_reason == "end_turn"
     assert resp.text == "done"
     assert "hi" in seen["prompt"]
+
+
+def test_default_runner_strips_controller_authority_and_disables_ambient_agents(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    secret_names = {
+        "FINDEVIL_CONTROLLER_CAPABILITY": "controller-secret",
+        "FINDEVIL_ACTIVE_SIGNER": "ed25519",
+        "FINDEVIL_ED25519_EXPECTED_FINGERPRINT": "trusted-pin",
+        "FINDEVIL_SIGNING_KEY_PATH": "/secret/key",
+        "OPENAI_API_KEY": "unrelated-provider-secret",
+        "AWS_SECRET_ACCESS_KEY": "cloud-secret",
+    }
+    for name, value in secret_names.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "required-inference-credential")
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        cwd = Path(kwargs["cwd"])
+        assert cwd.is_dir()
+        assert not any(cwd.iterdir())
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps({"result": '{"final":"done"}', "is_error": False})
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = _default_cli_runner("claude-opus-test")("prompt")
+    assert result["is_error"] is False
+
+    argv = captured["argv"]
+    kwargs = captured["kwargs"]
+    assert "--safe-mode" in argv
+    assert "--strict-mcp-config" in argv
+    assert "--no-session-persistence" in argv
+    assert "--no-chrome" in argv
+    assert "--disable-slash-commands" in argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert json.loads(argv[argv.index("--mcp-config") + 1]) == {"mcpServers": {}}
+    assert Path(kwargs["cwd"]).name.startswith("turn-")
+    assert kwargs["env"]["ANTHROPIC_API_KEY"] == "required-inference-credential"
+    assert all(name not in kwargs["env"] for name in secret_names)
+    assert kwargs["env"]["TMPDIR"] == kwargs["cwd"]
+    assert not Path(kwargs["cwd"]).exists()

@@ -92,7 +92,8 @@ is built so a person signs the receipt; the tool never self-certifies for releas
 
 The deepest point — and one where we'd mis-sold our own strength. Our actual mechanism
 *is* "recreatable from step 1 by a third party": a hash-chained audit log → Merkle root →
-**Ed25519-signed manifest** that `manifest_verify` checks **offline**, plus `verify_finding`
+**Ed25519-signed manifest** that `manifest_verify` checks **offline against a trusted
+public-key fingerprint obtained outside the case**, plus `verify_finding`
 that re-runs each cited tool call. The audience heard "LLM" and stopped.
 
 **What we did:** repositioned around the receipts, not the AI — *"deterministic,
@@ -141,7 +142,7 @@ close real gaps (Outlook Express `oe_dbx_parse`, network-recon, registry triage 
 ## Did it move the needle on rivals?
 
 We re-scanned 185 related projects and deep-scanned the strongest 16. None reached
-VERDICT's custody parity — Ed25519 + Merkle + **offline** `manifest_verify` with a
+VERDICT's custody parity — Ed25519 + Merkle + **offline, pinned-key** `manifest_verify` with a
 per-finding verifier. Rivals are genuinely ahead on cloud/identity-plane detection,
 in-product accuracy harnesses, and large-scale ingest; we adopted patterns from them. The
 unique axis remains third-party-reproducible custody, which is exactly what the court

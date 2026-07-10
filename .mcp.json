@@ -1,53 +1,23 @@
 {
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/draft/schema.json",
+  "_comment": "Split-trust Docker transport. scripts/verdict --docker builds only the Rust evidence parser in a disposable source-allow-listed builder, then starts a networkless/capability-free runtime with exact read-only evidence and parser binds. Rust runs inside findevil-dfir over docker exec. Python custody/signing stays on the host via a frozen/no-sync launcher; verify_finding replays through a fixed Docker route, so native parsers cannot read signing keys or rewrite audit/manifest output. Container name is fixed; do not hand-edit.",
   "mcpServers": {
     "findevil-mcp": {
       "type": "stdio",
-      "command": "bash",
+      "command": "docker",
       "args": [
-        "scripts/run-mcp-rust.sh"
-      ],
-      "cwd": "."
+        "exec",
+        "-i",
+        "findevil-dfir",
+        "/workspace/target/release/findevil-mcp"
+      ]
     },
     "findevil-agent-mcp": {
       "type": "stdio",
       "command": "bash",
       "args": [
-        "scripts/run-mcp-python.sh"
-      ],
-      "cwd": "."
-    },
-    "n8n-mcp": {
-      "type": "stdio",
-      "command": "bash",
-      "args": [
-        "scripts/run-mcp-n8n.sh"
-      ],
-      "cwd": "."
-    },
-    "playwright": {
-      "type": "stdio",
-      "command": "bash",
-      "args": [
-        "scripts/run-mcp-playwright.sh"
-      ],
-      "cwd": "."
-    },
-    "puppeteer": {
-      "type": "stdio",
-      "command": "bash",
-      "args": [
-        "scripts/run-mcp-puppeteer.sh"
-      ],
-      "cwd": "."
-    },
-    "qmd": {
-      "type": "stdio",
-      "command": "bash",
-      "args": [
-        "scripts/run-mcp-qmd.sh"
-      ],
-      "cwd": "."
+        "scripts/run-mcp-python-docker.sh"
+      ]
     }
   }
 }

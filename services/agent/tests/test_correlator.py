@@ -20,6 +20,7 @@ from findevil_agent.correlator import (
     score_verdict,
 )
 from findevil_agent.events import Finding
+from findevil_agent.resource_limits import SemanticInputLimitError
 
 
 def _f(
@@ -1564,3 +1565,9 @@ class TestFpSuppressorsWiring:
         refined, outcomes = correlate([f])
         # Masquerade is a tell, not a boring explanation -> not demoted by suppressor.
         assert outcomes[0].fp_suppressor != "system_path_legit"
+
+
+def test_correlator_rejects_oversized_merged_collection() -> None:
+    findings = [_f(f"f-{index}", "disk artifact observed") for index in range(101)]
+    with pytest.raises(SemanticInputLimitError, match="findings exceeds limit 100"):
+        correlate(findings)

@@ -33,6 +33,7 @@ $script:blockers = New-Object System.Collections.Generic.List[string]
 $script:warnings = New-Object System.Collections.Generic.List[string]
 $script:steps = New-Object System.Collections.Generic.List[object]
 $script:allowedFigureExtensions = @(".jpeg", ".jpg", ".png", ".webp")
+$script:trustedEd25519Fingerprint = [string]$env:FINDEVIL_ED25519_EXPECTED_FINGERPRINT
 
 function Write-ReadinessLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -701,13 +702,22 @@ function Invoke-ManifestVerify {
         Add-ReadinessBlocker "uv is unavailable; cannot recompute manifest verification"
         return $verifyPath
     }
-    $code = "import dataclasses, json, sys; from pathlib import Path; from findevil_agent.crypto.manifest import verify_manifest; result = verify_manifest(Path(sys.argv[1]), audit_log_path=Path(sys.argv[2])); Path(sys.argv[3]).write_text(json.dumps(dataclasses.asdict(result), indent=2, sort_keys=True), encoding='utf-8')"
+    $code = "import dataclasses, json, os, sys; from pathlib import Path; from findevil_agent.crypto.manifest import verify_manifest; from findevil_agent.crypto.signer import LocalEd25519Signer; pin = os.environ.get('FINDEVIL_ED25519_EXPECTED_FINGERPRINT', '').strip() or LocalEd25519Signer().public_fingerprint(); result = verify_manifest(Path(sys.argv[1]), audit_log_path=Path(sys.argv[2]), expected_ed25519_fingerprint=pin); Path(sys.argv[3]).write_text(json.dumps(dataclasses.asdict(result), indent=2, sort_keys=True), encoding='utf-8'); print(pin)"
     $result = Invoke-LoggedCommand -Name "manifest-verify-local" -Command $uv.Source -Arguments @(
         "run", "--directory", "services/agent", "python", "-c", $code,
         $ManifestPath, $AuditPath, $verifyPath
     )
     if ($result.exit_code -ne 0) {
         Add-ReadinessBlocker "manifest verification fallback failed"
+    }
+    else {
+        $pin = @($result.output | Where-Object { [string]$_ -match '^[0-9a-fA-F]{64}$' } | Select-Object -Last 1)
+        if ($pin.Count -eq 1) {
+            $script:trustedEd25519Fingerprint = ([string]$pin[0]).ToLowerInvariant()
+        }
+        else {
+            Add-ReadinessBlocker "manifest verification did not return a trusted Ed25519 fingerprint"
+        }
     }
     return $verifyPath
 }
@@ -839,9 +849,15 @@ function Invoke-SubmissionAssetsValidator {
         [Parameter(Mandatory = $true)][string]$SummaryPath,
         [Parameter(Mandatory = $true)][string]$PythonBin
     )
-    $result = Invoke-LoggedCommand -Name "submission-assets-validator" -Command $PythonBin -Arguments @(
+    $arguments = @(
         "scripts/validate-submission-assets.py", "--readiness-summary", $SummaryPath
     )
+    if (-not [string]::IsNullOrWhiteSpace($script:trustedEd25519Fingerprint)) {
+        $arguments += @(
+            "--expected-ed25519-fingerprint", $script:trustedEd25519Fingerprint
+        )
+    }
+    $result = Invoke-LoggedCommand -Name "submission-assets-validator" -Command $PythonBin -Arguments $arguments
     return $result
 }
 

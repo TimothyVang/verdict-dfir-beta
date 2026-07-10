@@ -4,7 +4,8 @@
    semantic accent per composition. Semantic colors have a FILL value (for chips)
    and a darker TEXT value (readable on cream). Kept in sync with _DEFAULT_CSS in
    scripts/render_report.py. */
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=Archivo+Narrow:wght@600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* Vendored WOFF2 faces are embedded as data: URLs by report_render_security.py.
+   Reports never load fonts or other resources from the network. */
 
 :root {
   --paper: #f5f1e8;        /* Paper Cream page */

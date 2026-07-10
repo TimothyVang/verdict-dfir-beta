@@ -14,6 +14,8 @@
 //! The allow-list is the boundary: an unknown provider is rejected before any
 //! parsing dispatch.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 
 use schemars::JsonSchema;
@@ -22,8 +24,38 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::tools::ez_parse::parse_csv_records;
+use crate::tools::proc_runner::byte_limit_from_env;
 
 const DEFAULT_LIMIT: usize = 10_000;
+const MAX_EVENT_LIMIT: usize = 100_000;
+
+pub const INPUT_BYTES_ENV: &str = "FINDEVIL_CLOUD_AUDIT_MAX_INPUT_BYTES";
+pub const RECORD_BYTES_ENV: &str = "FINDEVIL_CLOUD_AUDIT_MAX_RECORD_BYTES";
+pub const OUTPUT_BYTES_ENV: &str = "FINDEVIL_CLOUD_AUDIT_MAX_OUTPUT_BYTES";
+
+const DEFAULT_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const HARD_INPUT_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_RECORD_BYTES: usize = 1024 * 1024;
+const HARD_RECORD_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const HARD_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct CloudResourceLimits {
+    input: usize,
+    record: usize,
+    output: usize,
+}
+
+impl CloudResourceLimits {
+    fn from_env() -> Self {
+        Self {
+            input: byte_limit_from_env(INPUT_BYTES_ENV, DEFAULT_INPUT_BYTES, HARD_INPUT_BYTES),
+            record: byte_limit_from_env(RECORD_BYTES_ENV, DEFAULT_RECORD_BYTES, HARD_RECORD_BYTES),
+            output: byte_limit_from_env(OUTPUT_BYTES_ENV, DEFAULT_OUTPUT_BYTES, HARD_OUTPUT_BYTES),
+        }
+    }
+}
 
 /// Allow-listed cloud/identity providers.
 const ALLOWED_PROVIDERS: &[&str] = &[
@@ -91,6 +123,21 @@ pub struct CloudAuditOutput {
     pub events: Vec<CloudEvent>,
     /// Total events parsed before the limit was applied.
     pub events_seen: usize,
+    /// Events actually emitted after row/output ceilings.
+    pub events_emitted: usize,
+    /// Exact source bytes read after the pre-read size gate.
+    pub input_bytes_read: usize,
+    /// Canonical serialized bytes across all parsed raw records.
+    pub raw_bytes_seen: usize,
+    /// Canonical raw-record bytes represented in emitted events.
+    pub raw_bytes_emitted: usize,
+    /// Serialized event bytes emitted (excluding the small output envelope).
+    pub output_bytes: usize,
+    /// True when the row or output-byte ceiling omitted parsed records.
+    pub truncated: bool,
+    /// Machine-readable reason when `truncated` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +156,13 @@ pub enum CloudAuditError {
 
     #[error("could not parse {provider} log: {detail}")]
     ParseFailed { provider: String, detail: String },
+
+    #[error("cloud audit {resource} exceeded limit {limit} (observed {observed})")]
+    ResourceLimit {
+        resource: &'static str,
+        limit: usize,
+        observed: usize,
+    },
 }
 
 /// Parse an allow-listed cloud/identity audit log into normalized events.
@@ -119,24 +173,104 @@ pub enum CloudAuditError {
 /// * [`CloudAuditError::ReadFailed`] — the file could not be read.
 /// * [`CloudAuditError::ParseFailed`] — the content was not the expected format.
 pub fn cloud_audit(input: &CloudAuditInput) -> Result<CloudAuditOutput, CloudAuditError> {
+    cloud_audit_with_limits(input, CloudResourceLimits::from_env())
+}
+
+fn cloud_audit_with_limits(
+    input: &CloudAuditInput,
+    limits: CloudResourceLimits,
+) -> Result<CloudAuditOutput, CloudAuditError> {
     if !is_allowed_provider(&input.provider) {
         return Err(CloudAuditError::ProviderNotAllowed(input.provider.clone()));
+    }
+    let event_limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    if event_limit > MAX_EVENT_LIMIT {
+        return Err(CloudAuditError::ResourceLimit {
+            resource: "event_limit",
+            limit: MAX_EVENT_LIMIT,
+            observed: event_limit,
+        });
     }
     if !input.log_path.exists() {
         return Err(CloudAuditError::LogNotFound(input.log_path.clone()));
     }
-    let content = std::fs::read_to_string(&input.log_path)
-        .map_err(|e| CloudAuditError::ReadFailed(format!("{}: {e}", input.log_path.display())))?;
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
-    parse_provider(&input.provider, &content, limit)
+    let content = read_bounded_text(input, limits.input)?;
+    parse_provider_with_limits(
+        &input.provider,
+        &content,
+        event_limit,
+        content.len(),
+        limits,
+    )
+}
+
+fn read_bounded_text(
+    input: &CloudAuditInput,
+    input_limit: usize,
+) -> Result<String, CloudAuditError> {
+    let file = File::open(&input.log_path)
+        .map_err(|error| CloudAuditError::ReadFailed(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CloudAuditError::ReadFailed(error.to_string()))?;
+    let metadata_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if metadata_bytes > input_limit {
+        return Err(CloudAuditError::ResourceLimit {
+            resource: "input_bytes",
+            limit: input_limit,
+            observed: metadata_bytes,
+        });
+    }
+
+    let read_limit = u64::try_from(input_limit)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(metadata_bytes.min(input_limit));
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CloudAuditError::ReadFailed(error.to_string()))?;
+    if bytes.len() > input_limit {
+        return Err(CloudAuditError::ResourceLimit {
+            resource: "input_bytes",
+            limit: input_limit,
+            observed: bytes.len(),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        CloudAuditError::ReadFailed(format!(
+            "{} is not valid UTF-8: {error}",
+            input.log_path.display()
+        ))
+    })
 }
 
 /// Dispatch to the per-provider record loader, then map each record to the
 /// common envelope. Pure + unit-tested so the whole verb is testable offline.
-pub(crate) fn parse_provider(
+#[cfg(test)]
+fn parse_provider(
     provider: &str,
     content: &str,
     limit: usize,
+) -> Result<CloudAuditOutput, CloudAuditError> {
+    parse_provider_with_limits(
+        provider,
+        content,
+        limit,
+        content.len(),
+        CloudResourceLimits {
+            input: HARD_INPUT_BYTES,
+            record: HARD_RECORD_BYTES,
+            output: HARD_OUTPUT_BYTES,
+        },
+    )
+}
+
+fn parse_provider_with_limits(
+    provider: &str,
+    content: &str,
+    limit: usize,
+    input_bytes_read: usize,
+    limits: CloudResourceLimits,
 ) -> Result<CloudAuditOutput, CloudAuditError> {
     let records: Vec<serde_json::Map<String, Value>> = if provider == "vpc_flow" {
         parse_vpc_flow(content)
@@ -153,16 +287,64 @@ pub(crate) fn parse_provider(
     };
 
     let events_seen = records.len();
-    let events: Vec<CloudEvent> = records
-        .into_iter()
-        .take(limit)
-        .map(|r| to_cloud_event(provider, r))
-        .collect();
+    let mut raw_bytes_seen = 0usize;
+    let mut record_sizes = Vec::with_capacity(events_seen);
+    for record in &records {
+        let observed = serde_json::to_vec(record)
+            .map_err(|error| CloudAuditError::ParseFailed {
+                provider: provider.to_string(),
+                detail: format!("record byte accounting failed: {error}"),
+            })?
+            .len();
+        if observed > limits.record {
+            return Err(CloudAuditError::ResourceLimit {
+                resource: "record_bytes",
+                limit: limits.record,
+                observed,
+            });
+        }
+        raw_bytes_seen = raw_bytes_seen.saturating_add(observed);
+        record_sizes.push(observed);
+    }
+
+    let mut events = Vec::with_capacity(events_seen.min(limit));
+    let mut raw_bytes_emitted = 0usize;
+    let mut output_bytes = 0usize;
+    let mut truncation_reason = None;
+    for (record, raw_bytes) in records.into_iter().zip(record_sizes) {
+        if events.len() >= limit {
+            truncation_reason = Some("event_limit".to_string());
+            break;
+        }
+        let event = to_cloud_event(provider, record);
+        let event_bytes = serde_json::to_vec(&event)
+            .map_err(|error| CloudAuditError::ParseFailed {
+                provider: provider.to_string(),
+                detail: format!("output byte accounting failed: {error}"),
+            })?
+            .len();
+        if output_bytes.saturating_add(event_bytes) > limits.output {
+            truncation_reason = Some("output_byte_limit".to_string());
+            break;
+        }
+        output_bytes += event_bytes;
+        raw_bytes_emitted += raw_bytes;
+        events.push(event);
+    }
+    let events_emitted = events.len();
+    let truncated = events_emitted < events_seen;
 
     Ok(CloudAuditOutput {
         provider: provider.to_string(),
         events,
         events_seen,
+        events_emitted,
+        input_bytes_read,
+        raw_bytes_seen,
+        raw_bytes_emitted,
+        output_bytes,
+        truncated,
+        truncation_reason: truncated.then_some(truncation_reason).flatten(),
     })
 }
 
@@ -613,5 +795,118 @@ mod tests {
         let out = parse_provider("cloudtrail", body, 2).unwrap();
         assert_eq!(out.events_seen, 3);
         assert_eq!(out.events.len(), 2);
+        assert!(out.truncated);
+        assert_eq!(out.truncation_reason.as_deref(), Some("event_limit"));
+    }
+
+    fn test_limits() -> CloudResourceLimits {
+        CloudResourceLimits {
+            input: 1024,
+            record: 512,
+            output: 1024,
+        }
+    }
+
+    #[test]
+    fn oversized_input_returns_typed_resource_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cloudtrail.json");
+        std::fs::write(&path, vec![b'x'; 65]).expect("write fixture");
+        let input = CloudAuditInput {
+            case_id: "case".to_string(),
+            provider: "cloudtrail".to_string(),
+            log_path: path,
+            limit: None,
+        };
+        let limits = CloudResourceLimits {
+            input: 64,
+            ..test_limits()
+        };
+
+        let err = cloud_audit_with_limits(&input, limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CloudAuditError::ResourceLimit {
+                resource: "input_bytes",
+                limit: 64,
+                observed: 65,
+            }
+        ));
+    }
+
+    #[test]
+    fn caller_event_limit_above_hard_max_is_rejected_before_io() {
+        let input = CloudAuditInput {
+            case_id: "case".to_string(),
+            provider: "cloudtrail".to_string(),
+            log_path: PathBuf::from("/missing/should-not-be-opened.json"),
+            limit: Some(MAX_EVENT_LIMIT + 1),
+        };
+
+        let err = cloud_audit_with_limits(&input, test_limits()).unwrap_err();
+        assert!(matches!(
+            err,
+            CloudAuditError::ResourceLimit {
+                resource: "event_limit",
+                limit: MAX_EVENT_LIMIT,
+                observed,
+            } if observed == MAX_EVENT_LIMIT + 1
+        ));
+    }
+
+    #[test]
+    fn oversized_raw_record_returns_typed_resource_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cloudtrail.json");
+        let body = serde_json::json!([{"eventName": "A", "payload": "x".repeat(128)}]);
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).expect("write fixture");
+        let input = CloudAuditInput {
+            case_id: "case".to_string(),
+            provider: "cloudtrail".to_string(),
+            log_path: path,
+            limit: None,
+        };
+        let limits = CloudResourceLimits {
+            record: 64,
+            ..test_limits()
+        };
+
+        let err = cloud_audit_with_limits(&input, limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CloudAuditError::ResourceLimit {
+                resource: "record_bytes",
+                limit: 64,
+                observed,
+            } if observed > 64
+        ));
+    }
+
+    #[test]
+    fn output_byte_limit_is_explicit_in_coverage_telemetry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cloudtrail.json");
+        let body = r#"[{"eventName":"A"},{"eventName":"B"},{"eventName":"C"}]"#;
+        std::fs::write(&path, body).expect("write fixture");
+        let input = CloudAuditInput {
+            case_id: "case".to_string(),
+            provider: "cloudtrail".to_string(),
+            log_path: path,
+            limit: None,
+        };
+        let limits = CloudResourceLimits {
+            output: 1,
+            ..test_limits()
+        };
+
+        let out = cloud_audit_with_limits(&input, limits).expect("bounded result");
+        assert_eq!(out.events_seen, 3);
+        assert_eq!(out.events_emitted, 0);
+        assert_eq!(out.input_bytes_read, body.len());
+        assert!(out.raw_bytes_seen > 0);
+        assert_eq!(out.raw_bytes_emitted, 0);
+        assert_eq!(out.output_bytes, 0);
+        assert!(out.truncated);
+        assert_eq!(out.truncation_reason.as_deref(), Some("output_byte_limit"));
     }
 }

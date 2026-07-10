@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from report_render_security import markdown_code
+
 
 def entailment_evidence_lines(finding: dict[str, Any]) -> list[str]:
     """Markdown bullet lines naming the value the parser read from evidence for
@@ -30,8 +32,8 @@ def entailment_evidence_lines(finding: dict[str, Any]) -> list[str]:
     for m in matched:
         if not isinstance(m, dict):
             continue
-        path = str(m.get("path", "?"))
-        actual = str(m.get("actual", ""))
+        path = markdown_code(m.get("path", "?"))
+        actual = markdown_code(m.get("actual", ""))
         lines.append(
             f"- read from evidence (entailment-confirmed, not transcribed): "
             f"`{path}` = `{actual}`"

@@ -158,8 +158,8 @@ class TestMakeSigner:
 class TestLocalEd25519Signer:
     """Real local-keypair signing — the offline default tier.
 
-    Unlike the stub, an ed25519 bundle is genuine cryptographic proof of
-    integrity: the signature verifies against the embedded public key.
+    Unlike the stub, an Ed25519 bundle plus a separately trusted public-key
+    fingerprint is genuine cryptographic proof of integrity and key continuity.
     """
 
     def _signer(self, tmp_path):
@@ -188,10 +188,13 @@ class TestLocalEd25519Signer:
         assert (key_path.parent.stat().st_mode & 0o777) == 0o700
 
     def test_same_key_path_means_stable_fingerprint(self, tmp_path) -> None:
-        b1 = self._signer(tmp_path).sign(b"a")
+        signer = self._signer(tmp_path)
+        trusted_pin = signer.public_fingerprint()
+        b1 = signer.sign(b"a")
         b2 = self._signer(tmp_path).sign(b"b")
         # Two signer instances over the SAME key file = same identity.
         assert b1.cert_fingerprint == b2.cert_fingerprint
+        assert trusted_pin == b1.cert_fingerprint
 
     def test_signature_round_trips_with_cryptography(self, tmp_path) -> None:
         payload = b'{"case":"x","root":"deadbeef"}'

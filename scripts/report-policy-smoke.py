@@ -13,6 +13,7 @@ import importlib.util
 import hashlib
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 CANONICAL_SEPARATORS = (",", ":")
 VERDICT_SHA_TOKEN = "__VERDICT_SHA256__"
+FIXTURE_ED25519_PRIVATE_KEY = bytes(range(32))
 
 
 def canonicalize_json(obj: object) -> bytes:
@@ -49,6 +51,18 @@ def merkle_root_hex(leaves: list[str]) -> str:
             for i in range(0, len(tier), 2)
         ]
     return tier[0].hex()
+
+
+def fixture_ed25519_fingerprint() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private_key = Ed25519PrivateKey.from_private_bytes(FIXTURE_ED25519_PRIVATE_KEY)
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return sha256_hex(public_bytes)
 
 
 def build_chained_audit_text(audit_jsonl: str) -> str:
@@ -133,22 +147,26 @@ def build_manifest_bytes(audit_text: str) -> bytes:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-    private_key = Ed25519PrivateKey.generate()
+    private_key = Ed25519PrivateKey.from_private_bytes(FIXTURE_ED25519_PRIVATE_KEY)
     public_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
     signature = private_key.sign(body_bytes)
+    fingerprint = sha256_hex(public_bytes)
     bundle = {
+        "kind": "ed25519",
         "public_key_b64": base64.b64encode(public_bytes).decode("ascii"),
         "signature_b64": base64.b64encode(signature).decode("ascii"),
+        "payload_sha256": sha256_hex(body_bytes),
+        "cert_fingerprint": fingerprint,
     }
     manifest = {
         **body,
         "signature": {
             "payload_sha256": sha256_hex(body_bytes),
             "bundle_b64": base64.b64encode(canonicalize_json(bundle)).decode("ascii"),
-            "cert_fingerprint": None,
+            "cert_fingerprint": fingerprint,
             "signed_at": "2026-05-10T00:01:00Z",
             "kind": "ed25519",
         },
@@ -325,6 +343,7 @@ def load_find_evil_auto():
 
 
 def main() -> int:
+    os.environ["FINDEVIL_ED25519_EXPECTED_FINGERPRINT"] = fixture_ed25519_fingerprint()
     rr = load_render_report()
     validator = load_submission_validator()
     fea = load_find_evil_auto()
@@ -889,7 +908,7 @@ def main() -> int:
         )
         item19_aff_unit_ok = (
             len(item19_confirmed_aff) == 1
-            and "grep tc-confirmed-19 audit.jsonl" in item19_confirmed_aff[0]
+            and "grep -F -- tc-confirmed-19 audit.jsonl" in item19_confirmed_aff[0]
             and item19_inferred_aff == []
             and item19_missing_tcid_aff == []
         )
@@ -929,11 +948,11 @@ def main() -> int:
         )
         item19_md_text = item19_md.read_text(encoding="utf-8")
         item19_integration_ok = (
-            "grep tc-confirmed-19 audit.jsonl" in item19_md_text
-            and "grep tc-inferred-19 audit.jsonl" not in item19_md_text
+            "grep -F -- tc-confirmed-19 audit.jsonl" in item19_md_text
+            and "grep -F -- tc-inferred-19 audit.jsonl" not in item19_md_text
         )
         # The existing INFERRED finding (tc-psscan) gets no grep affordance.
-        item19_inferred_no_grep = "grep tc-psscan audit.jsonl" not in main_text
+        item19_inferred_no_grep = "grep -F -- tc-psscan audit.jsonl" not in main_text
         public_text = "\n".join(
             path.read_text(encoding="utf-8")
             for path in (

@@ -18,15 +18,25 @@ state leak between findings.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from findevil_agent.events import Finding
 from findevil_agent.mcp_client import McpClient, StdioMcpClient
 from findevil_agent.replay import ReplayArtifact
 from findevil_agent.verifier import reverify_finding
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
+from findevil_agent_mcp.tools._input_limits import (
+    MAX_TOOL_CALL_INDEX_ENTRIES,
+    enforce_json_budget,
+)
 
 
 class VerifyFindingInput(BaseModel):
@@ -48,20 +58,12 @@ class VerifyFindingInput(BaseModel):
     )
     tool_call_index: dict[str, dict[str, Any]] = Field(
         ...,
+        max_length=MAX_TOOL_CALL_INDEX_ENTRIES,
         description=(
             "Map tool_call_id -> {tool_name, arguments, output_sha256} "
             "from the audit log. The verifier looks up the cited "
             "tool_call_id here, then re-runs that exact call."
         ),
-    )
-    findevil_mcp_command: list[str] = Field(
-        ...,
-        description=(
-            "Argv to launch findevil-mcp (the Rust DFIR tool server). "
-            "Example: ['cargo', 'run', '--release', '-p', 'findevil-mcp', "
-            "'--quiet']."
-        ),
-        min_length=1,
     )
     force_fresh_replay: bool = Field(
         default=False,
@@ -76,6 +78,11 @@ class VerifyFindingInput(BaseModel):
             "persistent drift takes the terminal downgrade."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_input_budget(cls, value: Any) -> Any:
+        return enforce_json_budget(value, label="verify_finding")
 
 
 class VerifyFindingOutput(BaseModel):
@@ -104,10 +111,276 @@ class VerifyFindingOutput(BaseModel):
 # timeout is a ceiling, so fast tools still return immediately.
 _REPLAY_TIMEOUT_S = 1800.0
 
+# Explicit capability boundary for the verifier's Rust child. Replay is allowed
+# only for parsers/enumerators whose contract is read-only and does not create
+# mounts, cases, extracted output, or live collections. The caller-provided
+# citation map selects within this set; it can never turn verify_finding into a
+# deputy for lifecycle or state-changing tools.
+_REPLAY_SAFE_TOOLS = frozenset(
+    {
+        "ausearch",
+        "bits_parse",
+        "browser_history",
+        "bulk_extract",
+        "cloud_audit",
+        "email_parse",
+        "evtx_query",
+        "ez_parse",
+        "exif_parse",
+        "hashset_lookup",
+        "hayabusa_scan",
+        "indx_parse",
+        "journalctl_query",
+        "login_accounting",
+        "mft_timeline",
+        "nfdump_query",
+        "oe_dbx_parse",
+        "pcap_triage",
+        "plaso_parse",
+        "prefetch_parse",
+        "pst_parse",
+        "registry_query",
+        "setupapi_parse",
+        "srum_parse",
+        "suricata_eve",
+        "sysmon_network_query",
+        "thumbcache_parse",
+        "usnjrnl_query",
+        "vol_malfind",
+        "vol_pslist",
+        "vol_psscan",
+        "vol_psxview",
+        "vol_run",
+        "vss_list",
+        "wmi_persist_parse",
+        "yara_scan",
+        "zeek_summary",
+    }
+)
+
+_REPLAY_ENV_NAMES = (
+    "HOME",
+    "USER",
+    "USERPROFILE",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "FINDEVIL_HOME",
+    "FINDEVIL_INJECTION_LEDGER",
+    "FINDEVIL_OUTPUT_ROUTE",
+    "FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS",
+    "FINDEVIL_CASE_OPEN_BINDING",
+    "FINDEVIL_BROWSER_CASE_BINDING",
+    "FINDEVIL_BROWSER_DB_MAX_BYTES",
+    "FINDEVIL_BROWSER_FIELD_MAX_BYTES",
+    "FINDEVIL_BROWSER_SQLITE_MAX_OPS",
+    "FINDEVIL_BROWSER_OUTPUT_MAX_BYTES",
+    "FINDEVIL_BROWSER_SQLITE_HEAP_MAX_BYTES",
+    "FINDEVIL_BROWSER_SCHEMA_MAX_ENTRIES",
+    "FINDEVIL_CLOUD_AUDIT_MAX_INPUT_BYTES",
+    "FINDEVIL_CLOUD_AUDIT_MAX_OUTPUT_BYTES",
+    "FINDEVIL_CLOUD_AUDIT_MAX_RECORD_BYTES",
+    "FINDEVIL_PCAP_TIMEOUT_SECS",
+    "FINDEVIL_PLASO_TIMEOUT_SECS",
+    "FINDEVIL_SUBPROCESS_STDERR_MAX_BYTES",
+    "FINDEVIL_SUBPROCESS_STDOUT_MAX_BYTES",
+    "FINDEVIL_VOL_TIMEOUT_SECS",
+    "FINDEVIL_AUSEARCH_TIMEOUT_SECS",
+    "FINDEVIL_JOURNALCTL_TIMEOUT_SECS",
+    "FINDEVIL_LOGIN_ACCOUNTING_TIMEOUT_SECS",
+    "FINDEVIL_NFDUMP_TIMEOUT_SECS",
+    "FINDEVIL_INDX_TIMEOUT_SECS",
+    "FINDEVIL_EZ_PARSE_TIMEOUT_SECS",
+    "FINDEVIL_SURICATA_TIMEOUT_SECS",
+    "FINDEVIL_PST_TIMEOUT_SECS",
+    "FINDEVIL_SRUM_TIMEOUT_SECS",
+    "FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS",
+    "FINDEVIL_HAYABUSA_TIMEOUT_SECS",
+    "FINDEVIL_HAYABUSA_OUTPUT_MAX_BYTES",
+    "FINDEVIL_VSS_TIMEOUT_SECS",
+    "FINDEVIL_MAC_TRIAGE_TIMEOUT_SECS",
+    "FIND_EVIL_MEMORY_YARA_RULES",
+    "FIND_EVIL_DISK_YARA_RULES",
+    "FINDEVIL_YARA_RULES_ROOT",
+    "AUSEARCH_BIN",
+    "CHAINSAW_BIN",
+    "EWF_MOUNT_BIN",
+    "EZTOOLS_DIR",
+    "HAYABUSA_BIN",
+    "HAYABUSA_RULES_BASE",
+    "FINDEVIL_HAYABUSA_RULE_SET",
+    "INDXPARSE_BIN",
+    "JOURNALCTL_BIN",
+    "LAST_BIN",
+    "MAC_APT",
+    "NFDUMP_BIN",
+    "PLASO_DIR",
+    "SURICATA_BIN",
+    "TSHARK_BIN",
+    "VOLATILITY_BIN",
+    "FINDEVIL_BULK_EXTRACTOR_BIN",
+    "FINDEVIL_BULK_KEYWORD_FILE",
+    "FINDEVIL_ESEDBEXPORT_BIN",
+    "FINDEVIL_FLS_BIN",
+    "FINDEVIL_FLS_TIMEOUT_SECONDS",
+    "FINDEVIL_ICAT_TIMEOUT_SECONDS",
+    "FINDEVIL_MMLS_TIMEOUT_SECONDS",
+    "FINDEVIL_HASHSET_DIR",
+    "FINDEVIL_HASHSET_MAX_SETS",
+    "FINDEVIL_HASHSET_MAX_FILE_BYTES",
+    "FINDEVIL_HASHSET_MAX_TOTAL_BYTES",
+    "FINDEVIL_HASHSET_MAX_LINE_BYTES",
+    "FINDEVIL_HASHSET_SQLITE_MAX_OPS",
+    "FINDEVIL_HASHSET_SQLITE_MAX_FIELD_BYTES",
+    "FINDEVIL_HASHSET_SQLITE_HEAP_MAX_BYTES",
+    "FINDEVIL_ICAT_BIN",
+    "FINDEVIL_MMLS_BIN",
+    "FINDEVIL_MOUNT_BIN",
+    "FINDEVIL_PFFEXPORT_BIN",
+    "FINDEVIL_UMOUNT_BIN",
+    "FINDEVIL_VSHADOWINFO_BIN",
+    "FINDEVIL_VSHADOWMOUNT_BIN",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+)
+
+
+def _replay_env() -> dict[str, str]:
+    """Return the reviewed parser environment, excluding ambient secrets."""
+    selected = {
+        name: value for name in _REPLAY_ENV_NAMES if (value := os.environ.get(name, "").strip())
+    }
+    selected.setdefault("PATH", os.environ.get("PATH") or os.defpath)
+    selected.setdefault("HOME", os.environ.get("HOME") or str(Path.home()))
+    selected.setdefault("LANG", os.environ.get("LANG") or "C.UTF-8")
+    return selected
+
 
 # Indirection to let tests monkeypatch the client factory.
-def _make_mcp_client(command: list[str]) -> McpClient:
-    return StdioMcpClient(command, request_timeout_s=_REPLAY_TIMEOUT_S)
+def _make_mcp_client() -> McpClient:
+    """Build the replay client from a fixed server-side launcher.
+
+    Process argv, cwd, and environment are deliberately absent from the public
+    tool schema. The child inherits the Python MCP server's trusted case binding
+    and resource limits, while the executable is resolved only inside this
+    repository checkout.
+    """
+    repo_root = Path(__file__).resolve().parents[4]
+    transport = os.environ.get("FINDEVIL_REPLAY_TRANSPORT", "").strip()
+    abort_callback = None
+    if transport == "docker":
+        container = os.environ.get("FINDEVIL_REPLAY_DOCKER_CONTAINER", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", container):
+            raise RuntimeError(f"unsafe Docker replay container name: {container!r}")
+        docker = shutil.which("docker") or "docker"
+        replay_env_options = [
+            item
+            for name in (
+                "FINDEVIL_OUTPUT_ROUTE",
+                "FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS",
+                "FINDEVIL_BROWSER_CASE_BINDING",
+                "FINDEVIL_BROWSER_DB_MAX_BYTES",
+                "FINDEVIL_BROWSER_FIELD_MAX_BYTES",
+                "FINDEVIL_BROWSER_SQLITE_MAX_OPS",
+                "FINDEVIL_BROWSER_OUTPUT_MAX_BYTES",
+                "FINDEVIL_BROWSER_SQLITE_HEAP_MAX_BYTES",
+                "FINDEVIL_BROWSER_SCHEMA_MAX_ENTRIES",
+                "FINDEVIL_CLOUD_AUDIT_MAX_INPUT_BYTES",
+                "FINDEVIL_CLOUD_AUDIT_MAX_OUTPUT_BYTES",
+                "FINDEVIL_CLOUD_AUDIT_MAX_RECORD_BYTES",
+                "FINDEVIL_FLS_TIMEOUT_SECONDS",
+                "FINDEVIL_HASHSET_DIR",
+                "FINDEVIL_HASHSET_MAX_SETS",
+                "FINDEVIL_HASHSET_MAX_FILE_BYTES",
+                "FINDEVIL_HASHSET_MAX_TOTAL_BYTES",
+                "FINDEVIL_HASHSET_MAX_LINE_BYTES",
+                "FINDEVIL_HASHSET_SQLITE_MAX_OPS",
+                "FINDEVIL_HASHSET_SQLITE_MAX_FIELD_BYTES",
+                "FINDEVIL_HASHSET_SQLITE_HEAP_MAX_BYTES",
+                "FINDEVIL_ICAT_TIMEOUT_SECONDS",
+                "FINDEVIL_MMLS_TIMEOUT_SECONDS",
+                "FINDEVIL_PCAP_TIMEOUT_SECS",
+                "FINDEVIL_PLASO_TIMEOUT_SECS",
+                "FINDEVIL_SUBPROCESS_STDERR_MAX_BYTES",
+                "FINDEVIL_SUBPROCESS_STDOUT_MAX_BYTES",
+                "FINDEVIL_VOL_TIMEOUT_SECS",
+                "FINDEVIL_AUSEARCH_TIMEOUT_SECS",
+                "FINDEVIL_JOURNALCTL_TIMEOUT_SECS",
+                "FINDEVIL_LOGIN_ACCOUNTING_TIMEOUT_SECS",
+                "FINDEVIL_NFDUMP_TIMEOUT_SECS",
+                "FINDEVIL_INDX_TIMEOUT_SECS",
+                "FINDEVIL_EZ_PARSE_TIMEOUT_SECS",
+                "FINDEVIL_SURICATA_TIMEOUT_SECS",
+                "FINDEVIL_PST_TIMEOUT_SECS",
+                "FINDEVIL_SRUM_TIMEOUT_SECS",
+                "FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS",
+                "FINDEVIL_HAYABUSA_TIMEOUT_SECS",
+                "FINDEVIL_HAYABUSA_OUTPUT_MAX_BYTES",
+                "FINDEVIL_VSS_TIMEOUT_SECS",
+                "FINDEVIL_MAC_TRIAGE_TIMEOUT_SECS",
+            )
+            if (value := os.environ.get(name, "").strip())
+            for item in ("-e", f"{name}={value}")
+        ]
+        command = [
+            docker,
+            "exec",
+            "-i",
+            *replay_env_options,
+            container,
+            "/workspace/target/release/findevil-mcp",
+        ]
+        child_env = _replay_env()
+
+        def abort_docker_replay() -> None:
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    [docker, "rm", "-f", container],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=child_env,
+                    timeout=10,
+                    check=False,
+                )
+
+        abort_callback = abort_docker_replay
+    elif transport:
+        raise RuntimeError(f"unsupported verifier replay transport: {transport!r}")
+    else:
+        release_binary = repo_root / "target" / "release" / "findevil-mcp"
+        if release_binary.is_file():
+            command = [str(release_binary)]
+        else:
+            cargo = shutil.which("cargo") or "cargo"
+            command = [
+                cargo,
+                "run",
+                "--release",
+                "-p",
+                "findevil-mcp",
+                "--locked",
+                "--quiet",
+            ]
+        child_env = _replay_env()
+    return StdioMcpClient(
+        command,
+        cwd=repo_root,
+        env=child_env,
+        request_timeout_s=_REPLAY_TIMEOUT_S,
+        abort_callback=abort_callback,
+    )
 
 
 async def _handle(inp: BaseModel) -> VerifyFindingOutput:
@@ -135,7 +408,31 @@ async def _handle(inp: BaseModel) -> VerifyFindingOutput:
             replay_matched=None,
             replay_error=None,
         )
-    client = _make_mcp_client(list(inp.findevil_mcp_command))
+    citation = inp.tool_call_index.get(finding.tool_call_id)
+    if not isinstance(citation, dict):
+        return VerifyFindingOutput(
+            action="rejected",
+            finding_id=finding.finding_id,
+            reason=f"cited tool_call_id {finding.tool_call_id!r} missing from audit index",
+            replay_tool_name=None,
+            replay_expected_sha256=None,
+            replay_actual_sha256=None,
+            replay_matched=None,
+            replay_error=None,
+        )
+    tool_name = citation.get("tool_name")
+    if not isinstance(tool_name, str) or tool_name not in _REPLAY_SAFE_TOOLS:
+        return VerifyFindingOutput(
+            action="rejected",
+            finding_id=finding.finding_id,
+            reason=f"cited tool {tool_name!r} is not replay-safe",
+            replay_tool_name=tool_name if isinstance(tool_name, str) else None,
+            replay_expected_sha256=None,
+            replay_actual_sha256=None,
+            replay_matched=None,
+            replay_error=None,
+        )
+    client = _make_mcp_client()
     try:
         action, replay = reverify_finding(
             finding,
@@ -173,9 +470,9 @@ SPEC = ToolSpec(
         "Spawns a fresh findevil-mcp subprocess per call so replays are independent. "
         "tool_call_index must map every cited tool_call_id to its original "
         "{tool_name, arguments, output_sha256} from the audit log — build this index "
-        "from your audit_verify pass before calling here. "
-        "On error: if an MCP rpc error code surfaces, check that findevil_mcp_command "
-        "is correct (default: ['cargo','run','--release','-p','findevil-mcp','--quiet'])."
+        "from your audit_verify pass before calling here. The replay executable, "
+        "working directory, and environment are fixed server-side and are not "
+        "caller-configurable."
     ),
     input_model=VerifyFindingInput,
     output_model=VerifyFindingOutput,

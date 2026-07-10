@@ -92,7 +92,7 @@ Pin down "done" as a checklist of things you can *run*. A good DoD for this repo
 
 1. **Acceptance:** the behavior asked for is demonstrated by a named test/command (e.g.
    `pytest …::test_x` passes, or `scripts/verdict <evidence>` reaches `manifest_verify
-   overall=true`).
+   overall=true` with authenticated `signature_verified=true`).
 2. **TDD:** new behavior is covered by a test that **failed before and passes after** (red →
    green). A bugfix's regression test reproduces the bug first.
 3. **Suite:** the relevant existing suite still passes (no regressions).

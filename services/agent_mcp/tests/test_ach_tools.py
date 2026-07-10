@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from findevil_agent_mcp.tools.correlate_findings import (
     SPEC as CORRELATE_SPEC,
@@ -52,6 +53,56 @@ def _verifier_action(finding_id: str = "f-1", action: str = "approved") -> dict[
         "action": action,
         "reason": "tool re-run output_sha256 matches audit log",
     }
+
+
+def _nested_mapping(depth: int) -> dict[str, Any]:
+    value: dict[str, Any] = {"leaf": "value"}
+    for _ in range(depth):
+        value = {"next": value}
+    return value
+
+
+@pytest.mark.parametrize("pool_field", ["pool_a", "pool_b"])
+def test_detect_contradictions_rejects_more_than_fifty_findings(pool_field: str) -> None:
+    payload: dict[str, Any] = {"case_id": "case-001", "pool_a": [], "pool_b": []}
+    payload[pool_field] = [
+        _finding(finding_id=f"f-{index}", tool_call_id=f"tc-{index}") for index in range(51)
+    ]
+    with pytest.raises(ValidationError):
+        DetectContradictionsInput.model_validate(payload)
+
+
+def test_detect_contradictions_rejects_deeply_nested_finding_payload() -> None:
+    finding = _finding(confidence="HYPOTHESIS", unexpected=_nested_mapping(20))
+    with pytest.raises(ValidationError, match="nesting depth limit"):
+        DetectContradictionsInput(case_id="case-001", pool_a=[finding], pool_b=[])
+
+
+def test_detect_contradictions_rejects_oversized_nested_string() -> None:
+    finding = _finding(confidence="HYPOTHESIS", description="x" * 65_537)
+    with pytest.raises(ValidationError, match="string length limit"):
+        DetectContradictionsInput(case_id="case-001", pool_a=[finding], pool_b=[])
+
+
+def test_judge_rejects_more_than_fifty_findings_or_actions_per_pool() -> None:
+    findings = [
+        _finding(finding_id=f"f-{index}", tool_call_id=f"tc-{index}") for index in range(51)
+    ]
+    actions = [_verifier_action(f"f-{index}") for index in range(51)]
+    with pytest.raises(ValidationError):
+        JudgeFindingsInput(
+            pool_a_findings=findings,
+            pool_a_verifier_actions=actions,
+            pool_b_findings=[],
+        )
+
+
+def test_correlate_rejects_more_than_one_hundred_merged_findings() -> None:
+    findings = [
+        _finding(finding_id=f"f-{index}", tool_call_id=f"tc-{index}") for index in range(101)
+    ]
+    with pytest.raises(ValidationError):
+        CorrelateFindingsInput(findings=findings)
 
 
 class TestDetectContradictions:

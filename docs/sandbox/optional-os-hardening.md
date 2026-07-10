@@ -130,9 +130,10 @@ Notes:
   known-good image before relying on it.
 - **Disk-image mounting caveat:** `disk_mount` / `disk_extract_artifacts` use
   `sudo -n mount`/`ewfmount`, which need mount capabilities a fully cap-dropped
-  rootless container does not have. For disk-image cases prefer the SIFT VM
-  (`scripts/verdict --sift`) — the recommended full-parity path — and reserve
-  this rootless posture for memory / EVTX / PCAP / extracted-artifact cases.
+  rootless container does not have. For disk-image cases use a backend that can
+  mount — the DFIR container (`scripts/verdict --docker`, which runs with FUSE)
+  or the SIFT VM (`--sift`) — and reserve this rootless posture for memory /
+  EVTX / PCAP / extracted-artifact cases.
 
 This sandbox and the deny-hook are independent: you can enable either, both, or
 neither. Neither is required for a valid, custody-complete run.

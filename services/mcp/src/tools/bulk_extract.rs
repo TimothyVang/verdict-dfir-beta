@@ -45,8 +45,10 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,15 +56,30 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::tools::argsafe;
+use crate::tools::proc_runner::{
+    open_stable_output_file, run_with_limits, run_with_output_quota, timeout_from_env_clamped,
+    CaptureLimits, OutputQuota, RunError,
+};
 
 const DEFAULT_LIMIT: usize = 10_000;
-const STDERR_TAIL_BYTES: usize = 4096;
 const DEFAULT_BINARY: &str = "bulk_extractor";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1_800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7_200);
+const TIMEOUT_ENV: &str = "FINDEVIL_BULK_EXTRACT_TIMEOUT_SECS";
+const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+const VERSION_CAPTURE_BYTES: usize = 64 * 1024;
 /// Env var naming an operator-maintained keyword/regex file (one entry
 /// per line) fed to `bulk_extractor -F`. Evidence-agnostic: the file is
 /// operator-supplied, never a literal in this code.
 const KEYWORD_FILE_ENV: &str = "FINDEVIL_BULK_KEYWORD_FILE";
 const BIN_ENV: &str = "FINDEVIL_BULK_EXTRACTOR_BIN";
+const MAX_FIND_REGEXES: usize = 1_000;
+const MAX_FIND_REGEX_BYTES: usize = 4 * 1024;
+const MAX_FIND_REGEX_TOTAL_BYTES: usize = 1024 * 1024;
+const MAX_OUTPUT_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 4_096;
+const MAX_FEATURE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_COLLECTED_FEATURE_ROWS: usize = 100_000;
 
 /// The forensic feature scanners a `bulk_extract` caller may enable.
 ///
@@ -254,8 +271,18 @@ pub enum BulkExtractError {
     #[error("keyword file not found: {0}")]
     KeywordFileNotFound(PathBuf),
 
+    #[error("keyword file is not the exact operator-approved FINDEVIL_BULK_KEYWORD_FILE: {0}")]
+    KeywordFileNotAuthorized(PathBuf),
+
     #[error("find_regexes entry {index} contains an illegal control character (newline/NUL)")]
     InvalidRegex { index: usize },
+
+    #[error("find_regexes {limit_kind} limit exceeded: limit={limit}, observed={observed}")]
+    RegexLimit {
+        limit_kind: &'static str,
+        limit: usize,
+        observed: usize,
+    },
 
     #[error("bulk_extractor exited {exit_code}: {stderr}")]
     SubprocessFailed { exit_code: i32, stderr: String },
@@ -298,6 +325,7 @@ pub fn bulk_extract(input: &BulkExtractInput) -> Result<BulkExtractOutput, BulkE
             input.image_path.clone(),
         ));
     }
+    validate_find_regexes(&input.find_regexes)?;
 
     // Degrade-safe: no bulk_extractor on this host → typed "unavailable".
     let Some(binary) = resolve_binary() else {
@@ -353,41 +381,44 @@ pub fn bulk_extract(input: &BulkExtractInput) -> Result<BulkExtractOutput, BulkE
 
     let engine_version = capture_version(&binary);
 
-    let proc = match Command::new(&binary).args(&args).output() {
+    let mut command = Command::new(&binary);
+    command.args(&args);
+    let proc = match run_with_output_quota(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+        &bulk_output_quota(&feature_dir),
+    ) {
         Ok(proc) => proc,
         // Lost the resolve→spawn race (binary vanished): still degrade.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_dir_all(&staging);
             return Ok(unavailable_output());
         }
         Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(BulkExtractError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             });
         }
     };
 
-    // The failure path surfaces raw stderr in the (non-hashed) error
-    // message; the SUCCESS path folds stderr_tail into the hashed output
-    // body, so scrub the absolute paths we control (case dir, feature
-    // dir, image path) to keep two identical runs on different
-    // hosts/case-dirs hash-identical for verify_finding replay.
+    // Native diagnostics may reflect attacker-controlled regex/keyword source.
+    // Report only the exit status/presence, never the diagnostic body.
     if !proc.status.success() {
+        let _ = std::fs::remove_dir_all(&staging);
         return Err(BulkExtractError::SubprocessFailed {
             exit_code: proc.status.code().unwrap_or(-1),
-            stderr: tail_utf8_lossy(&proc.stderr),
+            stderr: "native diagnostics withheld".to_string(),
         });
     }
-    let stderr_tail = scrub_absolute_paths(
-        &tail_utf8_lossy(&proc.stderr),
-        &[
-            case_dir.as_path(),
-            feature_dir.as_path(),
-            input.image_path.as_path(),
-        ],
-    );
+    let stderr_tail = if proc.stderr.is_empty() {
+        String::new()
+    } else {
+        "bulk_extractor emitted diagnostics (content withheld)".to_string()
+    };
 
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = input.limit.unwrap_or(DEFAULT_LIMIT).min(DEFAULT_LIMIT);
     let (mut features, staged_files) = collect_outputs(&feature_dir, &case_dir)?;
     let features_seen = features.len();
     sort_features(&mut features);
@@ -573,17 +604,79 @@ fn normalize_scanners(scanners: &[BulkScanner]) -> Vec<String> {
 /// Resolve the operator keyword file: the explicit arg first, then the
 /// `$FINDEVIL_BULK_KEYWORD_FILE` default. A supplied path must exist.
 fn resolve_keyword_file(input: &BulkExtractInput) -> Result<Option<PathBuf>, BulkExtractError> {
-    let candidate = input.keyword_file.clone().or_else(|| {
-        std::env::var(KEYWORD_FILE_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    });
-    match candidate {
-        Some(path) if path.is_file() => Ok(Some(path)),
-        Some(path) => Err(BulkExtractError::KeywordFileNotFound(path)),
-        None => Ok(None),
+    let approved = std::env::var(KEYWORD_FILE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let Some(candidate) = input.keyword_file.clone().or_else(|| approved.clone()) else {
+        return Ok(None);
+    };
+    let Some(approved) = approved else {
+        return Err(BulkExtractError::KeywordFileNotAuthorized(candidate));
+    };
+    let candidate_metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|_| BulkExtractError::KeywordFileNotFound(candidate.clone()))?;
+    let approved_metadata = std::fs::symlink_metadata(&approved)
+        .map_err(|_| BulkExtractError::KeywordFileNotFound(approved.clone()))?;
+    if !single_link_regular(&candidate_metadata) || !single_link_regular(&approved_metadata) {
+        return Err(BulkExtractError::KeywordFileNotAuthorized(candidate));
     }
+    let canonical_candidate = crate::pathnorm::canonicalize(&candidate)
+        .map_err(|_| BulkExtractError::KeywordFileNotFound(candidate.clone()))?;
+    let canonical_approved = crate::pathnorm::canonicalize(&approved)
+        .map_err(|_| BulkExtractError::KeywordFileNotFound(approved))?;
+    if canonical_candidate != canonical_approved {
+        return Err(BulkExtractError::KeywordFileNotAuthorized(candidate));
+    }
+    Ok(Some(canonical_candidate))
+}
+
+fn single_link_regular(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn validate_find_regexes(regexes: &[String]) -> Result<(), BulkExtractError> {
+    if regexes.len() > MAX_FIND_REGEXES {
+        return Err(BulkExtractError::RegexLimit {
+            limit_kind: "count",
+            limit: MAX_FIND_REGEXES,
+            observed: regexes.len(),
+        });
+    }
+    let mut total_bytes = 0_usize;
+    for (index, regex) in regexes.iter().enumerate() {
+        let bytes = regex.len();
+        if bytes > MAX_FIND_REGEX_BYTES {
+            return Err(BulkExtractError::RegexLimit {
+                limit_kind: "entry_bytes",
+                limit: MAX_FIND_REGEX_BYTES,
+                observed: bytes,
+            });
+        }
+        if regex.contains('\n') || regex.contains('\r') || regex.contains('\0') {
+            return Err(BulkExtractError::InvalidRegex { index });
+        }
+        total_bytes = total_bytes.saturating_add(bytes.saturating_add(1));
+        if total_bytes > MAX_FIND_REGEX_TOTAL_BYTES {
+            return Err(BulkExtractError::RegexLimit {
+                limit_kind: "total_bytes",
+                limit: MAX_FIND_REGEX_TOTAL_BYTES,
+                observed: total_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Write operator-supplied `find_regexes` to a generated `-F` file under
@@ -597,11 +690,7 @@ fn write_find_regexes(
     if regexes.is_empty() {
         return Ok(None);
     }
-    for (index, regex) in regexes.iter().enumerate() {
-        if regex.contains('\n') || regex.contains('\r') || regex.contains('\0') {
-            return Err(BulkExtractError::InvalidRegex { index });
-        }
-    }
+    validate_find_regexes(regexes)?;
     let path = staging.join("find_regexes.txt");
     let body = regexes.join("\n");
     std::fs::write(&path, body).map_err(|source| BulkExtractError::Io {
@@ -629,7 +718,16 @@ fn collect_outputs(
         path: feature_dir.to_path_buf(),
         source,
     })?;
-    for entry in read_dir {
+    for (index, entry) in read_dir.enumerate() {
+        if index >= MAX_OUTPUT_ENTRIES {
+            return Err(BulkExtractError::Io {
+                path: feature_dir.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bulk_extractor output entry limit exceeded",
+                ),
+            });
+        }
         let entry = entry.map_err(|source| BulkExtractError::Io {
             path: feature_dir.to_path_buf(),
             source,
@@ -644,10 +742,7 @@ fn collect_outputs(
     }
 
     for (name, path) in entries {
-        let bytes = std::fs::read(&path).map_err(|source| BulkExtractError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let bytes = read_feature_file_bounded(&path)?;
         let sha256 = sha256_hex(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         let feature_type = name.trim_end_matches(".txt").to_string();
@@ -664,6 +759,12 @@ fn collect_outputs(
             if !is_histogram {
                 if let Some(row) = parse_feature_line(&feature_type, line) {
                     features.push(row);
+                    if features.len() > MAX_COLLECTED_FEATURE_ROWS {
+                        return Err(output_invalid_data(
+                            &path,
+                            "bulk_extractor parsed feature row limit exceeded",
+                        ));
+                    }
                 }
             }
         }
@@ -680,11 +781,65 @@ fn collect_outputs(
     Ok((features, staged))
 }
 
+fn bulk_output_quota(feature_dir: &Path) -> OutputQuota {
+    OutputQuota::new(
+        feature_dir.to_path_buf(),
+        MAX_OUTPUT_TREE_BYTES,
+        MAX_OUTPUT_ENTRIES,
+    )
+}
+
+fn read_feature_file_bounded(path: &Path) -> Result<Vec<u8>, BulkExtractError> {
+    let (file, metadata) =
+        open_stable_output_file(path).map_err(|source| BulkExtractError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.len() > MAX_FEATURE_FILE_BYTES {
+        return Err(output_invalid_data(
+            path,
+            "bulk_extractor feature file byte limit exceeded",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_FEATURE_FILE_BYTES)).unwrap_or(64 * 1024),
+    );
+    file.take(MAX_FEATURE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| BulkExtractError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_FEATURE_FILE_BYTES {
+        return Err(output_invalid_data(
+            path,
+            "bulk_extractor feature file byte limit exceeded",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn output_invalid_data(path: &Path, message: &'static str) -> BulkExtractError {
+    BulkExtractError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+    }
+}
+
 /// Capture `bulk_extractor --version` (first stdout line, trimmed).
 /// `unknown` when the probe fails — this string is part of the hashed
 /// body so a silent engine change is visible to replay.
 fn capture_version(binary: &Path) -> String {
-    match Command::new(binary).arg("--version").output() {
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    match run_with_limits(
+        command,
+        VERSION_TIMEOUT,
+        CaptureLimits {
+            stdout_bytes: VERSION_CAPTURE_BYTES,
+            stderr_bytes: VERSION_CAPTURE_BYTES,
+        },
+    ) {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
@@ -800,11 +955,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
-}
-
-fn tail_utf8_lossy(bytes: &[u8]) -> String {
-    let start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
-    String::from_utf8_lossy(&bytes[start..]).to_string()
 }
 
 // ---------------------------------------------------------------------------

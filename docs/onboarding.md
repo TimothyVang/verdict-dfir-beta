@@ -49,7 +49,7 @@ optional gaps (Node/pnpm only matter for the dashboard) and continue.
   the exact error and stop — never work around a broken environment silently.
 - **`setup` / `i'm new`:** run `bash scripts/setup`, then complete any browser-only
   gated step the shell could not. The only gated asset is the **SANS SIFT OVA**, and it
-  is needed **only** for `--sift`/disk-image parity; local mode is the default and needs
+  is needed **only** for `--sift`/disk-image parity; split-trust Docker is the default and needs
   no gated asset. Do not auto-fetch it unless the user wants SIFT mode. When fetching is
   needed, drive the registered browser MCP (Playwright/Puppeteer) — never invent or store
   SANS credentials.
@@ -90,5 +90,7 @@ Docs: README.md · INSTALL.md · QUICKSTART.md · docs/using/running-verdict.md
 
 A run is complete only when the pipeline reaches `case_open`, every Finding cites a
 `tool_call_id`, `report_qa` is audited, and `manifest_verify.json` reports `overall: true`.
-If that file is missing or `overall` is not `true`, report `RUN INCOMPLETE / CUSTODY
-INVALID` — do not call the output signed or customer-ready.
+Calling it cryptographically signed also requires `signature_verified: true` for an
+Ed25519/Sigstore tier under trusted external policy. If the receipt is missing,
+`overall` is not `true`, or a purported cryptographic tier is not verified, report
+`RUN INCOMPLETE / CUSTODY INVALID` — do not call the output signed or customer-ready.

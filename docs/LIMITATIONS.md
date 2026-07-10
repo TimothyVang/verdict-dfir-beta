@@ -16,8 +16,9 @@ label, and — for public-documented corpora only — a `contamination_caveat`.
 A recall / precision / F1 number from the scoring harness is a measure of how well
 a run matched a curated ground-truth golden. It is **not**:
 
-- **Custody integrity.** Whether the run is signed and offline-verifiable is the
-  job of `manifest_verify`, not the accuracy score. A high recall on a run whose
+- **Custody integrity.** Whether the run is signed and offline-verifiable under
+  trusted signer policy (external Ed25519 pin or exact Sigstore identity + issuer)
+  is the job of `manifest_verify`, not the accuracy score. A high recall on a run whose
   manifest does not verify is `RUN INCOMPLETE / CUSTODY INVALID`, not a win.
 - **Generalization.** A score is bounded to the scored corpus and the artifact
   classes present in those cases. It does not extrapolate to unseen evidence.

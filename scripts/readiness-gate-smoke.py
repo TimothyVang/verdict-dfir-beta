@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -192,16 +193,21 @@ def make_run(
                 },
             },
         )
+    signer = (
+        LocalEd25519Signer(root / "signing.key")
+        if cryptographic_signature
+        else StubSigner(run_id="run-ready")
+    )
+    if cryptographic_signature:
+        (root / "trusted-ed25519-fingerprint.txt").write_text(
+            signer.public_fingerprint() + "\n", encoding="ascii"
+        )
     manifest = build_manifest(
         case_id="case-ready",
         run_id="run-ready",
         started_at="2026-05-10T00:00:00Z",
         audit_log=audit,
-        signer=(
-            LocalEd25519Signer(root / "signing.key")
-            if cryptographic_signature
-            else StubSigner(run_id="run-ready")
-        ),
+        signer=signer,
         extra={"image_path": "synthetic"},
     )
     manifest_path = write_manifest(manifest, run / "run.manifest.json")
@@ -285,6 +291,12 @@ def make_run(
 def run_gate(
     ps: str, run_dir: Path, out: Path, run_id: str
 ) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    pin_path = run_dir.parent / "trusted-ed25519-fingerprint.txt"
+    if pin_path.is_file():
+        env["FINDEVIL_ED25519_EXPECTED_FINGERPRINT"] = pin_path.read_text(
+            encoding="ascii"
+        ).strip()
     return subprocess.run(
         [
             ps,
@@ -306,6 +318,7 @@ def run_gate(
         text=True,
         capture_output=True,
         timeout=120,
+        env=env,
     )
 
 

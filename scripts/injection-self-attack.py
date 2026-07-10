@@ -5,7 +5,7 @@ audit chain hold. No LLM, fully offline, deterministic.
 
 This is the demoable architectural proof behind the sanitizer boundary
 (``services/mcp/src/sanitize.rs`` mirrored by
-``services/agent_mcp/findevil_agent_mcp/sanitize.py``) and the signed manifest
+``services/agent_mcp/findevil_agent_mcp/sanitize.py``) and the manifest custody envelope
 (``manifest_finalize`` / ``manifest_verify``). For each attack it:
 
   1. pushes attacker-controlled evidence text -- chat/role control tokens
@@ -15,9 +15,14 @@ This is the demoable architectural proof behind the sanitizer boundary
      ``[neutralized:<id>]`` marker and every invisible code point is stripped;
   3. proves the transform is DETERMINISTIC (a re-run yields the identical
      ``output_sha256`` over the canonical serialized output); and
-  4. seals a run manifest whose ``tool_call_output`` leaf is that very hash and
-     verifies it offline (``manifest_verify`` overall=True) -- so the injection
-     cannot alter what the audit chain attests.
+  4. seals a development-tier run manifest whose ``tool_call_output`` leaf is
+     that very hash and replays it offline (``manifest_verify`` overall=True)
+     -- so the injection cannot alter what the audit chain attests.
+
+This focused harness intentionally uses ``StubSigner``: ``overall=True`` proves
+the payload-bound audit/Merkle envelope for this sanitizer test, **not** signer
+authentication. The Ed25519 custody tests separately require an externally
+trusted public-key fingerprint before ``signature_verified=True`` can pass.
 
 The harness logic lives in
 ``services/agent_mcp/findevil_agent_mcp/injection_self_attack.py`` and is

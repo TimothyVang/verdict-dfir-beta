@@ -23,10 +23,12 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use ntfs_core::usn::UsnReason;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use usnjrnl_forensic::usn::{UsnJournalReader, UsnReason};
+
+use super::usnjrnl_reader::UsnJournalReader;
 
 const DEFAULT_LIMIT: usize = 10_000;
 

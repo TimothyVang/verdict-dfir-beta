@@ -54,13 +54,21 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{
+    open_stable_output_file, run_with_output_quota, timeout_from_env_clamped, OutputQuota, RunError,
+};
+
 /// Default binary name when `$FINDEVIL_PFFEXPORT_BIN` is unset.
 const DEFAULT_BINARY: &str = "pffexport";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1_800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7_200);
+const TIMEOUT_ENV: &str = "FINDEVIL_PST_TIMEOUT_SECS";
 
 /// Hard cap on surfaced messages / aggregate entries. The true total is
 /// always reported in `message_count`.
@@ -73,6 +81,7 @@ const MAX_HEADER_BYTES: u64 = 256 * 1024;
 /// Cap on directory entries walked in the export tree (defense against a
 /// pathologically deep/wide export).
 const MAX_WALK_ENTRIES: usize = 500_000;
+const MAX_OUTPUT_TREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The header file `pffexport` writes per message.
 const HEADER_FILENAME: &str = "OutlookHeaders.txt";
@@ -214,12 +223,17 @@ pub fn pst_parse(input: &PstParseInput) -> Result<PstParseOutput, PstError> {
         });
     }
 
-    let proc = Command::new(&binary).args(&args).output();
-    let proc = match proc {
+    let mut command = Command::new(&binary);
+    command.args(&args);
+    let proc = match run_with_output_quota(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+        &OutputQuota::new(staging.clone(), MAX_OUTPUT_TREE_BYTES, MAX_WALK_ENTRIES),
+    ) {
         Ok(proc) => proc,
         // Lost the resolve→spawn race (binary vanished, or PATH probe found a
         // stale entry): still degrade, do not error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             let _ = std::fs::remove_dir_all(&staging);
             return Ok(unavailable_output());
         }
@@ -227,7 +241,7 @@ pub fn pst_parse(input: &PstParseInput) -> Result<PstParseOutput, PstError> {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(PstError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             });
         }
     };
@@ -358,9 +372,14 @@ fn summarize_export(root: &Path) -> Result<Vec<PstMessage>, String> {
                 return Ok(messages);
             }
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect pffexport output: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err("pffexport output contains a symlink".to_string());
+            }
+            if metadata.is_dir() {
                 stack.push(path);
-            } else if path.file_name().is_some_and(|n| n == HEADER_FILENAME) {
+            } else if metadata.is_file() && path.file_name().is_some_and(|n| n == HEADER_FILENAME) {
                 if let Some(msg) = read_message(&path) {
                     messages.push(msg);
                 }
@@ -383,7 +402,7 @@ fn read_message(header_path: &Path) -> Option<PstMessage> {
 /// Read at most `cap` bytes of a file as lossy UTF-8. `None` on IO error.
 fn read_capped(path: &Path, cap: u64) -> Option<String> {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
+    let (file, _) = open_stable_output_file(path).ok()?;
     let mut buf = Vec::new();
     file.take(cap).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())

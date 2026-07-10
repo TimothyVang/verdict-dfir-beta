@@ -16,7 +16,12 @@
 
 import path from "node:path";
 
-import { isAllowedCasePath, tailAuditLog } from "@/lib/audit-tail";
+import {
+  resolveAllowedCasePath,
+  statAllowedCaseFile,
+  tailAuditLog,
+} from "@/lib/audit-tail";
+import { authorizeDashboardRequest } from "@/lib/dashboard-auth";
 
 // SSE needs a long-lived connection — Node runtime, not Edge.
 export const runtime = "nodejs";
@@ -24,6 +29,8 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request): Promise<Response> {
+  const denied = authorizeDashboardRequest(request);
+  if (denied) return denied;
   const url = new URL(request.url);
   const caseDir = url.searchParams.get("case");
   if (!caseDir) {
@@ -35,12 +42,13 @@ export async function GET(request: Request): Promise<Response> {
   // Resolve the case dir first so the allow-list check sees the
   // post-traversal path (e.g. `goldens/../../etc` collapses to
   // `/etc` before comparison).
-  const resolvedCaseDir = path.resolve(caseDir);
-  if (!isAllowedCasePath(resolvedCaseDir)) {
+  const requestedCaseDir = path.resolve(caseDir);
+  const resolvedCaseDir = resolveAllowedCasePath(requestedCaseDir);
+  if (!resolvedCaseDir) {
     return new Response(
       JSON.stringify({
         error: "case path not in allow-list",
-        reason: `${resolvedCaseDir} is not inside any allow-listed root (see apps/web/README.md "Path allow-list for /api/audit")`,
+        reason: `${requestedCaseDir} is not a real, unlinked directory inside any allow-listed root (see apps/web/README.md "Path allow-list for /api/audit")`,
       }),
       {
         status: 400,
@@ -51,6 +59,11 @@ export async function GET(request: Request): Promise<Response> {
 
   // Resolve to the audit.jsonl inside the case dir.
   const auditPath = path.resolve(resolvedCaseDir, "audit.jsonl");
+  if (!(await statAllowedCaseFile(resolvedCaseDir, "audit.jsonl"))) {
+    return new Response("audit log not found or not a regular unlinked case file", {
+      status: 404,
+    });
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -66,7 +79,11 @@ export async function GET(request: Request): Promise<Response> {
       }, 15_000);
 
       try {
-        for await (const line of tailAuditLog(auditPath, request.signal)) {
+        for await (const line of tailAuditLog(
+          auditPath,
+          request.signal,
+          resolvedCaseDir,
+        )) {
           // SSE event format: "event: <name>\ndata: <json>\n\n".
           // Use `audit_line` as the event name so consumers can
           // addEventListener("audit_line", …).

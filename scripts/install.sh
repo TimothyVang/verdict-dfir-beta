@@ -146,11 +146,11 @@ fi
 RUST_VER="$(rustc --version | awk '{print $2}')"
 ok "rustc: ${RUST_VER}"
 
-# Rust 1.85 is the floor under A2 (CLAUDE.md spec/code divergence #1 —
-# repo ships rust-toolchain.toml = 1.88; transitive deps need edition-2024).
-if ! printf '%s\n%s\n' "1.85" "${RUST_VER}" | sort -V -C; then
-    warn "rustc ${RUST_VER} is older than the 1.85 floor. cargo will pull"
-    warn "the toolchain pinned in rust-toolchain.toml (1.88) on first build."
+# Rust 1.91 is the workspace MSRV and the pinned toolchain. YARA-X 1.19
+# requires this line and moves the in-process scanner off Wasmtime 38.
+if ! printf '%s\n%s\n' "1.91" "${RUST_VER}" | sort -V -C; then
+    warn "rustc ${RUST_VER} is older than the 1.91 workspace MSRV. cargo will pull"
+    warn "the toolchain pinned in rust-toolchain.toml (1.91) on first build."
 fi
 
 if bootstrap_enabled && ! command -v uv &> /dev/null; then
@@ -350,14 +350,14 @@ ok "services/agent_mcp/.venv ready."
 info "Verifying MCP servers (findevil-mcp + findevil-agent-mcp)..."
 
 if [ -x "target/release/findevil-mcp" ] || [ -x "target/release/findevil-mcp.exe" ]; then
-    ok "findevil-mcp (Rust, 32 DFIR tools) binary present."
+    ok "findevil-mcp (Rust, 43 DFIR tools) binary present."
 else
     fail "findevil-mcp binary missing after build — cannot continue."
     exit 1
 fi
 
 if (cd services/agent_mcp && uv run --frozen python -c "import findevil_agent_mcp" >/dev/null 2>&1); then
-    ok "findevil-agent-mcp (Python, 13 crypto/ACH/memory tools) imports cleanly."
+    ok "findevil-agent-mcp (Python, 14 crypto/ACH/memory tools) imports cleanly."
 else
     fail "findevil-agent-mcp import check failed — the Python MCP server will not start; re-run: uv sync --directory services/agent_mcp"
     exit 1
@@ -631,7 +631,7 @@ connect_sift_vm() {
             "${guest_user}@${guest_ip}" \
             "test -x ${guest_repo}/target/release/findevil-mcp" >/dev/null 2>&1; then
             ok "SIFT VM already set up + reachable at ${guest_ip}."
-            info "Run in SIFT mode:  scripts/find-evil-sift   (or  bash scripts/verdict --sift)"
+            info "Run in SIFT mode: bash scripts/verdict --sift <evidence> (zero LLM), or scripts/find-evil-sift --acknowledge-evidence-egress (interactive)"
             return 0
         fi
     fi
@@ -671,7 +671,7 @@ connect_sift_vm() {
 
     info "Running scripts/sift-vm-bootstrap.sh ..."
     if bash "${REPO}/scripts/sift-vm-bootstrap.sh"; then
-        ok "SIFT VM bootstrap complete. Run:  scripts/find-evil-sift"
+        ok "SIFT VM bootstrap complete. Run: scripts/verdict --sift <evidence>"
     else
         warn "SIFT bootstrap did not complete (non-fatal — local-host mode still works)."
         warn "  Re-run when ready:  bash scripts/sift-vm-bootstrap.sh"
@@ -786,8 +786,8 @@ echo "=========================================="
 echo ""
 echo "${c_blu}HOW TO USE THIS TOOL${c_off}"
 echo ""
-echo "  1. Open Claude Code in this repo:"
-echo "       claude"
+echo "  1. For interactive cloud analysis, explicitly acknowledge parsed-evidence egress:"
+echo "       scripts/find-evil --acknowledge-evidence-egress"
 echo "     Claude Code IS the agent — it reads CLAUDE.md automatically."
 echo ""
 echo "  2. Type 'help' to see all commands."
@@ -795,7 +795,7 @@ echo ""
 echo "  3. To run an investigation:"
 echo "       scripts/verdict /path/to/evidence.E01"
 echo "     Add --sift when disk evidence should run through the SANS SIFT VM."
-echo "     Interactive path: open claude or scripts/find-evil, then prompt investigate <path>."
+echo "     Interactive path: use scripts/find-evil --acknowledge-evidence-egress, then prompt investigate <path>."
 echo ""
 echo "  4. To watch the live dashboard while an investigation runs:"
 echo "       pnpm --filter @findevil/web dev"
@@ -808,9 +808,9 @@ echo ""
 echo "  bash scripts/verdict <evidence>           # canonical one-shot local mode"
 echo "  bash scripts/verdict <evidence> --sift    # one-shot SIFT-VM mode"
 echo "  bash scripts/verdict <evidence> --run-summary tmp/run.json"
-echo "  bash scripts/find-evil                    # interactive local mode"
+echo "  bash scripts/find-evil --acknowledge-evidence-egress # interactive cloud mode"
 echo "  bash scripts/sift-vm-bootstrap.sh         # build the SIFT VM (VMware or KVM/libvirt)"
-echo "  bash scripts/find-evil-sift               # SIFT-VM mode (after bootstrap)"
+echo "  bash scripts/find-evil-sift --acknowledge-evidence-egress # interactive SIFT mode"
 echo "  bash scripts/find-evil-auto <evidence>    # internal engine wrapper used by scripts/verdict"
 echo "  bash scripts/run-all-smokes.sh            # full smoke gate (pre-commit)"
 echo "  pnpm --filter @findevil/web dev           # start live dashboard"
@@ -823,6 +823,9 @@ echo "  docs/accuracy-report.md    — scoring and coverage method"
 echo ""
 echo "  To verify a signed manifest offline:"
 echo "    uv run --directory services/agent_mcp python -m findevil_agent_mcp.server"
-echo "    # then call the manifest_verify MCP tool"
+echo "    # then call manifest_verify with trusted signer policy obtained outside the case:"
+echo "    #   expected_ed25519_fingerprint=<trusted-public-key-sha256>"
+echo "    # or, for Sigstore, exact expected_sigstore_identity + expected_sigstore_issuer"
+echo "    # Never use the manifest's own embedded fingerprint as its trust pin."
 echo ""
 exit "${DOCTOR_STATUS}"

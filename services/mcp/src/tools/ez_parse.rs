@@ -21,12 +21,18 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const HARD_TIMEOUT: Duration = Duration::from_secs(3_600);
+const TIMEOUT_ENV: &str = "FINDEVIL_EZ_PARSE_TIMEOUT_SECS";
 
 /// Per-tool descriptor: the allow-list key, the binary name, and the flag the
 /// tool uses to take its input (most are `-f <file>`; `SBECmd` takes `-d <dir>`).
@@ -230,8 +236,13 @@ pub fn ez_parse(input: &EzParseInput) -> Result<EzParseOutput, EzParseError> {
     let mut cmd = Command::new(&binary);
     cmd.args(args);
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
+    let spawned = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|err| {
+        if matches!(&err, RunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound)
+        {
             EzParseError::BinaryNotFound {
                 binary: spec.binary.to_string(),
             }
@@ -239,10 +250,17 @@ pub fn ez_parse(input: &EzParseInput) -> Result<EzParseOutput, EzParseError> {
             EzParseError::SubprocessFailed {
                 binary: spec.binary.to_string(),
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             }
         }
-    })?;
+    });
+    let proc = match spawned {
+        Ok(proc) => proc,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&outdir);
+            return Err(error);
+        }
+    };
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 

@@ -12,9 +12,11 @@ bash scripts/setup                    # installs the product toolchain, common D
 scripts/verdict <path-to-evidence>    # investigate -> live dashboard -> signed verdict + report
 ```
 
-**Prefer to drive it with Claude Code?** Drop your evidence into **`evidence/`**, open `claude`, and
-type **`investigate evidence/`**. (Or hands-free in a session: `/verdict <path>` runs the pipeline
-and attempts SIFT VM setup when disk evidence needs it.)
+**Prefer to drive it with Claude Code?** Drop your evidence into **`evidence/`**, launch
+`scripts/find-evil --acknowledge-evidence-egress`, and type **`investigate evidence/`**. The
+acknowledgment is required because parsed evidence-derived output can enter the cloud model context;
+raw source files are not uploaded by the typed tools. For zero-LLM local processing, use
+`scripts/verdict <path>` directly in your terminal.
 
 No evidence yet? `bash scripts/fetch-fixtures.sh` stages public datasets (into `fixtures/`). A view-only Google Drive artifact folder is also available at <https://drive.google.com/drive/folders/1j4nPm3vjAcRwVdKOauIVc8yurxoADhOv?usp=drive_link>; CLI users can download it with their own authenticated rclone Google Drive remote:
 
@@ -33,7 +35,35 @@ run-mode catalog.
 
 ## 1. Pick your environment (one-time, ~15 min)
 
-### Path A — SIFT VM (recommended; the reference forensic environment)
+### Path A — DFIR container (recommended; the reference forensic backend)
+
+Pull the pinned toolchain image (~2.3 GB) and run against it. The image declares its toolchain in
+`docker/dfir.Dockerfile` and its `HEALTHCHECK` fails when `tshark`/`fls`/`ewfexport`/`vol`/`hayabusa`
+are not invocable, so a lane cannot silently read zero packets the way a drifted VM could.
+
+```bash
+FINDEVIL_DFIR_GHCR='ghcr.io/<owner>/verdict-dfir-toolkit@sha256:<reviewed-digest>' \
+  scripts/verdict <evidence>
+```
+
+The Docker evidence runtime is always networkless and capability-free. Raw
+`.dd`/`.001` uses direct Sleuth Kit. Compressed `.E01` mounting is intentionally
+refused in Docker because it requires a root/FUSE boundary; use local/SIFT or
+`ewfexport` the image to a raw `.dd` first.
+
+Evidence is a bind mount (native disk speed, no hgfs), and the container is driven over `docker exec -i`
+— the same stdio pipe `ssh -T` gives the VM. Two honest limits, both detailed in
+[docs/using/docker-backend.md](docs/using/docker-backend.md):
+
+- **`mac_triage` / mac_apt are not in the image** and degrade to `BinaryNotFound`. Use Path B for those.
+- **Compressed `.E01` mounting is not enabled in Docker.** `ewfexport` the set
+  to a raw `.dd`, or use local/SIFT.
+
+Docker is the no-flag production default. `--local` and `--sift` are mutually
+exclusive alternatives and require `--acknowledge-reduced-isolation` because
+native parsers then share an OS trust domain with custody/signing.
+
+### Path B — SIFT VM (supported; required for the mac_triage lanes)
 
 **The one-command way** — install local prerequisites, attempt the gated OVA fetch via Playwright,
 and build the VM when the download succeeds:
@@ -43,7 +73,7 @@ bash scripts/setup --with-sift
 ```
 
 If the headless fetch can't complete (the SANS page changed, you're offline, a hypervisor is
-missing), it falls back cleanly and tells you the manual step below — and local-host mode (Path B)
+missing), it falls back cleanly and tells you the manual step below — and local-host mode (Path C)
 still works meanwhile. In a `claude` session, typing `setup` does the same and can adapt to page
 changes.
 
@@ -61,19 +91,27 @@ bash scripts/sift-vm-bootstrap.sh
 
 This converts the OVA, boots the VM headless, installs Rust + DFIR tools inside, sets up the SSH transport, and rewrites `.mcp.json.sift` to point at the running VM. Runs ~15 min on first invocation; subsequent runs detect existing state and skip.
 
-> **Hypervisor note:** `scripts/verdict <path> --sift` invokes the SIFT helper under the hood. It supports **VMware Workstation** (primary, via `vmrun`/`ovftool`) or **KVM/libvirt** (Linux fallback — `scripts/sift-vm-bootstrap.sh` auto-installs qemu/libvirt and imports the OVA). **VirtualBox is not supported.** If you only have VirtualBox, use VMware or KVM/libvirt, or run local-host mode (Path B).
+> **Hypervisor note:** `scripts/verdict <path> --sift --acknowledge-reduced-isolation` invokes the SIFT helper under the hood. It supports **VMware Workstation** (primary, via `vmrun`/`ovftool`) or **KVM/libvirt** (Linux fallback — `scripts/sift-vm-bootstrap.sh` auto-installs qemu/libvirt and imports the OVA). **VirtualBox is not supported.** If you only have VirtualBox, use VMware or KVM/libvirt, or keep the Docker default.
 
-### Path B — Local Windows host (faster iteration)
+### Path C — Windows via WSL2 or Docker (faster iteration)
 
 ```bash
-# Install the four DFIR-tool binaries on Windows (one-time):
-winget install Volatility3 || pip install volatility3
-winget install Hayabusa  # or download from github.com/Yamato-Security/hayabusa/releases
-winget install Velociraptor  # or github.com/Velocidex/velociraptor/releases
-# YARA-X is already in our crate; no separate install needed.
+# From a WSL2 shell, install/verify the contained Linux toolchain:
+bash scripts/setup
+bash scripts/doctor.sh
 
-# That's it — `.mcp.json` points at local subprocesses by default.
+# The normal command uses isolated Docker. Host-local parsing is an explicit,
+# reduced-isolation development fallback:
+scripts/verdict <path-visible-in-WSL>
+scripts/verdict --local --acknowledge-reduced-isolation <path-visible-in-WSL>
 ```
+
+Native Windows parser binaries remain useful for development and the PowerShell
+smoke/readiness wrappers remain supported, but a native-NTFS custody run is
+deliberately refused: POSIX `0600`/`0700` modes do not establish private Windows
+DACLs, and the current audit lock is POSIX. Use WSL2, Docker, or SIFT for a
+signed Case. This prevents a report from claiming protected custody when local
+keys/audit files could inherit access from another Windows principal.
 
 ---
 
@@ -81,7 +119,8 @@ winget install Velociraptor  # or github.com/Velocidex/velociraptor/releases
 
 ### Option 2C — the `/verdict` skill (turnkey, recommended)
 
-The shortest path. In a Claude Code session (`claude` in the repo), type:
+After explicitly consenting with
+`scripts/find-evil --acknowledge-evidence-egress`, type:
 
 ```
 /verdict <path-to-evidence>
@@ -89,8 +128,10 @@ The shortest path. In a Claude Code session (`claude` in the repo), type:
 
 The skill is the turnkey path: it checks/builds the MCP servers, attempts SIFT VM setup when disk
 evidence needs it, auto-uses `--sift` when the VM is reachable, runs the parallel investigation to
-a signed Verdict, attempts optional n8n/grounding workflows only when enabled or already available,
-opens the dashboard + report, and prints the Verdict plus the workflow status. Full reference:
+a signed Verdict, opens the dashboard + report, and prints the Verdict plus workflow status.
+Optional n8n/grounding actions stay off even
+when a service is reachable; add `--acknowledge-post-verdict-egress` to authorize that separate,
+post-verdict network step. Full reference:
 [docs/using/running-verdict.md §0](docs/using/running-verdict.md). (Loaded at session start — if you
 just pulled it, start a fresh `claude` session.)
 
@@ -98,15 +139,20 @@ just pulled it, start a fresh `claude` session.)
 
 ```bash
 # Local mode:
-scripts/find-evil
-# or:
-claude
+scripts/find-evil --acknowledge-evidence-egress
+
+# Equivalent explicit environment gate for a bare Claude launch:
+FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1 claude
 
 # SIFT-VM evidence run:
 scripts/verdict <path-to-evidence> --sift
 ```
 
-`.mcp.json` (or `.mcp.json.sift`, swapped automatically) tells Claude Code to spawn both MCP servers — `findevil-mcp` (Rust, 34 typed DFIR tools) and `findevil-agent-mcp` (Python, 14 typed crypto/ACH/memory/ACP/expert-feedback tools).
+`.mcp.json` (or `.mcp.json.sift`, swapped automatically) tells Claude Code to spawn both audit-chained product MCP servers — `findevil-mcp` (Rust, 43 typed DFIR tools) and `findevil-agent-mcp` (Python, 14 typed crypto/ACH/memory/ACP/expert-feedback tools), for 57 product tools total.
+
+This consent covers parsed rows, filenames, hashes, and custody metadata entering the selected model
+context. It does not authorize uploading raw evidence files. Without the gate, evidence-facing Rust
+tool calls are denied before producing parsed output.
 
 In the session, prompt:
 
@@ -117,11 +163,12 @@ The agent reads `agent-config/SOUL.md` → `AGENTS.md` → `PLAYBOOK.md` → `TO
 ### Option 2B — `verdict` (the one command, no human input)
 
 ```bash
-scripts/verdict <evidence> [--sift] [--no-dashboard] [--unattended]
+scripts/verdict <evidence> [--local|--sift] [--acknowledge-reduced-isolation] [--no-dashboard] [--unattended]
 ```
 
-`verdict` runs the whole workflow: preflight → investigate → open the live dashboard at the case →
-signed verdict + report. Add `--sift` to run the DFIR tools inside the SANS SIFT VM.
+`verdict` runs the whole workflow in split-trust Docker by default: preflight → investigate → open
+the live dashboard at the case → signed verdict + report. SIFT and host-local alternatives require
+the explicit reduced-isolation acknowledgment.
 
 Examples:
 
@@ -129,27 +176,27 @@ All direct `/mnt/...` SIFT evidence paths must be mounted read-only in the guest
 
 ```bash
 # Memory image:
-scripts/verdict --sift /mnt/hgfs/evidence/extracted/base-dc/base-dc-memory.img --unattended
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/extracted/base-dc/base-dc-memory.img --unattended
 
 # Single EVTX from a read-only SIFT-visible evidence mount:
-scripts/verdict --sift /mnt/hgfs/evidence/single-evtx/Security.evtx --unattended
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/single-evtx/Security.evtx --unattended
 
 # Disk image (read-only mount/extract where prerequisites support it; otherwise custody-only):
-scripts/verdict --sift /mnt/hgfs/evidence/disk-images/base-dc-cdrive.E01 --unattended
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/disk-images/base-dc-cdrive.E01 --unattended
 
 # Host evidence root mounted read-only inside SIFT; skips multi-GB SCP staging:
 FINDEVIL_SIFT_HOST_EVIDENCE_ROOT=/path/to/evidence \
 FINDEVIL_SIFT_GUEST_EVIDENCE_ROOT=/mnt/verdict-evidence \
-scripts/verdict /path/to/evidence/disk-images/base-dc-cdrive.E01 --sift --unattended
+scripts/verdict /path/to/evidence/disk-images/base-dc-cdrive.E01 --sift --acknowledge-reduced-isolation --unattended
 
 # Mixed case directory (memory, EVTX, disk artifacts, network logs, Velociraptor zips):
-scripts/verdict --sift /mnt/hgfs/evidence/cases/base-dc/ --unattended
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/cases/base-dc/ --unattended
 
 # Same run, plus a machine-readable automation summary outside evidence paths:
-scripts/verdict --sift /mnt/hgfs/evidence/cases/base-dc/ --unattended --run-summary tmp/run-summary.json
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/cases/base-dc/ --unattended --run-summary tmp/run-summary.json
 
 # Velociraptor collection zip:
-scripts/verdict --sift /mnt/hgfs/evidence/velociraptor/base-dc.zip --unattended
+scripts/verdict --sift --acknowledge-reduced-isolation /mnt/hgfs/evidence/velociraptor/base-dc.zip --unattended
 ```
 
 What it does in one command (no interactive prompts):
@@ -208,7 +255,7 @@ You'll see:
 
 Output lands at `~/.findevil/cases/<case_id>/` (or inside the VM at `/home/sansforensics/find-evil/tmp/<case_id>/` in SIFT-VM mode).
 
-Verifying a manifest someone else produced: drive `manifest_verify` from the agent_mcp server, or call `findevil_agent.crypto.manifest.verify_manifest` directly. Recipe + expected output: [`docs/cryptographic-attestation.md`](docs/cryptographic-attestation.md) §"How a third party verifies offline."
+Verifying a manifest someone else produced: obtain the Ed25519 public-key SHA-256 through a trusted channel outside the case, then pass it to `manifest_verify` as `expected_ed25519_fingerprint` (or to `findevil_agent.crypto.manifest.verify_manifest` directly). Never trust the manifest's own fingerprint as the pin. Recipe + expected output: [`docs/cryptographic-attestation.md`](docs/cryptographic-attestation.md) §"How a third party verifies offline."
 
 ---
 
@@ -223,7 +270,7 @@ For the full doc map (every file with status badge + one-line purpose), see [`do
 - "What does the agent actually do?" → [`agent-config/PLAYBOOK.md`](agent-config/PLAYBOOK.md)
 - "What evidence is available?" → [`docs/DATASET.md`](docs/DATASET.md)
 - "What if a tool is missing?" → The agent returns `BinaryNotFound -32602`. Install the binary OR set the env var pointing at it (e.g. `VOLATILITY_BIN=/path/to/vol`).
-- "I changed something — how do I prove the app still works?" → run a **live test**: `scripts/verdict evidence/<file>` (e.g. an evidence file you supply under `evidence/`, or a fixture staged by `scripts/fetch-fixtures.sh`), then confirm `tmp/auto-runs/<case-id>/verdict.json` has a real Verdict with `tool_call_id`-cited Findings and `manifest_verify.json` `overall=true`. A live test — not a smoke run — is the verification standard.
+- "I changed something — how do I prove the app still works?" → run a **live test**: `scripts/verdict evidence/<file>` (e.g. an evidence file you supply under `evidence/`, or a fixture staged by `scripts/fetch-fixtures.sh`), then confirm `tmp/auto-runs/<case-id>/verdict.json` has a real Verdict with `tool_call_id`-cited Findings and `manifest_verify.json` has both `overall=true` and `signature_verified=true` for the default Ed25519 tier. A live test — not a smoke run — is the verification standard.
 - "I changed something — how do I confirm L1 CI will be happy?" → `bash scripts/run-all-smokes.sh` on POSIX/Git Bash, or `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-all-smokes.ps1` on native Windows. These are CI-predictor smoke runners, not live tests: they predict what L1 runs but don't exercise a real investigation. The scripts print the current smoke tally; runtime depends on Rust cache and shell startup. If native Windows Git Bash startup is slow enough to trip launcher syntax-check timeouts, set `FINDEVIL_LAUNCHER_SMOKE_BASH_TIMEOUT_SECONDS` to a larger value before rerunning.
 - "How do I produce a review packet?" → `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/readiness-gate.ps1 -Mode Full -EvidencePath <path-inside-sift-vm> -RunL1Docker`. The gate writes `readiness-summary.json` and `readiness-packet.zip` under `tmp/readiness-gates/<run-id>/`, with packet/readiness-packet-manifest.json listing copied artifacts. Fixed `-RunId` reruns refresh generated packet contents and may create a fresh timestamped build child run. A passing gate prints `READY_FOR_EXPERT_REVIEW`, not customer-ready; a failing gate prints `READINESS_BLOCKED` and lists blockers in `readiness-summary.json`.
 
@@ -240,8 +287,8 @@ For the full doc map (every file with status badge + one-line purpose), see [`do
 
 ## End-of-investigation checklist
 
-0. [ ] Live test passed: `scripts/verdict` produced `verdict.json` and `manifest_verify.json` `overall=true`
-1. [ ] `manifest_verify.json` or the `manifest_verify` MCP/library result returns `overall=True`
+0. [ ] Live test passed: `scripts/verdict` produced `verdict.json` and `manifest_verify.json` with `overall=true` and an authenticated `signature_verified=true`
+1. [ ] `manifest_verify.json` or a fresh `manifest_verify` MCP/library result returns `overall=True`; for Ed25519, the verifier received the trusted external fingerprint and returned `signature_verified=True`
 2. [ ] Findings table reviewed; CONFIRMED-tier findings traced back to their `tool_call_id` in `audit.jsonl`
 3. [ ] Contradictions resolved or explicitly flagged in the report
 4. [ ] Cross-host corroboration done (if multi-host case)

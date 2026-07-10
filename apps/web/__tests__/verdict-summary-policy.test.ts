@@ -55,7 +55,7 @@ describe("verdict summary policy", () => {
     ]);
   });
 
-  it("prefers signed verdict.json over live-stream derivation", () => {
+  it("prefers an authenticated verdict value over live-stream derivation", () => {
     expect(
       deriveVerdictWord(
         "NO_EVIL",

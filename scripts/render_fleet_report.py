@@ -20,11 +20,43 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
+try:
+    import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.patches as mpatches  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
+    matplotlib.use("Agg")  # headless
+    import matplotlib.font_manager as _fm  # noqa: E402
+    import matplotlib.patches as mpatches  # noqa: E402
+    import matplotlib.pyplot as plt  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - figure rendering needs matplotlib
+    # Mirrors render_report.py: the figure generators below need matplotlib, but
+    # the correlation/markdown rendering path does not. Degrade gracefully so the
+    # module stays importable where only the prose path is exercised.
+    matplotlib = None  # type: ignore[assignment]
+    _fm = mpatches = plt = None  # type: ignore[assignment]
+
+from report_render_security import (  # noqa: E402
+    MAX_CASE_ARTIFACT_BYTES,
+    MAX_REPORT_HTML_BYTES,
+    MAX_REPORT_MARKDOWN_BYTES,
+    MAX_REPORT_PDF_BYTES,
+    CHROMIUM_RENDER_TIMEOUT_SECONDS,
+    PANDOC_RENDER_TIMEOUT_SECONDS,
+    chromium_pdf_args,
+    chromium_profile,
+    ensure_safe_output_directory,
+    ensure_safe_report_output,
+    load_self_contained_css,
+    markdown_code,
+    markdown_text,
+    publish_report_output,
+    regular_file_size_no_follow,
+    report_render_workspace,
+    require_text_regular_file_no_follow,
+    save_matplotlib_figure,
+    secure_chromium_available,
+    secure_report_html,
+    write_report_text_no_follow,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,24 +106,23 @@ FIG_BG = SURFACE  # margins included, so the PNG is light to the edge
 SANS = "DejaVu Sans"
 MONO = "DejaVu Sans Mono"
 
-plt.rcParams.update(
-    {
-        "font.family": SANS,
-        "font.size": 11,
-        "text.color": INK,
-        "axes.edgecolor": HAIRLINE,
-        "axes.labelcolor": INK,
-        "xtick.color": MUTED,
-        "ytick.color": MUTED,
-        "savefig.dpi": 150,
-        "savefig.bbox": "tight",
-        "figure.facecolor": FIG_BG,
-        "axes.facecolor": FIG_BG,
-        "savefig.facecolor": FIG_BG,
-    }
-)
-
-import matplotlib.font_manager as _fm  # noqa: E402
+if plt is not None:
+    plt.rcParams.update(
+        {
+            "font.family": SANS,
+            "font.size": 11,
+            "text.color": INK,
+            "axes.edgecolor": HAIRLINE,
+            "axes.labelcolor": INK,
+            "xtick.color": MUTED,
+            "ytick.color": MUTED,
+            "savefig.dpi": 150,
+            "savefig.bbox": "tight",
+            "figure.facecolor": FIG_BG,
+            "axes.facecolor": FIG_BG,
+            "savefig.facecolor": FIG_BG,
+        }
+    )
 
 
 def _mono() -> _fm.FontProperties:
@@ -175,8 +206,13 @@ def _rule(fig, x0, x1, y, color=HAIRLINE, lw=0.8):
 
 
 def _save(fig, fig_path: Path) -> None:
-    fig.savefig(
-        fig_path, dpi=150, bbox_inches="tight", facecolor=FIG_BG, edgecolor="none"
+    save_matplotlib_figure(
+        fig,
+        fig_path,
+        dpi=150,
+        bbox_inches="tight",
+        facecolor=FIG_BG,
+        edgecolor="none",
     )
     plt.close(fig)
 
@@ -869,7 +905,9 @@ def _append_hygiene_section(out: list[str], corr: dict) -> None:
     out.append("## Cross-host hygiene (shared binaries & network pivots)")
     out.append("")
     if not hygiene.get("available", False):
-        out.append(f"*{hygiene.get('note', 'cross-host hygiene unavailable')}.*")
+        out.append(
+            f"*{markdown_text(hygiene.get('note', 'cross-host hygiene unavailable'))}.*"
+        )
         out.append("")
         return
     outcomes = hygiene.get("outcomes", [])
@@ -888,7 +926,7 @@ def _append_hygiene_section(out: list[str], corr: dict) -> None:
         f"**Cross-host actor-link:** "
         f"{'YES — discriminating pivot present' if hygiene.get('actor_link') else 'no'}  "
         f"**Co-occurrence only:** {'yes' if hygiene.get('co_occurrence') else 'no'}  "
-        f"**Attribution:** {hygiene.get('attribution', False)} (invariant)"
+        f"**Attribution:** {markdown_text(hygiene.get('attribution', False))} (invariant)"
     )
     out.append("")
     if leads:
@@ -898,7 +936,8 @@ def _append_hygiene_section(out: list[str], corr: dict) -> None:
         )
         for o in leads:
             out.append(
-                f"- `{o['value']}` ({o['kind']}, {len(set(o['hosts']))} hosts) — {o['reason']}"
+                f"- `{markdown_code(o['value'])}` ({markdown_text(o['kind'])}, "
+                f"{len(set(o['hosts']))} hosts) — {markdown_text(o['reason'])}"
             )
         out.append("")
     if review:
@@ -907,7 +946,9 @@ def _append_hygiene_section(out: list[str], corr: dict) -> None:
             "on multiple hosts; pull and YARA-scan before concluding:"
         )
         for o in review:
-            out.append(f"- `{o['value']}` ({len(set(o['hosts']))} hosts)")
+            out.append(
+                f"- `{markdown_code(o['value'])}` ({len(set(o['hosts']))} hosts)"
+            )
         out.append("")
     if suppressed:
         out.append(
@@ -922,6 +963,7 @@ def _append_hygiene_section(out: list[str], corr: dict) -> None:
 
 def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
     md = fleet_dir / "FLEET_REPORT.md"
+    ensure_safe_report_output(md)
     h = corr.get("host_count", 0)
     distrib = corr.get("verdict_distribution", {})
     cross = corr.get("cross_host_processes", {})
@@ -942,7 +984,7 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
     cross_high.sort(key=lambda kv: -kv[1])
 
     out = []
-    out.append(f"# Fleet investigation report — {fleet_dir.name}")
+    out.append(f"# Fleet investigation report — {markdown_text(fleet_dir.name)}")
     out.append("")
     out.append(f"**Hosts investigated:** {h}")
     out.append(
@@ -955,8 +997,8 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
     if crypto:
         out.append(
             f"**Cryptographic integrity:** "
-            f"{crypto.get('unique_merkle_roots', 0)}/"
-            f"{crypto.get('total_merkle_roots', 0)} unique Merkle roots "
+            f"{markdown_text(crypto.get('unique_merkle_roots', 0))}/"
+            f"{markdown_text(crypto.get('total_merkle_roots', 0))} unique Merkle roots "
             f"({'OK — all manifests independent' if crypto.get('all_unique') else 'WARN — duplicate roots'})"
         )
     out.append("")
@@ -1033,7 +1075,7 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
         )
         out.append("")
         for name, count in cross_high[:15]:
-            out.append(f"- `{name}` ({count} hosts)")
+            out.append(f"- `{markdown_code(name)}` ({count} hosts)")
         out.append("")
 
     _append_hygiene_section(out, corr)
@@ -1057,17 +1099,17 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
         sorted_clusters = sorted(clusters, key=lambda c: -c["host_count"])[:5]
         for i, cl in enumerate(sorted_clusters, 1):
             out.append(
-                f"### Cluster {i}: {cl['host_count']} hosts in "
-                f"{cl['duration_seconds']:.0f}s"
+                f"### Cluster {i}: {markdown_text(cl['host_count'])} hosts in "
+                f"{float(cl['duration_seconds']):.0f}s"
             )
             out.append("")
-            out.append(f"- First event: `{cl['first_event']}`")
-            out.append(f"- Last event:  `{cl['last_event']}`")
+            out.append(f"- First event: `{markdown_code(cl['first_event'])}`")
+            out.append(f"- Last event:  `{markdown_code(cl['last_event'])}`")
             out.append("- Sample events:")
             for ev in cl["events"][:8]:
                 out.append(
-                    f"  - `{ev['host']}` PID {ev['pid']} `{ev['name']}` "
-                    f"at {ev['create_time']}"
+                    f"  - `{markdown_code(ev['host'])}` PID {markdown_text(ev['pid'])} "
+                    f"`{markdown_code(ev['name'])}` at {markdown_text(ev['create_time'])}"
                 )
             out.append("")
 
@@ -1129,7 +1171,7 @@ def write_markdown(fleet_dir: Path, corr: dict, has_temporal: bool) -> Path:
         f"in each case directory; this report is a derivative summary.*"
     )
 
-    md.write_text("\n".join(out), encoding="utf-8")
+    write_report_text_no_follow(md, "\n".join(out))
     return md
 
 
@@ -1142,60 +1184,101 @@ def render_html_pdf(md_path: Path) -> tuple[Path, Path | None]:
     fleet_dir = md_path.parent
     html = fleet_dir / "FLEET_REPORT.html"
     pdf = fleet_dir / "FLEET_REPORT.pdf"
+    pdf_fallback = pdf.with_suffix(".new.pdf")
+    chrome_available = Path(CHROME).exists()
+
+    ensure_safe_report_output(html)
+    if chrome_available:
+        ensure_safe_report_output(pdf)
+        ensure_safe_report_output(pdf_fallback)
 
     style_path = REPO_ROOT / "scripts" / "_report_style.css"
     if not style_path.exists():
-        return html, None
+        raise FileNotFoundError(f"report stylesheet is missing: {style_path}")
 
-    subprocess.run(
-        [
-            PANDOC,
-            str(md_path),
-            "--standalone",
-            "--embed-resources",
-            "--css",
-            str(style_path),
-            "-o",
-            str(html),
-        ],
-        check=True,
-        capture_output=True,
+    markdown_snapshot = require_text_regular_file_no_follow(
+        md_path, max_bytes=MAX_REPORT_MARKDOWN_BYTES
     )
+    with report_render_workspace(fleet_dir) as workspace:
+        pandoc_input = workspace / "input.md"
+        pandoc_html = workspace / "output.html"
+        write_report_text_no_follow(pandoc_input, markdown_snapshot)
+        subprocess.run(
+            [
+                PANDOC,
+                str(pandoc_input),
+                "--from",
+                "markdown-raw_html-raw_tex",
+                "--to",
+                "html5",
+                "--sandbox",
+                "--standalone",
+                "-o",
+                str(pandoc_html),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=PANDOC_RENDER_TIMEOUT_SECONDS,
+        )
+        rendered = require_text_regular_file_no_follow(
+            pandoc_html, max_bytes=MAX_REPORT_HTML_BYTES
+        )
+
+    secured = secure_report_html(
+        rendered,
+        case_dir=fleet_dir,
+        css_text=load_self_contained_css(style_path),
+    )
+    write_report_text_no_follow(html, secured)
 
     pdf_out: Path | None = None
-    if Path(CHROME).exists():
-        # Render to a sibling .new.pdf first; rename atomically so a PDF
-        # locked by a viewer doesn't lose the new render. See
-        # render_report.py for the same pattern.
-        pdf_tmp = pdf.with_suffix(".new.pdf")
-        try:
-            html_url = "file:///" + str(html).replace("\\", "/")
-            subprocess.run(
-                [
-                    CHROME,
-                    "--headless",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--print-to-pdf=" + str(pdf_tmp),
-                    "--print-to-pdf-no-header",
-                    "--virtual-time-budget=10000",
-                    html_url,
-                ],
-                capture_output=True,
-                timeout=120,
+    if chrome_available:
+        if not secure_chromium_available():
+            print(
+                "  WARN: refusing fleet PDF render as root because Chromium's "
+                "secure sandbox is unavailable; HTML remains available"
             )
-            if pdf_tmp.exists() and pdf_tmp.stat().st_size > 1000:
-                try:
-                    pdf_tmp.replace(pdf)
-                    pdf_out = pdf
-                except OSError:
-                    print(
-                        f"  WARN: could not overwrite {pdf} (likely open "
-                        f"in a viewer); rendered output left at {pdf_tmp}"
+            return html, None
+        try:
+            with report_render_workspace(fleet_dir) as workspace:
+                chrome_html = workspace / "input.html"
+                pdf_tmp = workspace / "output.pdf"
+                write_report_text_no_follow(chrome_html, secured)
+                with chromium_profile(workspace) as profile:
+                    completed = subprocess.run(
+                        chromium_pdf_args(
+                            CHROME,
+                            html_path=chrome_html,
+                            pdf_path=pdf_tmp,
+                            user_data_dir=profile,
+                        ),
+                        capture_output=True,
+                        timeout=CHROMIUM_RENDER_TIMEOUT_SECONDS,
                     )
-                    pdf_out = pdf_tmp
-        except Exception:
-            pass
+                pdf_size = regular_file_size_no_follow(
+                    pdf_tmp, min_bytes=1001, max_bytes=MAX_REPORT_PDF_BYTES
+                )
+                if completed.returncode == 0 and pdf_size is not None:
+                    try:
+                        publish_report_output(pdf_tmp, pdf)
+                        pdf_out = pdf
+                    except ValueError:
+                        raise
+                    except OSError:
+                        publish_report_output(pdf_tmp, pdf_fallback)
+                        print(
+                            f"  WARN: could not overwrite {pdf} (likely open "
+                            f"in a viewer); rendered output left at {pdf_fallback}"
+                        )
+                        pdf_out = pdf_fallback
+                else:
+                    print(
+                        "  WARN: secure Chromium fleet PDF render failed; HTML remains available"
+                    )
+        except ValueError:
+            raise
+        except Exception as exc:
+            print(f"  WARN: secure Chromium fleet PDF render failed: {exc}")
     return html, pdf_out
 
 
@@ -1215,13 +1298,27 @@ def main() -> int:
         return 1
 
     corr_path = fleet_dir / "fleet_correlation.json"
-    if not corr_path.exists():
-        print(f"correlation file missing — run fleet_correlate.py first: {corr_path}")
+    try:
+        corr_text = require_text_regular_file_no_follow(
+            corr_path, max_bytes=MAX_CASE_ARTIFACT_BYTES
+        )
+    except ValueError:
+        print(
+            "correlation file missing, unsafe, or oversized — run "
+            f"fleet_correlate.py first: {corr_path}"
+        )
         return 1
-    corr = json.loads(corr_path.read_text(encoding="utf-8"))
+    try:
+        corr = json.loads(corr_text)
+    except json.JSONDecodeError:
+        print(f"correlation file is invalid JSON: {corr_path}")
+        return 1
+    if not isinstance(corr, dict):
+        print(f"correlation file must contain a JSON object: {corr_path}")
+        return 1
 
     fig_dir = fleet_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    ensure_safe_output_directory(fig_dir)
 
     fig_verdict_distribution(corr, fig_dir / "verdict_distribution.png")
     fig_mitre_density(corr, fig_dir / "mitre_density.png")

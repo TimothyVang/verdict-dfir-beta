@@ -12,6 +12,7 @@ The contract is intentionally mechanical and cheap:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -118,6 +119,7 @@ def contract_env() -> dict[str, str]:
     env = json.loads(proc.stdout)
     env["FINDEVIL_LOG_LEVEL"] = "WARNING"
     env["PYTHONUNBUFFERED"] = "1"
+    env["FINDEVIL_OUTPUT_ROUTE"] = "local_controller"
     for key in (
         "PROJECT_LOCAL",
         "TMPDIR",
@@ -307,6 +309,11 @@ def rust_mcp_contract() -> None:
         temp = Path(td)
         evidence = temp / "contract.E01"
         evidence.write_bytes(b"CASEFORGE CONTRACT SYNTHETIC EVIDENCE\n")
+        evidence_hash = hashlib.sha256(evidence.read_bytes()).hexdigest()
+        env["FINDEVIL_CASE_OPEN_BINDING"] = json.dumps(
+            {"artifacts": [{"path": str(evidence.resolve()), "sha256": evidence_hash}]},
+            separators=(",", ":"),
+        )
         client = StdioClient(
             [str(REPO / "scripts" / "run-mcp-rust.sh")],
             cwd=temp,
@@ -316,7 +323,11 @@ def rust_mcp_contract() -> None:
             names = initialize_and_list(client, {"case_open", "evtx_query"})
             handle = client.call_tool(
                 "case_open",
-                {"image_path": str(evidence), "label": "caseforge-contract-smoke"},
+                {
+                    "image_path": str(evidence),
+                    "expected_sha256": evidence_hash,
+                    "label": "caseforge-contract-smoke",
+                },
             )
         finally:
             client.close()
@@ -345,6 +356,24 @@ def python_mcp_contract() -> None:
         prefix="caseforge-agent-contract-", dir=env["TMPDIR"]
     ) as td:
         temp = Path(td)
+        case_id = "caseforge-agent-contract"
+        marker = temp / ".verdict-case-marker"
+        marker.write_text(case_id + "\n", encoding="utf-8")
+        if os.name != "nt":
+            temp.chmod(0o700)
+            marker.chmod(0o600)
+        env.update(
+            {
+                "FINDEVIL_CUSTODY_BOUNDARY": "reserved_case",
+                "FINDEVIL_ACTIVE_CASE_DIR": str(temp),
+                "FINDEVIL_ACTIVE_CASE_ID": case_id,
+                "FINDEVIL_ACTIVE_RUN_ID": "run-caseforge-agent-contract",
+                "FINDEVIL_ACTIVE_STARTED_AT": "2026-07-10T00:00:00Z",
+                "FINDEVIL_ACTIVE_SIGNER": "ed25519",
+                "FINDEVIL_MEMORY_STORE": str(temp / "memory.sqlite"),
+                "FINDEVIL_EXPERT_MISS_LEDGER": str(temp / "expert_misses.jsonl"),
+            }
+        )
         client = StdioClient(
             [str(REPO / "scripts" / "run-mcp-python.sh")],
             cwd=temp,
@@ -352,9 +381,7 @@ def python_mcp_contract() -> None:
         )
         try:
             names = initialize_and_list(client, {"audit_verify", "manifest_verify"})
-            body = client.call_tool(
-                "audit_verify", {"path": str(temp / "missing-audit.jsonl")}
-            )
+            body = client.call_tool("audit_verify", {"path": str(temp / "audit.jsonl")})
         finally:
             client.close()
     if body.get("ok") is not True or body.get("record_count") != 0:

@@ -22,7 +22,7 @@ three files `main()` loads unconditionally (a missing one is a hard error):
 
 | File | Role |
 |---|---|
-| `run.manifest.json` | Signed, hash-chained manifest (rs_merkle root plus the effective signer tier: Ed25519 by default, Sigstore when identity/transparency is configured, or explicit stub fallback). Drives the chain-of-custody figure and the offline-verification appendix. |
+| `run.manifest.json` | Hash-chained manifest envelope (rs_merkle root plus the effective signer tier: Ed25519 by default, Sigstore when identity/transparency is configured, or explicit stub fallback). It is cryptographically signed only when `signature_verified` is true for Ed25519/Sigstore; a stub is an unauthenticated development placeholder. Drives the chain-of-custody figure and the offline-verification appendix. |
 | `verdict.json` | The Verdict word plus every structured payload the report renders (see below). |
 | `audit.jsonl` | Append-only, hash-chained audit log (`prev_hash` per line). Parsed line-by-line for the chain-of-custody figure; bad lines are skipped, not fatal. |
 
@@ -50,7 +50,7 @@ Optional **sidecar files** in the Case dir are read only if present:
 `customer_release_gate.final.json` (final release-gate state). Each is best-effort:
 absent or malformed JSON degrades gracefully instead of failing the render.
 
-> Only the **48 product tools** (34 Rust + 14 Python) are audit-chained, so every
+> Only the **57 product tools** (43 Rust + 14 Python) are audit-chained, so every
 > Finding the report prints cites a `tool_call_id` traceable back through `audit.jsonl`.
 > See `docs/reference/mcp-and-tools.md` for the tool surface.
 

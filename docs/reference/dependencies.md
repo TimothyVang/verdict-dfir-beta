@@ -15,8 +15,8 @@ investigation in-process; the external DFIR binaries are needed for memory/disk/
 | Tool | Pin | Why | Install |
 |---|---|---|---|
 | `claude` CLI | latest | The agent IS the engine (A2) | `npm i -g @anthropic-ai/claude-code` |
-| Rust | **1.88** (`rust-toolchain.toml`) | builds `findevil-mcp` | `rustup` |
-| `cargo` | with Rust 1.88 | build/test | rustup |
+| Rust | **1.91** (`rust-toolchain.toml`) | builds `findevil-mcp` | `rustup` |
+| `cargo` | with Rust 1.91 | build/test | rustup |
 | C toolchain (`cc`) | system | links Rust crates (rustup does not install it) | `build-essential` (Debian/Ubuntu) · `xcode-select --install` (macOS) |
 | `uv` + Python | **3.11** | `findevil-agent-mcp` venv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | Node | **20** | `apps/web` dashboard | nodejs.org / nvm |
@@ -51,12 +51,11 @@ host. Each version below is the script's **default** and is overridable by env v
 | `volatility3` | **see note** | Volatility Software License (BSD-2-style) | `vol_pslist/psscan/psxview/malfind` | BinaryNotFound |
 | `hayabusa` | `2.19.0` | AGPL-3.0 | `hayabusa_scan` | BinaryNotFound (Sigma scan skipped) |
 | `chainsaw` | `2.13.0` | Elastic License 2.0 | optional EVTX hunting (not a core tool) | n/a |
-| `velociraptor` | `0.74.6` | Apache-2.0 | `vel_collect` | BinaryNotFound |
 | `sleuthkit` (`fls`/`icat`/`mmls`) | system pkg | IPL-1.0 / CPL-1.0 | `disk_extract_artifacts` reads `.e01`/`.dd` content directly; `mmls` resolves the partition offset | disk evidence stays custody-only (no registry/MFT/prefetch) |
 | `pandoc` | `3.1.11.1` | GPL-2.0 | report HTML/PDF (`render_report.py`) | HTML/PDF render skipped |
 | `tshark` | system pkg | GPL-2.0 | `pcap_triage` (preferred) | falls back to zeek |
 | `zeek` | system pkg | BSD-3-Clause | `zeek_summary`, `pcap_triage` (fallback) | env-limit, not evidence-absence |
-| `yara-x` | `1.12.0` (Rust crate) | BSD-3-Clause / Apache-2.0 | `yara_scan` | n/a — **in-process, not a subprocess** |
+| `yara-x` | `1.19.0` (Rust crate) | BSD-3-Clause / Apache-2.0 | `yara_scan` | n/a — **in-process, not a subprocess** |
 
 > **volatility3 version — a real spec/code divergence to know about.** Two install paths pin
 > different versions:
@@ -70,7 +69,7 @@ host. Each version below is the script's **default** and is overridable by env v
 > tracked here rather than silently resolved.
 
 Binary overrides (env-var first, then PATH): `VOLATILITY_BIN`, `HAYABUSA_BIN`,
-`VELOCIRAPTOR_BIN`, `TSHARK_BIN`, `ZEEK_BIN`. See [`environment-variables.md`](environment-variables.md).
+`TSHARK_BIN`, `ZEEK_BIN`. See [`environment-variables.md`](environment-variables.md).
 
 ---
 
@@ -84,16 +83,16 @@ spec amendment.
 | `evtx` | `=0.11.2` | `evtx_query`, `sysmon_network_query` (~1600× faster than python-evtx) |
 | `frnsc-prefetch` | `=0.13.3` | `prefetch_parse` |
 | `forensic-rs` | `=0.13` | prefetch FS abstraction |
-| `mft` | `=0.6.1` | `mft_timeline` (0.7+ needs rustc 1.90; we're locked at 1.88) |
-| `yara-x` (+ `-macros`/`-parser`/`-proto`) | `1.12.0` | `yara_scan` (in-process) |
-| `usnjrnl-forensic` | `0.6.0` | `usnjrnl_query` |
+| `mft` | `=0.7.0` | `mft_timeline` (header-preflighted before parsing hostile artifacts) |
+| `yara-x` (+ `-macros`/`-parser`/`-proto`) | `1.19.0` | `yara_scan` (in-process; Wasmtime 43 line) |
+| `ntfs-core` | `0.6.0` | `usnjrnl_query` (local streaming adapter) |
 | `sha2` | `0.10` | output SHA-256 over canonical JSON |
 | `uuid` | `1.x` | `case_id` |
 | `serde` / `serde_json` / `schemars` | 1.x / 1.x / 1.x | typed I/O + JSON schema |
 | `tokio` / `chrono` / `tracing` / `hex` / `thiserror` | 1.x / 0.4 / 0.1 / 0.4 / 1.0 | runtime, time, logging |
 
 > Registry hive parsing is **in-tree** (`src/tools/regf.rs`), not a crate: `frnsc-hive` panicked
-> on XP-era `lf`/`li`/`ri` cells and `notatin` doesn't build under rustc 1.88.
+> on XP-era `lf`/`li`/`ri` cells; the maintained reader is now in-tree.
 > `rmcp` (the MCP SDK) is **deliberately not activated** — the server in `src/server.rs` is a
 > hand-rolled stdio JSON-RPC 2.0 implementation pinned to MCP 2024-11-05.
 
@@ -113,8 +112,9 @@ spec amendment.
 | `anthropic` | `0.97.0` | LLM client (judge/correlator helpers) |
 | `pytest` / `pytest-asyncio` / `pytest-cov` / `ruff` / `mypy` | dev | test + lint + types |
 
-Crypto stack (in `services/agent/`): Ed25519 (the offline-verifiable default manifest signer),
-`sigstore` (opt-in identity/transparency signer tier), plus a hand-rolled `rs_merkle`-compatible
+Crypto stack (in `services/agent/`): Ed25519 (the default manifest signer; offline verification
+requires its externally trusted public-key fingerprint), `sigstore` (opt-in identity/transparency
+signer tier; verification requires exact trusted identity + issuer policy), plus a hand-rolled `rs_merkle`-compatible
 Merkle tree. **`opentimestamps-client` was REMOVED under Amendment A5** — the OTS/Bitcoin 4th tier is
 gone; the chain is 3 tiers (audit `prev_hash` → Merkle root → manifest signature).
 

@@ -45,6 +45,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from findevil_agent.events import Finding, VerifierAction
+from findevil_agent.resource_limits import MAX_FINDINGS_PER_POOL, require_collection_limit
 
 CONFIDENCE_VALUE = {"CONFIRMED": 1.0, "INFERRED": 0.6, "HYPOTHESIS": 0.3}
 THRESHOLD_CONFIRMED = 0.80
@@ -128,6 +129,14 @@ def judge_findings(
     drop to HYPOTHESIS but are still emitted (Spec #2 §"Epistemic
     hierarchy is strict" — HYPOTHESIS is a legal label).
     """
+    require_collection_limit("pool_a.findings", pool_a.findings, MAX_FINDINGS_PER_POOL)
+    require_collection_limit(
+        "pool_a.verified_actions", pool_a.verified_actions, MAX_FINDINGS_PER_POOL
+    )
+    require_collection_limit("pool_b.findings", pool_b.findings, MAX_FINDINGS_PER_POOL)
+    require_collection_limit(
+        "pool_b.verified_actions", pool_b.verified_actions, MAX_FINDINGS_PER_POOL
+    )
     started = time.monotonic()
 
     # Opt-in counter-hypothesis discipline (FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS=1,

@@ -63,6 +63,18 @@ class TestInputValidation:
         with pytest.raises(ValidationError):
             FindAiSignaturesInput(case_id="c", text="x", limit=10_001)
 
+    def test_inline_paths_and_categories_are_bounded_and_deduplicated(self) -> None:
+        with pytest.raises(ValidationError):
+            FindAiSignaturesInput(case_id="c", text="x" * 2_000_001)
+        with pytest.raises(ValidationError):
+            FindAiSignaturesInput(case_id="c", paths=[f"/evidence/{i}" for i in range(65)])
+        with pytest.raises(ValidationError, match="must be unique"):
+            FindAiSignaturesInput(
+                case_id="c",
+                text="x",
+                categories=["agent_framework", "agent_framework"],
+            )
+
 
 class TestHandler:
     @pytest.mark.asyncio
@@ -122,3 +134,13 @@ class TestHandler:
 
         out = await SPEC.handler(FindAiSignaturesInput(case_id="c", text="import openai"))
         json.dumps(out.model_dump())
+
+    @pytest.mark.asyncio
+    async def test_output_reports_resource_telemetry(self) -> None:
+        out = await SPEC.handler(FindAiSignaturesInput(case_id="c", text="import openai"))
+        assert out.bytes_scanned == len("import openai")
+        assert out.byte_limit == 32 * 1024 * 1024
+        assert out.paths_requested == 0
+        assert out.paths_considered == 0
+        assert out.sources_skipped == 0
+        assert out.truncation_reason is None

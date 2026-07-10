@@ -26,7 +26,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = ROOT / "fixtures" / "nhc003-synth-carve.dd"
 GOLDEN = ROOT / "goldens" / "nhc003-synth-carve"
-MAKE = ROOT / "scripts" / "make-nhc003-synth-image.py"
+MAKE = ROOT / "goldens" / "nhc003-synth-carve" / "make-image.py"
 
 
 def _load_find_evil_auto():

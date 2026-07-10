@@ -22,9 +22,11 @@ Usage:
 
 Exit code 0 iff the audit chain is intact AND every traced finding resolves to a
 tool execution and a Merkle leaf; 1 otherwise. A run with zero findings is OK when
-its verdict does not assert evil (a scoped NO_EVIL / INDETERMINATE control whose
-custody value is exactly that the chain, manifest, and verdict verify with nothing
-to trace); a SUSPICIOUS verdict with zero findings stays INCOMPLETE.
+its verdict does not assert evil (a scoped NO_EVIL / INDETERMINATE control with
+nothing to trace); a SUSPICIOUS verdict with zero findings stays INCOMPLETE.
+This command checks traceability and hash-chain/manifest linkage, not the Merkle
+root or signer authentication. Use ``manifest_verify`` (with trusted signer
+policy supplied outside the case) for the full cryptographic decision.
 """
 
 from __future__ import annotations
@@ -39,9 +41,13 @@ _CANONICAL_SEPARATORS = (",", ":")
 
 
 def _canonicalize(obj: Any) -> bytes:
-    """RFC-8785-compatible canonical bytes — identical to audit_log.canonicalize_json."""
+    """VERDICT canonical JSON v1 bytes, matching audit_log.canonicalize_json."""
     return json.dumps(
-        obj, sort_keys=True, separators=_CANONICAL_SEPARATORS, ensure_ascii=True
+        obj,
+        sort_keys=True,
+        separators=_CANONICAL_SEPARATORS,
+        ensure_ascii=True,
+        allow_nan=False,
     ).encode("ascii")
 
 

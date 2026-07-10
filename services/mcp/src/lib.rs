@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+mod pathnorm;
 pub mod sanitize;
 pub mod server;
 pub mod tools;
@@ -32,14 +33,30 @@ pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Acquire the process-wide environment lock for a test, tolerating poisoning.
+///
+/// Tests that mutate `std::env` serialize on [`ENV_LOCK`]. If one such test
+/// panics while holding the guard (e.g. a genuine assertion failure on one
+/// platform), a plain `.lock().unwrap()` in every other env test would then
+/// panic on the poisoned mutex, turning one real failure into a cascade of
+/// spurious ones. Recovering the guard keeps the failure localized to the test
+/// that actually failed.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Re-exports for test + binary convenience.
 pub use crate::crypto::merkle::{verify_inclusion_proof, InclusionProof, MerkleError, MerkleTree};
 pub use crate::tools::ausearch::{
     ausearch, path_looks_like_audit_log, AuditRow, AusearchError, AusearchInput, AusearchOutput,
 };
 pub use crate::tools::browser_history::{
-    browser_history, path_looks_like_browser_history, BrowserHistoryError, BrowserHistoryInput,
-    BrowserHistoryOutput, BrowserHistoryRow,
+    browser_history, path_looks_like_browser_history, BrowserArtifactKind, BrowserArtifactRow,
+    BrowserAutofillMetadataRow, BrowserCookieMetadataRow, BrowserDownloadRow, BrowserHistoryError,
+    BrowserHistoryInput, BrowserHistoryOutput, BrowserHistoryRow, BrowserLoginMetadataRow,
 };
 pub use crate::tools::bulk_extract::{
     build_bulk_args, bulk_extract, compare_offset, image_name_is_dash_leading, parse_feature_line,
@@ -106,9 +123,6 @@ pub use crate::tools::sysmon_network_query::{
 };
 pub use crate::tools::usnjrnl_query::{
     path_looks_like_usnjrnl, usnjrnl_query, UsnJrnlEntry, UsnJrnlError, UsnJrnlInput, UsnJrnlOutput,
-};
-pub use crate::tools::vel_collect::{
-    vel_collect, VelCollectError, VelCollectInput, VelCollectOutput, VelRow,
 };
 pub use crate::tools::vol_malfind::{
     vol_malfind, VolInjection, VolMalfindError, VolMalfindInput, VolMalfindOutput,

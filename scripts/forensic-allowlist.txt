@@ -63,9 +63,6 @@ mac_apt
 # --- INDX record parser (indx_parse / usnjrnl_query) ---
 INDXParse.py
 
-# --- Velociraptor collection (vel_collect) ---
-velociraptor
-
 # --- Linux audit/login accounting (ausearch / journalctl_query / login_accounting) ---
 ausearch
 journalctl

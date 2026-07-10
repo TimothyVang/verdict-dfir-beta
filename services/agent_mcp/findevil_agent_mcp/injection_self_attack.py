@@ -180,8 +180,9 @@ class AttackResult:
     @property
     def custody_held(self) -> bool:
         """The full claim: neutralized AND deterministic AND the sealed
-        manifest over the sanitized output verifies offline AND that exact
-        output hash is the sealed tool-output leaf."""
+        manifest over the sanitized output replays consistently (under this
+        harness's unauthenticated StubSigner envelope) AND that exact output
+        hash is the sealed tool-output leaf. This is not signer authentication."""
         return (
             bool(self.neutralized_counts)
             and self.deterministic

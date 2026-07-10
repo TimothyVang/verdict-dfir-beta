@@ -5,10 +5,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import stat
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from findevil_agent.crypto import anchor
+from findevil_agent.crypto import manifest as manifest_module
 from findevil_agent.crypto.audit_log import AuditLog
 from findevil_agent.crypto.manifest import (
     MANIFEST_VERSION,
@@ -27,6 +31,29 @@ def _good_transparency_block(merkle_root_hex: str) -> dict:
     body = anchor._build_statement(merkle_root_hex)._contents
     body_b64 = base64.b64encode(body).decode("ascii")
     root_hex = hashlib.sha256(b"\x00" + body).hexdigest()
+    checkpoint = "rekor - 000\n1\n<root>\n"
+    bundle_json = json.dumps(
+        {
+            "verificationMaterial": {
+                "tlogEntries": [
+                    {
+                        "canonicalizedBody": body_b64,
+                        "logId": {"keyId": base64.b64encode(bytes.fromhex("c0ffee")).decode()},
+                        "logIndex": "0",
+                        "integratedTime": "1700000000",
+                        "inclusionProof": {
+                            "checkpoint": {"envelope": checkpoint},
+                            "hashes": [],
+                            "logIndex": "0",
+                            "rootHash": base64.b64encode(bytes.fromhex(root_hex)).decode(),
+                            "treeSize": "1",
+                        },
+                    }
+                ]
+            }
+        },
+        separators=(",", ":"),
+    )
     return {
         "kind": "rekor",
         "anchored": True,
@@ -38,10 +65,11 @@ def _good_transparency_block(merkle_root_hex: str) -> dict:
             "log_id": "c0ffee",
             "log_index": 0,
             "integrated_time": 1_700_000_000,
-            "entry_uuid": "deadbeef",
+            "entry_uuid": None,
             "body": body_b64,
+            "bundle_b64": base64.b64encode(bundle_json.encode()).decode("ascii"),
             "inclusion_proof": {
-                "checkpoint": "rekor - 000\n1\n<root>\n",
+                "checkpoint": checkpoint,
                 "hashes": [],
                 "log_index": 0,
                 "root_hash": root_hex,
@@ -234,6 +262,83 @@ class TestWriteManifest:
 
 
 class TestVerifyManifest:
+    def test_manifest_read_is_bounded_and_rejects_links(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = tmp_path / "run.manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        hardlink = tmp_path / "hardlink.manifest.json"
+        hardlink.hardlink_to(manifest)
+        with pytest.raises(ValueError, match="hard-linked"):
+            verify_manifest(manifest)
+
+        hardlink.unlink()
+        target = tmp_path / "target.manifest.json"
+        manifest.rename(target)
+        manifest.symlink_to(target.name)
+        with pytest.raises(ValueError, match="symlink"):
+            verify_manifest(manifest)
+
+        manifest.unlink()
+        monkeypatch.setattr(manifest_module, "MAX_MANIFEST_BYTES", 16)
+        manifest.write_bytes(b"{" + b" " * 16 + b"}")
+        with pytest.raises(ValueError, match="size limit"):
+            verify_manifest(manifest)
+
+    def test_manifest_read_rechecks_link_count_after_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = tmp_path / "run.manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        real_fstat = manifest_module.os.fstat
+        calls = 0
+
+        class ChangedLinkCount:
+            def __init__(self, metadata: object) -> None:
+                self._metadata = metadata
+
+            def __getattr__(self, name: str) -> object:
+                if name == "st_nlink":
+                    return 2
+                return getattr(self._metadata, name)
+
+        def fstat_with_link_race(descriptor: int) -> object:
+            nonlocal calls
+            calls += 1
+            metadata = real_fstat(descriptor)
+            return ChangedLinkCount(metadata) if calls == 2 else metadata
+
+        monkeypatch.setattr(manifest_module.os, "fstat", fstat_with_link_race)
+
+        with pytest.raises(ValueError, match="changed while it was being read"):
+            verify_manifest(manifest)
+
+    def test_verification_uses_one_verified_audit_snapshot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = _seed_log(tmp_path / "audit.jsonl")
+        manifest = build_manifest(
+            case_id="case-snapshot",
+            run_id="ver-snapshot",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=StubSigner(run_id="ver-snapshot"),
+        )
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        unverified_reopens = 0
+
+        def forbidden_iter_records(self: AuditLog):  # type: ignore[no-untyped-def]
+            nonlocal unverified_reopens
+            unverified_reopens += 1
+            raise AssertionError("verifier reopened the audit log without its snapshot")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(AuditLog, "iter_records", forbidden_iter_records)
+        result = verify_manifest(path)
+
+        assert result.overall is True
+        assert unverified_reopens == 0
+
     def test_clean_manifest_verifies(self, tmp_path: Path) -> None:
         log = _seed_log(tmp_path / "audit.jsonl")
         manifest = build_manifest(
@@ -300,6 +405,38 @@ class TestVerifyManifest:
         assert result.audit_chain_ok is True, result.audit_chain_ok
         assert result.overall is True
 
+    def test_verification_never_changes_audit_permissions(self, tmp_path: Path) -> None:
+        source = tmp_path / "source"
+        source.mkdir()
+        log = _seed_log(source / "audit.jsonl")
+        manifest = build_manifest(
+            case_id="case-read-only-verify",
+            run_id="ver-read-only-verify",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=StubSigner(run_id="ver-read-only-verify"),
+        )
+        manifest_path = write_manifest(manifest, source / "run.manifest.json")
+
+        external = tmp_path / "external"
+        external.mkdir(mode=0o755)
+        audit_override = external / "arbitrary-current-user-file.jsonl"
+        audit_override.write_bytes((source / "audit.jsonl").read_bytes())
+        external.chmod(0o755)
+        audit_override.chmod(0o644)
+        before = (
+            stat.S_IMODE(external.stat().st_mode),
+            stat.S_IMODE(audit_override.stat().st_mode),
+        )
+
+        result = verify_manifest(manifest_path, audit_log_path=audit_override)
+
+        assert result.overall is True
+        assert (
+            stat.S_IMODE(external.stat().st_mode),
+            stat.S_IMODE(audit_override.stat().st_mode),
+        ) == before
+
     def test_ed25519_manifest_verifies_cryptographically_offline(self, tmp_path: Path) -> None:
         from findevil_agent.crypto.signer import LocalEd25519Signer
 
@@ -314,11 +451,47 @@ class TestVerifyManifest:
         path = write_manifest(manifest, tmp_path / "run.manifest.json")
         assert manifest.signature["kind"] == "ed25519"
 
-        result = verify_manifest(path)
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
         assert result.overall is True
         assert result.signature_kind == "ed25519"
         # The real claim: a genuine offline cryptographic verification.
         assert result.signature_verified is True
+
+        unpinned = verify_manifest(path)
+        assert unpinned.signature_verified is not True
+        assert "externally trusted" in str(unpinned.signature_verified)
+        assert unpinned.overall is False
+
+        wrong_pin = verify_manifest(path, expected_ed25519_fingerprint="0" * 64)
+        assert wrong_pin.signature_verified is not True
+        assert "trusted fingerprint" in str(wrong_pin.signature_verified)
+        assert wrong_pin.overall is False
+
+    def test_configured_ed25519_pin_cannot_be_overridden_by_caller(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from findevil_agent.crypto.signer import LocalEd25519Signer
+
+        log = _seed_log(tmp_path / "audit.jsonl")
+        manifest = build_manifest(
+            case_id="case-ed-policy",
+            run_id="ver-ed-policy",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=LocalEd25519Signer(key_path=tmp_path / "signing.key"),
+        )
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        actual = str(manifest.signature["cert_fingerprint"])
+        monkeypatch.setenv("FINDEVIL_ED25519_EXPECTED_FINGERPRINT", "0" * 64)
+
+        result = verify_manifest(path, expected_ed25519_fingerprint=actual)
+
+        assert result.signature_verified is not True
+        assert "conflicts with configured trust policy" in str(result.signature_verified)
+        assert result.overall is False
 
     def test_ed25519_tampered_body_fails_signature_verification(self, tmp_path: Path) -> None:
         from findevil_agent.crypto.signer import LocalEd25519Signer
@@ -336,7 +509,10 @@ class TestVerifyManifest:
         obj["case_id"] = "case-FORGED"
         path.write_text(json.dumps(obj), encoding="utf-8")
 
-        result = verify_manifest(path)
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
         # Body no longer matches the signed bytes: honest reason string, not True.
         assert result.signature_verified is not True
         assert "ed25519" in str(result.signature_verified)
@@ -370,10 +546,52 @@ class TestVerifyManifest:
         ).decode("ascii")
         path.write_text(json.dumps(obj), encoding="utf-8")
 
-        result = verify_manifest(path)
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
         assert result.signature_verified is not True
         assert "ed25519" in str(result.signature_verified)
         # A flipped signature bit must fail overall, not just the side-signal.
+        assert result.overall is False
+
+    def test_ed25519_rejects_identity_key_signature_forgery(self, tmp_path: Path) -> None:
+        """A pinned low-order key must fail before the platform verifier runs."""
+        log = _seed_log(tmp_path / "audit.jsonl")
+        manifest = build_manifest(
+            case_id="case-ed-identity-forgery",
+            run_id="ver-ed-identity-forgery",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=StubSigner(run_id="ver-ed-identity-forgery"),
+        )
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        identity = b"\x01" + (b"\x00" * 31)
+        forged_signature = identity + (b"\x00" * 32)
+        fingerprint = hashlib.sha256(identity).hexdigest()
+        bundle = {
+            "kind": "ed25519",
+            "public_key_b64": base64.b64encode(identity).decode("ascii"),
+            "signature_b64": base64.b64encode(forged_signature).decode("ascii"),
+            "payload_sha256": obj["signature"]["payload_sha256"],
+            "cert_fingerprint": fingerprint,
+        }
+        obj["signature"] = {
+            "kind": "ed25519",
+            "bundle_b64": base64.b64encode(
+                json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()
+            ).decode("ascii"),
+            "payload_sha256": obj["signature"]["payload_sha256"],
+            "cert_fingerprint": fingerprint,
+            "signed_at": "2026-04-24T00:00:00Z",
+        }
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+        result = verify_manifest(path, expected_ed25519_fingerprint=fingerprint)
+
+        assert result.signature_payload_ok is True
+        assert result.signature_verified is not True
         assert result.overall is False
 
     def test_records_signer_kind_and_honest_verification(self, tmp_path: Path) -> None:
@@ -396,6 +614,48 @@ class TestVerifyManifest:
         assert result.signature_kind == "stub"
         assert result.signature_verified is not True
         assert "not cryptographic proof" in str(result.signature_verified)
+
+    def test_forged_sigstore_kind_and_bundle_fail_overall(self, tmp_path: Path) -> None:
+        import base64
+
+        log = _seed_log(tmp_path / "audit.jsonl")
+        manifest = build_manifest(
+            case_id="case-forged-sigstore",
+            run_id="ver-forged-sigstore",
+            started_at="2026-04-24T00:00:00Z",
+            audit_log=log,
+            signer=StubSigner(run_id="ver-forged-sigstore"),
+        )
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj["signature"]["kind"] = "sigstore"
+        obj["signature"]["bundle_b64"] = base64.b64encode(b'\x7b"fake":true\x7d').decode()
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+        result = verify_manifest(path)
+
+        assert result.audit_chain_ok is True
+        assert result.signature_kind == "sigstore"
+        assert result.signature_verified is not True
+        assert result.overall is False
+
+    def test_sigstore_identity_without_exact_issuer_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from findevil_agent.crypto.manifest import _verify_sigstore_signature
+
+        monkeypatch.setenv("FINDEVIL_SIGSTORE_EXPECTED_IDENTITY", "release@example.test")
+        monkeypatch.delenv("FINDEVIL_SIGSTORE_EXPECTED_ISSUER", raising=False)
+
+        result = _verify_sigstore_signature(
+            {"bundle_b64": "not-even-decoded"},
+            {"case_id": "case-sigstore"},
+            expected_identity=None,
+            expected_issuer=None,
+        )
+
+        assert result is not True
+        assert "FINDEVIL_SIGSTORE_EXPECTED_ISSUER" in str(result)
 
     def test_fallback_reason_recorded_in_manifest(self, tmp_path: Path) -> None:
         from findevil_agent.crypto.signer import FallbackSigner
@@ -617,8 +877,8 @@ class TestCitationGate:
 
 class TestEntailmentReVerification:
     """manifest_verify re-runs the entailment matcher over the sealed slices
-    offline (no tool re-run). entailment_ok is a separate honest signal — it
-    does NOT gate overall, exactly like signature_verified."""
+    offline (no tool re-run). entailment_ok is a separate honest signal and
+    does NOT gate overall; cryptographic-tier signature verification does."""
 
     @staticmethod
     def _replay_record(*, sealed_actual: str) -> dict:
@@ -673,11 +933,14 @@ class TestEntailmentReVerification:
 
 
 class TestTransparencyAnchor:
-    """The optional Rekor/RFC-3161 anchor is a NON-GATING side-signal attached
-    AFTER signing. These prove the absent-by-default custody invariant: adding
-    the block never invalidates the signature and never flips ``overall``."""
+    """The optional Rekor/RFC-3161 anchor is attached after signing.
 
-    def _ed25519_manifest(self, tmp_path: Path):
+    The signed request commitment decides whether it gates ``overall``:
+    unrequested/legacy anchors remain compatibility side-signals, while a
+    requested anchor must be present and authenticate successfully.
+    """
+
+    def _ed25519_manifest(self, tmp_path: Path, *, requested: bool = False):
         from findevil_agent.crypto.signer import LocalEd25519Signer
 
         log = _seed_log(tmp_path / "audit.jsonl")
@@ -687,7 +950,143 @@ class TestTransparencyAnchor:
             started_at="2026-04-24T00:00:00Z",
             audit_log=log,
             signer=LocalEd25519Signer(key_path=tmp_path / "signing.key"),
+            transparency_anchor_requested=requested,
         )
+
+    def test_requested_commitment_is_signed_and_missing_anchor_gates(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        signed_body = _to_json_safe(manifest, exclude_signature=True)
+        assert signed_body["transparency_anchor_requested"] is True
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
+
+        assert result.signature_verified is True
+        assert result.transparency_ok is not True
+        assert "requested" in str(result.transparency_ok)
+        assert result.overall is False
+
+    def test_stripping_requested_proof_still_leaves_overall_failed(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        path = write_manifest(
+            replace(
+                manifest,
+                transparency_log=_good_transparency_block(manifest.merkle_root_hex),
+            ),
+            tmp_path / "run.manifest.json",
+        )
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj.pop("transparency_log")
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
+
+        # The post-signing proof was removable without altering the Ed25519
+        # signature, but the signed request remains and makes removal fail.
+        assert result.signature_payload_ok is True
+        assert result.signature_verified is True
+        assert result.transparency_ok is not True
+        assert result.overall is False
+
+    def test_stripping_request_commitment_breaks_signature_payload(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj.pop("transparency_anchor_requested")
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
+
+        assert result.signature_payload_ok is not True
+        assert result.signature_verified is not True
+        assert result.overall is False
+
+    def test_requested_authenticated_anchor_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        anchored = replace(
+            manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
+        )
+        path = write_manifest(anchored, tmp_path / "run.manifest.json")
+        monkeypatch.setattr(
+            anchor,
+            "_verify_sigstore_dsse",
+            lambda bundle, identity, issuer: (
+                "application/vnd.in-toto+json",
+                anchor._build_statement(manifest.merkle_root_hex)._contents,
+            ),
+        )
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+            expected_sigstore_identity="release@example.test",
+            expected_sigstore_issuer="https://issuer.example.test",
+        )
+
+        assert result.transparency_ok is True
+        assert result.overall is True
+
+    def test_requested_corrupted_anchor_gates_overall(self, tmp_path: Path) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        block = _good_transparency_block(manifest.merkle_root_hex)
+        block["rekor"]["bundle_b64"] = base64.b64encode(b'{"forged":true}').decode()
+        path = write_manifest(
+            replace(manifest, transparency_log=block),
+            tmp_path / "run.manifest.json",
+        )
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+            expected_sigstore_identity="release@example.test",
+            expected_sigstore_issuer="https://issuer.example.test",
+        )
+
+        assert result.transparency_ok is not True
+        assert result.signature_verified is True
+        assert result.overall is False
+
+    def test_requested_rfc3161_is_not_an_authenticated_anchor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = self._ed25519_manifest(tmp_path, requested=True)
+        token = base64.b64encode(b"syntactically-valid-tsr").decode("ascii")
+        block = {
+            "kind": "rfc3161",
+            "anchored": True,
+            "subject": {"merkle_root_sha256": manifest.merkle_root_hex},
+            "tsa": {"tsr_b64": token, "authenticated": False},
+        }
+        path = write_manifest(
+            replace(manifest, transparency_log=block),
+            tmp_path / "run.manifest.json",
+        )
+        monkeypatch.setattr(anchor, "_openssl_available", lambda: True)
+        monkeypatch.setattr(
+            anchor,
+            "_run_openssl",
+            lambda args: f"Message data:\n    {manifest.merkle_root_hex}\n",
+        )
+
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+        )
+
+        assert result.transparency_ok is not True
+        assert "certificate chain was not pinned or verified" in str(result.transparency_ok)
+        assert result.overall is False
 
     def test_block_excluded_from_signed_body(self, tmp_path: Path) -> None:
         manifest = self._ed25519_manifest(tmp_path)
@@ -705,20 +1104,69 @@ class TestTransparencyAnchor:
         assert "transparency_log" in on_disk
         assert "signature" in on_disk
 
-    def test_ed25519_still_verifies_offline_with_anchor_present(self, tmp_path: Path) -> None:
+    def test_legacy_manifest_without_request_field_keeps_anchor_non_gating(
+        self, tmp_path: Path
+    ) -> None:
+        from findevil_agent.crypto.audit_log import canonicalize_json
+
+        manifest = self._ed25519_manifest(tmp_path)
+        path = write_manifest(manifest, tmp_path / "run.manifest.json")
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        obj.pop("transparency_anchor_requested")
+        obj["transparency_log"] = {
+            "kind": "none",
+            "anchored": False,
+            "subject": {"merkle_root_sha256": manifest.merkle_root_hex},
+            "fallback_reason": "legacy side-signal failed",
+        }
+        signed_body = {
+            key: value for key, value in obj.items() if key not in ("signature", "transparency_log")
+        }
+        bundle = StubSigner(run_id="legacy-anchor").sign(canonicalize_json(signed_body))
+        obj["signature"] = {
+            "payload_sha256": bundle.payload_sha256,
+            "bundle_b64": bundle.bundle_b64,
+            "cert_fingerprint": bundle.cert_fingerprint,
+            "signed_at": bundle.signed_at,
+            "kind": bundle.kind,
+        }
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+        result = verify_manifest(path)
+
+        assert result.signature_payload_ok is True
+        assert result.transparency_ok is not True
+        assert result.overall is True
+
+    def test_ed25519_still_verifies_offline_with_anchor_present(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
         manifest = self._ed25519_manifest(tmp_path)
         anchored = replace(
             manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
         )
         path = write_manifest(anchored, tmp_path / "run.manifest.json")
 
-        result = verify_manifest(path)
+        monkeypatch.setattr(
+            anchor,
+            "_verify_sigstore_dsse",
+            lambda bundle, identity, issuer: (
+                "application/vnd.in-toto+json",
+                anchor._build_statement(manifest.merkle_root_hex)._contents,
+            ),
+        )
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+            expected_sigstore_identity="release@example.test",
+            expected_sigstore_issuer="https://issuer.example.test",
+        )
         # The core claim: attaching + re-writing the anchor does NOT break the
         # already-computed Ed25519 signature.
         assert result.signature_kind == "ed25519"
         assert result.signature_verified is True, result.signature_verified
         assert result.overall is True
-        # And the anchor itself verifies offline (real RFC-6962 inclusion proof).
+        # And the authenticated DSSE statement binds the manifest Merkle root.
         assert result.transparency_ok is True, result.transparency_ok
 
     def test_overall_unchanged_by_anchor_presence(self, tmp_path: Path) -> None:
@@ -726,29 +1174,40 @@ class TestTransparencyAnchor:
         # must be identical (True) both ways.
         manifest = self._ed25519_manifest(tmp_path)
         bare = write_manifest(manifest, tmp_path / "bare.manifest.json")
-        bare_result = verify_manifest(bare)
+        expected_fingerprint = str(manifest.signature["cert_fingerprint"])
+        bare_result = verify_manifest(bare, expected_ed25519_fingerprint=expected_fingerprint)
 
         anchored = replace(
             manifest, transparency_log=_good_transparency_block(manifest.merkle_root_hex)
         )
         anchored_path = write_manifest(anchored, tmp_path / "anchored.manifest.json")
         # Point the anchored manifest's verification at the same audit log.
-        anchored_result = verify_manifest(anchored_path, audit_log_path=tmp_path / "audit.jsonl")
+        anchored_result = verify_manifest(
+            anchored_path,
+            audit_log_path=tmp_path / "audit.jsonl",
+            expected_ed25519_fingerprint=expected_fingerprint,
+        )
         assert bare_result.overall is True
         assert anchored_result.overall == bare_result.overall
 
     def test_corrupted_anchor_flagged_but_does_not_gate_overall(self, tmp_path: Path) -> None:
         manifest = self._ed25519_manifest(tmp_path)
         block = _good_transparency_block(manifest.merkle_root_hex)
-        # Corrupt the inclusion proof's declared root so it no longer chains.
-        block["rekor"]["inclusion_proof"]["root_hash"] = "ff" * 32
+        # Corrupt the authenticated Bundle. Display-only normalized proof fields
+        # are deliberately insufficient to authenticate an anchor.
+        block["rekor"]["bundle_b64"] = base64.b64encode(b'{"forged":true}').decode()
         anchored = replace(manifest, transparency_log=block)
         path = write_manifest(anchored, tmp_path / "run.manifest.json")
 
-        result = verify_manifest(path)
+        result = verify_manifest(
+            path,
+            expected_ed25519_fingerprint=str(manifest.signature["cert_fingerprint"]),
+            expected_sigstore_identity="release@example.test",
+            expected_sigstore_issuer="https://issuer.example.test",
+        )
         # The corruption is surfaced honestly as a reason string ...
         assert result.transparency_ok is not True
-        assert "inclusion proof" in str(result.transparency_ok)
+        assert "Sigstore bundle did not verify" in str(result.transparency_ok)
         # ... but the signature is intact and overall stays True (non-gating).
         assert result.signature_verified is True
         assert result.overall is True

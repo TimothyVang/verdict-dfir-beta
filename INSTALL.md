@@ -6,7 +6,7 @@ pitch see [README.md](README.md); for run modes and every flag see
 
 VERDICT runs as a [Claude Code](https://claude.com/claude-code) agent. Installation builds the two
 product MCP servers and the host DFIR toolchain; Claude Code auto-spawns the servers from
-`.mcp.json` on session start. The product surface is 48 tools total: 34 Rust DFIR tools in
+`.mcp.json` on session start. The product surface is 57 tools total: 43 Rust DFIR tools in
 `findevil-mcp` plus 14 Python crypto/ACH/memory/ACP/expert-feedback tools in
 `findevil-agent-mcp`.
 
@@ -22,7 +22,7 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 
 | Tool | Version | Why | Required? |
 |---|---|---|---|
-| Rust + Cargo | 1.88 (pinned in `rust-toolchain.toml`) | builds `findevil-mcp` (34 DFIR tools) | **yes** |
+| Rust + Cargo | 1.88 (pinned in `rust-toolchain.toml`) | builds `findevil-mcp` (43 DFIR tools) | **yes** |
 | uv | latest | syncs the Python `findevil-agent-mcp` env (14 tools) | **yes** |
 | Python | 3.11–3.12 | runs the Python `findevil-agent-mcp` + smoke/score tooling | **yes** |
 | git | recent | clones the repo; used by the smokes | **yes** |
@@ -40,8 +40,11 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 ### Two hard floors (stated plainly, not bugs)
 
 - **The Claude credential is required** for the investigating agent (one of the three modes above).
-- **Disk-image inner-volume extraction needs Sleuth Kit/libewf locally or the SANS SIFT VM** (a
-  ~9.3 GB browser-gated download — see [QUICKSTART.md](QUICKSTART.md) "Path A"). Local-host mode
+- **Disk-image inner-volume extraction needs the DFIR container, Sleuth Kit/libewf locally, or the
+  SANS SIFT VM.** The container is the recommended path (a ~2.3 GB `docker pull` — see
+  [QUICKSTART.md](QUICKSTART.md) "Path A"); the SIFT VM is a ~9.3 GB browser-gated download
+  ([QUICKSTART.md](QUICKSTART.md) "Path B") and is required for `mac_triage` and `--fleet`.
+  Local-host mode
   fully handles memory, EVTX, PCAP, and Velociraptor evidence; raw `.E01`/`.dd` disks are custody-only
   when mount/extract prerequisites are absent or no supported artifacts are produced.
 
@@ -98,7 +101,8 @@ scripts/verdict fixtures/<staged-path>
 
 A run is a **live test**, not a smoke run: confirm `tmp/auto-runs/<case-id>/verdict.json` carries a
 real Verdict (`SUSPICIOUS` / `INDETERMINATE` / `NO_EVIL`), every Finding cites a `tool_call_id`, and
-`manifest_verify.json` reports `overall: true`.
+`manifest_verify.json` reports `overall: true` plus authenticated
+`signature_verified: true` under the trusted signer policy.
 
 You can also drive it interactively — open `claude` (or `scripts/find-evil`) in the repo and prompt
 `investigate <path>` — or use the turnkey `/verdict <path>` skill, which also bootstraps n8n and the
@@ -108,7 +112,7 @@ SIFT VM. See [docs/using/running-verdict.md](docs/using/running-verdict.md).
 
 ## Where to read next
 
-- [QUICKSTART.md](QUICKSTART.md) — environment choice (SIFT VM vs. local) and run modes
+- [QUICKSTART.md](QUICKSTART.md) — environment choice (DFIR container vs. SIFT VM vs. local) and run modes
 - [docs/using/running-verdict.md](docs/using/running-verdict.md) — every flag, output layout
 - [docs/reference/dependencies.md](docs/reference/dependencies.md) — the full dependency + version matrix
 - [docs/troubleshooting.md](docs/troubleshooting.md) — failure mode → detector → fix

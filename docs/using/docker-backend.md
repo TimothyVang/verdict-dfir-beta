@@ -19,8 +19,8 @@ The container fixes each of these by construction:
 
 | SIFT-VM problem | Container |
 |---|---|
-| Silent missing tools | Toolchain is declared in `docker/dfir.Dockerfile`; the image `HEALTHCHECK` fails if `tshark`/`fls`/`ewfexport`/`vol`/`hayabusa` are not invocable. |
-| Can't update in place | Add a line, `docker build` — network is available at build time. |
+| Silent missing tools | Toolchain is declared in `docker/dfir.Dockerfile`; downloaded parser payloads and the Rust compiler archive are content-pinned, and Hayabusa rules are commit-pinned. Before any host mount is attached, `scripts/run-dfir-container.sh` executes all 28 parser probes in a disposable container with no network, writable root, mounts, or Linux capabilities. Each probe and the overall preflight have hard timeouts. The mounted runtime `HEALTHCHECK` verifies a sealed SHA-256 manifest over parser executables, managed payloads, and rules without executing parser code; bring-up polls until Docker reports `healthy`. |
+| Can't update in place | Rebuild explicitly after reviewing the Dockerfile and third-party payload pins. |
 | Slow hgfs reads | Evidence is a bind mount — native disk speed. |
 | Heavy VM + SSH | A container driven over `docker exec -i` (the same stdio pipe `ssh -T` gives the VM). |
 
@@ -28,31 +28,35 @@ The image pins Volatility 3, Hayabusa (**with its Sigma rules baked in**, so
 scans are never silently empty), Chainsaw, Velociraptor, Sleuth Kit, libewf,
 `tshark`, Suricata, `nfdump`, the Eric Zimmerman tools (`ez_parse`, via a pinned
 .NET 10 LTS runtime the .NET 9 builds roll forward onto) and plaso /
-`log2timeline` (`plaso_parse`, from the GIFT stable PPA), plus the Rust 1.88 +
-`uv` build environment.
+`log2timeline` (`plaso_parse`, from the GIFT stable PPA), plus the content-pinned
+Rust 1.91 build environment.
 
-## Download (recommended) or build
+## Select a reviewed image (recommended) or explicitly build
 
-The image is published to GHCR, so most users can just pull it (~2.3 GB) instead
-of building the toolchain locally:
-
-```bash
-docker pull ghcr.io/<owner>/verdict-dfir-toolkit:latest
-```
-
-`scripts/run-dfir-container.sh` does this automatically — it uses a local image if
-present, else **pulls the published one**, else builds from the Dockerfile. So the
-common path is simply:
+For a published image, use its immutable release digest. Mutable tags such as
+`:latest` are deliberately refused by the backend launcher:
 
 ```bash
-scripts/run-dfir-container.sh <path-to-evidence>
+FINDEVIL_DFIR_GHCR='ghcr.io/<owner>/verdict-dfir-toolkit@sha256:<reviewed-digest>' \
+  scripts/verdict --docker <path-to-evidence>
 ```
 
-To build locally instead (offline, or to modify the toolchain):
+An explicitly supplied digest always wins over a same-named local tag. With no
+digest, the launcher reuses an existing local `findevil/dfir:local` image. It
+never pulls a mutable remote tag and never performs a networked Dockerfile build
+implicitly.
+
+To build locally after reviewing the build inputs, approve that trust decision
+on the run:
 
 ```bash
-docker build -f docker/dfir.Dockerfile -t findevil/dfir:local .
+FINDEVIL_DFIR_ALLOW_LOCAL_BUILD=1 \
+  scripts/verdict --docker <path-to-evidence>
 ```
+
+The opt-in remains intentional: a local networked image build is a supply-chain
+trust decision even though downloaded non-APT payloads are content-pinned and
+the resulting parser payload is sealed.
 
 **Maintainers** publish a new image with `scripts/publish-dfir-image.sh <tag>`
 (needs a `write:packages` token in `GHCR_TOKEN`); CI also builds + pushes it on
@@ -60,14 +64,35 @@ release. The pull target is overridable with `FINDEVIL_DFIR_GHCR`.
 
 ## Bring up
 
-`run-dfir-container.sh` gets the image (per above), starts a long-lived
-`findevil-dfir` container with the repo bind-mounted read-write at `/workspace`
-and evidence read-only at `/evidence`, builds the MCP server inside it (mirroring
-how `sift-vm-bootstrap` builds it in the VM), and prints a toolchain check.
+`run-dfir-container.sh` selects the image, resolves its immutable local
+`sha256:` image ID once, and uses that same ID for preflight, build, and runtime
+so a concurrent retag cannot swap parser code after approval. It then starts
+one unprivileged Rust builder that can read only the
+Cargo manifests and `services/mcp`: `cargo fetch --locked` runs while a temporary
+Docker network is attached, Docker disconnects every network and verifies the
+zero-network state, and only then can `cargo build --frozen --offline` execute
+dependency build scripts. Build stdin is closed; time, memory, CPU, process,
+tmpfs, log, and exported-binary sizes are bounded, and an EXIT/signal trap
+removes a partially running builder. Ambient Docker proxy values
+are explicitly blanked so proxy credentials cannot leak into the image,
+preflight, builder, or runtime.
 
-Disk-image mounting needs FUSE, so the container runs with
-`--cap-add SYS_ADMIN --device /dev/fuse`; every other lane (memory, pcap, evtx,
-registry, artifact parsing) runs unprivileged.
+The case-scoped `findevil-dfir` runtime has no network, a read-only root, no
+capabilities/devices/sudo path, exact read-only binds for the Rust binary, YARA
+rule, and selected evidence, plus two hard-sized private tmpfs mounts for parser
+state. It cannot see the repository, other cases, the signing key, or signed
+case output. The launcher removes the runtime and its bounded build/runtime
+handoff state on every normal or error exit when invoked by `scripts/verdict`,
+which owns the case lifecycle and cleanup trap. A deliberately direct invocation
+of the internal bring-up helper leaves its runtime available until an explicit
+case-scoped `--down`.
+
+Python custody/signing runs on the host through a frozen/no-sync launcher.
+`verify_finding` uses a fixed server-side `docker exec` route to replay the cited
+Rust tool in the container; callers cannot supply process argv or environment.
+Raw `.dd`/`.001` uses direct Sleuth Kit. Compressed EWF (`.E01`) is refused in
+Docker because FUSE/kernel mounting would reintroduce a root parser boundary;
+use local/SIFT or `ewfexport` it to raw first.
 
 ## One command: `scripts/verdict --docker`
 
@@ -80,52 +105,57 @@ scripts/verdict --docker <path-to-evidence>
 
 It:
 
-- brings the container up via `scripts/run-dfir-container.sh` (build/pull the
-  image, mount the evidence read-only at `/evidence`, build the MCP in-container);
+- brings the container up via `scripts/run-dfir-container.sh` (select a reviewed
+  image, build the Rust parser before evidence attachment, mount evidence read-only);
 - skips the host `cargo build` — the MCP is built in the container;
 - swaps in the docker MCP transport (`.mcp.json.docker` over `.mcp.json`, backed
   up and restored on exit, exactly as `--sift` swaps `.mcp.json.sift`);
 - hands the run the in-container evidence path (`/evidence`, where the evidence
   is bind-mounted read-only), since the tools run in the container and see it
   there;
-- leaves the container running for reuse.
+- removes the case-scoped container and transient parser/build state on exit.
 
 `--sift` and `--docker` are mutually exclusive (each picks where the DFIR tools
-run), and `--docker` is single-host — a multi-host case folder is refused. Tear
-the container down when finished:
+run), and `--docker` is single-host — a multi-host case folder is refused. If a
+host crash or force-kill prevents the exit trap, remove that exact case-scoped
+container with the name printed by the launcher, or use the internal helper
+with the same `FINDEVIL_DFIR_CONTAINER` value:
 
 ```bash
-scripts/run-dfir-container.sh --down
+FINDEVIL_DFIR_CONTAINER="<printed-case-container>" \
+  scripts/run-dfir-container.sh --down
 ```
 
-## Point VERDICT at the container (manual equivalent)
+## Transport boundary
 
-`scripts/verdict --docker` performs the two steps below for you; run them by hand
-when driving the container from an interactive Claude Code session. Activate the
-Docker MCP transport (the container analog of `.mcp.json.sift`):
+Use `scripts/verdict --docker`; it reserves the marked host case and private
+parser state before invoking the internal bring-up helper. `.mcp.json.docker`
+routes only `findevil-mcp` through `docker exec`; `findevil-agent-mcp` remains a
+host process for custody/signing. This split is a security boundary, not an
+implementation detail to collapse for convenience.
 
-```bash
-scripts/run-dfir-container.sh <path-to-evidence>   # bring the container up
-cp .mcp.json.docker .mcp.json                       # route the MCP over `docker exec -i`
-```
-
-Both product MCP servers now run **inside** the container. The evidence is
-bind-mounted read-only at `/evidence`, so that is the in-container evidence path
-(`case_open /evidence`). Revert with `git checkout .mcp.json` (or `cp .mcp.json`
-from your local backend variant) to return to local/`--sift`.
-
-Tear down when finished:
-
-```bash
-scripts/run-dfir-container.sh --down
-```
+Normal `scripts/verdict --docker` runs tear down automatically. Set
+`FINDEVIL_DFIR_KEEP_RUNTIME_STATE=1` only for deliberate local debugging; it
+retains the bounded runtime handoff directory, never the evidence container.
 
 ## Evidence safety
 
-The read-only contract is unchanged. Evidence is mounted `:ro`, so the container
-cannot modify source evidence even if a tool tried. Only the two product MCP
-servers run in the container; the operator-convenience servers are not part of
-this image.
+The read-only contract is layered. Directory evidence is rejected if it is the
+repository, contains the repository, or overlaps `.project-local`, `.git`, case
+output, signing/memory/ledger state, SSH keys, or Docker certificate state.
+Symlinks, hard-linked files, sockets, devices, and FIFOs are refused; a second
+scope/identity check runs immediately before mounting. The runtime sees no
+repo-root or repo-wide `tmp` bind—only the exact Rust binary/YARA rule and
+selected evidence. It has no outbound network, capabilities, devices, or
+custody key. The host-only Python MCP owns audit, manifest, Verdict, and report
+output.
+
+Host custody directories are owner-only (`0700`) and custody files/keys are
+`0600`. Run `bash scripts/setup` after cloning, moving, or upgrading an older
+checkout to migrate safe project-local state. An existing signing key with an
+unsafe owner, mode, symlink, or hard link is refused rather than silently
+re-permissioned; inspect and rotate it, or explicitly set a verified key to
+`0600`, before retrying.
 
 ## Known limitations (honest scope)
 
@@ -135,7 +165,9 @@ this image.
   `RBCmd`, `LECmd`, `AppCompatCacheParser`, `SBECmd`, `WxTCmd`) and plaso
   (`plaso_parse`: `log2timeline.py` / `psort.py`) are now **baked into the
   image** — the EZ .NET 9 builds run on a pinned .NET 10 LTS runtime via
-  `DOTNET_ROLL_FORWARD=Major`, and plaso comes from the GIFT stable PPA — so a
+  `DOTNET_ROLL_FORWARD=Major`, and plaso comes from the GIFT stable PPA. Both
+  families are invoked by the isolated pre-mount gate, while mounted-runtime
+  health verifies their sealed executable hashes without invoking them — so a
   disk case runs `case_open` → `disk_mount` → `disk_extract_artifacts` →
   `evtx_query` / `registry_query` / `mft_timeline` / `usnjrnl_query` /
   `hayabusa_scan` **and** `ez_parse` (Amcache/ShimCache/LNK/JumpList/RecycleBin/
@@ -143,14 +175,20 @@ this image.
   `disk_extract_artifacts` having carved the target artifact. Remaining SIFT-only
   long-tail lanes (e.g. `mac_triage` / mac_apt) are not in the image and still
   degrade to `BinaryNotFound`. Prefer `--sift` when you need one of those lanes.
-- **Multi-segment E01.** The image ships Ubuntu 22.04's `libewf` (`ewfmount
-  20140807`), the same era as the SIFT VM. A truncated multi-segment E01 read
-  seen on the VM may persist. Workaround until a newer `libewf` is pinned:
-  `ewfexport` the segmented `.E01`/`.E02` to a single raw `.dd` first, then point
-  VERDICT at the `.dd`.
-- **The MCP server is built at bring-up, not baked into the image**, so the image
-  stays decoupled from any single repo snapshot. First bring-up compiles
-  `findevil-mcp` inside the container; subsequent starts reuse it.
+- **Compressed EWF is not mounted in Docker.** The image still carries pinned
+  libewf inspection/export tools, but the runtime refuses `.E01` rather than
+  grant FUSE/root parser authority. Use local/SIFT, or `ewfexport` the set to a
+  raw `.dd` and point Docker VERDICT at that file.
+- **The EWF tools are RPATH-isolated.** `/opt/libewf/lib` is deliberately kept out
+  of `ld.so.conf` so plaso's `python3-libewf` bindings keep loading the GIFT
+  shared library they were compiled against (`pyewf` still reports `20140816`).
+  Do not "simplify" this by running `ldconfig` over the prefix.
+- **The Rust MCP server is built at bring-up, not baked into the image**, so the
+  image stays decoupled from a single repo snapshot. Only locked dependency
+  retrieval is networked; compilation and all dependency build scripts run
+  after Docker proves the builder has zero attached networks. Python custody
+  uses the host's already-synced frozen/no-sync environment and is never built
+  by the Docker parser builder.
 
 ## See also
 

@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from findevil_agent.events import ContradictionFound, Finding
+from findevil_agent.resource_limits import MAX_FINDINGS_PER_POOL, materialize_bounded
 
 _CONFIDENCE_RANK = {"CONFIRMED": 2, "INFERRED": 1, "HYPOTHESIS": 0}
 
@@ -63,8 +64,10 @@ def detect_contradictions(
     Spec #2 design budget so this stays well under a millisecond
     in practice.
     """
-    a_list = [f for f in pool_a if (f.pool_origin or "A") == "A"]
-    b_list = [f for f in pool_b if (f.pool_origin or "B") == "B"]
+    a_input = materialize_bounded("pool_a", pool_a, MAX_FINDINGS_PER_POOL)
+    b_input = materialize_bounded("pool_b", pool_b, MAX_FINDINGS_PER_POOL)
+    a_list = [f for f in a_input if (f.pool_origin or "A") == "A"]
+    b_list = [f for f in b_input if (f.pool_origin or "B") == "B"]
     contradictions: list[ContradictionPair] = []
 
     for a in a_list:

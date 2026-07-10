@@ -54,9 +54,10 @@ Full semantics in [verdict-semantics.md](verdict-semantics.md). None of them mea
 | **`output_hash` / `_meta.output_sha256`** | SHA-256 digest of the tool's raw output. This is separate from the opaque `tool_call_id`. |
 | **audit chain / `audit.jsonl`** | Append-only, hash-chained log (each record carries `prev_hash`) of every tool call and finding. |
 | **Merkle root / `run.manifest.json`** | A Merkle tree over canonical tool outputs, recorded in the run manifest. |
-| **manifest / `manifest_verify`** | The signed seal over the run; `manifest_verify` re-checks the chain + Merkle root **offline**. Post-A5 the chain is audit `prev_hash` → `rs_merkle` → manifest signature, with Ed25519 as the offline-verifiable default and Sigstore as the identity/transparency tier. |
-| **SIFT VM** | The SANS SIFT Workstation VM (a gated ~9.3 GB download) that supplies the full disk-forensics toolchain. Needed only for disk-image inner-volume extraction. |
-| **Live test** | The dev "done" gate: a real investigation producing a real Verdict + `manifest_verify overall:true` — not a smoke run. |
+| **manifest / `manifest_verify`** | The signed seal over the run; `manifest_verify` re-checks the chain + Merkle root **offline**. Post-A5 the chain is audit `prev_hash` → `rs_merkle` → manifest signature. Ed25519 is the default and requires a trusted public-key fingerprint supplied outside the case; Sigstore requires exact trusted identity + issuer policy. |
+| **DFIR container** | The pinned, health-checked forensic toolchain image (`ghcr.io/<owner>/verdict-dfir-toolkit`, ~2.3 GB) driven by `scripts/verdict --docker`. The recommended disk-image backend. Does not carry `mac_triage`, and is single-host (no `--fleet`). |
+| **SIFT VM** | The SANS SIFT Workstation VM (a gated ~9.3 GB download) that supplies the full disk-forensics toolchain. Now needed only for `mac_triage` / mac_apt and for `--fleet` runs. |
+| **Live test** | The dev "done" gate: a real investigation producing a real Verdict + `manifest_verify overall:true` + authenticated `signature_verified:true` — not a smoke run. |
 
 ---
 

@@ -13,18 +13,24 @@
 //! event-log, or network artifacts are needed before making execution or
 //! exfiltration claims.
 //!
-//! Volatility invocation: `<vol> -f <memory> -r json windows.malfind`.
+//! Volatility invocation: `<vol> --offline -f <memory> -r json windows.malfind`.
 //! Reuses the same binary-discovery helper as `vol_pslist`.
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
 const PREVIEW_BYTES: usize = 64;
+const TIMEOUT_ENV: &str = "FINDEVIL_VOL_TIMEOUT_SECS";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +109,12 @@ pub enum VolMalfindError {
     #[error("volatility exited {exit_code}: {stderr}")]
     SubprocessFailed { exit_code: i32, stderr: String },
 
+    #[error("volatility exceeded its {seconds} s time budget and was killed")]
+    Timeout { seconds: u64 },
+
+    #[error("volatility {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit { stream: String, limit: usize },
+
     #[error("could not parse volatility JSON output: {0}")]
     OutputParse(String),
 }
@@ -129,23 +141,17 @@ pub fn vol_malfind(input: &VolMalfindInput) -> Result<VolMalfindOutput, VolMalfi
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
 
     let mut cmd = Command::new(&binary);
-    cmd.arg("-f")
-        .arg(&input.memory_path)
-        .arg("-r")
-        .arg("json")
-        .arg("-q")
-        .arg("windows.malfind");
+    cmd.args(crate::tools::vol_run::build_vol_args(
+        &input.memory_path,
+        "windows.malfind",
+        None,
+    ));
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            VolMalfindError::BinaryNotFound
-        } else {
-            VolMalfindError::SubprocessFailed {
-                exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
-            }
-        }
-    })?;
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(map_run_error)?;
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -163,6 +169,45 @@ pub fn vol_malfind(input: &VolMalfindInput) -> Result<VolMalfindOutput, VolMalfi
         limit,
         stderr_tail,
     )
+}
+
+fn map_run_error(error: RunError) -> VolMalfindError {
+    match error {
+        RunError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            VolMalfindError::BinaryNotFound
+        }
+        RunError::Timeout(duration) => VolMalfindError::Timeout {
+            seconds: duration.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => VolMalfindError::OutputLimit {
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::Spawn(error) => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("spawn failed: {error}"),
+        },
+        RunError::Io(error) => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("io error: {error}"),
+        },
+        RunError::PipeStillOpen { streams } => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => VolMalfindError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "volatility output reader thread panicked".to_string(),
+        },
+    }
 }
 
 fn resolve_binary() -> Result<PathBuf, VolMalfindError> {

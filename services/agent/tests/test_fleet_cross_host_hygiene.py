@@ -19,9 +19,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 _SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 
 def _load(name: str):
@@ -247,7 +247,6 @@ def test_fleet_correlation_md_contains_hygiene_section(tmp_path: Path) -> None:
 
 
 def test_render_fleet_report_md_contains_hygiene_section(tmp_path: Path) -> None:
-    pytest.importorskip("matplotlib")
     render = _load("render_fleet_report")
     corr = {
         "host_count": 2,

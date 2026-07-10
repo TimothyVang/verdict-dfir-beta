@@ -17,21 +17,25 @@ from findevil_agent.contradiction import (
     to_events,
 )
 from findevil_agent.events import Finding
-from pydantic import BaseModel, ConfigDict, Field
+from findevil_agent.resource_limits import MAX_FINDINGS_PER_POOL
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
+from findevil_agent_mcp.tools._input_limits import enforce_json_budget
 
 
 class DetectContradictionsInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    case_id: str = Field(..., description="UUID4 of the case.", min_length=1)
+    case_id: str = Field(..., description="UUID4 of the case.", min_length=1, max_length=128)
     pool_a: list[dict[str, Any]] = Field(
         ...,
+        max_length=MAX_FINDINGS_PER_POOL,
         description="Pool A findings as Finding-event dicts (pool_origin='A').",
     )
     pool_b: list[dict[str, Any]] = Field(
         ...,
+        max_length=MAX_FINDINGS_PER_POOL,
         description="Pool B findings as Finding-event dicts (pool_origin='B').",
     )
     resolution_required: bool = Field(
@@ -41,6 +45,11 @@ class DetectContradictionsInput(BaseModel):
             "before the judge fires); False for --unattended."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_input_budget(cls, value: Any) -> Any:
+        return enforce_json_budget(value, label="detect_contradictions")
 
 
 class ContradictionRecord(BaseModel):

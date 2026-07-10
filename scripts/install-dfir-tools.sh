@@ -31,8 +31,6 @@ export PATH="${LOCAL_BIN}:${PATH}"
 HAYABUSA_VERSION="${HAYABUSA_VERSION:-2.19.0}"
 CHAINSAW_VERSION="${CHAINSAW_VERSION:-2.13.0}"
 VOLATILITY_VERSION="${VOLATILITY_VERSION:-2.11.0}"
-VELOCIRAPTOR_VERSION="${VELOCIRAPTOR_VERSION:-0.74.6}"
-VELOCIRAPTOR_RELEASE="${VELOCIRAPTOR_RELEASE:-0.74}"
 PANDOC_VERSION="${PANDOC_VERSION:-3.1.11.1}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -101,18 +99,6 @@ else
     warn "chainsaw download/extract failed (optional; EVTX hunting will BinaryNotFound)."
   fi
   rm -rf "${t}"
-fi
-
-# --- velociraptor (collection) — single static binary ---
-if have velociraptor || [ -x "${LOCAL_BIN}/velociraptor" ]; then
-  ok "velociraptor present."
-else
-  info "Installing velociraptor ${VELOCIRAPTOR_VERSION}..."
-  if curl -fsSL "https://github.com/Velocidex/velociraptor/releases/download/v${VELOCIRAPTOR_RELEASE}/velociraptor-v${VELOCIRAPTOR_VERSION}-linux-amd64-musl" -o "${LOCAL_BIN}/velociraptor"; then
-    chmod +x "${LOCAL_BIN}/velociraptor"; ok "velociraptor -> ${LOCAL_BIN}/velociraptor"
-  else
-    rm -f "${LOCAL_BIN}/velociraptor"; warn "velociraptor download failed (optional; vel_collect will BinaryNotFound)."
-  fi
 fi
 
 # --- pandoc (report HTML/PDF render) — static tarball ---

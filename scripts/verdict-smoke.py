@@ -760,6 +760,38 @@ def test_dry_run_produces_no_investigation() -> None:
         "DRY-RUN" in combined
     ), f"--dry-run did not emit DRY-RUN markers: {combined[:300]}"
     assert "4/4" in combined, "verdict --dry-run did not reach the final stage (4/4)"
+    assert (
+        "--docker: MCP routed" in combined
+    ), "no-flag production run should select the split-trust Docker backend"
+
+
+def test_reduced_isolation_backends_require_explicit_acknowledgment() -> None:
+    for backend in ("--local", "--sift"):
+        denied = subprocess.run(
+            ["bash", str(SCRIPT), "--dry-run", backend],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert (
+            denied.returncode != 0
+        ), f"{backend} ran without reduced-isolation consent"
+        assert "--acknowledge-reduced-isolation" in denied.stderr
+
+    allowed = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--dry-run",
+            "--local",
+            "--acknowledge-reduced-isolation",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert "reduced-isolation local parser backend" in allowed.stderr
 
 
 def test_dry_run_with_skip_build() -> None:

@@ -27,9 +27,10 @@ finishing the rollout. Written for whoever extends this next.
    dishonest assertion or silently drop them. The gate requires values for
    CONFIRMED, and values **or** `derived_from` for INFERRED.
 
-4. **`entailment_ok` is a separate signal, not part of `overall`.** It mirrors
-   `signature_verified`: an honest status that does not gate the presence-based
-   `overall`, so dev/offline stub runs still verify end-to-end. Byte tampering of
+4. **`entailment_ok` is a separate signal, not part of `overall`.** Signature
+   authentication is different: the signed-payload digest always gates, and
+   Ed25519/Sigstore tiers must cryptographically verify; only a payload-bound
+   stub remains a development advisory. Byte tampering of
    a sealed slice is already caught by the audit chain; `entailment_ok` is the
    *semantic* re-check.
 

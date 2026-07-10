@@ -21,14 +21,26 @@
 //! spawn path degrades to a typed `BinaryNotFound` rather than crashing.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{
+    open_stable_output_file, run_with_output_quota, timeout_from_env_clamped, OutputQuota, RunError,
+};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1_800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7_200);
+const TIMEOUT_ENV: &str = "FINDEVIL_SURICATA_TIMEOUT_SECS";
+const MAX_EVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_OUTPUT_TREE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -123,7 +135,7 @@ pub fn suricata_eve(input: &SuricataEveInput) -> Result<SuricataEveOutput, Suric
     }
 
     let binary = resolve_binary()?;
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = input.limit.unwrap_or(DEFAULT_LIMIT).min(DEFAULT_LIMIT);
 
     // Suricata writes eve.json (and stats.log, fast.log, …) into -l <outdir>.
     // Use a fresh per-call temp directory so concurrent runs don't collide.
@@ -142,13 +154,19 @@ pub fn suricata_eve(input: &SuricataEveInput) -> Result<SuricataEveOutput, Suric
     let mut cmd = Command::new(&binary);
     cmd.args(build_suricata_args(&input.pcap_path, &outdir));
 
-    let spawn = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
+    let spawn = run_with_output_quota(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+        &OutputQuota::new(outdir.clone(), MAX_OUTPUT_TREE_BYTES, MAX_OUTPUT_ENTRIES),
+    )
+    .map_err(|err| {
+        if matches!(&err, RunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound)
+        {
             SuricataEveError::BinaryNotFound
         } else {
             SuricataEveError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             }
         }
     });
@@ -187,8 +205,21 @@ fn read_and_parse_eve(
     if !eve_path.is_file() {
         return Err(SuricataEveError::NoOutput);
     }
-    let body = std::fs::read_to_string(&eve_path).map_err(|err| {
-        SuricataEveError::OutputParse(format!("could not read {}: {err}", eve_path.display()))
+    let (file, metadata) = open_stable_output_file(&eve_path).map_err(|err| {
+        SuricataEveError::OutputParse(format!("could not safely open eve.json: {err}"))
+    })?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.len().min(MAX_EVE_BYTES)).unwrap_or(64 * 1024));
+    file.take(MAX_EVE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| SuricataEveError::OutputParse(format!("could not read eve.json: {err}")))?;
+    if bytes.len() as u64 > MAX_EVE_BYTES {
+        return Err(SuricataEveError::OutputParse(format!(
+            "eve.json byte limit exceeded ({MAX_EVE_BYTES})"
+        )));
+    }
+    let body = String::from_utf8(bytes).map_err(|err| {
+        SuricataEveError::OutputParse(format!("eve.json is not valid UTF-8: {err}"))
     })?;
     parse_events(&body, limit, stderr_tail)
 }
@@ -358,6 +389,17 @@ mod tests {
         let out = read_and_parse_eve(tmp.path(), 100, String::new()).unwrap();
         assert_eq!(out.events_seen, 2);
         assert_eq!(out.events.len(), 2);
+    }
+
+    #[test]
+    fn read_and_parse_eve_rejects_oversized_file_before_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(tmp.path().join("eve.json")).unwrap();
+        file.set_len(MAX_EVE_BYTES + 1).unwrap();
+        let err = read_and_parse_eve(tmp.path(), 100, String::new()).unwrap_err();
+        assert!(
+            matches!(err, SuricataEveError::OutputParse(message) if message.contains("byte limit"))
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ Two committed trace shapes are recognised, each verified against its sidecar
 
 1. Hash-chained excerpt (e.g. natural-self-correction-trace.jsonl). Every record
    carries ``seq``, ``ts``, and ``prev_hash``. We re-canonicalize each line
-   (RFC-8785-compatible, identical to findevil_agent.crypto.audit_log), confirm
+   (VERDICT canonical JSON v1, identical to findevil_agent.crypto.audit_log), confirm
    the byte-for-byte canonical form, confirm ``seq`` is contiguous, and replay the
    ``prev_hash`` chain within the contiguous window (record N's prev_hash equals
    the SHA-256 of record N-1's raw canonical line). We also confirm the file's
@@ -49,9 +49,13 @@ _CANONICAL_SEPARATORS = (",", ":")
 
 
 def _canonicalize(obj: Any) -> bytes:
-    """RFC-8785-compatible canonical bytes — identical to audit_log.canonicalize_json."""
+    """VERDICT canonical JSON v1 bytes, matching audit_log.canonicalize_json."""
     return json.dumps(
-        obj, sort_keys=True, separators=_CANONICAL_SEPARATORS, ensure_ascii=True
+        obj,
+        sort_keys=True,
+        separators=_CANONICAL_SEPARATORS,
+        ensure_ascii=True,
+        allow_nan=False,
     ).encode("ascii")
 
 

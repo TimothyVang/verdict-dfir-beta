@@ -1,11 +1,10 @@
 // Timeline data model + reducers for the LiveTimeline component.
 //
-// Dual-source by design:
-//   - PROVISIONAL dots are synthesized live from the audit stream's
-//     `finding_approved` events while the investigation runs.
-//   - AUTHORITATIVE events come from the engine's normalized_timeline
-//     (verdict.json / timeline.json) via /api/timeline once the run finalizes.
-// The component prefers authoritative when present, keyed by tool_call_id.
+// Trust-aware sources:
+//   - PROVISIONAL dots are synthesized from the explicitly unverified live
+//     audit stream while the investigation runs.
+//   - CUSTODY-BOUND events come only from normalized_timeline inside the exact
+//     authenticated verdict snapshot. Standalone sidecars remain presentation.
 
 import type { AuditLine } from "@/lib/audit-tail";
 
@@ -64,7 +63,7 @@ export function deriveProvisionalTimeline(
   return out;
 }
 
-/** Normalize the authoritative /api/timeline payload into TimelineEvent[]. */
+/** Normalize a timeline-shaped payload; the caller assigns its trust tier. */
 export function normalizeAuthoritative(raw: unknown): TimelineEvent[] {
   if (!raw || typeof raw !== "object") return [];
   const events = (raw as Record<string, unknown>).events;
@@ -87,6 +86,41 @@ export function normalizeAuthoritative(raw: unknown): TimelineEvent[] {
     });
   }
   return out;
+}
+
+export interface TimelineCustodyInputs {
+  liveEvents: ReadonlyArray<AuditLine>;
+  sealObserved: boolean;
+  custodyAuthenticated: boolean;
+  authenticatedVerdict: { normalized_timeline?: unknown } | null;
+  /** Optional presentation sidecar; deliberately never treated as custody. */
+  standaloneTimeline?: unknown;
+}
+
+export interface TimelineCustodySelection {
+  events: TimelineEvent[];
+  source: "live-unverified" | "verdict-authenticated" | "terminal-unverified";
+}
+
+/** Pick a timeline without attaching signed custody to post-seal sidecars. */
+export function selectTimelineForCustody(
+  inputs: TimelineCustodyInputs,
+): TimelineCustodySelection {
+  if (inputs.custodyAuthenticated) {
+    return {
+      events: normalizeAuthoritative(
+        inputs.authenticatedVerdict?.normalized_timeline,
+      ),
+      source: "verdict-authenticated",
+    };
+  }
+  if (inputs.sealObserved) {
+    return { events: [], source: "terminal-unverified" };
+  }
+  return {
+    events: deriveProvisionalTimeline(inputs.liveEvents),
+    source: "live-unverified",
+  };
 }
 
 /**

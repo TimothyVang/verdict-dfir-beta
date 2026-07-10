@@ -9,11 +9,14 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { requireRepoRoot } from "@/lib/repo-root";
+import { authorizeDashboardRequest } from "@/lib/dashboard-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET(): Promise<Response> {
+export async function GET(request: Request): Promise<Response> {
+  const denied = authorizeDashboardRequest(request);
+  if (denied) return denied;
   let root: string;
   try {
     root = requireRepoRoot();

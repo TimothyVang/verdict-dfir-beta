@@ -1,6 +1,7 @@
 // Integration test: audit-tail.ts against a real on-disk audit.jsonl
 // that gets appended to mid-test. Per A3 plan Task 4.2.
 
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   isAllowedCasePath,
   listCases,
+  readAllowedCaseFile,
   tailAuditLog,
   type AuditLine,
 } from "@/lib/audit-tail";
@@ -73,6 +75,14 @@ describe("tailAuditLog", () => {
     expect(collected).toHaveLength(2);
     expect(collected[0].seq).toBe(0);
     expect(collected[0].kind).toBe("agent_message");
+    const firstRaw = lineFor(0, "agent_message", {
+      role: "supervisor",
+      content: "go",
+    });
+    expect(collected[0].line_hash).toBe(
+      createHash("sha256").update(firstRaw, "utf-8").digest("hex"),
+    );
+    expect(collected[0].line_hash).not.toBe("deadbeef".padEnd(64, "0"));
     expect(collected[1].seq).toBe(1);
     expect(collected[1].kind).toBe("tool_call_start");
   });
@@ -150,6 +160,31 @@ describe("tailAuditLog", () => {
     expect(collected[0].payload).toEqual({ content: "first" });
     expect(collected[1].payload).toEqual({ content: "second" });
   });
+
+  it("fails closed before streaming an audit larger than the connection cap", async () => {
+    const auditPath = path.join(tmpDir, "audit.jsonl");
+    await fs.writeFile(
+      auditPath,
+      lineFor(0, "agent_message", { content: "bounded" }) + "\n",
+      "utf-8",
+    );
+    const ac = new AbortController();
+    const iter = tailAuditLog(auditPath, ac.signal, undefined, { maxBytes: 64 });
+
+    await expect(iter.next()).rejects.toThrow(/exceeds the 64-byte stream limit/);
+  });
+
+  it("rejects an unterminated audit line once its bounded buffer is full", async () => {
+    const auditPath = path.join(tmpDir, "audit.jsonl");
+    await fs.writeFile(auditPath, "x".repeat(129), "utf-8");
+    const ac = new AbortController();
+    const iter = tailAuditLog(auditPath, ac.signal, undefined, {
+      maxBytes: 1024,
+      maxLineBytes: 128,
+    });
+
+    await expect(iter.next()).rejects.toThrow(/line exceeds the 128-byte limit/);
+  });
 });
 
 describe("isAllowedCasePath", () => {
@@ -159,28 +194,31 @@ describe("isAllowedCasePath", () => {
     fakeRepoRoot = path.join(tmpDir, "repo");
     await createRepoMarkers(fakeRepoRoot);
     vi.spyOn(process, "cwd").mockReturnValue(fakeRepoRoot);
+    delete process.env.FINDEVIL_REPO_ROOT;
     delete process.env.FINDEVIL_DASHBOARD_EXTRA_ROOTS;
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    delete process.env.FINDEVIL_REPO_ROOT;
     delete process.env.FINDEVIL_DASHBOARD_EXTRA_ROOTS;
   });
 
-  it("allows a case dir directly under goldens/synthetic-benign/", () => {
+  it("allows an existing case dir directly under goldens/synthetic-benign/", async () => {
     const caseDir = path.join(
       fakeRepoRoot,
       "goldens",
       "synthetic-benign",
       "case-001",
     );
+    await fs.mkdir(caseDir, { recursive: true });
     expect(isAllowedCasePath(caseDir)).toBe(true);
   });
 
-  it("allows a custom root supplied via FINDEVIL_DASHBOARD_EXTRA_ROOTS", () => {
-    const customRoot =
-      process.platform === "win32" ? "D:\\evidence" : "/srv/evidence";
+  it("allows a custom root supplied via FINDEVIL_DASHBOARD_EXTRA_ROOTS", async () => {
+    const customRoot = path.join(tmpDir, "custom-evidence");
     const caseDir = path.join(customRoot, "case-2026-04-26");
+    await fs.mkdir(caseDir, { recursive: true });
     // Path-delimiter-separated: ":" on POSIX, ";" on Windows.
     process.env.FINDEVIL_DASHBOARD_EXTRA_ROOTS = customRoot;
     expect(isAllowedCasePath(caseDir)).toBe(true);
@@ -199,16 +237,16 @@ describe("isAllowedCasePath", () => {
     expect(isAllowedCasePath(traversal)).toBe(false);
   });
 
-  it("does not prefix-match (custom root /foo/bar allowed != /foo/baroot allowed)", () => {
+  it("does not prefix-match (custom root /foo/bar allowed != /foo/baroot allowed)", async () => {
     // Allow-list a narrow custom root, then check that a sibling
     // directory whose name shares the prefix does NOT match it. The
     // trailing path-separator check is what prevents this foot-gun.
     // Use a custom root well outside the default allow-list so the
     // assertion is unambiguous.
-    const allowed =
-      process.platform === "win32" ? "D:\\foo\\bar" : "/foo/bar";
-    const siblingPrefix =
-      process.platform === "win32" ? "D:\\foo\\baroot" : "/foo/baroot";
+    const allowed = path.join(tmpDir, "foo", "bar");
+    const siblingPrefix = path.join(tmpDir, "foo", "baroot");
+    await fs.mkdir(path.join(allowed, "case-1"), { recursive: true });
+    await fs.mkdir(path.join(siblingPrefix, "case-1"), { recursive: true });
     process.env.FINDEVIL_DASHBOARD_EXTRA_ROOTS = allowed;
     expect(isAllowedCasePath(path.join(siblingPrefix, "case-1"))).toBe(
       false,
@@ -218,13 +256,96 @@ describe("isAllowedCasePath", () => {
     expect(isAllowedCasePath(path.join(allowed, "case-1"))).toBe(true);
   });
 
+  it("blocks a symlink inside an allowed root that resolves outside", async () => {
+    if (process.platform === "win32") return;
+    const allowedRoot = path.join(fakeRepoRoot, "tmp", "auto-runs");
+    const outside = path.join(tmpDir, "external-secret-case");
+    await fs.mkdir(allowedRoot, { recursive: true });
+    await fs.mkdir(outside, { recursive: true });
+    const linkedCase = path.join(allowedRoot, "linked-case");
+    await fs.symlink(outside, linkedCase, "dir");
+
+    expect(isAllowedCasePath(linkedCase)).toBe(false);
+  });
+
   it("fails closed when no trusted repo root is available", async () => {
     const markerlessRoot = path.join(tmpDir, "not-a-repo");
     await fs.mkdir(markerlessRoot, { recursive: true });
     vi.restoreAllMocks();
     vi.spyOn(process, "cwd").mockReturnValue(markerlessRoot);
+    // Containment may place os.tmpdir() below the real repository, so cwd
+    // discovery can legitimately walk upward and find that repository. An
+    // explicit invalid trusted-root override exercises the intended
+    // fail-closed boundary without writing a fixture outside containment.
+    process.env.FINDEVIL_REPO_ROOT = markerlessRoot;
 
     expect(isAllowedCasePath(path.join(markerlessRoot, "goldens", "case-1"))).toBe(false);
     await expect(listCases()).resolves.toEqual([]);
+  });
+});
+
+describe("readAllowedCaseFile", () => {
+  let fakeRepoRoot: string;
+  let caseDir: string;
+
+  beforeEach(async () => {
+    fakeRepoRoot = path.join(tmpDir, "repo-read");
+    await createRepoMarkers(fakeRepoRoot);
+    caseDir = path.join(fakeRepoRoot, "tmp", "auto-runs", "case-read");
+    await fs.mkdir(caseDir, { recursive: true });
+    process.env.FINDEVIL_REPO_ROOT = fakeRepoRoot;
+  });
+
+  afterEach(() => {
+    delete process.env.FINDEVIL_REPO_ROOT;
+    vi.restoreAllMocks();
+  });
+
+  it("rejects a same-size file rewrite during the read", async () => {
+    const target = path.join(caseDir, "verdict.json");
+    await fs.writeFile(target, Buffer.alloc(128 * 1024, 0x61));
+    const realOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...args);
+      const realRead = handle.read.bind(handle);
+      let firstRead = true;
+      handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+        const result = await realRead(...readArgs);
+        if (firstRead) {
+          firstRead = false;
+          await fs.writeFile(target, Buffer.alloc(128 * 1024, 0x62));
+          await fs.utimes(target, new Date(1_000), new Date(1_000));
+        }
+        return result;
+      }) as typeof handle.read;
+      return handle;
+    });
+
+    await expect(readAllowedCaseFile(caseDir, "verdict.json")).resolves.toBeNull();
+    expect(openSpy).toHaveBeenCalled();
+  });
+
+  it("rejects a path replacement after the descriptor read completes", async () => {
+    const target = path.join(caseDir, "verdict.json");
+    const displaced = path.join(caseDir, "verdict.original.json");
+    await fs.writeFile(target, Buffer.alloc(128 * 1024, 0x61));
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...args);
+      const realRead = handle.read.bind(handle);
+      let readCount = 0;
+      handle.read = (async (...readArgs: Parameters<typeof handle.read>) => {
+        const result = await realRead(...readArgs);
+        readCount += 1;
+        if (readCount === 2) {
+          await fs.rename(target, displaced);
+          await fs.writeFile(target, Buffer.alloc(128 * 1024, 0x63));
+        }
+        return result;
+      }) as typeof handle.read;
+      return handle;
+    });
+
+    await expect(readAllowedCaseFile(caseDir, "verdict.json")).resolves.toBeNull();
   });
 });

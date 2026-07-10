@@ -85,9 +85,24 @@ echo "=========================================="
 echo "Find Evil! - run all L1 smokes locally"
 echo "=========================================="
 
+# 0. Recommended Docker-backend capability contract. This is fast and does not
+# require Docker: it proves Plaso + every EZ parser run in the isolated
+# pre-mount gate,
+# verifies fail-closed timeout/readiness structure, and executes a controlled
+# failing probe so error propagation cannot degrade into a text-only promise.
+run_smoke \
+    "dfir-container-contract-smoke (isolated + timed + fail-closed parser gate)" \
+    "python3 scripts/dfir-container-contract-smoke.py"
+
+# 0a. Evidence-facing local MCP children get only reviewed runtime variables;
+# provider/cloud credentials and signing material never reach Rust parsers.
+run_smoke \
+    "mcp-env-smoke (ambient credentials excluded from parser children)" \
+    "python3 scripts/mcp-env-smoke.py"
+
 # 1. Rust MCP server end-to-end.
 run_smoke \
-    "rust-mcp-smoke (34-tool catalog + core error paths)" \
+    "rust-mcp-smoke (tool catalog + core error paths)" \
     "python3 scripts/rust-mcp-smoke.py --release" \
     '[ -x "${CARGO_TARGET_DIR:-target}/release/findevil-mcp" ] || [ -x "${CARGO_TARGET_DIR:-target}/release/findevil-mcp.exe" ]'
 
@@ -98,11 +113,12 @@ run_smoke \
     "[ -d services/agent_mcp ]"
 
 # 2a. Local ed25519 seal-proof (no Spark): default + explicit ed25519 finalize
-#     verifies cryptographically offline; stub signer is coerced unless
+#     verifies cryptographically against the trusted finalizer-returned pin;
+#     stub signer is coerced unless
 #     FINDEVIL_ALLOW_STUB_SIGNER=1. Runs when uv + agent_mcp are present; SKIPs
 #     cleanly without them. When run, a seal-proof failure fails this gate.
 run_smoke \
-    "local-ed25519-seal-proof (offline ed25519 seals verify; stub coerced by default)" \
+    "local-ed25519-seal-proof (ed25519 verifies against trusted pin; stub coerced by default)" \
     "bash scripts/local-ed25519-seal-proof.sh" \
     "command -v uv && [ -d services/agent_mcp ]"
 
@@ -419,7 +435,7 @@ run_smoke \
 #     no uv/venv/cryptography wheel.
 run_smoke \
     "manifest-verify-offline-smoke (stdlib-only re-derivation agrees with committed sample-run)" \
-    "python3 scripts/manifest-verify-offline.py docs/release-evidence/sample-run/run.manifest.json --check"
+    "python3 scripts/manifest-verify-offline.py docs/release-evidence/sample-run/run.manifest.json --expected-ed25519-fingerprint b98df1a9d09da3741e295d7da21b9b675287adfb36b10ca17c280e2a1fee0f54 --check"
 
 total=$((passed + failed + skipped))
 echo
@@ -432,7 +448,7 @@ fi
 echo "${c_red}FAIL${c_off} - ${passed} passed, ${skipped} skipped, ${failed} failed (of ${total})"
 echo "The CI-equivalent gate runs via docker/l1-compose.yml. If a smoke"
 echo "fails locally and passes in Docker/CI, check toolchain versions:"
-echo "  cargo build --release -p findevil-mcp  (Rust 1.88 per rust-toolchain.toml)"
+echo "  cargo build --release -p findevil-mcp  (Rust 1.91 per rust-toolchain.toml)"
 echo "  uv sync --directory services/agent --extra dev (Python 3.11 in services/agent)"
 echo "  uv sync --directory services/agent_mcp --extra dev (Python 3.11 in services/agent_mcp)"
 echo "=========================================="

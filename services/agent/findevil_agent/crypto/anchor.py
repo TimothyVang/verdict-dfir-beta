@@ -2,20 +2,24 @@
 
 This module publishes the run's audit-chain Merkle root to a public
 transparency log so a third party can later prove *when* the sealed root
-existed, independent of our servers. It is a strictly ADDITIVE custody
-side-signal:
+existed, independent of our servers. The proof block is additive, while a
+separate signed request commitment makes the requested custody tier fail
+closed:
 
   * **Absent by default.** Anchoring only happens when the operator opts in
     with ``FINDEVIL_REKOR_ENABLE`` *and* the caller sets the per-call
-    ``anchor_transparency`` flag. With the flag unset the manifest is
-    byte-identical to today: no network is touched and no ``transparency_log``
-    block is written.
+    ``anchor_transparency`` flag. With the flag unset no network is touched and
+    no ``transparency_log`` block is written; new manifests sign an explicit
+    ``transparency_anchor_requested=false`` policy for downgrade resistance.
   * **Never part of the signed body.** The block is attached *after* the
     manifest is signed and is excluded from the signed bytes (see
     ``manifest._to_json_safe`` / ``_verify_ed25519_signature``), so adding it
     cannot invalidate an existing Ed25519 signature.
-  * **Non-gating.** ``verify_anchor`` reports a side-signal (``transparency_ok``)
-    that never flips a manifest's ``overall`` custody verdict.
+  * **Conditionally gating.** ``verify_anchor`` reports ``transparency_ok``.
+    When the signed request commitment is true, a missing, failed,
+    unauthenticated, or invalid proof fails the manifest's ``overall`` custody
+    verdict. Legacy/unrequested attached proofs remain non-gating for backward
+    compatibility.
 
 What leaves the host when anchoring fires is the bare 32-byte SHA-256 Merkle
 root (a hash of hashes) — **no evidence text**, so the egress risk is low.
@@ -35,6 +39,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import json
 import os
 import subprocess  # only invokes the local `openssl` binary with fixed args, no shell
 import tempfile
@@ -53,7 +59,8 @@ _SUBJECT_NAME = "audit-merkle-root"
 _STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 _PREDICATE_TYPE = "https://verdict.dev/attestations/audit-merkle-root/v1"
 
-# Public production Rekor + a public RFC-3161 TSA for the offline-time fallback.
+# Public production Rekor + an RFC-3161 imprint-only fallback. The TSA chain is
+# not pinned here, so the fallback is never treated as authenticated time.
 _DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
 _DEFAULT_TSA_URL = "https://freetsa.org/tsr"
 
@@ -124,8 +131,8 @@ def anchor_merkle_root(
 
     effective_rekor_url = rekor_url or _DEFAULT_REKOR_URL
     try:
-        entry, body_b64 = _submit_to_rekor(merkle_root_hex)
-        return _rekor_block(merkle_root_hex, entry, body_b64, effective_rekor_url)
+        bundle_json = _submit_to_rekor(merkle_root_hex)
+        return _rekor_block(merkle_root_hex, bundle_json, effective_rekor_url)
     except Exception as rekor_exc:  # degrade on ANY Rekor failure — never raise into the run
         rekor_reason = f"rekor anchoring failed: {rekor_exc}"
         if not allow_tsa_fallback:
@@ -136,28 +143,38 @@ def anchor_merkle_root(
             return _none_block(merkle_root_hex, f"{rekor_reason}; tsa fallback failed: {tsa_exc}")
 
 
-def verify_anchor(block: dict[str, Any], merkle_root_hex: str) -> bool | str:
+def verify_anchor(
+    block: dict[str, Any],
+    merkle_root_hex: str,
+    *,
+    expected_identity: str | None = None,
+    expected_issuer: str | None = None,
+) -> bool | str:
     """Offline-verify a ``transparency_log`` block against ``merkle_root_hex``.
 
-    Pure/offline — contacts no network. Confirms the block's subject digest
-    equals the manifest's Merkle root, then verifies the transparency evidence:
-    a Rekor inclusion proof is re-derived from its embedded body/hashes/root
-    (sigstore's own RFC-6962 verifier), and an RFC-3161 token is checked with
-    ``openssl ts``. Returns ``True`` or an honest reason string. Never raises.
+    Pure/offline — contacts no network. A Rekor Bundle is authenticated with
+    Sigstore production roots plus exact identity and issuer policy. An
+    RFC-3161 token is decoded only to check its imprint; because this module
+    does not pin/verify a TSA certificate chain, that path returns an honest
+    structural-only reason and never ``True``. Never raises.
     """
     if not isinstance(block, dict):
         return "transparency_log block is not an object"
     subject = _subject_digest(block)
     if subject != merkle_root_hex:
         return (
-            f"transparency subject digest {subject!r} != manifest merkle root "
-            f"{merkle_root_hex!r}"
+            f"transparency subject digest {subject!r} != manifest merkle root {merkle_root_hex!r}"
         )
     kind = block.get("kind")
     if kind == "none":
         return str(block.get("fallback_reason") or "root was not anchored")
     if kind == "rekor":
-        return _verify_rekor_block(block)
+        return _verify_rekor_block(
+            block,
+            merkle_root_hex,
+            expected_identity=expected_identity,
+            expected_issuer=expected_issuer,
+        )
     if kind == "rfc3161":
         return _verify_tsa_block(block, merkle_root_hex)
     return f"unknown transparency kind {kind!r}"
@@ -168,14 +185,18 @@ def verify_anchor(block: dict[str, Any], merkle_root_hex: str) -> bool | str:
 # ---------------------------------------------------------------------------
 
 
-def _submit_to_rekor(merkle_root_hex: str) -> tuple[Any, str]:
+def _submit_to_rekor(merkle_root_hex: str) -> str:
     """Keyless-sign a DSSE Statement over the root and submit it to Rekor.
 
-    Returns ``(log_entry, body_b64)``. Requires ``$SIGSTORE_ID_TOKEN`` and
-    network — raises on any missing prerequisite so the caller can degrade.
+    Returns Sigstore's public Bundle JSON serialization. Requires
+    ``$SIGSTORE_ID_TOKEN`` and network — raises on any missing prerequisite so
+    the caller can degrade. Persisting the whole Bundle lets offline verification
+    authenticate the certificate, SET/checkpoint, DSSE signature, and statement
+    binding instead of trusting caller-supplied proof fields.
     Isolated as a single function so tests can monkeypatch it without touching
     the live log.
     """
+    from sigstore.models import ClientTrustConfig  # type: ignore[import-not-found]
     from sigstore.oidc import IdentityToken  # type: ignore[import-not-found]
     from sigstore.sign import SigningContext  # type: ignore[import-not-found]
 
@@ -187,12 +208,11 @@ def _submit_to_rekor(merkle_root_hex: str) -> tuple[Any, str]:
         )
 
     statement = _build_statement(merkle_root_hex)
-    ctx = SigningContext.production()
+    ctx = SigningContext.from_trust_config(ClientTrustConfig.production())
     identity = IdentityToken(token)
     with ctx.signer(identity) as signer:
         bundle = signer.sign_dsse(statement)
-    entry = bundle.log_entry
-    return entry, str(entry.body)
+    return bundle.to_json()
 
 
 def _build_statement(merkle_root_hex: str) -> Any:
@@ -209,73 +229,144 @@ def _build_statement(merkle_root_hex: str) -> Any:
     ).build()
 
 
-def _rekor_block(merkle_root_hex: str, entry: Any, body_b64: str, rekor_url: str) -> dict[str, Any]:
-    proof = entry.inclusion_proof
+def _rekor_block(
+    merkle_root_hex: str,
+    bundle_json: str,
+    rekor_url: str,
+) -> dict[str, Any]:
+    """Normalize public Sigstore Bundle JSON into the manifest side-signal."""
+    normalized = _normalized_rekor_entry(bundle_json)
+    normalized["url"] = rekor_url
+    normalized["bundle_b64"] = base64.b64encode(bundle_json.encode("utf-8")).decode("ascii")
     return {
         "kind": "rekor",
         "anchored": True,
         "subject": {"merkle_root_sha256": merkle_root_hex},
         "statement_type": _STATEMENT_TYPE,
         "predicate_type": _PREDICATE_TYPE,
-        "rekor": {
-            "url": rekor_url,
-            "log_id": entry.log_id,
-            "log_index": entry.log_index,
-            "integrated_time": entry.integrated_time,
-            "entry_uuid": entry.uuid,
-            # The canonical Rekor entry body — needed to recompute the RFC-6962
-            # leaf hash during OFFLINE inclusion-proof verification.
-            "body": body_b64,
-            "inclusion_proof": {
-                "checkpoint": _checkpoint_str(proof.checkpoint),
-                "hashes": list(proof.hashes),
-                "log_index": proof.log_index,
-                "root_hash": proof.root_hash,
-                "tree_size": proof.tree_size,
-            },
-        },
+        "rekor": normalized,
         "tsa": None,
         "fallback_reason": None,
     }
 
 
-def _verify_rekor_block(block: dict[str, Any]) -> bool | str:
-    rekor = block.get("rekor") or {}
-    proof = rekor.get("inclusion_proof") or {}
-    body = rekor.get("body")
-    if not body:
-        return "rekor block missing entry body; cannot verify inclusion proof offline"
+def _normalized_rekor_entry(bundle_json: str) -> dict[str, Any]:
+    """Extract display fields exclusively from public Sigstore Bundle JSON."""
     try:
-        from sigstore.models import (  # type: ignore[import-not-found]
-            LogEntry,
-            LogInclusionProof,
-            verify_merkle_inclusion,
-        )
+        bundle_obj = json.loads(bundle_json)
+        entries = bundle_obj["verificationMaterial"]["tlogEntries"]
+        if not isinstance(entries, list) or len(entries) != 1:
+            raise ValueError("Sigstore Bundle must contain exactly one tlog entry")
+        entry = entries[0]
+        proof = entry["inclusionProof"]
+        body_b64 = _validated_b64(entry["canonicalizedBody"], "canonicalizedBody")
+        log_id = _b64_hex(entry["logId"]["keyId"], "logId.keyId")
+        root_hash = _b64_hex(proof["rootHash"], "inclusionProof.rootHash")
+        hashes = [
+            _b64_hex(value, f"inclusionProof.hashes[{index}]")
+            for index, value in enumerate(proof.get("hashes") or [])
+        ]
+        log_index = int(entry["logIndex"])
+        proof_log_index = int(proof["logIndex"])
+        if proof_log_index != log_index:
+            raise ValueError("tlog entry and inclusion proof log indexes differ")
+        integrated_time = int(entry["integratedTime"])
+        tree_size = int(proof["treeSize"])
+        checkpoint = str(proof["checkpoint"]["envelope"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"malformed Sigstore v4 Bundle JSON: {exc}") from exc
 
-        inclusion = LogInclusionProof(
-            checkpoint=str(proof.get("checkpoint") or ""),
-            hashes=[str(h) for h in (proof.get("hashes") or [])],
-            log_index=int(proof.get("log_index") or 0),
-            root_hash=str(proof.get("root_hash") or ""),
-            tree_size=int(proof.get("tree_size") or 0),
+    return {
+        "log_id": log_id,
+        "log_index": log_index,
+        "integrated_time": integrated_time,
+        # Sigstore Bundle v0.3 no longer exposes a Rekor UUID.
+        "entry_uuid": None,
+        "body": body_b64,
+        "inclusion_proof": {
+            "checkpoint": checkpoint,
+            "hashes": hashes,
+            "log_index": proof_log_index,
+            "root_hash": root_hash,
+            "tree_size": tree_size,
+        },
+    }
+
+
+def _verify_rekor_block(
+    block: dict[str, Any],
+    merkle_root_hex: str,
+    *,
+    expected_identity: str | None,
+    expected_issuer: str | None,
+) -> bool | str:
+    rekor = block.get("rekor") or {}
+    bundle_b64 = rekor.get("bundle_b64")
+    if not bundle_b64:
+        return (
+            "rekor block missing full Sigstore bundle; normalized proof fields "
+            "alone cannot authenticate a transparency-log entry"
         )
-        entry = LogEntry(
-            uuid=(str(rekor["entry_uuid"]) if rekor.get("entry_uuid") else None),
-            body=str(body),
-            integrated_time=int(rekor.get("integrated_time") or 0),
-            log_id=str(rekor.get("log_id") or ""),
-            log_index=int(rekor.get("log_index") or proof.get("log_index") or 0),
-            inclusion_proof=inclusion,
-            inclusion_promise=None,
+    identity = (
+        expected_identity or os.environ.get("FINDEVIL_SIGSTORE_EXPECTED_IDENTITY", "").strip()
+    )
+    issuer = expected_issuer or os.environ.get("FINDEVIL_SIGSTORE_EXPECTED_ISSUER", "").strip()
+    if not identity or not issuer:
+        return (
+            "rekor verification requires exact expected Sigstore identity and issuer "
+            "policy (FINDEVIL_SIGSTORE_EXPECTED_IDENTITY and "
+            "FINDEVIL_SIGSTORE_EXPECTED_ISSUER)"
         )
-        verify_merkle_inclusion(entry)
+    try:
+        bundle_json = base64.b64decode(str(bundle_b64), validate=True).decode("utf-8")
+        payload_type, payload = _verify_sigstore_dsse(bundle_json, identity, issuer)
+        if payload_type != "application/vnd.in-toto+json":
+            raise ValueError(f"unexpected DSSE payload type {payload_type!r}")
+        statement = json.loads(payload)
+        if statement.get("_type") != _STATEMENT_TYPE:
+            raise ValueError("signed payload is not the required in-toto Statement type")
+        if statement.get("predicateType") != _PREDICATE_TYPE:
+            raise ValueError("signed payload has the wrong predicate type")
+        subjects = statement.get("subject")
+        if not isinstance(subjects, list) or len(subjects) != 1:
+            raise ValueError("signed statement must contain exactly one subject")
+        subject = subjects[0]
+        if not isinstance(subject, dict):
+            raise ValueError("signed statement subject is not an object")
+        digest_obj = subject.get("digest")
+        digest = digest_obj.get("sha256") if isinstance(digest_obj, dict) else None
+        if subject.get("name") != _SUBJECT_NAME or not isinstance(digest, str):
+            raise ValueError("signed statement does not identify the audit Merkle root")
+        if not hmac.compare_digest(digest.lower(), merkle_root_hex.lower()):
+            raise ValueError("signed statement Merkle root does not match the manifest")
+        normalized = _normalized_rekor_entry(bundle_json)
+        for field, trusted_value in normalized.items():
+            if rekor.get(field) != trusted_value:
+                raise ValueError(
+                    f"mirrored {field} does not match the authenticated Sigstore Bundle"
+                )
     except Exception as exc:  # honest reason, never a crash
-        return f"rekor inclusion proof did not verify offline: {exc}"
+        return f"rekor Sigstore bundle did not verify offline: {exc}"
     return True
 
 
+def _verify_sigstore_dsse(
+    bundle_json: str,
+    expected_identity: str,
+    expected_issuer: str,
+) -> tuple[str, bytes]:
+    """Verify a DSSE Bundle with Sigstore's production roots and exact policy."""
+    from sigstore.models import Bundle  # type: ignore[import-not-found]
+    from sigstore.verify import Verifier  # type: ignore[import-not-found]
+    from sigstore.verify.policy import Identity  # type: ignore[import-not-found]
+
+    bundle = Bundle.from_json(bundle_json)
+    policy = Identity(identity=expected_identity, issuer=expected_issuer)
+    return Verifier.production(offline=True).verify_dsse(bundle, policy)
+
+
 # ---------------------------------------------------------------------------
-# RFC-3161 TSA fallback (offline-time trust when Rekor is unreachable).
+# RFC-3161 TSA fallback (structural imprint only when Rekor is unreachable).
 # ---------------------------------------------------------------------------
 
 
@@ -289,7 +380,9 @@ def _tsa_block(merkle_root_hex: str, tsa_url: str, fallback_reason: str) -> dict
     tsr_bytes = base64.b64decode(tsr_b64)
     return {
         "kind": "rfc3161",
-        "anchored": True,
+        # A public TSA response without a pinned issuing chain is retained as
+        # an analyst side-signal, never claimed as authenticated proof.
+        "anchored": False,
         "subject": {"merkle_root_sha256": merkle_root_hex},
         "statement_type": _STATEMENT_TYPE,
         "predicate_type": _PREDICATE_TYPE,
@@ -298,10 +391,10 @@ def _tsa_block(merkle_root_hex: str, tsa_url: str, fallback_reason: str) -> dict
             "kind": "rfc3161",
             "tsa_url": tsa_url,
             "tsr_b64": tsr_b64,
-            # SHA-256 over the DER RFC-3161 token — a stable identifier for the
-            # returned timestamp. Full issuing-CA-chain extraction is not done
-            # here (the chain is not bundled), so this is a token fingerprint.
-            "cert_chain_sha256": hashlib.sha256(tsr_bytes).hexdigest(),
+            "authenticated": False,
+            # SHA-256 over the DER token itself, explicitly not a certificate-
+            # chain fingerprint.
+            "token_sha256": hashlib.sha256(tsr_bytes).hexdigest(),
         },
         "fallback_reason": fallback_reason,
     }
@@ -339,8 +432,8 @@ def _verify_tsa_block(block: dict[str, Any], merkle_root_hex: str) -> bool | str
 
     Uses ``openssl ts -reply`` to decode the stored token and confirm its hashed
     message imprint equals the Merkle root. Full TSA-signature verification needs
-    the issuing CA chain (not bundled) — a documented residual — so this is a
-    structural imprint check, honestly reported.
+    a pinned issuing CA chain, which this fallback does not bundle. A matching
+    imprint is therefore structural evidence only and never returns ``True``.
     """
     tsa = block.get("tsa") or {}
     tsr_b64 = tsa.get("tsr_b64")
@@ -366,7 +459,10 @@ def _verify_tsa_block(block: dict[str, Any], merkle_root_hex: str) -> bool | str
             "rfc3161 token message imprint does not match the Merkle root "
             "(timestamp is over a different digest)"
         )
-    return True
+    return (
+        "rfc3161 token imprint matches the Merkle root, but its TSA signature/"
+        "certificate chain was not pinned or verified"
+    )
 
 
 def _post_timestamp(tsa_url: str, request_bytes: bytes) -> bytes:
@@ -430,6 +526,24 @@ def _subject_digest(block: dict[str, Any]) -> str | None:
         return None
     val = subject.get("merkle_root_sha256")
     return str(val) if val is not None else None
+
+
+def _validated_b64(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be non-empty base64")
+    try:
+        base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ValueError(f"{field} is not valid base64") from exc
+    return value
+
+
+def _b64_hex(value: Any, field: str) -> str:
+    encoded = _validated_b64(value, field)
+    decoded = base64.b64decode(encoded, validate=True)
+    if not decoded:
+        raise ValueError(f"{field} decodes to an empty value")
+    return decoded.hex()
 
 
 def _checkpoint_str(checkpoint: Any) -> str:

@@ -15,10 +15,10 @@
 //! posture is enforced semantically by `SQLite`'s read-only transaction mode, not
 //! lexically — lowercase, comment-hidden, UNION-prefixed, and subquery-bearing
 //! mutations are all rejected identically. It also proves there is no injection
-//! *surface*: `browser_history`'s only string consumed near SQL is the table
-//! name in fixed, parameter-bound `SELECT`s, and `case_id` is never executed —
-//! a `case_id` carrying a `DROP TABLE` payload is read back inertly and the
-//! table survives. It does NOT prove anything about the audit chain, the signed
+//! *surface*: every dynamic table/column projection comes from a fixed internal
+//! allow-list, evidence values are never interpolated into SQL, and `case_id`
+//! is never executed — a `case_id` carrying a `DROP TABLE` payload is read back
+//! inertly and the table survives. It does NOT prove anything about the audit chain, the signed
 //! manifest, or scoring — this is a pure tool-boundary characterization test
 //! and is custody-neutral (no audit record, manifest, or verdict is produced).
 //!
@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use findevil_mcp::{browser_history, BrowserHistoryInput};
+use findevil_mcp::{browser_history, BrowserArtifactRow, BrowserHistoryInput};
 use rusqlite::{Connection, OpenFlags};
 
 /// Build a minimal, valid Chrome-shaped `History` DB with one row, returning
@@ -54,7 +54,16 @@ fn chrome_fixture(dir: &Path) -> PathBuf {
 /// immutable URI. This is the *same* driver boundary the tool relies on, so a
 /// mutation rejected here is a mutation the tool's connection would reject too.
 fn open_like_tool(path: &Path) -> Connection {
-    let uri = format!("file:{}?immutable=1", path.to_string_lossy());
+    let mut encoded = String::with_capacity(path.as_os_str().as_encoded_bytes().len() + 32);
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    let uri = format!("file:{encoded}?mode=ro&immutable=1");
     Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -125,7 +134,10 @@ fn benign_read_still_succeeds_no_overblocking() {
 
     assert_eq!(out.browser_family, "chrome");
     assert_eq!(out.rows.len(), 1, "the one seeded row must come back");
-    assert_eq!(out.rows[0].url, "http://evil.example/payload.exe");
+    let BrowserArtifactRow::Visit(row) = &out.rows[0] else {
+        panic!("expected visit row")
+    };
+    assert_eq!(row.url, "http://evil.example/payload.exe");
 }
 
 #[test]

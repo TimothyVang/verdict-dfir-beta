@@ -3,29 +3,28 @@
 // positioned by UTC time, mirroring the engine's own fig_timeline_overview so
 // the in-app view and the PDF figure tell the same story.
 //
-// Dual-source (see lib/timeline-data.ts): provisional dots stream live from the
-// audit chain's findings; on manifest_finalize it fetches the authoritative
-// normalized_timeline from /api/timeline and reconciles. Motion is
-// compositor-friendly (opacity/transform) and disabled under reduced-motion.
+// Before seal, provisional dots stream from the explicitly unverified live
+// audit feed. After seal, the only authenticated source is normalized_timeline
+// inside the hash-bound verdict snapshot; standalone timeline sidecars are
+// presentation-only and never inherit the custody badge.
 
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 
 import type { AuditLine } from "@/lib/audit-tail";
+import type { VerdictPayload } from "@/lib/verdict-summary-policy";
 import {
-  deriveProvisionalTimeline,
   layoutTimeline,
-  mergeTimeline,
-  normalizeAuthoritative,
-  type TimelineEvent,
+  selectTimelineForCustody,
 } from "@/lib/timeline-data";
 import { BODY, MONO, RADIUS, SectionHeading, VERDICT } from "@/lib/verdict-ui";
 
 interface LiveTimelineProps {
   events: AuditLine[];
-  caseDir: string;
-  manifestDone: boolean;
+  sealObserved: boolean;
+  custodyAuthenticated: boolean;
+  authenticatedVerdict: VerdictPayload | null;
 }
 
 const LANE_HEIGHT = 30;
@@ -46,41 +45,23 @@ function fmtTs(ts: number): string {
   return new Date(ts).toISOString().slice(0, 16).replace("T", " ") + "Z";
 }
 
-export function LiveTimeline({ events, caseDir, manifestDone }: LiveTimelineProps) {
-  const [authoritative, setAuthoritative] = useState<TimelineEvent[]>([]);
-  const fetchedFor = useRef<string>("");
-
-  const provisional = useMemo(() => deriveProvisionalTimeline(events), [events]);
-
-  // Fetch the authoritative timeline once the run finalizes (or when a
-  // completed case is opened via deep-link). Re-fetch if the case changes.
-  useEffect(() => {
-    if (!caseDir) return;
-    const key = `${caseDir}|${manifestDone}`;
-    if (fetchedFor.current === key) return;
-    // Only spend a fetch once there's a reason to (finalized, or a fresh case
-    // dir that may already be complete).
-    fetchedFor.current = key;
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const res = await fetch(`/api/timeline?case=${encodeURIComponent(caseDir)}`, {
-          signal: controller.signal,
-        });
-        if (!res.ok) return;
-        const raw = await res.json();
-        setAuthoritative(normalizeAuthoritative(raw));
-      } catch {
-        // Timeline not ready yet — provisional dots still render.
-      }
-    })();
-    return () => controller.abort();
-  }, [caseDir, manifestDone]);
-
-  const merged = useMemo(
-    () => mergeTimeline(provisional, authoritative),
-    [provisional, authoritative],
+export function LiveTimeline({
+  events,
+  sealObserved,
+  custodyAuthenticated,
+  authenticatedVerdict,
+}: LiveTimelineProps) {
+  const selection = useMemo(
+    () =>
+      selectTimelineForCustody({
+        liveEvents: events,
+        sealObserved,
+        custodyAuthenticated,
+        authenticatedVerdict,
+      }),
+    [events, sealObserved, custodyAuthenticated, authenticatedVerdict],
   );
+  const merged = selection.events;
   const layout = useMemo(() => layoutTimeline(merged), [merged]);
 
   const hasData = merged.length > 0;
@@ -106,7 +87,13 @@ export function LiveTimeline({ events, caseDir, manifestDone }: LiveTimelineProp
         right={
           <>
             {merged.length} event{merged.length === 1 ? "" : "s"}
-            {authoritative.length > 0 ? " · normalized" : provisional.length > 0 ? " · live" : ""}
+            {selection.source === "verdict-authenticated"
+              ? " · authenticated verdict snapshot"
+              : selection.source === "live-unverified" && merged.length > 0
+                ? " · live · unverified"
+                : selection.source === "terminal-unverified"
+                  ? " · terminal state unverified"
+                  : ""}
           </>
         }
       >
@@ -115,7 +102,9 @@ export function LiveTimeline({ events, caseDir, manifestDone }: LiveTimelineProp
 
       {!hasData ? (
         <p style={{ fontFamily: BODY, fontSize: 13, color: VERDICT.mutedDark, margin: "8px 0" }}>
-          timeline builds as findings land — the full normalized timeline appears when the run finalizes.
+          {selection.source === "terminal-unverified"
+            ? "timeline withheld until the joint verdict snapshot authenticates."
+            : "timeline builds from the unverified live stream; authenticated events come only from the bound verdict snapshot."}
         </p>
       ) : (
         <>

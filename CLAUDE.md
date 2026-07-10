@@ -36,7 +36,7 @@ VERDICT is a local-first DFIR (digital forensics & incident response) agent plat
 |---|---|---|
 | [`caseforge-core`](https://github.com/TimothyVang/caseforge-core) | Headless **controller**: privacy routing, model selection, structured findings, custody validation, the `caseforge` CLI. | the **driver** |
 | [`verdict-opencode`](https://github.com/TimothyVang/verdict-opencode) | The agent **runtime** — a branded fork of [opencode](https://github.com/sst/opencode); the `verdict` binary is built from it. | the **engine** |
-| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 34 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
+| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 43 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
 
 **Runtime flow:** `caseforge` (controls + guards) → `verdict` binary (runs the agent) → **this repo's `findevil` MCP tools (do the forensics)** → hash-chained custody → `caseforge verify`.
 
@@ -68,7 +68,7 @@ bash scripts/doctor.sh --json
 bash scripts/install.sh
 ```
 
-SIFT VM mode is recommended for full disk-image parity. Local mode can handle memory, EVTX, PCAP, Velociraptor collections, extracted artifacts, and supported disk artifacts when Sleuth Kit/libewf prerequisites are present. Raw disk images such as `.E01`, `.dd`, `.raw`, and `.aff` remain custody-only whenever `disk_mount` / `disk_extract_artifacts` fail or produce no supported parsed artifacts; never turn `case_open` alone into broad disk-content claims.
+The **DFIR container** (`scripts/verdict --docker`) is the recommended disk-image backend, and its parity is partial, not complete. It does not carry `mac_triage` / mac_apt, and multi-segment `.E01` sets can read truncated under its `libewf` (`ewfexport` them to a single raw `.dd` first). Before any host path is mounted, bring-up executes `tshark`, Sleuth Kit, libewf, Volatility, Hayabusa, both Plaso stages (`log2timeline.py`, `psort.py`), and all seven allow-listed EZ wrappers in a disposable, timed, networkless/read-only/no-capability preflight. The mounted runtime `HEALTHCHECK` then verifies a sealed SHA-256 toolchain manifest—including the Plaso Python runtime/package payload, the pinned Hayabusa Sigma corpus, and every EZ managed assembly—without repeatedly executing third-party parser code, and bring-up waits for Docker's terminal `healthy` state. A missing, non-invocable, timed-out, or integrity-mismatched required parser therefore blocks the recommended backend unless the operator explicitly opts into a deliberately partial image with `FINDEVIL_DFIR_ALLOW_MISSING=1`. Within those limits it content-pins the unversioned EZ archives and pins the rest of the toolchain in `docker/dfir.Dockerfile`, bind-mounts evidence instead of hgfs, and runs over `docker exec -i`. SIFT VM mode (`--sift`) remains supported and is required for `mac_triage` and for `--fleet`, which `--docker` rejects as a single-host backend. Local mode can handle memory, EVTX, PCAP, Velociraptor collections, extracted artifacts, and supported disk artifacts when Sleuth Kit/libewf prerequisites are present. Raw disk images such as `.E01`, `.dd`, `.raw`, and `.aff` remain custody-only whenever `disk_mount` / `disk_extract_artifacts` fail or produce no supported parsed artifacts; never turn `case_open` alone into broad disk-content claims.
 
 ## Investigation Read Order
 
@@ -112,7 +112,7 @@ These rules are part of the product safety boundary.
 - Product/audit-chain servers: `findevil-mcp` and `findevil-agent-mcp`.
 - Operator convenience servers: `n8n-mcp`, `playwright`, `puppeteer`, and `qmd`.
 
-Only the two product servers can emit audit-chain tool calls for Findings. The product surface is 48 audit-chained product tools: 34 Rust DFIR tools in `findevil-mcp` plus 14 Python crypto/ACH/memory/ACP/expert-feedback/accuracy/ai-tradecraft tools in `findevil-agent-mcp`. The operator convenience servers must never emit Findings, satisfy Finding citations, or mutate evidence.
+Only the two product servers can emit audit-chain tool calls for Findings. The product surface is 57 audit-chained product tools: 43 Rust DFIR tools in `findevil-mcp` plus 14 Python crypto/ACH/memory/ACP/expert-feedback/accuracy/ai-tradecraft tools in `findevil-agent-mcp`. The operator convenience servers must never emit Findings, satisfy Finding citations, or mutate evidence.
 
 Do not add a broad filesystem, shell, Docker, Kubernetes, browser, GitHub, fetch, or raw-command MCP to the product surface. Do not add an `execute_shell` tool. Long-tail DFIR execution belongs behind allow-listed typed tools such as `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, and `cloud_audit`.
 
@@ -169,7 +169,7 @@ Expected high-value outputs:
 - `manifest_verify.json` - offline verification result.
 - `REPORT.html` / `REPORT.pdf` - analyst report. Committed `verdict_revision` flips render as a Self-Correction section.
 
-A run is not complete unless the pipeline reaches `case_open`, all Findings cite `tool_call_id`, `report_qa` is audited, and `manifest_verify.json` reports `overall: true` for the completed manifest. If `manifest_verify.json` is missing or `overall` is not `true`, report `RUN INCOMPLETE / CUSTODY INVALID` and do not describe the output as signed or customer-ready.
+A run is not complete unless the pipeline reaches `case_open`, all Findings cite `tool_call_id`, `report_qa` is audited, and `manifest_verify.json` reports `overall: true` for the completed manifest. Describing the output as cryptographically signed additionally requires `signature_verified: true` for an Ed25519/Sigstore tier under trusted external policy; a payload-bound stub can be internally consistent but is not authenticated. If the receipt is missing, `overall` is not `true`, or a purported cryptographic tier lacks `signature_verified: true`, report `RUN INCOMPLETE / CUSTODY INVALID` and do not describe the output as signed or customer-ready.
 
 ## Large And Multi-Host Cases
 

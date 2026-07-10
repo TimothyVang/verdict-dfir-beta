@@ -92,6 +92,7 @@ ROOT_ALLOWLIST: frozenset[str] = frozenset(
         ".claude",  # only .claude/skills/** ships; rest gitignored
         ".githooks",
         ".github",
+        ".cargo",  # standard cargo-audit policy; documents one reviewed reachability exception
     }
 )
 

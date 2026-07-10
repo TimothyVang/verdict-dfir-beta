@@ -49,17 +49,29 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{
+    open_stable_output_file, run_with_output_quota, timeout_from_env_clamped, OutputQuota, RunError,
+};
+
 /// Hard cap on surfaced rows. The true parsed count is reported separately
 /// in [`SrumParseOutput::row_count`], so a cap never hides how much the
 /// table actually held.
 const MAX_ROWS: usize = 5_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1_800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7_200);
+const TIMEOUT_ENV: &str = "FINDEVIL_SRUM_TIMEOUT_SECS";
+const MAX_TABLE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OUTPUT_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 4_096;
 
 /// How many top egress applications to surface in `top_talkers`.
 const MAX_TOP_TALKERS: usize = 20;
@@ -182,6 +194,9 @@ pub enum SrumError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[error("esedbexport network table exceeds the {limit} byte limit")]
+    OutputLimit { limit: u64 },
 }
 
 /// Decode the SRUM network data usage table from a `SRUDB.dat` ESE database.
@@ -233,10 +248,16 @@ pub fn srum_parse(input: &SrumParseInput) -> Result<SrumParseOutput, SrumError> 
         });
     }
 
-    let spawned = Command::new(&binary).args(&args).output();
+    let mut command = Command::new(&binary);
+    command.args(&args);
+    let spawned = run_with_output_quota(
+        command,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+        &OutputQuota::new(staging.clone(), MAX_OUTPUT_TREE_BYTES, MAX_OUTPUT_ENTRIES),
+    );
     let proc = match spawned {
         Ok(proc) => proc,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             // Resolver found a path that vanished between check and spawn:
             // still the degraded (no-binary) path, not a failure.
             let _ = std::fs::remove_dir_all(&staging);
@@ -246,7 +267,7 @@ pub fn srum_parse(input: &SrumParseInput) -> Result<SrumParseOutput, SrumError> 
             let _ = std::fs::remove_dir_all(&staging);
             return Err(SrumError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             });
         }
     };
@@ -296,10 +317,7 @@ fn decode_export(export_dir: &Path) -> Result<SrumParseOutput, SrumError> {
         }
     };
 
-    let text = std::fs::read_to_string(&table_path).map_err(|source| SrumError::OutputRead {
-        path: table_path.clone(),
-        source,
-    })?;
+    let text = read_table_bounded(&table_path)?;
 
     let rows = parse_srum_network_export(&text);
     Ok(assemble_output(rows))
@@ -313,10 +331,23 @@ fn find_network_table_file(export_dir: &Path) -> std::io::Result<Option<PathBuf>
         return Ok(None);
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(export_dir)? {
+    for (index, entry) in std::fs::read_dir(export_dir)?.enumerate() {
+        if index >= MAX_OUTPUT_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "esedbexport output entry limit exceeded",
+            ));
+        }
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "esedbexport output contains a symlink",
+            ));
+        }
+        if !metadata.is_file() {
             continue;
         }
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -328,6 +359,37 @@ fn find_network_table_file(export_dir: &Path) -> std::io::Result<Option<PathBuf>
     // Deterministic pick when esedbexport split a table across `.0`, `.1`, …
     candidates.sort();
     Ok(candidates.into_iter().next())
+}
+
+fn read_table_bounded(path: &Path) -> Result<String, SrumError> {
+    let (file, metadata) =
+        open_stable_output_file(path).map_err(|source| SrumError::OutputRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.len() > MAX_TABLE_BYTES {
+        return Err(SrumError::OutputLimit {
+            limit: MAX_TABLE_BYTES,
+        });
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_TABLE_BYTES)).unwrap_or(64 * 1024),
+    );
+    file.take(MAX_TABLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| SrumError::OutputRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_TABLE_BYTES {
+        return Err(SrumError::OutputLimit {
+            limit: MAX_TABLE_BYTES,
+        });
+    }
+    String::from_utf8(bytes).map_err(|source| SrumError::OutputRead {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
 }
 
 /// Turn parsed rows into the sorted, capped, aggregated output.
@@ -746,6 +808,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("MSysObjects.0"), "x").unwrap();
         assert!(find_network_table_file(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_export_rejects_oversized_network_table_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("{973F5D5C-1D90-4944-BE8E-24B94231A174}.0");
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(MAX_TABLE_BYTES + 1).unwrap();
+        let err = decode_export(dir.path()).unwrap_err();
+        assert!(matches!(err, SrumError::OutputLimit { limit } if limit == MAX_TABLE_BYTES));
     }
 
     #[test]

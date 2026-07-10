@@ -101,6 +101,7 @@ from findevil_agent.correlator_temporal import (
 )
 from findevil_agent.events import Finding
 from findevil_agent.execution_claim import is_execution_claim
+from findevil_agent.resource_limits import MAX_MERGED_FINDINGS, require_collection_limit
 
 # ---------------------------------------------------------------------------
 # Evidence-type-weighted confidence scoring (custody-neutral).
@@ -156,6 +157,7 @@ def correlate(
     Returns a tuple of (refined_findings, outcomes). ``outcomes`` is
     one entry per input Finding describing what the correlator did.
     """
+    require_collection_limit("findings", findings, MAX_MERGED_FINDINGS)
     refined: list[Finding] = []
     outcomes: list[CorrelationOutcome] = []
 

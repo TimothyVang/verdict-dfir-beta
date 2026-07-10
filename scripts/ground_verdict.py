@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -33,18 +34,76 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from n8n_security import (
+    read_private_secret,
+    validate_loopback_http_url,
+    validate_public_http_url,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 AUTO_RUNS = ROOT / "tmp" / "auto-runs"
-WEBHOOK = os.environ.get(
-    "GROUNDING_WEBHOOK", "http://127.0.0.1:5678/webhook/findevil-grounding"
+WEBHOOK = validate_loopback_http_url(
+    os.environ.get(
+        "GROUNDING_WEBHOOK", "http://127.0.0.1:5678/webhook/findevil-grounding"
+    )
 )
+WEBHOOK_SECRET_FILE = ROOT / "tmp" / "n8n-webhook-secret.txt"
+WEBHOOK_HEADER = "X-Findevil-Grounding-Token"
 RESEARCH_FILENAME = "grounding_research.json"
 HTTP_TIMEOUT_S = 240
+MAX_TECHNIQUES_PER_REQUEST = 16
+MAX_TECHNIQUES_TOTAL = 128
+MAX_WEBHOOK_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_VERDICT_BYTES = 16 * 1024 * 1024
+MAX_NVD_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_CVES = 32
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_WEBHOOK_OPENER = urllib.request.build_opener(_NoRedirect)
+_PUBLIC_OPENER = urllib.request.build_opener(_NoRedirect)
 
 # NVD JSON REST API (keyless; ~5 req/30s unauthenticated, so space the calls).
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 NVD_RATE_DELAY_S = float(os.environ.get("NVD_RATE_DELAY", "6"))
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
+
+def _read_bounded_json_object(path: Path, limit: int) -> dict[str, Any]:
+    if path.is_symlink():
+        raise SystemExit(f"error: refusing symlinked JSON input: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SystemExit(
+                f"error: JSON input must be an unlinked regular file: {path}"
+            )
+        chunks = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) > limit:
+        raise SystemExit(f"error: JSON input exceeds {limit} bytes: {path}")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"error: invalid JSON input: {path}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"error: JSON input must contain an object: {path}")
+    return parsed
 
 
 def resolve_case_dir(arg: str) -> Path:
@@ -186,10 +245,17 @@ def extract_cves(verdict: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def _nvd_get(cve_id: str) -> dict[str, Any]:
-    req = urllib.request.Request(f"{NVD_API}?cveId={cve_id}")
+    url = validate_public_http_url(f"{NVD_API}?cveId={cve_id}", resolve=True)
+    req = urllib.request.Request(url)
     req.add_header("User-Agent", "findevil-grounding")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+    with _PUBLIC_OPENER.open(req, timeout=30) as response:
+        raw = response.read(MAX_NVD_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_NVD_RESPONSE_BYTES:
+        raise ValueError("NVD response exceeded 4 MiB")
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("NVD returned a non-object response")
+    return parsed
 
 
 def ground_cves(cve_map: dict[str, list[str]]) -> dict[str, Any] | None:
@@ -247,36 +313,89 @@ def ground_cves(cve_map: dict[str, list[str]]) -> dict[str, Any] | None:
     return {"results": results}
 
 
+def build_webhook_request(
+    payload: dict[str, Any], secret: str
+) -> urllib.request.Request:
+    if len(secret.encode("utf-8")) < 32:
+        raise ValueError("grounding webhook capability must contain at least 32 bytes")
+    request = urllib.request.Request(
+        validate_loopback_http_url(WEBHOOK),
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    request.add_header(WEBHOOK_HEADER, secret)
+    return request
+
+
+def _call_workflow_once(payload: dict[str, Any], secret: str) -> dict[str, Any]:
+    req = build_webhook_request(payload, secret)
+    try:
+        with _WEBHOOK_OPENER.open(req, timeout=HTTP_TIMEOUT_S) as resp:
+            raw = resp.read(MAX_WEBHOOK_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_WEBHOOK_RESPONSE_BYTES:
+                raise SystemExit("error: grounding webhook response exceeded 2 MiB")
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise SystemExit(
+                    "error: grounding webhook returned a non-object response"
+                )
+            return parsed
+    except urllib.error.HTTPError as e:
+        raise SystemExit(
+            f"error: grounding webhook returned HTTP {e.code}. "
+            f"Is the authenticated workflow deployed? Run: "
+            f"python3 scripts/setup-grounding-workflow.py"
+        ) from None
+    except (urllib.error.URLError, OSError) as e:
+        raise SystemExit(
+            f"error: cannot reach grounding webhook at {WEBHOOK} ({e}).\n"
+            "  - start the local n8n sidecar with scripts/setup-n8n.py, and\n"
+            "  - deploy the authenticated workflow: "
+            "python3 scripts/setup-grounding-workflow.py"
+        ) from None
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("error: grounding webhook returned invalid JSON") from exc
+
+
 def call_workflow(
     case_id: str,
     techs: dict[str, dict[str, Any]],
     queries: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    payload = {
-        "case_id": case_id,
-        "techniques": [
-            {"id": e["technique_id"], "claim": claim_for(e)} for e in techs.values()
-        ],
-        "queries": queries or [],
-    }
-    req = urllib.request.Request(
-        WEBHOOK, data=json.dumps(payload).encode(), method="POST"
-    )
-    req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
+        secret = read_private_secret(WEBHOOK_SECRET_FILE, minimum_bytes=32)
+    except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
         raise SystemExit(
-            f"error: grounding webhook returned HTTP {e.code}. "
-            f"Is the workflow deployed? Run: python3 scripts/setup-grounding-workflow.py"
+            f"error: refusing unauthenticated grounding webhook: {exc}. "
+            "Run scripts/setup-n8n.py first."
+        ) from None
+    items = [
+        {"id": entry["technique_id"], "claim": claim_for(entry)}
+        for entry in techs.values()
+    ]
+    technique_research: list[dict[str, Any]] = []
+    open_web_research: list[dict[str, Any]] = []
+    generated_at = None
+    for offset in range(0, len(items), MAX_TECHNIQUES_PER_REQUEST):
+        response = _call_workflow_once(
+            {
+                "case_id": str(case_id)[:128],
+                "techniques": items[offset : offset + MAX_TECHNIQUES_PER_REQUEST],
+                "queries": (queries or [])[:4] if offset == 0 else [],
+            },
+            secret,
         )
-    except (urllib.error.URLError, OSError) as e:
-        raise SystemExit(
-            f"error: cannot reach grounding webhook at {WEBHOOK} ({e}).\n"
-            f"  - start n8n + browserless (scripts/setup-n8n.py, browserless container), and\n"
-            f"  - deploy the workflow: python3 scripts/setup-grounding-workflow.py"
-        )
+        technique_research.extend(response.get("technique_research") or [])
+        if offset == 0:
+            open_web_research = response.get("open_web_research") or []
+            generated_at = response.get("generated_at")
+    return {
+        "case_id": case_id,
+        "generated_at": generated_at,
+        "technique_research": technique_research,
+        "open_web_research": open_web_research,
+    }
 
 
 def merge_bundle(
@@ -483,6 +602,13 @@ def run_ioc_enrichment(iocs: dict[str, list[str]]) -> dict[str, Any] | None:
 
 
 def main(argv: list[str]) -> int:
+    if os.environ.get("FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS") != "1":
+        print(
+            "ground_verdict: refused without "
+            "FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS=1",
+            file=sys.stderr,
+        )
+        return 2
     if len(argv) != 1:
         print(__doc__)
         return 2
@@ -490,13 +616,18 @@ def main(argv: list[str]) -> int:
     verdict_path = case_dir / "verdict.json"
     if not verdict_path.is_file():
         raise SystemExit(f"error: no verdict.json in {case_dir}")
-    verdict = json.loads(verdict_path.read_text())
+    verdict = _read_bounded_json_object(verdict_path, MAX_VERDICT_BYTES)
     case_id = verdict.get("case_id") or case_dir.name
 
     techs = collect_techniques(verdict)
     if not techs:
         raise SystemExit(
             "error: verdict references no MITRE techniques — nothing to ground."
+        )
+    if len(techs) > MAX_TECHNIQUES_TOTAL:
+        raise SystemExit(
+            f"error: verdict references {len(techs)} techniques; "
+            f"limit is {MAX_TECHNIQUES_TOTAL}"
         )
     claimed = sum(1 for e in techs.values() if e["claimed"])
     print(
@@ -513,6 +644,10 @@ def main(argv: list[str]) -> int:
     ioc_block = run_ioc_enrichment(iocs)
 
     cve_map = extract_cves(verdict)
+    if len(cve_map) > MAX_CVES:
+        raise SystemExit(
+            f"error: verdict references {len(cve_map)} CVEs; limit is {MAX_CVES}"
+        )
     if cve_map:
         print(f"grounding {len(cve_map)} CVE(s) host-side via NVD…")
     cve_block = ground_cves(cve_map)

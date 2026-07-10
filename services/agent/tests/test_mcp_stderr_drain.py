@@ -38,6 +38,19 @@ _FAKE_SERVER = textwrap.dedent(
     """
 )
 
+_INVALID_UTF8_FAKE_SERVER = textwrap.dedent(
+    """
+    import json, os, sys
+    line = sys.stdin.buffer.readline()
+    req = json.loads(line)
+    os.write(2, b"\\xff\\n")
+    os.write(2, b"E" * 300_000)
+    resp = {"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}
+    sys.stdout.buffer.write(json.dumps(resp).encode("utf-8") + b"\\n")
+    sys.stdout.buffer.flush()
+    """
+)
+
 
 def test_call_does_not_deadlock_when_server_floods_stderr(tmp_path: Path) -> None:
     server = tmp_path / "fake_mcp.py"
@@ -49,5 +62,22 @@ def test_call_does_not_deadlock_when_server_floods_stderr(tmp_path: Path) -> Non
         # 300 KB stderr write, never answers, and this raises "timed out".
         result = client.call("tools/call", {"name": "x", "arguments": {}}, timeout=10.0)
         assert result == {"ok": True}
+        assert len(client._stderr_tail) == 1
+        assert len(client._stderr_tail[0]) <= fea.MCP_STDERR_RETAIN_MAX_BYTES + 12
+        assert client._stderr_tail[0].endswith("[truncated]")
+    finally:
+        client.close()
+
+
+def test_invalid_utf8_diagnostic_does_not_kill_stderr_drain(tmp_path: Path) -> None:
+    server = tmp_path / "invalid_utf8_mcp.py"
+    server.write_text(_INVALID_UTF8_FAKE_SERVER)
+
+    client = fea.StdioMcpClient([sys.executable, str(server)], "fake")
+    try:
+        result = client.call("tools/call", {"name": "x", "arguments": {}}, timeout=10.0)
+        assert result == {"ok": True}
+        assert any("\ufffd" in line for line in client._stderr_tail)
+        assert any(line.endswith("[truncated]") for line in client._stderr_tail)
     finally:
         client.close()

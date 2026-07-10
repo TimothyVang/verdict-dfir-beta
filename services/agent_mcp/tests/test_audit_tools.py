@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,29 @@ class TestAuditVerify:
         assert result.ok is True
         assert result.record_count == 0
 
+    async def test_verify_does_not_change_existing_permissions(
+        self, tmp_path: Path, seeded_audit_log: Path
+    ) -> None:
+        external = tmp_path / "external"
+        external.mkdir(mode=0o755)
+        path = external / "audit.jsonl"
+        path.write_bytes(seeded_audit_log.read_bytes())
+        external.chmod(0o755)
+        path.chmod(0o644)
+        before = (
+            stat.S_IMODE(external.stat().st_mode),
+            stat.S_IMODE(path.stat().st_mode),
+        )
+
+        result = await VERIFY_SPEC.handler(AuditVerifyInput(path=str(path)))
+
+        assert result.ok is True
+        assert result.record_count == 7
+        assert (
+            stat.S_IMODE(external.stat().st_mode),
+            stat.S_IMODE(path.stat().st_mode),
+        ) == before
+
 
 class TestSchemaShape:
     def test_append_input_rejects_extra_fields(self) -> None:
@@ -108,3 +132,25 @@ class TestSchemaShape:
 
         with pytest.raises(ValidationError):
             AuditVerifyInput.model_validate({"path": "/x", "extra": True})
+
+    def test_append_rejects_oversized_scalar_fields(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            AuditAppendInput(path="p" * 4097, kind="k", payload={})
+        with pytest.raises(ValidationError):
+            AuditAppendInput(path="/x", kind="k" * 129, payload={})
+
+    def test_append_rejects_deep_and_oversized_payloads(self) -> None:
+        from pydantic import ValidationError
+
+        deep: dict[str, object] = {}
+        cursor = deep
+        for _ in range(13):
+            child: dict[str, object] = {}
+            cursor["child"] = child
+            cursor = child
+        with pytest.raises(ValidationError, match="nesting depth"):
+            AuditAppendInput(path="/x", kind="k", payload=deep)
+        with pytest.raises(ValidationError, match="string length"):
+            AuditAppendInput(path="/x", kind="k", payload={"value": "x" * 4097})

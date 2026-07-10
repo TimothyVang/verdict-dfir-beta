@@ -16,6 +16,7 @@ from findevil_agent.judge import (
     compute_coverage_discounted_score,
     judge_findings,
 )
+from findevil_agent.resource_limits import SemanticInputLimitError
 
 
 def _f(
@@ -401,3 +402,9 @@ class TestCoverageDiscountedScore:
             ["CONFIRMED", "HYPOTHESIS", "INFERRED"], applicable_classes=5, consulted_classes=3
         )
         assert 0.0 <= score <= 1.0
+
+
+def test_judge_rejects_oversized_pool_before_grouping() -> None:
+    findings = [_f(f"f-{index}") for index in range(51)]
+    with pytest.raises(SemanticInputLimitError, match="pool_a.findings exceeds limit 50"):
+        judge_findings(PoolStats(pool="A", findings=findings), PoolStats(pool="B", findings=[]))

@@ -5,7 +5,7 @@ Not SCHARDT content. Proves free-space / whole-image email feature recovery for
 the nhc-003 *mechanism* without inventing a NIST true positive.
 
 Usage:
-  python3 scripts/make-nhc003-synth-image.py [output.dd]
+  python3 goldens/nhc003-synth-carve/make-image.py [output.dd]
 """
 
 from __future__ import annotations

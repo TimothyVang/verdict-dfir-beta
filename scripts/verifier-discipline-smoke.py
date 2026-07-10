@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """verifier-discipline-smoke - mechanical, LLM-free verifier-discipline gate.
 
-A completed VERDICT run leaves two offline-verifiable artifacts: the hash-chained
-``audit.jsonl`` and the scoped ``verdict.json``. ``manifest_verify`` already proves
-the chain is intact and that each Finding's tool re-run reproduces its hash. What
-it does NOT mechanically assert is that the *verifier was actually exercised* for
-everything that shipped, and that the recovery records cite real executed tool
-calls. A run could (in principle) ship a Finding whose ``tool_call_id`` never
+A completed VERDICT run leaves a hash-chained ``audit.jsonl`` and scoped
+``verdict.json``. Separately, ``manifest_verify`` re-checks the audit chain,
+Merkle root, payload binding, and tier signature under trusted signer policy
+(external Ed25519 pin or exact Sigstore identity + issuer). It does **not** rerun
+tools. This smoke instead proves from the sealed records that the live verifier
+was actually exercised for everything that shipped and that recovery records
+cite real executed tool calls. A run could (in principle) ship a Finding whose ``tool_call_id`` never
 appears as an executed ``tool_call_output``, ship a Finding the verifier
 ``rejected``, or log a ``course_correction`` blaming a tool call that never ran.
 

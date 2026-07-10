@@ -1,289 +1,639 @@
-//! `browser_history` — read visited URLs from an offline browser history
-//! `SQLite` database (Chrome/Edge `History`, Firefox `places.sqlite`).
+//! `browser_history` — read offline browser `SQLite` artifacts through one typed,
+//! read-only interface.
 //!
-//! Pool B exfil + general triage surface: a downloaded-payload URL, a
-//! credential-phishing visit, or a C2 panel opened in a browser all land
-//! here. The tool reads the DB **read-only** (and `immutable=1`, so it never
-//! touches the evidence's `-wal`/`-journal`) and emits a typed, browser-
-//! agnostic row shape.
+//! The historical tool name is kept for wire compatibility, but the module now
+//! recognizes Chrome/Edge `History` (visits + downloads), Firefox
+//! `places.sqlite`, Chromium `Cookies`, `Web Data`, and `Login Data`. Callers do
+//! not select a mode: the schema is the source of truth. Rows use a tagged,
+//! browser-agnostic shape so a single audit-chained call remains useful as
+//! browser schemas grow.
 //!
-//! Timestamps are normalized to UTC ISO-8601Z from each browser's native
-//! epoch: Chrome/`Chromium` store `last_visit_time` as **`WebKit` microseconds
-//! since 1601-01-01 UTC**; Firefox stores `last_visit_date` as **microseconds
-//! since the Unix epoch (1970)**.
+//! Privacy invariant: metadata queries use explicit positive projections. They
+//! never select or represent cookie values, encrypted cookie values, autofill
+//! values, password blobs, form data, or password notes. The DB is opened
+//! read-only with `immutable=1`, so `SQLite` cannot create a WAL or journal beside
+//! evidence.
 //!
-//! HONEST SCOPE (see `agent-config/SOUL.md`): a history row CONFIRMS that a URL
-//! *was recorded as visited* at time T — a browser-artifact fact. It does NOT
-//! assert the user *ran* anything (no execution token), so a single
-//! `browser_history` Finding is a legitimate CONFIRMED browser fact and never
-//! trips the >=2-artifact-class execution rule. Intent ("this is a malware
-//! stager") is a separate `hypothesis:`-prefixed layer.
+//! HONEST SCOPE: these records confirm what the browser database stored. A visit
+//! is not execution; a download row is not proof the file ran; cookie/autofill/
+//! login metadata is not proof of user intent or account compromise.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::OnceLock;
 
+use rusqlite::config::DbConfig;
+use rusqlite::ffi::ErrorCode;
+use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use serde::Serialize;
 
-/// `WebKit`/Chrome epoch (1601-01-01) to Unix epoch (1970-01-01), in seconds.
+mod history_readers;
+mod metadata_readers;
+mod types;
+use history_readers::{read_chromium_history, read_firefox};
+use metadata_readers::{read_autofill, read_cookies, read_logins};
+pub use types::{
+    BrowserArtifactKind, BrowserArtifactRow, BrowserAutofillMetadataRow, BrowserCookieMetadataRow,
+    BrowserDownloadRow, BrowserHistoryError, BrowserHistoryInput, BrowserHistoryOutput,
+    BrowserHistoryRow, BrowserLoginMetadataRow,
+};
+
+/// WebKit/Chromium epoch (1601-01-01) to Unix epoch (1970-01-01), in seconds.
 const WEBKIT_UNIX_OFFSET_SECS: i64 = 11_644_473_600;
+const MAX_PLAUSIBLE_UNIX_SECONDS: i64 = 10_000_000_000;
 const DEFAULT_LIMIT: usize = 10_000;
+const MAX_LIMIT: usize = 10_000;
+const DEFAULT_MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_FIELD_BYTES: u64 = 1024 * 1024;
+const DEFAULT_MAX_SQLITE_OPS: u64 = 50_000_000;
+// The Python JSON-RPC readers reject any frame above 64 MiB. The typed payload
+// is serialized once into MCP's text field and then JSON-escaped again in the
+// outer response, which can nearly double hostile quote/backslash-heavy data.
+// Keep the inner payload at 24 MiB so the envelope and metadata retain a hard
+// safety margin. Operator configuration may lower this limit, never raise it.
+const MAX_BROWSER_OUTPUT_BYTES: u64 = 24 * 1024 * 1024;
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = MAX_BROWSER_OUTPUT_BYTES;
+const DEFAULT_MAX_SQLITE_HEAP_BYTES: u64 = 128 * 1024 * 1024;
+const MIN_MAX_SQLITE_HEAP_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MAX_SQLITE_HEAP_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_MAX_SCHEMA_ENTRIES: u64 = 512;
+const MAX_MAX_SCHEMA_ENTRIES: u64 = 4096;
+const MAX_PROGRESS_INTERVAL: u64 = 10_000;
+static SQLITE_HEAP_LIMIT: OnceLock<Result<u64, String>> = OnceLock::new();
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserHistoryInput {
-    /// Case ID from a prior `case_open` call. Accepted for audit-log
-    /// correlation; not consumed by the parser.
-    pub case_id: String,
-
-    /// Path to the history `SQLite` database: a Chrome/Edge `History` file
-    /// (`.../User Data/Default/History`) or a Firefox `places.sqlite`.
-    /// Pass the file extracted from the mounted image, not a live profile.
-    pub history_path: PathBuf,
-
-    /// Hard cap on rows returned, highest `last_visit_time` first.
-    /// Default 10000.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
+#[derive(Clone, Copy)]
+struct BrowserResourceLimits {
+    database_bytes: u64,
+    field_bytes: u64,
+    sqlite_ops: u64,
+    output_bytes: u64,
+    sqlite_heap_bytes: u64,
+    schema_entries: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BrowserHistoryRow {
-    /// The visited URL.
-    pub url: String,
-
-    /// Page title, when the browser recorded one.
-    pub title: Option<String>,
-
-    /// Last-visit time as UTC ISO-8601Z, or None when the stored timestamp
-    /// is zero/unparseable (a row with no recorded visit time).
-    pub last_visit_time_iso: Option<String>,
-
-    /// Number of recorded visits to this URL.
-    pub visit_count: i64,
+impl BrowserResourceLimits {
+    fn from_env() -> Self {
+        Self {
+            database_bytes: env_u64("FINDEVIL_BROWSER_DB_MAX_BYTES", DEFAULT_MAX_DATABASE_BYTES),
+            field_bytes: env_u64("FINDEVIL_BROWSER_FIELD_MAX_BYTES", DEFAULT_MAX_FIELD_BYTES)
+                .min(i32::MAX as u64),
+            sqlite_ops: env_u64("FINDEVIL_BROWSER_SQLITE_MAX_OPS", DEFAULT_MAX_SQLITE_OPS),
+            output_bytes: bounded_browser_output_bytes(env_u64(
+                "FINDEVIL_BROWSER_OUTPUT_MAX_BYTES",
+                DEFAULT_MAX_OUTPUT_BYTES,
+            )),
+            sqlite_heap_bytes: env_u64(
+                "FINDEVIL_BROWSER_SQLITE_HEAP_MAX_BYTES",
+                DEFAULT_MAX_SQLITE_HEAP_BYTES,
+            )
+            .clamp(MIN_MAX_SQLITE_HEAP_BYTES, MAX_MAX_SQLITE_HEAP_BYTES),
+            schema_entries: env_u64(
+                "FINDEVIL_BROWSER_SCHEMA_MAX_ENTRIES",
+                DEFAULT_MAX_SCHEMA_ENTRIES,
+            )
+            .min(MAX_MAX_SCHEMA_ENTRIES),
+        }
+    }
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct BrowserHistoryOutput {
-    /// Which browser family the schema matched: `chrome` or `firefox`.
-    pub browser_family: String,
-    pub rows: Vec<BrowserHistoryRow>,
-    pub rows_seen: usize,
+const fn bounded_browser_output_bytes(configured: u64) -> u64 {
+    if configured < MAX_BROWSER_OUTPUT_BYTES {
+        configured
+    } else {
+        MAX_BROWSER_OUTPUT_BYTES
+    }
 }
 
-#[derive(Debug, Error)]
-pub enum BrowserHistoryError {
-    #[error("browser history database not found: {0}")]
-    NotFound(PathBuf),
-
-    #[error("browser history database unreadable {path}: {source}")]
-    Unreadable {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error("browser history parse failed for {path}: {source}")]
-    ParseFailed {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error(
-        "{0} is not a recognized browser history database \
-         (no Chrome urls/visits or Firefox moz_places table)"
-    )]
-    UnknownSchema(PathBuf),
+struct OutputBudget {
+    used_bytes: u64,
+    max_bytes: u64,
 }
 
-/// Cheap pre-flight: the path looks like a browser history database.
-///
-/// Matches the canonical base names (`History`, `places.sqlite`) and any
-/// `.sqlite` file. The parser is the source of truth on whether the file is
-/// genuinely a history DB.
+impl OutputBudget {
+    const fn new(max_bytes: u64) -> Self {
+        Self {
+            used_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn charge<T: Serialize>(&mut self, value: &T) -> Result<(), BrowserHistoryError> {
+        // Charge the representation that will actually cross the MCP boundary.
+        // Neutralization markers can be larger than attacker-controlled chat
+        // tokens (for example `[INST]` -> `[neutralized:inst_open]`), so charging
+        // raw rows would let a database amplify beyond the advertised ceiling
+        // after parsing. Per-row sanitization keeps peak expansion bounded before
+        // the row is retained in the aggregate output.
+        let raw_value = serde_json::to_value(value).map_err(BrowserHistoryError::OutputEncoding)?;
+        let (sanitized_value, _) = crate::sanitize::sanitize_value(&raw_value);
+        let row_bytes = serde_json::to_vec(&sanitized_value)
+            .map_err(BrowserHistoryError::OutputEncoding)?
+            .len() as u64;
+        self.used_bytes = self.used_bytes.saturating_add(row_bytes);
+        if self.used_bytes > self.max_bytes {
+            Err(BrowserHistoryError::ResourceLimit(
+                "cumulative serialized output budget exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn browser_history_output_max_bytes() -> u64 {
+    BrowserResourceLimits::from_env().output_bytes
+}
+
+pub(crate) fn validate_browser_history_limit(
+    input: &BrowserHistoryInput,
+) -> Result<(), BrowserHistoryError> {
+    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    if limit > MAX_LIMIT {
+        return Err(BrowserHistoryError::InvalidLimit {
+            requested: limit,
+            max: MAX_LIMIT,
+        });
+    }
+    Ok(())
+}
+
+/// Cheap pre-flight based on canonical browser DB names. Generic `.sqlite`
+/// files remain accepted; schema detection is still the source of truth.
 #[must_use]
 pub fn path_looks_like_browser_history(path: &Path) -> bool {
     if path
         .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("sqlite"))
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sqlite"))
     {
         return true;
     }
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "history" | "places.sqlite"
+        "history" | "archived history" | "places.sqlite" | "cookies" | "web data" | "login data"
     )
 }
 
-/// Read visited URLs from an offline browser history database.
+/// Read one extracted browser database without modifying it.
 ///
 /// # Errors
-/// * [`BrowserHistoryError::NotFound`] — the file does not exist.
-/// * [`BrowserHistoryError::Unreadable`] — exists but cannot be opened.
-/// * [`BrowserHistoryError::ParseFailed`] — opened but a query failed
-///   (corrupt DB / unexpected column shape).
-/// * [`BrowserHistoryError::UnknownSchema`] — a valid `SQLite` file that is
-///   neither a Chrome nor a Firefox history database.
+/// Returns a typed error when the file is missing/unreadable, its schema is
+/// unknown or ambiguous, required metadata columns are absent, or a projected
+/// query cannot be decoded.
 pub fn browser_history(
     input: &BrowserHistoryInput,
 ) -> Result<BrowserHistoryOutput, BrowserHistoryError> {
+    validate_browser_history_limit(input)?;
+    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+    let query_limit = limit.saturating_add(1);
     let path = &input.history_path;
-    if !path.is_file() {
-        return Err(BrowserHistoryError::NotFound(path.clone()));
-    }
-    // Read-only + immutable so we never write a -wal/-journal next to the
-    // evidence file, and a stale WAL header can't block the open.
-    let uri = format!("file:{}?immutable=1", path.to_string_lossy());
+    preflight_browser_file(path)?;
+    let resource_limits = BrowserResourceLimits::from_env();
+    install_global_sqlite_heap_limit(resource_limits.sqlite_heap_bytes)?;
+    let uri = sqlite_immutable_uri(path);
     let conn = Connection::open_with_flags(
-        &uri,
+        uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|source| BrowserHistoryError::Unreadable {
         path: path.clone(),
         source,
     })?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .and_then(|_| conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false))
+        .and_then(|_| conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false))
+        .and_then(|_| conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false))
+        .map_err(BrowserHistoryError::ResourceConfiguration)?;
+    conn.execute_batch(
+        "PRAGMA query_only=ON; \
+         PRAGMA trusted_schema=OFF; \
+         PRAGMA cell_size_check=ON; \
+         PRAGMA mmap_size=0;",
+    )
+    .map_err(|source| BrowserHistoryError::Unreadable {
+        path: path.clone(),
+        source,
+    })?;
+    install_sqlite_limits(&conn, resource_limits)?;
+    let mut output_budget = OutputBudget::new(resource_limits.output_bytes);
 
-    let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
-    let family = detect_family(&conn, path)?;
-    let rows = match family {
-        Family::Chrome => read_chrome(&conn, path, limit)?,
-        Family::Firefox => read_firefox(&conn, path, limit)?,
+    let detected = detect_artifact(&conn, path, resource_limits.schema_entries)?;
+    let mut rows = match detected {
+        DetectedArtifact::ChromiumHistory => {
+            read_chromium_history(&conn, path, query_limit, &mut output_budget)?
+        }
+        DetectedArtifact::FirefoxHistory => {
+            read_firefox(&conn, path, query_limit, &mut output_budget)?
+                .into_iter()
+                .map(BrowserArtifactRow::Visit)
+                .collect()
+        }
+        DetectedArtifact::ChromiumCookies => {
+            { read_cookies(&conn, path, query_limit, &mut output_budget)? }
+                .into_iter()
+                .map(BrowserArtifactRow::CookieMetadata)
+                .collect()
+        }
+        DetectedArtifact::ChromiumWebData => {
+            { read_autofill(&conn, path, query_limit, &mut output_budget)? }
+                .into_iter()
+                .map(BrowserArtifactRow::AutofillMetadata)
+                .collect()
+        }
+        DetectedArtifact::ChromiumLoginData => {
+            { read_logins(&conn, path, query_limit, &mut output_budget)? }
+                .into_iter()
+                .map(BrowserArtifactRow::LoginMetadata)
+                .collect()
+        }
     };
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+
     Ok(BrowserHistoryOutput {
-        browser_family: family.as_str().to_string(),
+        schema_version: 2,
+        browser_family: detected.browser_family().to_string(),
+        artifact_kind: detected.artifact_kind(),
         rows_seen: rows.len(),
         rows,
+        truncated,
     })
 }
 
-enum Family {
-    Chrome,
-    Firefox,
+pub(super) fn preflight_browser_file(
+    path: &Path,
+) -> Result<std::fs::Metadata, BrowserHistoryError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| BrowserHistoryError::NotFound(path.into()))?;
+    if !metadata.is_file() {
+        return Err(BrowserHistoryError::NotRegular(path.into()));
+    }
+    enforce_database_size(metadata.len(), BrowserResourceLimits::from_env())?;
+    Ok(metadata)
 }
 
-impl Family {
-    const fn as_str(&self) -> &'static str {
+const fn enforce_database_size(
+    size_bytes: u64,
+    limits: BrowserResourceLimits,
+) -> Result<(), BrowserHistoryError> {
+    if size_bytes > limits.database_bytes {
+        Err(BrowserHistoryError::DatabaseTooLarge {
+            size_bytes,
+            max_bytes: limits.database_bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn install_sqlite_limits(
+    conn: &Connection,
+    limits: BrowserResourceLimits,
+) -> Result<(), BrowserHistoryError> {
+    let max_field_bytes = i32::try_from(limits.field_bytes).unwrap_or(i32::MAX);
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, max_field_bytes)
+        .map_err(BrowserHistoryError::ResourceConfiguration)?;
+    for (limit, value) in [
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, 100_000),
+        (Limit::SQLITE_LIMIT_COLUMN, 100),
+        (Limit::SQLITE_LIMIT_EXPR_DEPTH, 10),
+        (Limit::SQLITE_LIMIT_COMPOUND_SELECT, 3),
+        (Limit::SQLITE_LIMIT_VDBE_OP, 25_000),
+        (Limit::SQLITE_LIMIT_FUNCTION_ARG, 8),
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+        (Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 64),
+        (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 16),
+        (Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 10),
+        (Limit::SQLITE_LIMIT_WORKER_THREADS, 0),
+    ] {
+        conn.set_limit(limit, value)
+            .map_err(BrowserHistoryError::ResourceConfiguration)?;
+    }
+
+    let interval = limits.sqlite_ops.clamp(1, MAX_PROGRESS_INTERVAL);
+    let allowed_callbacks = limits.sqlite_ops.div_ceil(interval).max(1);
+    let mut callbacks = 0_u64;
+    conn.progress_handler(
+        i32::try_from(interval).unwrap_or(i32::MAX),
+        Some(move || {
+            callbacks = callbacks.saturating_add(1);
+            callbacks >= allowed_callbacks
+        }),
+    )
+    .map_err(BrowserHistoryError::ResourceConfiguration)?;
+    Ok(())
+}
+
+fn install_global_sqlite_heap_limit(max_bytes: u64) -> Result<(), BrowserHistoryError> {
+    let configured = SQLITE_HEAP_LIMIT.get_or_init(|| {
+        let requested = i64::try_from(max_bytes).map_err(|error| error.to_string())?;
+        // A bootstrap in-memory connection lets us use SQLite's safe PRAGMA
+        // wrapper before the hostile on-disk database is opened. The hard heap
+        // ceiling is process-global, so it applies to every later connection.
+        let bootstrap = Connection::open_in_memory().map_err(|error| error.to_string())?;
+        bootstrap
+            .pragma_update(None, "hard_heap_limit", requested)
+            .map_err(|error| error.to_string())?;
+        let current: i64 = bootstrap
+            .query_row("PRAGMA hard_heap_limit", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let current = u64::try_from(current).map_err(|error| error.to_string())?;
+        if current == 0 || current > max_bytes {
+            return Err("SQLite did not install the requested hard heap limit".to_string());
+        }
+        Ok(current)
+    });
+    configured
+        .as_ref()
+        .map(|_| ())
+        .map_err(|_| BrowserHistoryError::ResourceLimit("SQLite hard heap limit unavailable"))
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
+    // Detection already bounded schema cardinality. Downstream readers still
+    // need a few optional-table checks; repeat the unspoofable PRAGMA statement
+    // instead of its attacker-shadowable table-valued alias.
+    let mut statement = conn.prepare("PRAGMA main.table_list")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let schema = row.get::<_, String>(0)?;
+        let table_name = row.get::<_, String>(1)?;
+        let table_type = row.get::<_, String>(2)?;
+        if schema == "main" && table_name == name && table_type == "table" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DetectedArtifact {
+    ChromiumHistory,
+    FirefoxHistory,
+    ChromiumCookies,
+    ChromiumWebData,
+    ChromiumLoginData,
+}
+
+impl DetectedArtifact {
+    const fn browser_family(self) -> &'static str {
         match self {
-            Self::Chrome => "chrome",
-            Self::Firefox => "firefox",
+            Self::FirefoxHistory => "firefox",
+            Self::ChromiumHistory
+            | Self::ChromiumCookies
+            | Self::ChromiumWebData
+            | Self::ChromiumLoginData => "chrome",
+        }
+    }
+
+    const fn artifact_kind(self) -> BrowserArtifactKind {
+        match self {
+            Self::ChromiumHistory => BrowserArtifactKind::ChromiumHistory,
+            Self::FirefoxHistory => BrowserArtifactKind::FirefoxHistory,
+            Self::ChromiumCookies => BrowserArtifactKind::ChromiumCookies,
+            Self::ChromiumWebData => BrowserArtifactKind::ChromiumWebData,
+            Self::ChromiumLoginData => BrowserArtifactKind::ChromiumLoginData,
         }
     }
 }
 
-fn has_table(conn: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
+fn detect_artifact(
+    conn: &Connection,
+    path: &Path,
+    max_schema_entries: u64,
+) -> Result<DetectedArtifact, BrowserHistoryError> {
+    let tables = ordinary_tables(conn, path, max_schema_entries)?;
+    let mut matches = BTreeSet::new();
+    if (tables.contains("urls") && tables.contains("visits")) || tables.contains("downloads") {
+        matches.insert(DetectedArtifact::ChromiumHistory);
+    }
+    if tables.contains("moz_places") {
+        matches.insert(DetectedArtifact::FirefoxHistory);
+    }
+    if tables.contains("cookies") {
+        matches.insert(DetectedArtifact::ChromiumCookies);
+    }
+    if tables.contains("autofill") {
+        matches.insert(DetectedArtifact::ChromiumWebData);
+    }
+    if tables.contains("logins") {
+        matches.insert(DetectedArtifact::ChromiumLoginData);
+    }
+    match matches.len() {
+        0 => Err(BrowserHistoryError::UnknownSchema(path.to_path_buf())),
+        1 => Ok(*matches.first().expect("one detected artifact")),
+        _ => Err(BrowserHistoryError::AmbiguousSchema(path.to_path_buf())),
+    }
 }
 
-fn detect_family(conn: &Connection, path: &Path) -> Result<Family, BrowserHistoryError> {
-    let map_err = |source| BrowserHistoryError::ParseFailed {
+fn ordinary_tables(
+    conn: &Connection,
+    path: &Path,
+    max_schema_entries: u64,
+) -> Result<BTreeSet<String>, BrowserHistoryError> {
+    // `sqlite_master.type='table'` also matches virtual FTS5 tables. Forensic
+    // databases are attacker-controlled and SQLite FTS has had crafted-index
+    // memory-safety CVEs, while every supported browser target is an ordinary
+    // table. `pragma_table_list` distinguishes ordinary, virtual, and shadow
+    // tables, so reject the latter two before preparing any artifact query.
+    // Use the PRAGMA statement itself: its table-valued SQL alias can be
+    // shadowed by an attacker-created ordinary table named
+    // `pragma_table_list`.
+    let map_err = |source| parse_error(path, source);
+    let mut statement = conn.prepare("PRAGMA main.table_list").map_err(map_err)?;
+    let mut rows = statement.query([]).map_err(map_err)?;
+    let mut seen = 0_u64;
+    let mut tables = BTreeSet::new();
+    while let Some(row) = rows.next().map_err(map_err)? {
+        seen = seen.saturating_add(1);
+        if seen > max_schema_entries {
+            return Err(BrowserHistoryError::ResourceLimit(
+                "SQLite schema entry budget exceeded",
+            ));
+        }
+        let schema = row.get::<_, String>(0).map_err(map_err)?;
+        let table_name = row.get::<_, String>(1).map_err(map_err)?;
+        let table_type = row.get::<_, String>(2).map_err(map_err)?;
+        if schema == "main" && table_type == "table" {
+            tables.insert(table_name);
+        }
+    }
+    Ok(tables)
+}
+
+fn table_columns(
+    conn: &Connection,
+    path: &Path,
+    table: &'static str,
+) -> Result<BTreeSet<String>, BrowserHistoryError> {
+    let sql = match table {
+        "downloads" => "SELECT name FROM pragma_table_info('downloads')",
+        "downloads_url_chains" => "SELECT name FROM pragma_table_info('downloads_url_chains')",
+        "cookies" => "SELECT name FROM pragma_table_info('cookies')",
+        "autofill" => "SELECT name FROM pragma_table_info('autofill')",
+        "logins" => "SELECT name FROM pragma_table_info('logins')",
+        _ => unreachable!("table name is an internal allow-list"),
+    };
+    let map_err = |source| parse_error(path, source);
+    let mut stmt = conn.prepare(sql).map_err(map_err)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(map_err)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(map_err)?;
+    Ok(columns)
+}
+
+fn require_columns(
+    columns: &BTreeSet<String>,
+    path: &Path,
+    table: &'static str,
+    required: &[&str],
+) -> Result<(), BrowserHistoryError> {
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|name| !columns.contains(*name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(BrowserHistoryError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            table,
+            missing: missing.join(", "),
+        })
+    }
+}
+
+fn collect_budgeted<T, F>(
+    rows: rusqlite::MappedRows<'_, F>,
+    path: &Path,
+    output_budget: &mut OutputBudget,
+) -> Result<Vec<T>, BrowserHistoryError>
+where
+    T: Serialize,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut output = Vec::new();
+    for row in rows {
+        let row = row.map_err(|source| parse_error(path, source))?;
+        output_budget.charge(&row)?;
+        output.push(row);
+    }
+    Ok(output)
+}
+
+fn first_present<'a>(columns: &BTreeSet<String>, names: &'a [&'a str]) -> Option<&'a str> {
+    names.iter().copied().find(|name| columns.contains(*name))
+}
+
+fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str, fallback: &'a str) -> &'a str {
+    if columns.contains(name) {
+        name
+    } else {
+        fallback
+    }
+}
+
+fn unsupported(path: &Path, table: &'static str, missing: &str) -> BrowserHistoryError {
+    BrowserHistoryError::UnsupportedSchema {
+        path: path.to_path_buf(),
+        table,
+        missing: missing.to_string(),
+    }
+}
+
+fn parse_error(path: &Path, source: rusqlite::Error) -> BrowserHistoryError {
+    match source.sqlite_error_code() {
+        Some(ErrorCode::OperationInterrupted) => {
+            return BrowserHistoryError::ResourceLimit("SQLite operation budget exceeded");
+        }
+        Some(ErrorCode::TooBig) => {
+            return BrowserHistoryError::ResourceLimit("SQLite field length limit exceeded");
+        }
+        Some(ErrorCode::OutOfMemory) => {
+            return BrowserHistoryError::ResourceLimit("SQLite hard heap limit exceeded");
+        }
+        _ => {}
+    }
+    BrowserHistoryError::ParseFailed {
         path: path.to_path_buf(),
         source,
-    };
-    if has_table(conn, "urls").map_err(map_err)? && has_table(conn, "visits").map_err(map_err)? {
-        return Ok(Family::Chrome);
     }
-    if has_table(conn, "moz_places").map_err(map_err)? {
-        return Ok(Family::Firefox);
-    }
-    Err(BrowserHistoryError::UnknownSchema(path.to_path_buf()))
 }
 
-/// `LIMIT` accepts an `i64`; a `usize` past `i64::MAX` is clamped (no real
-/// history DB has that many rows, and a smaller bound would silently truncate).
+fn sqlite_immutable_uri(path: &Path) -> String {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    let mut encoded = String::with_capacity(path_bytes.len() + 32);
+    for &byte in path_bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    format!("file:{encoded}?mode=ro&immutable=1")
+}
+
+fn empty_to_none(value: Option<String>) -> Option<String> {
+    value.filter(|item| !item.is_empty())
+}
+
 fn limit_as_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
-fn read_chrome(
-    conn: &Connection,
-    path: &Path,
-    limit: usize,
-) -> Result<Vec<BrowserHistoryRow>, BrowserHistoryError> {
-    let map_err = |source| BrowserHistoryError::ParseFailed {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut stmt = conn
-        .prepare(
-            "SELECT url, title, visit_count, last_visit_time \
-             FROM urls ORDER BY last_visit_time DESC LIMIT ?1",
-        )
-        .map_err(map_err)?;
-    let rows = stmt
-        .query_map([limit_as_i64(limit)], |row| {
-            let webkit_micros: i64 = row.get(3)?;
-            Ok(BrowserHistoryRow {
-                url: row.get(0)?,
-                title: row.get::<_, Option<String>>(1)?,
-                visit_count: row.get(2)?,
-                last_visit_time_iso: webkit_micros_to_iso(webkit_micros),
-            })
-        })
-        .map_err(map_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_err)?;
-    Ok(rows)
-}
-
-fn read_firefox(
-    conn: &Connection,
-    path: &Path,
-    limit: usize,
-) -> Result<Vec<BrowserHistoryRow>, BrowserHistoryError> {
-    let map_err = |source| BrowserHistoryError::ParseFailed {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut stmt = conn
-        .prepare(
-            "SELECT url, title, visit_count, last_visit_date \
-             FROM moz_places ORDER BY last_visit_date DESC LIMIT ?1",
-        )
-        .map_err(map_err)?;
-    let rows = stmt
-        .query_map([limit_as_i64(limit)], |row| {
-            let unix_micros: Option<i64> = row.get(3)?;
-            Ok(BrowserHistoryRow {
-                url: row.get(0)?,
-                title: row.get::<_, Option<String>>(1)?,
-                visit_count: row.get(2)?,
-                last_visit_time_iso: unix_micros.and_then(unix_micros_to_iso),
-            })
-        })
-        .map_err(map_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_err)?;
-    Ok(rows)
-}
-
-/// `WebKit` microseconds (since 1601) -> UTC ISO-8601Z. Zero/negative -> None.
 fn webkit_micros_to_iso(webkit_micros: i64) -> Option<String> {
     if webkit_micros <= 0 {
         return None;
     }
-    let unix_micros = webkit_micros - WEBKIT_UNIX_OFFSET_SECS * 1_000_000;
+    let unix_micros = webkit_micros.checked_sub(WEBKIT_UNIX_OFFSET_SECS * 1_000_000)?;
     unix_micros_to_iso(unix_micros)
 }
 
-/// Unix microseconds (since 1970) -> UTC ISO-8601Z. Zero/negative -> None.
 fn unix_micros_to_iso(unix_micros: i64) -> Option<String> {
     if unix_micros <= 0 {
         return None;
     }
     let secs = unix_micros.div_euclid(1_000_000);
-    let nanos = u32::try_from(unix_micros.rem_euclid(1_000_000) * 1_000).unwrap_or(0);
+    let nanos = u32::try_from(unix_micros.rem_euclid(1_000_000) * 1_000).ok()?;
     chrono::DateTime::from_timestamp(secs, nanos)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .map(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn unix_seconds_to_iso(unix_seconds: i64) -> Option<String> {
+    if unix_seconds <= 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(unix_seconds, 0)
+        .map(|timestamp| timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+const fn unix_seconds_to_webkit_micros(unix_seconds: i64) -> i64 {
+    unix_seconds
+        .saturating_add(WEBKIT_UNIX_OFFSET_SECS)
+        .saturating_mul(1_000_000)
+}
+
+fn chromium_login_time_to_iso(value: i64) -> Option<String> {
+    if value > 0 && value < MAX_PLAUSIBLE_UNIX_SECONDS {
+        unix_seconds_to_iso(value)
+    } else {
+        webkit_micros_to_iso(value)
+    }
 }
 
 #[cfg(test)]
@@ -292,8 +642,6 @@ mod tests {
 
     #[test]
     fn webkit_epoch_converts_to_known_instant() {
-        // The `WebKit` value for the Unix epoch is the offset itself; +1s lands
-        // one second past 1970-01-01.
         let unix_epoch_in_webkit = WEBKIT_UNIX_OFFSET_SECS * 1_000_000;
         assert_eq!(
             webkit_micros_to_iso(unix_epoch_in_webkit + 1_000_000),
@@ -303,7 +651,6 @@ mod tests {
 
     #[test]
     fn firefox_unix_micros_converts() {
-        // 2021-01-01T00:00:00Z = 1609459200 s.
         assert_eq!(
             unix_micros_to_iso(1_609_459_200 * 1_000_000),
             Some("2021-01-01T00:00:00Z".to_string())
@@ -311,17 +658,187 @@ mod tests {
     }
 
     #[test]
-    fn zero_timestamps_are_none() {
-        assert_eq!(webkit_micros_to_iso(0), None);
-        assert_eq!(unix_micros_to_iso(0), None);
+    fn unix_seconds_convert_for_autofill() {
+        assert_eq!(
+            unix_seconds_to_iso(1_609_459_200),
+            Some("2021-01-01T00:00:00Z".to_string())
+        );
     }
 
     #[test]
-    fn path_predicate_matches_history_dbs() {
-        assert!(path_looks_like_browser_history(Path::new("History")));
-        assert!(path_looks_like_browser_history(Path::new("places.sqlite")));
-        assert!(path_looks_like_browser_history(Path::new("x.sqlite")));
+    fn zero_and_pre_unix_timestamps_are_none() {
+        assert_eq!(webkit_micros_to_iso(0), None);
+        assert_eq!(unix_micros_to_iso(0), None);
+        assert_eq!(unix_seconds_to_iso(0), None);
+        assert_eq!(webkit_micros_to_iso(1), None);
+    }
+
+    #[test]
+    fn immutable_uri_percent_encodes_query_delimiters() {
+        let uri = sqlite_immutable_uri(Path::new("/tmp/a b?#/History"));
+        assert_eq!(uri, "file:/tmp/a%20b%3F%23/History?mode=ro&immutable=1");
+    }
+
+    #[test]
+    fn path_predicate_matches_supported_names() {
+        for name in [
+            "History",
+            "Archived History",
+            "places.sqlite",
+            "Cookies",
+            "Web Data",
+            "Login Data",
+            "x.sqlite",
+        ] {
+            assert!(path_looks_like_browser_history(Path::new(name)));
+        }
         assert!(!path_looks_like_browser_history(Path::new("evil.evtx")));
         assert!(!path_looks_like_browser_history(Path::new("SOFTWARE")));
+    }
+
+    #[test]
+    fn database_size_ceiling_is_loud() {
+        let limits = BrowserResourceLimits {
+            database_bytes: 7,
+            field_bytes: DEFAULT_MAX_FIELD_BYTES,
+            sqlite_ops: DEFAULT_MAX_SQLITE_OPS,
+            output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            sqlite_heap_bytes: DEFAULT_MAX_SQLITE_HEAP_BYTES,
+            schema_entries: DEFAULT_MAX_SCHEMA_ENTRIES,
+        };
+        let error = enforce_database_size(8, limits).expect_err("reject oversized database");
+        assert!(matches!(
+            error,
+            BrowserHistoryError::DatabaseTooLarge {
+                size_bytes: 8,
+                max_bytes: 7
+            }
+        ));
+    }
+
+    #[test]
+    fn sqlite_operation_budget_interrupts_expensive_work() {
+        let conn = Connection::open_in_memory().expect("open SQLite fixture");
+        install_sqlite_limits(
+            &conn,
+            BrowserResourceLimits {
+                database_bytes: DEFAULT_MAX_DATABASE_BYTES,
+                field_bytes: DEFAULT_MAX_FIELD_BYTES,
+                sqlite_ops: 1,
+                output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                sqlite_heap_bytes: DEFAULT_MAX_SQLITE_HEAP_BYTES,
+                schema_entries: DEFAULT_MAX_SCHEMA_ENTRIES,
+            },
+        )
+        .expect("install operation budget");
+        let error = conn
+            .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .expect_err("operation budget must interrupt query");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted)
+        );
+    }
+
+    #[test]
+    fn sqlite_field_length_limit_rejects_oversized_values() {
+        let conn = Connection::open_in_memory().expect("open SQLite fixture");
+        conn.execute("CREATE TABLE values_table (value TEXT)", [])
+            .expect("create fixture table");
+        conn.execute("INSERT INTO values_table VALUES (?1)", ["x".repeat(1024)])
+            .expect("insert oversized fixture value before limiting reads");
+        install_sqlite_limits(
+            &conn,
+            BrowserResourceLimits {
+                database_bytes: DEFAULT_MAX_DATABASE_BYTES,
+                field_bytes: 128,
+                sqlite_ops: DEFAULT_MAX_SQLITE_OPS,
+                output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+                sqlite_heap_bytes: DEFAULT_MAX_SQLITE_HEAP_BYTES,
+                schema_entries: DEFAULT_MAX_SCHEMA_ENTRIES,
+            },
+        )
+        .expect("install field budget");
+        let error = conn
+            .query_row("SELECT value FROM values_table", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect_err("field limit must reject oversized value");
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::TooBig));
+    }
+
+    #[test]
+    fn sqlite_heap_exhaustion_is_a_typed_resource_limit() {
+        let sqlite_error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM),
+            None,
+        );
+        let error = parse_error(Path::new("History"), sqlite_error);
+
+        assert!(matches!(
+            error,
+            BrowserHistoryError::ResourceLimit("SQLite hard heap limit exceeded")
+        ));
+    }
+
+    #[test]
+    fn cumulative_output_budget_rejects_many_individually_small_rows() {
+        let row = BrowserHistoryRow {
+            url_id: 1,
+            url: "x".repeat(64),
+            title: Some("y".repeat(64)),
+            last_visit_time_iso: None,
+            visit_count: 1,
+        };
+        let single_size = serde_json::to_vec(&row).unwrap().len() as u64;
+        let mut budget = OutputBudget::new(single_size * 3);
+        for _ in 0..3 {
+            budget.charge(&row).expect("row remains under total budget");
+        }
+        assert!(matches!(
+            budget.charge(&row),
+            Err(BrowserHistoryError::ResourceLimit(
+                "cumulative serialized output budget exceeded"
+            ))
+        ));
+    }
+
+    #[test]
+    fn configured_output_budget_reserves_json_rpc_envelope_space() {
+        assert_eq!(
+            bounded_browser_output_bytes(u64::MAX),
+            MAX_BROWSER_OUTPUT_BYTES
+        );
+        assert_eq!(bounded_browser_output_bytes(1024), 1024);
+        assert_eq!(DEFAULT_MAX_OUTPUT_BYTES, MAX_BROWSER_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn output_budget_charges_sanitizer_expansion_before_rows_accumulate() {
+        let row = serde_json::json!({"title": "[INST]".repeat(8)});
+        let raw_size = serde_json::to_vec(&row).unwrap().len() as u64;
+        let (sanitized, _) = crate::sanitize::sanitize_value(&row);
+        let sanitized_size = serde_json::to_vec(&sanitized).unwrap().len() as u64;
+        assert!(sanitized_size > raw_size);
+
+        let mut budget = OutputBudget::new(raw_size);
+        assert!(matches!(
+            budget.charge(&row),
+            Err(BrowserHistoryError::ResourceLimit(
+                "cumulative serialized output budget exceeded"
+            ))
+        ));
+    }
+
+    #[test]
+    fn bundled_sqlite_includes_hostile_fts_database_fixes() {
+        // SQLite 3.50.3 fixes CVE-2025-7709's corrupt-FTS-index path. Forensic
+        // inputs are attacker-controlled database files, so the usual "trusted
+        // DB" caveat does not apply to this parser.
+        assert!(
+            rusqlite::version_number() >= 3_050_003,
+            "bundled SQLite {} is below the hostile-FTS safety floor 3.50.3",
+            rusqlite::version()
+        );
     }
 }

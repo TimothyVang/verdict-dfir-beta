@@ -25,7 +25,7 @@ The divergences (matching CLAUDE.md "Spec/code divergences"):
   §1  Rust 1.83 -> 1.88                bad: rust:1.83-bookworm
   §2  Cargo.lock committed             declarative; nothing to scan
   §3  findevil_agent.cli dropped (A2)  bad: python -m findevil_agent.cli
-  §4  Rust MCP tool count is 31        bad: stale 11/12/20 Rust or 32-tool count
+  §4  Rust MCP tool count is 43        bad: stale 11/12/20/31/32/34/44 counts
   §5  rmcp not a runtime dep           bad: live `rmcp = "=...` (uncommented)
   §7  A3 MemoryStore phrase-quote      doc-only; no shipped wrong-pattern
   §8  A3 audit push: SSE not WebSocket bad: "ws": "..." dep in apps/web pkg
@@ -140,12 +140,12 @@ ALLOWED_FILES = {
 DIVERGENCES = [
     {
         "id": "#1",
-        "label": "Rust 1.83 -> 1.88 (Dockerfile + plan files use 1.88)",
+        "label": "Rust 1.83 -> 1.91 (Dockerfile + plan files use 1.91)",
         "regex": re.compile(r"\brust:1\.83-(?:bookworm|bullseye|slim)\b"),
         "allowed_in_path": (),
         "remediation": (
-            "rust-toolchain.toml channel=1.88.0 is authoritative; "
-            "Cargo.toml requires rust-version=1.88. Do not pin a "
+            "rust-toolchain.toml channel=1.91.0 is authoritative; "
+            "Cargo.toml requires rust-version=1.91. Do not pin a "
             "Docker base older than that. See CLAUDE.md "
             "'Spec/code divergences' §1."
         ),
@@ -179,7 +179,7 @@ DIVERGENCES = [
     },
     {
         "id": "#4",
-        "label": "Rust MCP tool count is 32 (long-tail typed wrappers included)",
+        "label": "Rust MCP tool count is 43 (long-tail typed wrappers included)",
         "regex": re.compile(
             r"(?:1[12]\s+typed\s+Rust|"
             r"1[12]\s+DFIR\s+tools|"
@@ -193,13 +193,21 @@ DIVERGENCES = [
             r"\b31-tool\s+surface\b|"
             r"\b31-tool\s+(?:typed\s+)?product\b|"
             r"\b31-tool\s+count\b|"
+            r"\b(?:32|34|44)\s+(?:typed\s+)?(?:Rust\s+)?(?:DFIR\s+)?(?:MCP\s+)?(?:tools|primitives)\b|"
+            r"\b(?:32|34|44)-tool\s+(?:dispatch|catalog|surface|product)\b|"
             r"all\s+1[12]\s+Rust|"
             r"findevil-mcp.*?\(1[12]\s+(?:typed|DFIR|tools))"
         ),
-        "allowed_in_path": (),
+        # These are dated decision/snapshot records whose historical counts are
+        # evidence about the surface at that time, not current product claims.
+        "allowed_in_path": (
+            "docs/internal/find-evil-2026/judging-pass-2026-06-19.md",
+            "docs/internal/find-evil-2026/judging-pass-2026-06-24.md",
+            "docs/internal/session-resume-plan.md",
+        ),
         "remediation": (
-            "The current product surface is 45 tools: 32 Rust DFIR "
-            "tools plus 13 Python crypto/ACH/memory/ACP/expert tools. "
+            "The current product surface is 57 tools: 43 Rust DFIR "
+            "tools plus 14 Python crypto/ACH/memory/ACP/expert tools. "
             "See CLAUDE.md 'Spec/code divergences' §4."
         ),
     },

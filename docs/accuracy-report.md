@@ -367,6 +367,11 @@ bash scripts/run-all-smokes.sh
 - Unsupported raw disk coverage must remain custody-only until supported artifacts
   are mounted or extracted.
 
+
+## Held-out program status
+
+**No held-out goldens are committed in this repository yet.** `goldens/CORPUS.json` records `held_out_program.status = none_yet`. Public-documented cases (e.g. NIST Hacking Case) carry a contamination caveat; synthetic controls measure the FP floor only. Do not read a strong public-corpus score as held-out generalization.
+
 ## Known Limits
 
 - The public source tree does not ship bulky completed case directories or raw

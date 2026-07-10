@@ -39,13 +39,18 @@ def main() -> int:
         text=True,
     )
     if proc.returncode not in (0, 1):
-        print(f"FAIL: unexpected exit {proc.returncode}\n{proc.stderr}", file=sys.stderr)
+        print(
+            f"FAIL: unexpected exit {proc.returncode}\n{proc.stderr}", file=sys.stderr
+        )
         return 1
     line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
     try:
         data = json.loads(line)
     except json.JSONDecodeError:
-        print(f"FAIL: doctor --offline --json did not emit JSON:\n{proc.stdout}\n{proc.stderr}", file=sys.stderr)
+        print(
+            f"FAIL: doctor --offline --json did not emit JSON:\n{proc.stdout}\n{proc.stderr}",
+            file=sys.stderr,
+        )
         return 1
     if data.get("offline") is not True:
         print(f"FAIL: offline flag missing in JSON: {data}", file=sys.stderr)
@@ -61,18 +66,26 @@ def main() -> int:
     )
     out = (proc2.stdout or "") + (proc2.stderr or "")
     if "offline" not in out.lower():
-        print("FAIL: human offline doctor output does not mention offline", file=sys.stderr)
+        print(
+            "FAIL: human offline doctor output does not mention offline",
+            file=sys.stderr,
+        )
         print(out[-1500:], file=sys.stderr)
         return 1
 
     # scripts/verdict must invoke doctor with --offline by default.
     verdict = (REPO / "scripts" / "verdict").read_text(encoding="utf-8")
     if "--offline" not in verdict or "DOCTOR_ARGS" not in verdict:
-        print("FAIL: scripts/verdict must preflight with doctor --offline", file=sys.stderr)
+        print(
+            "FAIL: scripts/verdict must preflight with doctor --offline",
+            file=sys.stderr,
+        )
         return 1
 
     print("PASS: doctor --offline JSON+human; scripts/verdict offline preflight")
-    print(f"  offline JSON ready={data.get('ready')} missing_required={data.get('missing_required')}")
+    print(
+        f"  offline JSON ready={data.get('ready')} missing_required={data.get('missing_required')}"
+    )
     return 0
 
 

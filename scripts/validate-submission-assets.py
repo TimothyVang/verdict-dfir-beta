@@ -13,12 +13,28 @@ import base64
 import csv
 from dataclasses import dataclass
 import hashlib
+import hmac
+import importlib.util
 import io
 import json
+import os
 import re
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 import zipfile
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_STRICT_ED25519_PATH = (
+    REPO_ROOT / "services" / "agent" / "findevil_agent" / "crypto" / "ed25519_strict.py"
+)
+_STRICT_ED25519_SPEC = importlib.util.spec_from_file_location(
+    "verdict_release_ed25519_strict", _STRICT_ED25519_PATH
+)
+if _STRICT_ED25519_SPEC is None or _STRICT_ED25519_SPEC.loader is None:
+    raise RuntimeError(f"cannot load strict Ed25519 validator: {_STRICT_ED25519_PATH}")
+_STRICT_ED25519_MODULE = importlib.util.module_from_spec(_STRICT_ED25519_SPEC)
+_STRICT_ED25519_SPEC.loader.exec_module(_STRICT_ED25519_MODULE)
+validate_strict_ed25519_inputs = _STRICT_ED25519_MODULE.validate_strict_ed25519_inputs
 
 REQUIRED_ZIP_FILES = {
     "README-submission.md",
@@ -372,7 +388,9 @@ def validate_stage_dir(path: Path) -> CheckResult:
     return CheckResult(True, "stage dir contains required files")
 
 
-def validate_zip(path: Path) -> CheckResult:
+def validate_zip(
+    path: Path, *, expected_ed25519_fingerprint: str | None = None
+) -> CheckResult:
     if not path.is_file():
         return CheckResult(False, f"submission zip missing: {path}")
     with zipfile.ZipFile(path) as zf:
@@ -420,7 +438,9 @@ def validate_zip(path: Path) -> CheckResult:
             )
         if "readiness-packet.zip" in names:
             readiness_result = validate_readiness_packet_bytes(
-                zf.read("readiness-packet.zip"), "readiness-packet.zip"
+                zf.read("readiness-packet.zip"),
+                "readiness-packet.zip",
+                expected_ed25519_fingerprint=expected_ed25519_fingerprint,
             )
             if not readiness_result.ok:
                 return CheckResult(
@@ -625,13 +645,30 @@ def add_customer_ready_blockers(obj: object, label: str, blockers: list[str]) ->
             add_customer_ready_blockers(nested, f"{label}.{nested_key}", blockers)
 
 
+def audit_physical_lines(
+    text: str, label: str, blockers: list[str]
+) -> list[str] | None:
+    if not text.endswith("\n"):
+        blockers.append(f"{label} is missing its required terminal LF")
+        return None
+    lines = text.split("\n")
+    lines.pop()
+    if not lines:
+        blockers.append(f"{label} has no audit records")
+        return None
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            blockers.append(f"{label} line {line_number} is an empty physical record")
+            return None
+    return lines
+
+
 def parse_readiness_audit_text(text: str, blockers: list[str]) -> list[dict]:
     records: list[dict] = []
-    line_count = 0
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        if not line.strip():
-            continue
-        line_count += 1
+    physical_lines = audit_physical_lines(text, "audit.jsonl", blockers)
+    if physical_lines is None:
+        return records
+    for line_number, line in enumerate(physical_lines, start=1):
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -643,8 +680,6 @@ def parse_readiness_audit_text(text: str, blockers: list[str]) -> list[dict]:
         records.append(record)
         if not isinstance(record.get("kind"), str):
             blockers.append(f"audit.jsonl line {line_number} lacks top-level kind")
-    if line_count == 0:
-        blockers.append("audit.jsonl has no audit records")
     return records
 
 
@@ -798,7 +833,10 @@ def derive_audit_manifest_state(
     final_hash = ""
     leaves: list[dict[str, object]] = []
     record_count = 0
-    for raw_line in [line for line in audit_text.splitlines() if line.strip()]:
+    physical_lines = audit_physical_lines(audit_text, f"{label} audit.jsonl", blockers)
+    if physical_lines is None:
+        return None
+    for raw_line in physical_lines:
         raw = raw_line.encode("utf-8")
         try:
             record = json.loads(raw_line)
@@ -851,7 +889,13 @@ def derive_audit_manifest_state(
     return record_count, final_hash, leaves
 
 
-def verify_manifest_signature(manifest: dict, blockers: list[str], label: str) -> None:
+def verify_manifest_signature(
+    manifest: dict,
+    blockers: list[str],
+    label: str,
+    *,
+    expected_ed25519_fingerprint: str | None = None,
+) -> None:
     signature = manifest.get("signature")
     if not isinstance(signature, dict):
         blockers.append(f"{label} lacks signature object")
@@ -877,11 +921,71 @@ def verify_manifest_signature(manifest: dict, blockers: list[str], label: str) -
         )
         return
     try:
-        bundle = json.loads(base64.b64decode(str(signature.get("bundle_b64") or "")))
-        public_key = base64.b64decode(str(bundle["public_key_b64"]))
-        signature_bytes = base64.b64decode(str(bundle["signature_b64"]))
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        bundle = json.loads(
+            base64.b64decode(
+                str(signature.get("bundle_b64") or ""), validate=True
+            ).decode("utf-8")
+        )
+        public_key = base64.b64decode(bundle["public_key_b64"], validate=True)
+        signature_bytes = base64.b64decode(bundle["signature_b64"], validate=True)
+    except (
+        KeyError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
         blockers.append(f"{label} ed25519 bundle malformed: {exc}")
+        return
+    if (
+        not isinstance(bundle, dict)
+        or len(public_key) != 32
+        or len(signature_bytes) != 64
+    ):
+        blockers.append(f"{label} ed25519 bundle has invalid key/signature length")
+        return
+
+    actual_fingerprint = hashlib.sha256(public_key).hexdigest()
+    outer_fingerprint = str(signature.get("cert_fingerprint") or "").lower()
+    bundle_fingerprint = str(bundle.get("cert_fingerprint") or "").lower()
+    if not hmac.compare_digest(outer_fingerprint, actual_fingerprint):
+        blockers.append(f"{label} ed25519 signature metadata fingerprint mismatch")
+        return
+    if not hmac.compare_digest(bundle_fingerprint, actual_fingerprint):
+        blockers.append(f"{label} ed25519 bundle fingerprint mismatch")
+        return
+
+    configured_fingerprint = (
+        os.environ.get("FINDEVIL_ED25519_EXPECTED_FINGERPRINT", "").strip().lower()
+    )
+    supplied_fingerprint = str(expected_ed25519_fingerprint or "").strip().lower()
+    if (
+        configured_fingerprint
+        and supplied_fingerprint
+        and not hmac.compare_digest(configured_fingerprint, supplied_fingerprint)
+    ):
+        blockers.append(
+            f"{label} expected Ed25519 fingerprint conflicts with configured trust policy"
+        )
+        return
+    trusted_fingerprint = configured_fingerprint or supplied_fingerprint
+    if not trusted_fingerprint:
+        blockers.append(
+            f"{label} requires an externally trusted Ed25519 public-key fingerprint"
+        )
+        return
+    if not SHA256_HEX_RE.fullmatch(trusted_fingerprint):
+        blockers.append(f"{label} trusted Ed25519 fingerprint is not SHA-256")
+        return
+    if not hmac.compare_digest(trusted_fingerprint, actual_fingerprint):
+        blockers.append(
+            f"{label} Ed25519 public key does not match trusted fingerprint"
+        )
+        return
+
+    strict_error = validate_strict_ed25519_inputs(public_key, signature_bytes)
+    if strict_error is not None:
+        blockers.append(f"{label} ed25519 signature inputs rejected: {strict_error}")
         return
     try:
         from cryptography.exceptions import InvalidSignature
@@ -897,10 +1001,24 @@ def verify_manifest_signature(manifest: dict, blockers: list[str], label: str) -
 
 
 def validate_recomputed_manifest(
-    manifest: dict | None, audit_text: str | None, blockers: list[str], label: str
+    manifest: dict | None,
+    audit_text: str | None,
+    blockers: list[str],
+    label: str,
+    *,
+    expected_ed25519_fingerprint: str | None = None,
 ) -> None:
     if manifest is None or audit_text is None:
         return
+    anchor_requested = manifest.get("transparency_anchor_requested", False)
+    if not isinstance(anchor_requested, bool):
+        blockers.append(f"{label} transparency_anchor_requested is not a JSON boolean")
+    elif anchor_requested:
+        blockers.append(
+            f"{label} requested transparency anchor requires the full product "
+            "verifier with Sigstore production roots and exact identity + issuer; "
+            "this standalone release validator fails closed"
+        )
     state = derive_audit_manifest_state(audit_text, blockers, label)
     if state is None:
         return
@@ -920,7 +1038,12 @@ def validate_recomputed_manifest(
     derived_root = merkle_root_hex([str(leaf["digest_hex"]) for leaf in leaves])
     if manifest.get("merkle_root_hex") != derived_root:
         blockers.append(f"{label} merkle_root_hex does not match audit-derived leaves")
-    verify_manifest_signature(manifest, blockers, label)
+    verify_manifest_signature(
+        manifest,
+        blockers,
+        label,
+        expected_ed25519_fingerprint=expected_ed25519_fingerprint,
+    )
 
 
 def audit_record_finding_id(record: dict) -> str | None:
@@ -1276,7 +1399,9 @@ def readiness_artifact_is_allowed(relative_path: str, allowed_exact: set[str]) -
     )
 
 
-def validate_readiness_summary(path: Path) -> CheckResult:
+def validate_readiness_summary(
+    path: Path, *, expected_ed25519_fingerprint: str | None = None
+) -> CheckResult:
     blockers: list[str] = []
     summary = read_json_file(path, "readiness summary", blockers)
     if summary is None:
@@ -1415,7 +1540,11 @@ def validate_readiness_summary(path: Path) -> CheckResult:
     )
     validate_manifest_verify_object(manifest_verify, blockers)
     validate_recomputed_manifest(
-        run_manifest, audit_text, blockers, "run.manifest.json"
+        run_manifest,
+        audit_text,
+        blockers,
+        "run.manifest.json",
+        expected_ed25519_fingerprint=expected_ed25519_fingerprint,
     )
     verdict_bytes = read_artifact_bytes(packet_dir, "verdict.json")
     validate_verdict_artifact_binding(verdict_bytes, audit_records, blockers)
@@ -1504,7 +1633,10 @@ def read_zip_json(
 
 
 def validate_readiness_packet_archive(
-    zf: zipfile.ZipFile, label: str = "readiness packet"
+    zf: zipfile.ZipFile,
+    label: str = "readiness packet",
+    *,
+    expected_ed25519_fingerprint: str | None = None,
 ) -> CheckResult:
     blockers: list[str] = []
     validate_readiness_zip_members(zf, blockers, label)
@@ -1615,7 +1747,11 @@ def validate_readiness_packet_archive(
     validate_manifest_verify_object(manifest_verify, blockers)
     run_manifest = read_zip_json(zf, "run.manifest.json", "run.manifest.json", blockers)
     validate_recomputed_manifest(
-        run_manifest, audit_text, blockers, "run.manifest.json"
+        run_manifest,
+        audit_text,
+        blockers,
+        "run.manifest.json",
+        expected_ed25519_fingerprint=expected_ed25519_fingerprint,
     )
 
     verdict_bytes = read_zip_bytes(zf, "verdict.json", blockers)
@@ -1673,20 +1809,35 @@ def validate_readiness_packet_archive(
     return CheckResult(True, f"{label} is complete and expert-review gated")
 
 
-def validate_readiness_packet_bytes(data: bytes, label: str) -> CheckResult:
+def validate_readiness_packet_bytes(
+    data: bytes,
+    label: str,
+    *,
+    expected_ed25519_fingerprint: str | None = None,
+) -> CheckResult:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            return validate_readiness_packet_archive(zf, label)
+            return validate_readiness_packet_archive(
+                zf,
+                label,
+                expected_ed25519_fingerprint=expected_ed25519_fingerprint,
+            )
     except zipfile.BadZipFile:
         return CheckResult(False, f"{label} is not a valid ZIP file")
 
 
-def validate_readiness_packet(path: Path) -> CheckResult:
+def validate_readiness_packet(
+    path: Path, *, expected_ed25519_fingerprint: str | None = None
+) -> CheckResult:
     if not path.is_file():
         return CheckResult(False, f"readiness packet missing: {path}")
     try:
         with zipfile.ZipFile(path) as zf:
-            return validate_readiness_packet_archive(zf, str(path))
+            return validate_readiness_packet_archive(
+                zf,
+                str(path),
+                expected_ed25519_fingerprint=expected_ed25519_fingerprint,
+            )
     except zipfile.BadZipFile:
         return CheckResult(False, f"readiness packet is not a valid ZIP file: {path}")
 
@@ -1727,6 +1878,14 @@ def main() -> int:
     parser.add_argument(
         "--stage-two-packet", type=Path, help="Stage Two judge packet markdown path"
     )
+    parser.add_argument(
+        "--expected-ed25519-fingerprint",
+        default=os.environ.get("FINDEVIL_ED25519_EXPECTED_FINGERPRINT"),
+        help=(
+            "trusted SHA-256 fingerprint obtained outside the readiness packet; "
+            "defaults to FINDEVIL_ED25519_EXPECTED_FINGERPRINT"
+        ),
+    )
     args = parser.parse_args()
 
     checks: list[tuple[str, CheckResult]] = []
@@ -1739,14 +1898,34 @@ def main() -> int:
     if args.stage_dir is not None:
         checks.append(("stage-dir", validate_stage_dir(args.stage_dir)))
     if args.zip_path is not None:
-        checks.append(("zip", validate_zip(args.zip_path)))
+        checks.append(
+            (
+                "zip",
+                validate_zip(
+                    args.zip_path,
+                    expected_ed25519_fingerprint=args.expected_ed25519_fingerprint,
+                ),
+            )
+        )
     if args.readiness_summary is not None:
         checks.append(
-            ("readiness-summary", validate_readiness_summary(args.readiness_summary))
+            (
+                "readiness-summary",
+                validate_readiness_summary(
+                    args.readiness_summary,
+                    expected_ed25519_fingerprint=args.expected_ed25519_fingerprint,
+                ),
+            )
         )
     if args.readiness_packet is not None:
         checks.append(
-            ("readiness-packet", validate_readiness_packet(args.readiness_packet))
+            (
+                "readiness-packet",
+                validate_readiness_packet(
+                    args.readiness_packet,
+                    expected_ed25519_fingerprint=args.expected_ed25519_fingerprint,
+                ),
+            )
         )
     if args.stage_two_packet is not None:
         checks.append(

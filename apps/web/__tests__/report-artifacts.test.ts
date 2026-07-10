@@ -6,6 +6,7 @@ import {
   REPORT_ARTIFACT_LABELS,
   REPORT_ARTIFACT_NAMES,
   REPORT_ARTIFACTS,
+  REPORT_PRESENTATION_NOTICE,
 } from "@/lib/report-artifacts";
 
 describe("report artifact registry", () => {
@@ -51,17 +52,28 @@ describe("report artifact registry", () => {
     );
     expect(REPORT_ARTIFACT_LABELS["audit.jsonl"]).toBe("audit chain");
     expect(REPORT_ARTIFACT_LABELS["REPORT-internal.md"]).toBe(
-      "internal QA packet",
+      "internal QA packet (presentation-only)",
     );
-    expect(REPORT_ARTIFACT_LABELS["REPORT.new.pdf"]).toBe("PDF report (new)");
+    expect(REPORT_ARTIFACT_LABELS["REPORT.new.pdf"]).toBe(
+      "PDF report (new; presentation-only)",
+    );
     expect(REPORT_ARTIFACT_LABELS["REPORT-internal.new.pdf"]).toBe(
-      "internal QA PDF (new)",
+      "internal QA PDF (new; presentation-only)",
     );
     expect(REPORT_ARTIFACT_LABELS["expert_signoff.json"]).toBe(
       "expert signoff",
     );
     expect(REPORT_ARTIFACT_LABELS["customer_release_gate.final.json"]).toBe(
       "customer release gate",
+    );
+  });
+
+  it("never describes post-seal report bytes as signed or authenticated", () => {
+    expect(REPORT_PRESENTATION_NOTICE.toLowerCase()).toContain("presentation-only");
+    expect(REPORT_PRESENTATION_NOTICE.toLowerCase()).toContain("not authenticated");
+    expect(REPORT_PRESENTATION_NOTICE.toLowerCase()).not.toContain("signed report");
+    expect(REPORT_ARTIFACT_LABELS["REPORT.pdf"].toLowerCase()).toContain(
+      "presentation-only",
     );
   });
 });

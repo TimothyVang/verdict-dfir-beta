@@ -36,13 +36,23 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
+import signal
 import subprocess
 import threading
 import time
 import uuid
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
+
+_MCP_STDOUT_FRAME_MAX_BYTES = 64 * 1024 * 1024
+_MCP_STDERR_LINE_MAX_BYTES = 64 * 1024
+_MCP_STDERR_RETAIN_MAX_BYTES = 4096
+_PROCESS_REAP_TIMEOUT_S = 1.0
+_READER_JOIN_TIMEOUT_S = 0.5
 
 
 class McpClientError(RuntimeError):
@@ -120,16 +130,23 @@ class StdioMcpClient:
         env: dict[str, str] | None = None,
         startup_timeout_s: float = 5.0,
         request_timeout_s: float = 120.0,
+        abort_callback: Callable[[], None] | None = None,
     ) -> None:
         self._command = list(command)
         self._cwd = cwd
         self._env = env
         self._startup_timeout_s = startup_timeout_s
         self._request_timeout_s = request_timeout_s
-        self._proc: subprocess.Popen[str] | None = None
+        self._abort_callback = abort_callback
+        self._abort_callback_called = False
+        self._abort_lock = threading.Lock()
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._stdout_reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._next_id = 1
         self._closed = False
+        self._stderr_tail: deque[str] = deque(maxlen=200)
 
     # --- lifecycle ---
 
@@ -151,12 +168,131 @@ class StdioMcpClient:
                 stderr=subprocess.PIPE,
                 cwd=str(self._cwd) if self._cwd else None,
                 env=self._env,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,  # line-buffered
+                **self._process_group_options(),
             )
         except FileNotFoundError as exc:
             raise McpClientError(f"could not spawn MCP server {self._command!r}: {exc}") from exc
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    @staticmethod
+    def _process_group_options() -> dict[str, Any]:
+        if os.name == "posix":
+            return {"start_new_session": True}
+        if os.name == "nt":
+            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return {}
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        discarding_oversize_line = False
+        try:
+            while True:
+                line = proc.stderr.readline(_MCP_STDERR_LINE_MAX_BYTES + 1)
+                if line == b"":
+                    return
+                terminated = line.endswith(b"\n")
+                if discarding_oversize_line:
+                    if terminated:
+                        discarding_oversize_line = False
+                    continue
+                if len(line) > _MCP_STDERR_LINE_MAX_BYTES:
+                    retained_bytes = line[:_MCP_STDERR_RETAIN_MAX_BYTES].rstrip(b"\r\n")
+                    retained = retained_bytes.decode("utf-8", errors="replace")
+                    self._stderr_tail.append(f"{retained} [truncated]")
+                    discarding_oversize_line = not terminated
+                    continue
+                retained_bytes = line[:_MCP_STDERR_RETAIN_MAX_BYTES].rstrip(b"\r\n")
+                retained = retained_bytes.decode("utf-8", errors="replace")
+                if len(line.rstrip(b"\r\n")) > _MCP_STDERR_RETAIN_MAX_BYTES:
+                    retained = f"{retained} [truncated]"
+                self._stderr_tail.append(retained)
+        except (ValueError, OSError):
+            return
+
+    def _abort_transport(self) -> None:
+        self._closed = True
+        proc = self._proc
+        if proc is not None:
+            self._terminate_process_tree(proc)
+            self._reap_process(proc)
+            self._join_reader_threads()
+        callback: Callable[[], None] | None = None
+        with self._abort_lock:
+            if not self._abort_callback_called:
+                self._abort_callback_called = True
+                callback = self._abort_callback
+        if callback is not None:
+            with contextlib.suppress(Exception):
+                callback()
+        if proc is not None:
+            self._close_process_streams(proc)
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen[bytes]) -> None:
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        elif os.name == "nt":
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_PROCESS_REAP_TIMEOUT_S,
+                    check=False,
+                )
+                if completed.returncode == 0:
+                    return
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                pass
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                with contextlib.suppress(OSError):
+                    proc.send_signal(ctrl_break)
+        with contextlib.suppress(OSError):
+            proc.kill()
+
+    @staticmethod
+    def _reap_process(proc: subprocess.Popen[bytes]) -> None:
+        try:
+            proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+
+    def _join_reader_threads(self) -> None:
+        deadline = time.monotonic() + _READER_JOIN_TIMEOUT_S
+        current = threading.current_thread()
+        for thread in (self._stdout_reader_thread, self._stderr_thread):
+            if thread is None or thread is current or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _close_process_streams(self, proc: subprocess.Popen[bytes]) -> None:
+        streams = (
+            (proc.stdin, None),
+            (proc.stdout, self._stdout_reader_thread),
+            (proc.stderr, self._stderr_thread),
+        )
+        for stream, reader in streams:
+            if stream is None or stream.closed:
+                continue
+            # BufferedReader.close() waits on its internal lock. If a failed
+            # platform-specific tree kill left a reader blocked on an inherited
+            # pipe, skip that descriptor rather than blocking cleanup/callbacks.
+            if reader is not None and reader.is_alive():
+                continue
+            with contextlib.suppress(OSError):
+                stream.close()
 
     def close(self) -> None:
         if self._closed:
@@ -165,17 +301,13 @@ class StdioMcpClient:
         if self._proc is None:
             return
         proc = self._proc
-        try:
-            if proc.stdin and not proc.stdin.closed:
+        if proc.stdin and not proc.stdin.closed:
+            with contextlib.suppress(Exception):  # nosec - best effort
                 proc.stdin.close()
-        except Exception:  # nosec - best effort
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
+        self._terminate_process_tree(proc)
+        self._reap_process(proc)
+        self._join_reader_threads()
+        self._close_process_streams(proc)
 
     # --- core call ---
 
@@ -202,12 +334,13 @@ class StdioMcpClient:
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
             }
-            line = json.dumps(request, separators=(",", ":")) + "\n"
+            line = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
             started = time.monotonic()
             try:
                 self._proc.stdin.write(line)
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
+                self._abort_transport()
                 raise McpClientError(f"MCP stdin write failed: {exc}") from exc
 
             response_line = self._read_line_with_timeout()
@@ -215,10 +348,24 @@ class StdioMcpClient:
 
             try:
                 response = json.loads(response_line)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, RecursionError) as exc:
+                self._abort_transport()
                 raise McpClientError(
                     f"MCP server returned non-JSON line: {response_line[:200]!r}"
                 ) from exc
+            if not isinstance(response, dict):
+                self._raise_protocol_error("MCP server returned a non-object JSON-RPC envelope")
+            if response.get("jsonrpc") != "2.0":
+                self._raise_protocol_error("MCP server returned an invalid JSON-RPC version")
+            response_id = response.get("id")
+            if isinstance(response_id, bool) or response_id != request_id:
+                self._raise_protocol_error("MCP server returned a mismatched JSON-RPC id")
+            has_result = "result" in response
+            has_error = "error" in response
+            if has_result == has_error:
+                self._raise_protocol_error(
+                    "MCP server response must contain exactly one result or error"
+                )
 
             return self._parse_response(
                 response=response,
@@ -238,26 +385,49 @@ class StdioMcpClient:
         """
         assert self._proc is not None
         assert self._proc.stdout is not None
-        result: dict[str, str] = {}
+        result: dict[str, bytes | str] = {}
 
         def reader() -> None:
             try:
-                ln = self._proc.stdout.readline()  # type: ignore[union-attr]
-                result["line"] = ln
+                ln = self._proc.stdout.readline(  # type: ignore[union-attr]
+                    _MCP_STDOUT_FRAME_MAX_BYTES + 1
+                )
+                if len(ln) > _MCP_STDOUT_FRAME_MAX_BYTES:
+                    result["error"] = "JSON-RPC response exceeded the 64 MiB frame limit"
+                elif ln and not ln.endswith(b"\n"):
+                    result["error"] = "server emitted an unterminated JSON-RPC frame"
+                else:
+                    result["line"] = ln
             except Exception as exc:
                 result["error"] = repr(exc)
 
         thread = threading.Thread(target=reader, daemon=True)
+        self._stdout_reader_thread = thread
         thread.start()
         thread.join(timeout=self._request_timeout_s)
         if thread.is_alive():
+            self._abort_transport()
             raise McpClientError(f"MCP request timed out after {self._request_timeout_s}s")
+        self._stdout_reader_thread = None
         if "error" in result:
-            raise McpClientError(f"MCP read error: {result['error']}")
-        line = result.get("line", "")
+            self._abort_transport()
+            error = result["error"]
+            assert isinstance(error, str)
+            raise McpClientError(f"MCP read error: {error}")
+        line = result.get("line", b"")
         if not line:
+            self._abort_transport()
             raise McpClientError("MCP server closed stdout before responding")
-        return line.rstrip("\r\n")
+        assert isinstance(line, bytes)
+        try:
+            return line.rstrip(b"\r\n").decode("utf-8")
+        except UnicodeDecodeError as exc:
+            self._abort_transport()
+            raise McpClientError("MCP server returned invalid UTF-8") from exc
+
+    def _raise_protocol_error(self, message: str) -> NoReturn:
+        self._abort_transport()
+        raise McpClientError(message)
 
     def _parse_response(
         self,
@@ -269,24 +439,41 @@ class StdioMcpClient:
     ) -> ToolCallResult:
         if "error" in response:
             err = response["error"]
+            if not isinstance(err, dict):
+                self._raise_protocol_error("MCP server returned an invalid error object")
+            code = err.get("code", -1)
+            message = err.get("message", "<no message>")
+            if isinstance(code, bool) or not isinstance(code, int):
+                self._raise_protocol_error("MCP server returned an invalid error code")
+            if not isinstance(message, str):
+                self._raise_protocol_error("MCP server returned an invalid error message")
             raise McpRpcError(
-                code=int(err.get("code", -1)),
-                message=str(err.get("message", "<no message>")),
+                code=code,
+                message=message,
                 data=err.get("data"),
             )
-        result = response.get("result") or {}
-        content = result.get("content") or []
+        result = response.get("result")
+        if not isinstance(result, dict):
+            self._raise_protocol_error("MCP server returned an invalid result object")
+        content = result.get("content")
+        if not isinstance(content, list):
+            self._raise_protocol_error("MCP server returned invalid result content")
         text = ""
-        if content and isinstance(content[0], dict):
-            text = str(content[0].get("text", ""))
-        meta = result.get("_meta") or {}
+        if content:
+            first = content[0]
+            if not isinstance(first, dict) or not isinstance(first.get("text"), str):
+                self._raise_protocol_error("MCP server returned invalid result content")
+            text = first["text"]
+        meta = result.get("_meta", {})
+        if not isinstance(meta, dict):
+            self._raise_protocol_error("MCP server returned invalid result metadata")
         sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         parsed: dict[str, Any] | None = None
         try:
             obj = json.loads(text)
             if isinstance(obj, dict):
                 parsed = obj
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             parsed = None
         return ToolCallResult(
             tool_call_id=tool_call_id,

@@ -21,13 +21,15 @@
 #   - a Claude Code credential (CLAUDE_CODE_OAUTH_TOKEN, a logged-in
 #     `claude`, or ANTHROPIC_API_KEY) — VERDICT is a Claude Code agent.
 #   - git (see step 1).
-# Recommended for full disk-image parity: the SANS SIFT VM (pass --with-sift,
-# or run `setup` inside `claude`). Local mode works without it.
+# Recommended for full disk-image parity: the DFIR container
+# (`docker pull ghcr.io/<owner>/verdict-dfir-toolkit:latest`, then
+# `scripts/verdict --docker`). The SANS SIFT VM (--with-sift) stays supported and
+# is required only for the mac_triage / mac_apt lanes. Local mode works without either.
 #
 # Flags (all optional):
 #   --dir=PATH     clone target directory (default: ./verdict)
 #   --ref=REF      branch or tag to clone (default: main)
-#   --with-sift    forwarded to scripts/setup (also set up the SIFT VM)
+#   --with-sift    forwarded to scripts/setup (SIFT VM; needed only for mac_triage)
 #   --run          forwarded to scripts/setup (investigate after setup)
 #   -h | --help    show this help and exit
 #
@@ -61,7 +63,7 @@ installers (driven by setup's --bootstrap).
 Flags:
   --dir=PATH     clone target directory (default: ./verdict)
   --ref=REF      branch or tag to clone (default: main)
-  --with-sift    also set up the SANS SIFT VM (forwarded to scripts/setup)
+  --with-sift    also set up the SANS SIFT VM; needed only for mac_triage lanes
   --run          investigate evidence once setup is green (forwarded)
   -h, --help     show this help and exit
 

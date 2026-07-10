@@ -58,9 +58,13 @@ _ENTITY_FIELDS = (
 
 
 def _canonicalize(obj: Any) -> bytes:
-    """RFC-8785-compatible canonical bytes — matches audit_log.canonicalize_json."""
+    """VERDICT canonical JSON v1 bytes, matching audit_log.canonicalize_json."""
     return json.dumps(
-        obj, sort_keys=True, separators=_CANONICAL_SEPARATORS, ensure_ascii=True
+        obj,
+        sort_keys=True,
+        separators=_CANONICAL_SEPARATORS,
+        ensure_ascii=True,
+        allow_nan=False,
     ).encode("ascii")
 
 

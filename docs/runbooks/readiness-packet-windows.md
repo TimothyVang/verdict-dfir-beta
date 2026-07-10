@@ -17,7 +17,7 @@ the host's VMware Workstation.
 | Windows with PowerShell 5.1+ | All invocations use `-ExecutionPolicy Bypass` |
 | VMware Workstation | Required for Full mode SIFT transport (`scripts/verdict <path> --sift` invokes the helper); not needed for PacketOnly |
 | `uv` on PATH | `pip install uv` |
-| `cargo` on PATH | Rust 1.88 (`rust-toolchain.toml`) |
+| `cargo` on PATH | Rust 1.91 (`rust-toolchain.toml`) |
 | `gh` CLI authenticated | `gh auth login` |
 | `claude` CLI on PATH | For Full mode; inherits Claude Code subscription credentials |
 
@@ -142,7 +142,7 @@ tmp/readiness-gates/<run-id>/
 | `-EvidencePath` | `$env:EVIDENCE_PATH` | Path to evidence file/dir inside SIFT VM (Full mode) |
 | `-ExistingRunDir` | `$env:EVIDENCE_RUN_DIR` | Skip evidence run; validate existing run directory |
 | `-RunId` | auto-generated | Fix the run ID for reruns; gate refreshes packet contents |
-| `-Signer` | `ed25519` | `ed25519` (real local signature, verifies offline), `sigstore` (identity + Rekor transparency log), or `stub` (explicit test placeholder) |
+| `-Signer` | `ed25519` | `ed25519` (real local signature, verifies offline with a trusted external fingerprint), `sigstore` (identity + Rekor transparency log), or `stub` (explicit test placeholder) |
 | `-ForceFreshReplay` | off | Force replay even if a cached run exists |
 | `-RunL1Docker` | off | Also run L1 Docker gate during Full mode |
 | `-SkipBuild` | off | Skip `cargo build` (use pre-built binary) |

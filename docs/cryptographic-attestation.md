@@ -8,10 +8,14 @@ file collects the load-bearing claims in one place.
 
 > **Why this matters:** audit-trail quality turns on whether the
 > agent's findings are independently verifiable by a third party
-> with no trust in the agent itself. VERDICT's answer is "yes, by
-> `manifest_verify` alone — no network, no trusted third-party
-> servers." This supports a FRE 902(14) self-authenticating-evidence
-> claim, with the honest caveat documented below.
+> with no trust in the agent itself. VERDICT's answer is "yes, offline,
+> by `manifest_verify` plus signer trust obtained outside the case." An
+> Ed25519 run requires the trusted public-key SHA-256 fingerprint; a
+> Sigstore run requires the exact trusted identity and OIDC issuer. No
+> live server is contacted during verification. This supplies the technical
+> digital-identification record contemplated by FRE 902(14); legal
+> self-authentication still requires a qualified person's certification and
+> the Rule 902(11) notice process, as documented below.
 
 > **Amendment A5 (2026-05-01):** the OpenTimestamps + Bitcoin
 > anchoring tier was removed. The chain dropped from five links
@@ -54,15 +58,15 @@ Each link's role:
 | 1 | SHA-256 of the evidence | The image we read is the image we received | `sha2 = 0.10` (Rust) |
 | 2 | Audit hash chain | No record was deleted, reordered, or back-dated after the fact | `services/agent/findevil_agent/crypto/audit_log.py` |
 | 3 | rs_merkle tree | The set of records named in the manifest is the set the agent actually wrote | `rs_merkle = 1.4.0` (Rust) |
-| 4 | manifest signature | See signer tiers below — every run is signed; the tier determines what the signature proves | `cryptography` (ed25519) / `sigstore = 3.x` |
+| 4 | manifest signature bundle | See signer tiers below — every run carries a bundle, but only a cryptographically verified Ed25519 or Sigstore tier authenticates the manifest | `cryptography` (ed25519) / `sigstore = 3.x` |
 
 **Signer tiers** (choose with `--signer` / `FINDEVIL_SIGNER`; the manifest
 records the tier that *actually* sealed the run in `signature.kind`):
 
 | Tier | Default? | What it proves | Verified offline? |
 |---|---|---|---|
-| `ed25519` | **yes** | A real Ed25519 signature over the manifest body, signed with a local keypair (`~/.findevil/signing.key`, auto-generated; override `FINDEVIL_SIGNING_KEY`). Proves **integrity + local key continuity** — the manifest body has not changed since sealing | **yes** — `manifest_verify` rebuilds the canonical body and checks it against the embedded public key: `signature_verified=true` is a genuine cryptographic pass |
-| `sigstore` | opt-in | Everything ed25519 proves, **plus identity**: the sealing key's Fulcio cert is logged in Rekor — non-repudiable provenance via a public transparency log. The customer-release tier | bundle recorded; full verification needs the expected signer identity (deployment policy) |
+| `ed25519` | **yes** | A real Ed25519 signature over the manifest body, signed with a local keypair (`~/.findevil/signing.key`, auto-generated; override `FINDEVIL_SIGNING_KEY`). Proves **integrity + local key continuity only when the verifier supplies that key's trusted SHA-256 fingerprint out of band** | **yes, with a trusted pin** — `manifest_verify` applies strict RFC 8032 validation, rebuilds the canonical body, and requires `expected_ed25519_fingerprint` (or `FINDEVIL_ED25519_EXPECTED_FINGERPRINT`) to match the public key; an embedded key alone never authenticates itself |
+| `sigstore` | opt-in | Manifest integrity **plus identity**: the sealing key's Fulcio certificate is logged in Rekor, providing identity-bound public transparency-log provenance. The customer-release tier | **yes, with trusted policy** — the full bundle must verify against Sigstore's production roots and the verifier's exact expected identity **and** OIDC issuer; a bundle or embedded identity alone never authenticates itself |
 | `stub` | explicit opt-in | Nothing cryptographic — a deterministic dev/offline placeholder | never (`signature_verified` honestly says so) |
 
 A failed signer degrades honestly (`sigstore → ed25519 → stub`) with the
@@ -71,10 +75,11 @@ never silently overstates its tier.
 
 **No single primitive is load-bearing alone.** A SHA-256 by itself
 proves byte equality but not freshness; a Merkle root proves set
-membership but not who built the set; the signer tier states who, if
-anyone, sealed the manifest. Ed25519 proves local key continuity
-offline, while Sigstore adds public identity and a Rekor time lower
-bound. The composition is the attestation.
+membership but not who built the set; the signer tier states whether and
+how the manifest was authenticated. Pinned Ed25519 proves local key continuity
+offline, while Sigstore adds public identity and authenticated transparency-log
+inclusion. Rekor's ordinary integrated time is not itself a cryptographically
+trusted timestamp. The composition is the attestation.
 
 ---
 
@@ -86,14 +91,14 @@ services/mcp/                                    ← (Rust DFIR tool MCP)
 └── (every tool emits _meta.output_sha256 over its canonical JSON output)
 
 services/agent/findevil_agent/crypto/            ← (M2 crypto stack)
-├── audit.py                                     — link 2: prev_hash chain
+├── audit_log.py                                 — link 2: prev_hash chain
 ├── merkle.py                                    — link 3: rs_merkle tree
 ├── signer.py                                    — link 4: Ed25519/Sigstore/stub signer tiers
 └── manifest.py                                  — composes 2/3/4 into run.manifest.json
 
 services/agent_mcp/findevil_agent_mcp/tools/     ← (Python MCP wrapping the above)
 ├── audit_append.py                              ↘  one MCP tool per link
-├── audit_verify.py                              ↘  11 Python tools total — see TOOLS.md
+├── audit_verify.py                              ↘  14 Python tools total — see TOOLS.md
 ├── manifest_finalize.py                         ↘  (the OTS pair was removed under A5)
 └── manifest_verify.py                           ↘
 ```
@@ -111,14 +116,16 @@ agent can verify a VERDICT manifest with one tool, offline:
 
 ```bash
 # The manifest signature, audit chain, and Merkle root.
-# No network required (the manifest is self-contained).
+# No network required. The case artifacts are self-contained, but signer trust
+# is not: supply the Ed25519 pin obtained through a channel outside the case.
 # Direct library call — no MCP server, no JSON-RPC plumbing.
 uv run --directory services/agent python -c "
 from pathlib import Path
 from findevil_agent.crypto.manifest import verify_manifest
 case = Path('<absolute-path-to-case-dir>')
 r = verify_manifest(case / 'run.manifest.json',
-                    audit_log_path=case / 'audit.jsonl')
+                    audit_log_path=case / 'audit.jsonl',
+                    expected_ed25519_fingerprint='<trusted SHA-256 obtained outside the case>')
 print(r)
 "
 # Returns: ManifestVerification(audit_chain_ok=True, merkle_root_ok=True,
@@ -127,6 +134,25 @@ print(r)
 # Any field becomes a string instead of True on failure, naming the
 # precise reason (e.g. 'audit chain seq=4 prev_hash mismatch').
 ```
+
+For an independent, zero-dependency cross-check on a stock Python 3
+installation, run the standalone verifier directly:
+
+```bash
+python scripts/manifest-verify-offline.py \
+    <absolute-path-to-case-dir>/run.manifest.json \
+    --audit-log <absolute-path-to-case-dir>/audit.jsonl \
+    --expected-ed25519-fingerprint <trusted-sha256-obtained-outside-the-case>
+```
+
+Its vendored verifier applies strict RFC 8032 input validation before the
+Ed25519 equation: canonical point encodings, `S < L`, and exact prime-order
+subgroup membership for both the public key and signature `R`. It also opens
+the manifest as a bounded, identity-checked regular file without following a
+final symlink. The pin must come from the operator/controller or another trusted
+channel—not `signature.cert_fingerprint` in the manifest being tested. Sigstore
+authentication still requires the product verifier's pinned trust roots and exact
+identity/issuer policy; the dependency-free cross-check fails closed for that tier.
 
 For a fuller workout that also exercises `audit_verify`,
 `detect_contradictions`, `judge_findings`, and `correlate_findings`
@@ -161,23 +187,31 @@ is what the verifier consumes.
    payload digest is attached, and `signature_verified` reports the
    honest cryptographic status — never `true` for a stub bundle (a
    deterministic placeholder is not proof), and a sigstore bundle is
-   recorded for offline verification by a party that supplies the
-   expected signer identity. `overall` requires a bundle to be present
-   and treats a `stub` or recorded `sigstore` bundle as advisory (so
-   dev/offline stub runs verify end-to-end), but a present `ed25519`
-   bundle that does **not** cryptographically verify fails `overall` —
-   a forged or corrupted signature cannot pass.
+   verified offline only against both an exact expected signer identity and
+   exact OIDC issuer. `overall` always requires the signed-payload
+   digest to match. A payload-bound `stub` remains development-advisory, while
+   both `ed25519` and `sigstore` must cryptographically verify; a Sigstore label
+   or arbitrary bundle is not authentication and fails closed.
 
 If all checks pass, `overall=true`. Any one fails → `overall=false`
 with a precise diagnostic naming the field and the expected vs actual
 value. Tampering with the audit log, or with the manifest's account of
-it, is loud. The honest limits per tier: an **ed25519**-signed run (the
-default) verifies cryptographically offline — `signature_verified=true`
-proves the manifest body is exactly what the local key sealed — but a
-local key carries no third-party identity; a **stub**-signed run proves
-chain and Merkle integrity but nothing about who sealed it. Only a real
-sigstore signature adds non-repudiable identity via the transparency
-log, which is why customer release requires `signer=sigstore`.
+it, is loud for an authenticated Ed25519 or Sigstore tier. The honest limits per tier: an **ed25519**-signed run (the
+default) verifies cryptographically offline only when the verifier supplies
+the trusted external key fingerprint — `signature_verified=true` then proves
+the manifest body is exactly what that pinned local key sealed — but a local
+key carries no third-party identity; a **stub** bundle can demonstrate internal
+chain/Merkle consistency but provides no authenticated tamper proof or signer
+identity because an attacker could recompute the whole envelope. Only a real,
+policy-verified Sigstore signature adds identity-bound transparency-log
+provenance, which is why customer release requires `signer=sigstore`.
+
+Native Windows custody sealing is currently fail-closed. Until VERDICT can
+apply and verify private DACLs for the case directory, audit log, signing key,
+manifest, memory database, and SQLite sidecars—and provide a Windows
+interprocess audit lock—run signed cases under WSL2, Docker, or SIFT. Native
+Windows smoke/readiness wrappers may inspect and package existing artifacts but
+must not be read as a native custody-seal guarantee.
 
 ---
 
@@ -241,52 +275,58 @@ and certification (the Rule 902(11) notice requirement).
 > exist.** Neither 902(13) nor 902(14) requires a third-party
 > timestamp. The rule requires only the qualified-person
 > certification via a process of digital identification (ordinarily
-> hashing) plus 902(11) notice. VERDICT therefore satisfies
-> 902(14) on hash-value identification alone — the sigstore/Rekor
-> signature is **defense-in-depth, not a legal prerequisite.**
+> hashing) plus 902(11) notice. VERDICT supplies the hash-value
+> identification component; it does not replace the qualified person's
+> certification or notice. The sigstore/Rekor signature is
+> **defense-in-depth, not a legal prerequisite.**
 
-**How VERDICT meets the actual requirement:**
+**How VERDICT supports the actual requirement:**
 
 - **Accurate process of digital identification (the rule's core):**
   every evidence image is SHA-256 hashed at `case_open` and every
   tool output is content-addressed by SHA-256. The `verify_finding`
   MCP tool re-executes any cited `tool_call_id` and confirms the
-  original output's hash matches. The qualified-person certification
-  is the human expert sign-off attached to the readiness packet.
-  This is exactly the hash-value identification the Advisory
-  Committee Note contemplates.
+  original output's hash matches. The readiness packet gives a qualified
+  person the process record needed to make a certification; the software and
+  its automatic expert-signoff template do not themselves become that person
+  or guarantee legal compliance. This is the hash-value identification the
+  Advisory Committee Note contemplates.
 - **Signature + transparency log (supplementary, not required):**
-  sigstore's Rekor transparency log records every signature with an
-  append-only inclusion proof, establishing that the signed body
-  existed at or before the entry's logged time, attested by an
-  independent party (the Linux Foundation) with no relationship to
-  VERDICT's authors. This *strengthens* provenance and gives a
-  lower-bound time, but the 902(14) admissibility claim does not
-  depend on it.
-  - **Historical (pre-A5):** the shipped chain is Rekor-only for this
-    independent-time property. An OpenTimestamps/Bitcoin tier that
-    *also* anchored it was **removed under Amendment A5 and is not part
-    of the current chain.** Bitcoin offered a stronger no-single-party
-    timestamp; Rekor trusts the LF to operate the log honestly. Either
-    way, this is supplementary to — not part of — the 902(14) requirement.
+  Sigstore's Rekor transparency log records the signature with an
+  authenticated append-only inclusion proof. This strengthens identity-bound
+  provenance, but Rekor's ordinary `integratedTime` is not part of the Merkle
+  leaf and is not, by itself, a cryptographically trusted timestamp. The
+  902(14) admissibility claim does not depend on either property.
+  - **Historical (pre-A5):** an OpenTimestamps/Bitcoin tier was **removed under
+    Amendment A5 and is not part of the current chain.** The current Rekor path
+    provides authenticated inclusion/provenance, not the removed tier's
+    no-single-party timestamp. This is supplementary to — not part of — the
+    902(14) requirement.
   - **Merkle-root anchoring opt-in (verified 2026-07-05):** publishing the
-    audit Merkle root to Rekor (RFC-3161 TSA fallback) is a double-locked
+    audit Merkle root to Rekor (with an RFC-3161 TSA fallback) is a double-locked
     opt-in — the `manifest_finalize` call must pass `anchor_transparency=True`
     **and** the operator must set `FINDEVIL_REKOR_ENABLE=1`; requesting it
-    without the env fails closed, and when off the manifest is byte-identical
-    with no network touched. The crypto path (signer + manifest + anchor) is
-    clean-venv verified: 75 `test_crypto_*` cases pass in a freshly synced
-    `services/agent` venv, including that a present-but-corrupted anchor is
-    flagged without gating the offline `signature_verified` pass (the anchor is
-    attached after signing and excluded from the signed body). The opt-in stays
-    off by default; only the bare 32-byte root egresses when enabled.
+    without the env fails closed. New manifests commit the boolean
+    `transparency_anchor_requested` inside the signed body before the proof block
+    is attached. Therefore, stripping the after-signing `transparency_log`, or
+    leaving a requested proof missing, `kind="none"`, unauthenticated, or
+    invalid, makes both `transparency_ok` and `overall` fail. Legacy manifests
+    without the field, and manually attached proofs on explicitly unrequested
+    runs, retain their non-gating compatibility behavior. Rekor bundles
+    authenticate only under Sigstore's production roots plus exact identity and
+    issuer policy. The RFC-3161 fallback currently parses the token and matches
+    its message imprint, but does **not** pin or verify the TSA certificate chain;
+    it is therefore an unauthenticated structural side-signal and cannot satisfy
+    a requested authenticated anchor. The opt-in stays off by default with no
+    network touch; only the bare 32-byte root egresses when enabled.
 
 A court looking at a `run.manifest.json` three years from now
-establishes the record's integrity from the hash chain and signature
-offline, without trusting VERDICT or the analyst. Trusting Rekor
-not to have been silently rewritten is relevant only to the
-*supplementary* time claim, not to the core 902(14) self-
-authentication, which rests on hash-value identification.
+can establish the record's integrity from the hash chain and signature
+offline when it also has the signer trust policy obtained outside the case,
+without trusting VERDICT or the analyst. Rekor inclusion is supplementary
+identity/transparency evidence, not a trusted-time prerequisite for the core
+902(14) digital-identification showing. Certification, notice, and admissibility
+remain matters for the qualified person, parties, and court.
 
 ---
 
@@ -307,7 +347,10 @@ p.write_text(json.dumps(d, indent=2, sort_keys=True))
 "
 
 # Verify — expect failure with diagnostic:
-# manifest_verify { manifest_path: "run.manifest.json" }
+# manifest_verify {
+#   manifest_path: "run.manifest.json",
+#   expected_ed25519_fingerprint: "<trusted SHA-256 obtained outside the case>"
+# }
 # →
 # {
 #   "overall": false,

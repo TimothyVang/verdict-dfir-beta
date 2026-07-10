@@ -313,7 +313,8 @@ decision it is NOT a scoring gate (training-data contamination is not modeled). 
   artifacts and non-scored lead hypotheses instead of reportable expected Findings.
 - **Disk classes need mount/extract prerequisites.** Local raw `.dd/.E01` runs can parse supported
   artifacts when Sleuth Kit/libewf are present; otherwise they return `INDETERMINATE`
-  (custody-only). SIFT remains the recommended parity path. `INDETERMINATE` is an honest PASS of
+  (custody-only). The DFIR container (`--docker`) is the recommended parity path; SIFT remains
+  required for `mac_triage` and `--fleet`. `INDETERMINATE` is an honest PASS of
   the live-test gate when coverage is limited, but it will score below the recall target until
   supported artifacts are parsed.
 

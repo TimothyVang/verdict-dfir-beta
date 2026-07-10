@@ -5,14 +5,14 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-4D5DFF.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/MCP-compatible-4D5DFF.svg" alt="MCP compatible">
-  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-FF6257.svg" alt="46 typed read-only tools">
+  <img src="https://img.shields.io/badge/tools-57%20typed%20%C2%B7%20read--only-FF6257.svg" alt="57 typed read-only tools">
   <a href="https://timothyvang.github.io/verdict-dfir/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-73D9C2" alt="Documentation"></a>
-  <img src="https://img.shields.io/badge/rust-1.88-orange.svg" alt="Rust 1.88">
+  <img src="https://img.shields.io/badge/rust-1.91-orange.svg" alt="Rust 1.91">
   <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
   <img src="https://img.shields.io/badge/node-20-green.svg" alt="Node 20">
 </p>
 
-<p align="center"><b>Show Me the Evidence — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
+<p align="center"><b>Show Me the Evidence — 57 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
 
 <p align="center">
   <a href="https://timothyvang.github.io/verdict-dfir/"><b>Docs</b></a> ·
@@ -35,9 +35,10 @@
 **VERDICT is DFIR (digital forensics & incident response) for agents** — a typed, read-only,
 audit-chained forensic tool surface any AI agent can plug into and drive. Point an agent at a
 Windows-host investigation (memory images, EVTX logs, disk artifacts, network captures) and it works
-through **45 narrow, schema-validated, read-only MCP (Model Context Protocol) tools**, so every
+through **57 narrow, schema-validated, read-only MCP (Model Context Protocol) tools**, so every
 Finding cites the exact tool call that produced it. The result is an evidence-bound verdict backed by
-a cryptographic chain of custody any third party can verify offline. The three verdict words are
+a cryptographic chain of custody any third party can verify offline with trusted signer policy (an
+out-of-band key fingerprint for Ed25519, or exact identity and issuer for Sigstore). The three verdict words are
 scoped tightly: **`SUSPICIOUS`** means reportable evidence was found, **`INDETERMINATE`** means
 coverage was too limited to scope a clearance, and **`NO_EVIL`** means no reportable finding in the
 artifacts actually examined. `NO_EVIL` is never a whole-environment clean bill of health: coverage is
@@ -50,9 +51,11 @@ in three modes, and it matters which one you're in:
    engine (curated DFIR signature logic + ACH scoring) over the same typed tools and custody spine —
    **zero LLM calls** (`token_usage: llm_api_calls 0` in the committed trace). This is the proven,
    benchmarked path.
-2. **Interactive analyst.** Run [`claude`](https://claude.com/claude-code) in this repo and type
-   `/verdict <evidence>`: that Claude Code session becomes the analyst — it opens the Case, drives
-   the tools, runs the verifier, and signs the verdict, with no separate application server.
+2. **Interactive analyst (explicit cloud consent).** Run
+   `scripts/find-evil --acknowledge-evidence-egress`, then type `/verdict <evidence>`: that Claude
+   Code session becomes the analyst, drives the tools, and runs the verifier. Raw source files stay
+   behind the typed MCP boundary, while parsed rows, filenames, hashes, and custody metadata can
+   enter the selected model context; the launcher therefore fails closed without acknowledgment.
 3. **Agent mode (opt-in, experimental).** `scripts/verdict --agent` swaps the pools for a
    provider-agnostic LLM tool-use loop (Claude, OpenAI-compatible, or local endpoints). Currently
    live-verified on single-artifact evidence (e.g. one EVTX); not yet proven at disk/memory scale.
@@ -69,9 +72,9 @@ not validate the interpretation.
 
 <p align="center"><sub><b>Drives:</b> memory images · EVTX · disk images (<code>.E01</code>/<code>.dd</code>) · packet captures · registry · MFT · Prefetch · Velociraptor · whole multi-host case folders</sub></p>
 
-- **Plug it into your agent** — two standard MCP stdio servers (34 Rust + 14 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
+- **Plug it into your agent** — two standard MCP stdio servers (43 Rust + 14 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
 - **Stay read-only by design** — no `execute_shell`; every tool is a narrow, schema-validated read-only verb, and evidence is hashed first and never mutated.
-- **Verify it offline** — runs seal into a hash-chained audit log → Merkle root → signed manifest; `manifest_verify` confirms the whole chain offline.
+- **Verify it offline** — runs seal into a hash-chained audit log → Merkle root → signed manifest; `manifest_verify` confirms the whole chain offline when given trusted signer policy (an external Ed25519 pin, or Sigstore identity + issuer).
 
 ## VERDICT ecosystem — what is what
 
@@ -81,11 +84,11 @@ VERDICT is a local-first DFIR (digital forensics & incident response) agent plat
 |---|---|---|
 | [`caseforge-core`](https://github.com/TimothyVang/caseforge-core) | Headless **controller**: privacy routing, model selection, structured findings, custody validation, the `caseforge` CLI. | the **driver** |
 | [`verdict-opencode`](https://github.com/TimothyVang/verdict-opencode) | The agent **runtime** — a branded fork of [opencode](https://github.com/sst/opencode); the `verdict` binary is built from it. | the **engine** |
-| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 34 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
+| **verdict-dfir-beta** / this repo | The **forensic toolkit**: `findevil-mcp` (Rust, 43 read-only tools) + `findevil-agent-mcp` (Python, 14 custody/crypto tools) + DFIR doctrine (`agent-config/`) + hash-chained custody. Consumed by caseforge via `VERDICT_DFIR_HOME`. | the **evidence lab** (you are here) |
 
 **Runtime flow:** `caseforge` (controls + guards) → `verdict` binary (runs the agent) → **this repo's `findevil` MCP tools (do the forensics)** → hash-chained custody → `caseforge verify`.
 
-**Two rules everything obeys:** the LLM is not the forensic source of truth (findings must cite a `tool_call_id` + `output_sha256` + verified manifest); real evidence stays local by default.
+**Two rules everything obeys:** the LLM is not the forensic source of truth (findings must cite a `tool_call_id` + `output_sha256` + verified manifest); raw evidence stays behind the local typed-tool boundary, and sending parsed evidence-derived output to a cloud model is explicit opt-in.
 
 ## Install and run
 
@@ -130,8 +133,10 @@ capture, Velociraptor collection, or a whole multi-host case folder. Output land
 `tmp/auto-runs/<case-id>/`. Unsupported formats degrade to custody/limitation records rather than a
 broad clearance claim.
 
-Prefer Claude Code interactively? Run `claude` in the repo and type `/verdict <evidence>` or
-`investigate <evidence>`.
+Prefer Claude Code interactively? Run
+`scripts/find-evil --acknowledge-evidence-egress`, then type `/verdict <evidence>` or
+`investigate <evidence>`. For a zero-LLM run with no model-context egress, invoke
+`scripts/verdict <evidence>` directly from your terminal.
 
 ## Get test evidence
 
@@ -167,7 +172,7 @@ Public datasets you can download to try VERDICT, mapped to the path each exercis
 | **Memory CTF / sample backlog** (Volatility samples, MemLabs 4-6) | memory → `vol_*` | [Volatility Memory Samples](https://github.com/volatilityfoundation/volatility/wiki/Memory-Samples) · [MemLabs](https://github.com/stuxnet999/MemLabs) |
 | **Curated image / CTF lists** | everything | [DFIR.Training test images](https://www.dfir.training/downloads/test-images) · [AboutDFIR Challenges & CTFs](https://aboutdfir.com/education/challenges-ctfs/) · ["Where to find DFIR images" — soji256](https://soji256.medium.com/where-can-you-find-images-that-you-can-use-to-learn-forensics-141c6c8cdc9e) · [awesome-forensics](https://github.com/cugu/awesome-forensics) |
 
-**SANS DFIR.** The [SANS SIFT Workstation](https://www.sans.org/tools/sift-workstation) — VERDICT's recommended disk-image parity path — is a free download from the [SANS DFIR community page](https://digital-forensics.sans.org/community/downloads). Note: the enterprise multi-host scenario in our own showcase (a domain controller + file server, the kind used in [SANS FOR508](https://www.sans.org/cyber-security-courses/advanced-incident-response-threat-hunting-training)-style labs) is course lab material and **is not publicly redistributable** — use the public datasets above to reproduce that class of investigation.
+**SANS DFIR.** The [SANS SIFT Workstation](https://www.sans.org/tools/sift-workstation) — VERDICT's supported backend for fleet runs and the mac_triage lanes — is a free download from the [SANS DFIR community page](https://digital-forensics.sans.org/community/downloads). Note: the enterprise multi-host scenario in our own showcase (a domain controller + file server, the kind used in [SANS FOR508](https://www.sans.org/cyber-security-courses/advanced-incident-response-threat-hunting-training)-style labs) is course lab material and **is not publicly redistributable** — use the public datasets above to reproduce that class of investigation.
 
 ## What you get
 
@@ -178,13 +183,13 @@ Every run writes a self-contained case directory:
 | `audit.jsonl` | Append-only, hash-chained log of every tool call and Finding (`prev_hash` per record) |
 | `verdict.json` | The evidence-bound verdict and Findings, each citing a `tool_call_id` and a confidence tier |
 | `coverage_manifest.json` | Per-artifact-class scope ledger: available / attempted / parsed / failed / unsupported / not-supplied — the explicit anti-overclaim boundary |
-| `run.manifest.json` | Merkle root over canonical tool outputs plus signature metadata — verifiable offline |
+| `run.manifest.json` | Merkle root over canonical tool outputs plus signature metadata — verifiable offline with signer trust supplied outside the case |
 | `REPORT.md` / `REPORT.html` / `REPORT.pdf` | Analyst report: Findings, ATT&CK coverage, normalized timeline, next actions. `REPORT.md` is always written; `REPORT.html` (needs pandoc) and `REPORT.pdf` (needs headless Chrome) are produced when those tools are present |
 
 <p align="center">
   <img src="assets/screenshots/chain-of-custody.png" alt="Chain of custody: hash-chained audit log to Merkle root to signed manifest" width="760">
 </p>
-<p align="center"><sub>Each run seals into a hash-chained audit log, a Merkle root over canonical tool outputs, and a signed manifest — verifiable offline with <code>manifest_verify</code>.</sub></p>
+<p align="center"><sub>Each run seals into a hash-chained audit log, a Merkle root over canonical tool outputs, and a signed manifest — verifiable offline with <code>manifest_verify</code> plus trusted signer policy.</sub></p>
 
 ## Reproduce a finding
 
@@ -196,7 +201,8 @@ Worked example, committed for spot-checks: Finding `f-A-evtx-audit-log-cleared` 
 tool call `tc-002`. Its cited output, SHA-256, verifier replay, and coverage state are in
 [`docs/release-evidence/`](docs/release-evidence/); the offline-verification recipe is in
 [`docs/cryptographic-attestation.md`](docs/cryptographic-attestation.md). After any run, confirm
-`tmp/auto-runs/<case-id>/manifest_verify.json` reports `overall: true`.
+`tmp/auto-runs/<case-id>/manifest_verify.json` reports `overall: true` and
+`signature_verified: true` for the authenticated signer tier.
 
 A match proves the cited operation reproduces and the custody chain holds. It does not validate the
 interpretation; that stays the examiner's call.
@@ -281,7 +287,7 @@ Every Case runs the same nine-stage pipeline, each stage landing live on the das
 
 Three design choices carry the weight:
 
-1. **A typed MCP tool surface — no `execute_shell`.** 45 narrow, schema-validated product tools: 32
+1. **A typed MCP tool surface — no `execute_shell`.** 57 narrow, schema-validated product tools: 43
    Rust DFIR tools (`case_open`, `vol_pslist`/`psscan`/`psxview`, `mft_timeline`, `evtx_query`,
    `hayabusa_scan`, `yara_scan`, `registry_query`, `prefetch_parse`, `pcap_triage`, and allow-listed
    long-tail wrappers) plus 14 Python crypto/analysis tools. Copyleft and source-available engines
@@ -289,7 +295,7 @@ Three design choices carry the weight:
    the Apache-2.0 tree license-clean.
 2. **A cryptographic chain of custody.** Hash-chained audit log → Merkle root over canonical-JSON
    tool outputs (computed by the Python manifest builder, mirroring `rs_merkle` semantics) → a signed
-   manifest. The default signer is a local Ed25519 key that verifies offline; Sigstore/Rekor is the
+   manifest. The default signer is a local Ed25519 key that verifies offline against the controller's trusted public-key fingerprint; Sigstore/Rekor is the
    identity and transparency-log tier. `manifest_verify` checks the chain and root offline, and
    customer-release candidates carry an expert-signoff packet. This is about integrity and offline
    replayability, not admissibility; the courtroom framing (FRE 902(14)) and its caveats live in
@@ -318,7 +324,7 @@ claims require at least two artifact classes.
 > real evidence in a committed run. Committed sample runs exercise the core disk / registry / EVTX /
 > MFT / Prefetch / Hayabusa / USN / PCAP and `vol_*` memory paths (each with a real tool call in a
 > committed `audit.jsonl`; see [Results](#results-whats-proven)). `yara_scan`, `sysmon_network_query`,
-> `zeek_summary`, `vel_collect`, and `browser_history` are typed and fixture-tested but not yet in a
+> `zeek_summary` and `browser_history` (visits, downloads, and privacy-bounded metadata: secret/value columns excluded, usernames retained) are typed and fixture-tested but not yet in a
 > committed real-evidence run.
 
 ## Architecture
@@ -329,12 +335,12 @@ subprocesses** → **two typed MCP servers** → the **Claude Code agent loop** 
 custody** → the **presentation** layer, with trust boundaries marked.
 
 <p align="center">
-  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 14 Python tools), the Claude Code agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
+  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, forensic tool subprocesses, two typed MCP servers (findevil-mcp 43 Rust tools and findevil-agent-mcp 14 Python tools), the Claude Code agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
 </p>
 
 The same pipeline mapped to the repository — entrypoints (`scripts/`), the agent loop governed by
 `agent-config/`, the `.mcp.json` surface (product servers `findevil-mcp` + `findevil-agent-mcp` =
-48 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
+57 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
 emit findings), the SIFT DFIR tools, the read-only evidence vault, the custody chain
 (`audit.jsonl` → `manifest_finalize` → `manifest_verify`), and the outputs:
 
@@ -382,7 +388,9 @@ Details: [`docs/fact-fidelity.md`](docs/fact-fidelity.md).
   ([whole-case local run](docs/using/whole-case-local-run.md)).
 - **Optional post-verdict action.** When the operator deploys an n8n workflow, a verdict can drive a
   notification, ticket, or containment step. Out of the box no workflow is deployed, so the step
-  records as skipped. Either way it sits outside the audit chain — never evidence, never a Finding.
+  records as skipped. Reachability never opts the operator in: the launcher requires
+  `--acknowledge-post-verdict-egress` before sending case metadata to n8n/grounding. Either way it
+  sits outside the audit chain — never evidence, never a Finding.
 
 ## Accuracy and scope
 
@@ -414,11 +422,11 @@ reproducible with `scripts/score-recall.py`; full method and caveats are in
 | Case | Evidence | Recall (bar) | Run verdict | What it shows |
 |---|---|---|---|---|
 | **Nitroba** | network (PCAP) | **5/5 = 100%** (80%) | `INDETERMINATE` | Full network-evidence recall with no over-attribution. All five golden facts surfaced; attribution stays `INFERRED` / `HYPOTHESIS`, so the verdict scopes down. The strongest single result. |
-| **NIST Hacking Case** | disk (Windows XP) | **10/14 = 71%** (bar 71%) | `SUSPICIOUS` | Recalls ten of fourteen golden claims — Prefetch-backed tool-use, on-disk tool files (MFT), IE internet history, shellbag + removable-media LNK staging, Recycle-Bin staging, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU, ACMru search history, and service/named-pipe recon. Passes at its floor. Four misses (USB history, deleted email, XP logon `.evt` — unsatisfiable, empty on this image — and thumbcache) **published, not hidden**. Caveat: SCHARDT is in the golden set, so read a strong score as regression signal, not blind generalization. |
+| **NIST Hacking Case** | disk (Windows XP) | **11/14 = 79% live** (bar 71%) | `SUSPICIOUS` | The 2026-07-09 live re-carve recalls eleven golden claims: Prefetch-backed tool-use, on-disk tool files (MFT), IE internet history, shellbag + removable-media LNK staging, Recycle-Bin staging, a suspiciously-named local account (SAM, T1136.001), OpenSaveMRU, ACMru search history, service/named-pipe recon, and a recovered deleted-email lead. Three misses (USB history, XP logon `.evt` — unsatisfiable, empty on this image — and thumbcache) are **published, not hidden**. The immutable committed sample-run remains historical at 10/14; see the live-vs-sample receipt in `docs/benchmark/RESULTS.md`. Caveat: SCHARDT is in the golden set, so read a strong score as regression signal, not blind generalization. |
 
-On the local-runnable corpus, **9 of 9 cases pass** (aggregate recall 23/27 = 85%; measured
-2026-07-01, [`docs/benchmark/RESULTS.md`](docs/benchmark/RESULTS.md); `manifest_verify` overall:true
-on every run) — Nitroba, NIST, and seven EVTX / control cases. NIST now passes at its 71% floor. The
+On the local-runnable corpus, **9 of 9 cases pass** (aggregate recall 24/27 = 89%; measured
+2026-07-09, [`docs/benchmark/RESULTS.md`](docs/benchmark/RESULTS.md); the live NIST re-carve has
+`manifest_verify` overall:true) — Nitroba, NIST, and seven EVTX / control cases. NIST passes above its 71% floor. The
 larger gated disk/memory goldens (19 cases) are fixture-staged and **not yet run, with no number
 fabricated**. A staged control is `alihadi-09-encrypt` (dual-use crypto should not become an
 overconfident `SUSPICIOUS`).
@@ -436,7 +444,8 @@ Each is backed by a real tool call in a committed `audit.jsonl`:
 
 The long-tail verbs (`vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, `cloud_audit`,
 `journalctl_query`, `login_accounting`, `ausearch`, `nfdump_query`, `suricata_eve`, `indx_parse`)
-plus `yara_scan`, `sysmon_network_query`, `zeek_summary`, `vel_collect`, and `browser_history` are
+plus `yara_scan`, `sysmon_network_query`, `zeek_summary`, and `browser_history`
+(visits, downloads, and privacy-bounded cookie/autofill/login metadata: secret/value columns excluded, usernames retained) are
 typed and fixture-tested, **not yet exercised on real evidence in a committed run**.
 
 ### Wins, with the receipt
@@ -468,6 +477,11 @@ manifest_verify : overall true · audit_chain_ok · leaf_count_ok · merkle_root
 ```
 
 → [`docs/release-evidence/sample-run/manifest_verify.json`](docs/release-evidence/sample-run/manifest_verify.json)
+
+That JSON is a stored product-verifier receipt, not an independent trust root.
+Re-derive it with the standalone verifier and reviewed fixture pin in
+[`docs/release-evidence/sample-run/README.md`](docs/release-evidence/sample-run/README.md);
+never take the pin from the manifest being tested.
 
 **Self-correction under real failure (organic, not injected).**
 
@@ -520,7 +534,7 @@ YARA is built into the Rust binary), builds and verifies both MCP servers, runs 
 
 ```bash
 bash scripts/setup --run         # install, then watch evidence/ and investigate on drop
-bash scripts/setup --with-sift   # install local prerequisites and provision the SANS SIFT VM
+bash scripts/setup --with-sift   # also provision the SANS SIFT VM (only needed for mac_triage)
 bash scripts/setup --json        # machine-readable status for scripts/CI
 ```
 
@@ -529,10 +543,21 @@ bash scripts/setup --json        # machine-readable status for scripts/CI
 </p>
 <p align="center"><sub><code>scripts/doctor.sh</code>: one preflight, an honest green/amber summary, then you are ready to run.</sub></p>
 
-The **SANS SIFT VM** is the reference forensic environment and provides the full workstation baseline
-for disk-image parity; `--with-sift` fetches the gated 9.3&nbsp;GB OVA headlessly and builds the VM,
-falling back cleanly to local mode (memory, EVTX, PCAP, Velociraptor, and supported disk artifacts)
-on any failure. Full prerequisites are in [INSTALL.md](INSTALL.md); per-environment detail (local vs.
+The **DFIR container** is the recommended forensic backend and provides the disk-image baseline:
+set `FINDEVIL_DFIR_GHCR=ghcr.io/<owner>/verdict-dfir-toolkit@sha256:<reviewed-digest>`
+(~2.3&nbsp;GB), then run `scripts/verdict --docker <evidence>`. Its toolchain is pinned and
+health-checked, so a missing tool fails loudly instead of
+silently reading zero packets. The evidence runtime is always networkless and
+capability-free: raw `.dd`/`.001` uses direct Sleuth Kit, while compressed
+`.E01` mounting is refused in Docker and must use local/SIFT or an `ewfexport`
+conversion to raw. Python custody/signing remains on the host, outside the
+native-parser trust boundary. The
+**SANS SIFT VM** stays supported for the long-tail lanes the image
+does not carry (`mac_triage` / mac_apt); `--with-sift` fetches the gated 9.3&nbsp;GB OVA headlessly and
+builds the VM, falling back cleanly to local mode (memory, EVTX, PCAP, Velociraptor, and supported
+disk artifacts) on any failure. See [docs/using/docker-backend.md](docs/using/docker-backend.md) for
+the container's honest scope, including the `.E01` boundary. Full prerequisites are in
+[INSTALL.md](INSTALL.md); per-environment detail (local vs.
 SIFT VM) is in [QUICKSTART.md](QUICKSTART.md).
 
 To run a Case, point `verdict` at a single image or a mixed case directory (memory + EVTX + disk +
@@ -540,7 +565,11 @@ network + Velociraptor):
 
 ```bash
 scripts/verdict <path-to-evidence>
-#   --sift          run the DFIR tools inside the SANS SIFT VM (default: local host)
+#   --docker        explicitly select the split-trust default
+#   --local         reduced-isolation host parsers (also requires the acknowledgment below)
+#   --sift          reduced-isolation SANS SIFT VM (also requires the acknowledgment below)
+#   --acknowledge-reduced-isolation  required with --local/--sift
+#   --acknowledge-post-verdict-egress  allow optional n8n/grounding network actions
 #   --watch         watch evidence/ and investigate on the next drop
 #   --no-dashboard  do not auto-open the browser
 ```
@@ -549,7 +578,8 @@ The dashboard at `http://localhost:3000` streams the run live. Evidence files ar
 (they are gitignored), so a fresh clone ships with none — stage public datasets with
 `bash scripts/fetch-fixtures.sh` (sources and SHA-256 in [docs/DATASET.md](docs/DATASET.md)) or drop
 your own image into `evidence/`. Every run is a live test: confirm `tmp/auto-runs/<case-id>/verdict.json`
-carries a real verdict and `manifest_verify.json` reports `overall: true`.
+carries a real verdict and `manifest_verify.json` reports `overall: true` plus
+`signature_verified: true` for the authenticated signer tier.
 
 <p align="center">
   <img src="docs/showcase/claude-code-live-run.png" alt="Driving VERDICT interactively as a Claude Code agent investigating four EVTX samples" width="640">
@@ -561,8 +591,8 @@ carries a real verdict and `manifest_verify.json` reports `overall: true`.
 ```
 .
 ├── agent-config/        — runtime agent identity (SOUL / AGENTS / PLAYBOOK / TOOLS / MEMORY)
-├── services/mcp/        — Rust MCP server (34 typed DFIR tools)
-├── services/agent_mcp/  — Python MCP server (13 crypto / ACH / memory tools)
+├── services/mcp/        — Rust MCP server (43 typed DFIR tools)
+├── services/agent_mcp/  — Python MCP server (14 crypto / ACH / memory tools)
 ├── services/agent/      — findevil_agent package (crypto chain + ACH primitives)
 ├── apps/web/            — Next.js dashboard (live audit-stream viewer + design system)
 ├── scripts/             — verdict launcher, report renderer, CI smoke runners

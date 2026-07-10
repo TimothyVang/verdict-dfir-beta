@@ -1,2 +1,19 @@
 packages:
   - "apps/*"
+
+# pnpm 11 fails CI when dependency install scripts have no explicit policy.
+# These three locked native/tooling packages need their setup step for the web
+# build; es5-ext's informational postinstall is not required.
+allowBuilds:
+  es5-ext: false
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+
+# Next's transitive PostCSS floor lags the patched XSS release. Keep the
+# workspace resolver on the audited fixed version until Next raises its floor.
+overrides:
+  esbuild: 0.25.0
+  js-yaml: 4.3.0
+  postcss: 8.5.10
+  vite: 6.4.3

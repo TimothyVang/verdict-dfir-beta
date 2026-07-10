@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from findevil_agent import ai_signatures as ai
 from findevil_agent.ai_signatures import (
     _SIGNATURE_TABLE,
     CONFIDENCE_TIER,
@@ -107,6 +110,11 @@ class TestScanText:
         assert "\n" not in match.preview
         assert "  " not in match.preview
 
+    def test_repetitive_adversarial_text_counts_without_match_materialization(self) -> None:
+        text = "langchain " * 100_000
+        hit = next(h for h in scan_text(text, source="s") if h.signature_id.endswith(".langchain"))
+        assert hit.occurrences == 100_000
+
 
 class TestScanSources:
     def test_inline_only(self) -> None:
@@ -156,6 +164,38 @@ class TestScanSources:
         filtered = scan_sources(text="x", categories=frozenset({"agent_framework"}))
         assert full.signatures_evaluated == signature_count()
         assert 0 < filtered.signatures_evaluated < full.signatures_evaluated
+
+    def test_aggregate_byte_budget_stops_before_scanning_remaining_paths(
+        self, tmp_path: Path
+    ) -> None:
+        paths = []
+        for index in range(4):
+            path = tmp_path / f"{index}.txt"
+            path.write_bytes(b"abcdefgh")
+            paths.append(str(path))
+
+        scan = scan_sources(paths=tuple(paths), byte_limit=16)
+        assert scan.bytes_scanned == 16
+        assert scan.paths_considered == 2
+        assert scan.sources_skipped == 2
+        assert scan.truncated is True
+        assert scan.truncation_reason == "aggregate_byte_limit"
+
+    def test_domain_path_cap_prevents_unbounded_file_policy_work(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ai, "MAX_PATHS", 2)
+        paths = []
+        for index in range(3):
+            path = tmp_path / f"{index}.txt"
+            path.write_text("benign")
+            paths.append(str(path))
+
+        scan = scan_sources(paths=tuple(paths))
+        assert scan.paths_requested == 3
+        assert scan.paths_considered == 2
+        assert scan.sources_skipped == 1
+        assert scan.truncation_reason == "path_limit"
 
 
 class TestEpistemicContract:

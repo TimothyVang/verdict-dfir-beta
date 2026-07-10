@@ -12,9 +12,11 @@ from typing import Any
 
 from findevil_agent.correlator import correlate
 from findevil_agent.events import Finding
-from pydantic import BaseModel, ConfigDict, Field
+from findevil_agent.resource_limits import MAX_MERGED_FINDINGS
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from findevil_agent_mcp.tools._base import ToolSpec
+from findevil_agent_mcp.tools._input_limits import enforce_json_budget
 
 
 class CorrelateFindingsInput(BaseModel):
@@ -22,8 +24,14 @@ class CorrelateFindingsInput(BaseModel):
 
     findings: list[dict[str, Any]] = Field(
         ...,
+        max_length=MAX_MERGED_FINDINGS,
         description="Findings to correlate (typically the judge's merged output).",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_input_budget(cls, value: Any) -> Any:
+        return enforce_json_budget(value, label="correlate_findings")
 
 
 class CorrelationRecord(BaseModel):

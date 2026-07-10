@@ -21,11 +21,12 @@ session *is* the engine. You point it at evidence (a memory image, Windows Event
 a packet capture, or a whole multi-host case folder) and it:
 
 1. opens a read-only **Case** and SHA-256s the evidence,
-2. drives a **narrow, typed, read-only** tool surface (48 product tools — 34 Rust DFIR tools + 14
+2. drives a **narrow, typed, read-only** tool surface (57 product tools — 43 Rust DFIR tools + 14
    Python crypto/memory tools; **no `execute_shell`, ever**),
 3. **verifies every Finding** (re-runs the cited tool and compares output hashes),
 4. and writes a **scoped verdict** — `SUSPICIOUS` / `INDETERMINATE` / `NO_EVIL` — plus an analyst
-   report, sealed into a **hash-chained, signed manifest you can verify offline**.
+   report, sealed into a **hash-chained, signed manifest you can verify offline with
+   signer trust supplied outside the case**.
 
 What it is **not**: an autonomous responder (the analyst approves the plan and the verifier re-runs
 every cited tool before any Finding reaches the report), and `NO_EVIL` is never a whole-environment
@@ -75,7 +76,8 @@ against re-runnable tool output and corroborating artifacts. Today those gates a
   from two distinct evidence classes (Prefetch + Amcache, EVTX 4688 + MFT, …) or it's auto-downgraded
   to `HYPOTHESIS`. Hayabusa/Sigma/YARA/malfind output are **leads, not facts**.
 - **A confidence taxonomy + coverage manifest** that make the limits explicit instead of papering
-  over them, and a **signed manifest** anyone can verify offline.
+  over them, and a **signed manifest** anyone can verify offline against a trusted
+  external Ed25519 fingerprint (or exact Sigstore identity + issuer policy).
 
 The full picture: [`docs/false-positives.md`](false-positives.md),
 [`docs/architecture.md`](architecture.md), and the runtime rules in
@@ -115,7 +117,8 @@ vice versa.
    [`.github/ISSUE_TEMPLATE/`](../.github/ISSUE_TEMPLATE/)) so we can agree on the approach before
    you spend a weekend on it.
 3. **The "done" gate is a live run**, not a green smoke: `scripts/verdict evidence/<file>` produces a
-   real verdict with `manifest_verify.json` → `overall: true`. An honest `INDETERMINATE` on thin
+   real verdict with `manifest_verify.json` → `overall: true` and authenticated
+   `signature_verified: true`. An honest `INDETERMINATE` on thin
    evidence is a pass.
 
 ### Invariants a PR must not break (so your work isn't wasted)

@@ -36,10 +36,10 @@ dependencies = [
 
   # M2 cryptographic chain-of-custody stack. Pinned per Spec #2 §16.
   # Sigstore is the opt-in identity/transparency tier; the default
-  # manifest signer is local Ed25519 and verifies offline.
+  # manifest signer is local Ed25519 and verifies offline against an external key pin.
   # opentimestamps-client was removed in Amendment A5 along with
   # the OpenTimestamps + Bitcoin tier of the custody chain.
-  "sigstore>=3,<5",
+  "sigstore>=4.2,<5",
 
   # L1 DuckDB per case.
   "duckdb>=0.10",
@@ -99,10 +99,16 @@ build-backend = "hatchling.build"
 packages = ["findevil_agent"]
 
 [tool.uv]
-# sigstore 3.x has a transitive prerelease pin (sigstore-protobuf-specs);
-# uv refuses by default. Allow prereleases project-wide so the dep tree
-# resolves. Same setting applied in services/agent_mcp/pyproject.toml.
+# Some optional forensic/tooling dependencies publish prerelease-compatible
+# transitive versions. Keep resolution explicit and identical in agent_mcp.
 prerelease = "allow"
+constraint-dependencies = [
+  "cryptography>=48.0.1,<49",
+  "idna>=3.15,<4",
+  "pyjwt>=2.13,<3",
+  "tuf>=7,<8",
+  "urllib3>=2.7,<3",
+]
 
 [tool.ruff]
 target-version = "py311"

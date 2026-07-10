@@ -103,8 +103,9 @@ try:
     r = json.load(open(summ)).get("result", {})
     row = {"host": label, "verdict": r.get("verdict"),
            "manifest_ok": r.get("manifest_verify_overall"),
+           "signature_verified": r.get("manifest_signature_verified"),
            "packet": r.get("packet_state"), "case_dir": r.get("local_dir")}
-    if row.get("manifest_ok") is not True:
+    if row.get("manifest_ok") is not True or row.get("signature_verified") is not True:
         status = 3
 except Exception as e:
     row = {"host": label, "verdict": "ERROR", "error": str(e)}
@@ -113,7 +114,7 @@ open(res, "a").write(json.dumps(row) + "\n")
 sys.exit(status)
 PY
   then
-    echo "$(ts)        manifest verification failed for $label" >&2
+    echo "$(ts)        authenticated manifest verification failed for $label" >&2
     failed=1
   fi
 done

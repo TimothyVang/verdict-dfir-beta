@@ -2,19 +2,19 @@
 
 > **Status: ACTIVE.** This is the single source of truth for *which MCP servers exist*, *which
 > tools they expose*, and *what is and is not in the audit chain*. `agent-config/TOOLS.md` is
-> the agent read-order catalog of the 46 typed **product** tools; this file is the wider map
+> the agent read-order catalog of the 57 typed **product** tools; this file is the wider map
 > (every registered server + the host/browser MCP). When the two disagree, the tool *counts* in
 > both must match — fix the drift, don't pick a winner.
 
 Two numbers that look like a contradiction but aren't:
 
-- **48** = the **product tool surface** (34 Rust + 14 Python). This is the narrow, typed,
+- **57** = the **product tool surface** (43 Rust + 14 Python). This is the narrow, typed,
   audit-chained verb set the investigation runs on. It does not change lightly.
 - **6** = the number of **MCP servers actually registered in `.mcp.json`**. Only the first two
   are product-default and in the audit chain; the other four are non-product conveniences
   (operator-runtime browser/automation + the optional `qmd` memory sidecar).
 
-Neither number contradicts the other: 46 counts *product tools*, 6 counts *registered servers*.
+Neither number contradicts the other: 57 counts *product tools*, 6 counts *registered servers*.
 
 ---
 
@@ -22,7 +22,7 @@ Neither number contradicts the other: 46 counts *product tools*, 6 counts *regis
 
 | # | Server | Transport / command | Role | In audit chain? | Emits Findings? |
 |---|---|---|---|---|---|
-| 1 | `findevil-mcp` | stdio · `bash scripts/run-mcp-rust.sh` | 34 typed Rust DFIR tools | **Yes** | **Yes** |
+| 1 | `findevil-mcp` | stdio · `bash scripts/run-mcp-rust.sh` | 43 typed Rust DFIR tools | **Yes** | **Yes** |
 | 2 | `findevil-agent-mcp` | stdio · `bash scripts/run-mcp-python.sh` | 14 Python crypto / ACH / memory / ACP / expert tools | **Yes** | **Yes** |
 | 3 | `n8n-mcp` | stdio · `npx -y n8n-mcp` (`MCP_MODE=stdio`) | Post-verdict finding-to-action automation (operator-local) | No | No |
 | 4 | `playwright` | stdio · `npx -y @playwright/mcp@latest` | Browser automation / dashboard verification | No | No |
@@ -57,7 +57,7 @@ operator-runtime servers, it is **not** part of the investigation surface.
 
 ---
 
-## 2. Product tools — 48 total (34 Rust + 14 Python)
+## 2. Product tools — 57 total (43 Rust + 14 Python)
 
 **Invariant: there is no `execute_shell` tool, ever.** This typed surface is the entire verb
 set the investigation has. The narrowness *is* the security pitch. The five generic Rust verbs
@@ -74,9 +74,10 @@ never a flag or a shell fragment.
 `suricata_eve`, and `indx_parse` are implemented as typed, allow-listed, shell-free tools and
 unit-tested against synthetic fixtures, but they have not yet been exercised on real evidence in a
 committed case run. The committed sample runs prove the core disk/registry/EVTX/MFT/Prefetch/YARA/
-USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` paths.
+USN/Hayabusa/Sysmon/Zeek/PCAP and `vol_*` paths. `browser_history` is fixture-tested
+across its version-2 artifact variants but does not yet have a committed real-evidence receipt.
 
-### `findevil-mcp` — 34 Rust DFIR tools (`services/mcp/src/tools/`)
+### `findevil-mcp` — 43 Rust DFIR tools (`services/mcp/src/tools/`)
 
 | Tool | Purpose | Source |
 |---|---|---|
@@ -84,6 +85,15 @@ USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` pat
 | `disk_mount` | Register a read-only disk-mount session for raw/E01 images | `disk.rs` |
 | `disk_extract_artifacts` | Copy `$MFT`/Registry/EVTX/Prefetch/… from the mount into the case area; also recovers deleted-but-metadata-intact files (staged under `__deleted__/<inode>/`, reallocated inodes skipped, opt out with `recover_deleted: false`) | `disk.rs` |
 | `disk_unmount` | Unmount a disk-mount session, mark it unmounted in the ledger | `disk.rs` |
+| `bulk_extract` | Scan raw image bytes — including unallocated space, slack, and deleted regions — with `bulk_extractor` for email/RFC-822/URL/domain features and operator keyword hits; degrades to `bulk_extractor_available: false` when the scanner is absent | `bulk_extract.rs` |
+| `srum_parse` | Decode Windows SRUM (`SRUDB.dat`) network-usage table via `esedbexport` + pure-Rust row parse; degrades when esedbexport absent | `srum_parse.rs` |
+| `bits_parse` | BITS job-queue state (`qmgr*.dat` / `qmgr.db`) — T1197 URL/path leads (conservative string scan) | `bits_parse.rs` |
+| `wmi_persist_parse` | WMI CIM repository (`OBJECTS.DATA`) — T1546.003 consumer/filter/binding pattern lead | `wmi_persist_parse.rs` |
+| `email_parse` | Standalone `.eml` / `mbox` header+attachment metadata | `email_parse.rs` |
+| `pst_parse` | Outlook `.pst`/`.ost` message metadata export | `pst_parse.rs` |
+| `exif_parse` | Image/document EXIF metadata | `exif_parse.rs` |
+| `setupapi_parse` | Windows setupapi.dev.log / setupapi.app.log USB device-install history | `setupapi_parse.rs` |
+| `vss_list` / `vss_mount` | Volume Shadow Copy inventory and read-only mount (when available) | `vss.rs` |
 | `evtx_query` | Parse `.evtx` with EventID/limit filtering (in-process `evtx` crate) | `evtx_query.rs` |
 | `prefetch_parse` | Execution evidence from Windows Prefetch (MAM + SCCA) | `prefetch_parse.rs` |
 | `mft_timeline` | NTFS `$MFT` timeline with `$SI`/`$FN` MAC times | `mft_timeline.rs` |
@@ -98,8 +108,7 @@ USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` pat
 | `vol_psscan` | Volatility3 `windows.psscan` (pool-scan; DKOM cross-check) | `vol_psscan.rs` |
 | `vol_psxview` | Volatility3 `windows.psxview` (cross-view process compare) | `vol_psxview.rs` |
 | `vol_malfind` | Volatility3 `windows.malfind` (injected code, T1055) | `vol_malfind.rs` |
-| `vel_collect` | Run a Velociraptor artifact via subprocess, stream rows | `vel_collect.rs` |
-| `browser_history` | Read visited URLs from a Chrome/Edge `History` or Firefox `places.sqlite` (read-only, in-process via `rusqlite`) | `browser_history.rs` |
+| `browser_history` | Schema-detect Chrome/Edge History visits+downloads, Firefox history, and Chromium cookie/autofill/login metadata; cookie/autofill values and password/form/note contents excluded, username metadata retained (read-only, in-process `rusqlite`) | `browser_history.rs` + `browser_history/` modules |
 | `oe_dbx_parse` | Read an Outlook Express `.dbx` mail/news store — OE-signature-validated, extracts RFC822 `Subject`/`From`/`Newsgroups` headers (in-process; no other parser reads DBX) | `oe_dbx_parse.rs` |
 | `thumbcache_parse` | Parse XP `Thumbs.db` (OLE/CFB catalog) and Vista+ `thumbcache_*.db`/`iconcache_*.db` (CMMM) — image-viewed/presence evidence that survives file deletion (in-process, magic-byte detected) | `thumbcache_parse.rs` |
 | `hashset_lookup` | NSRL known-good / operator known-bad hash-set lookup — streamed text sets or read-only-immutable SQLite (RDS v3 / generic), parameterized queries only | `hashset_lookup.rs` |
@@ -121,8 +130,8 @@ USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` pat
 |---|---|---|
 | `audit_append` | Append one record to the hash-chained audit log | `audit_append.py` |
 | `audit_verify` | Replay the audit chain offline (every `prev_hash` link) | `audit_verify.py` |
-| `manifest_finalize` | Build the rs_merkle tree, sign, write `run.manifest.json` | `manifest_finalize.py` |
-| `manifest_verify` | Offline verify: chain → Merkle root → signature presence | `manifest_verify.py` |
+| `manifest_finalize` | Build the rs_merkle tree, sign (including the transparency-request policy), then attach any requested proof and write `run.manifest.json` | `manifest_finalize.py` |
+| `manifest_verify` | Offline verify: chain → Merkle root → payload digest → tier signature; requires external Ed25519 pin or exact Sigstore identity + issuer, and gates on an authenticated anchor when the signed request is true | `manifest_verify.py` |
 | `verify_finding` | Re-run a Finding's cited tool call; confirm output SHA-256 still matches | `verify_finding.py` |
 | `detect_contradictions` | Surface Pool A vs Pool B disagreements before judging | `detect_contradictions.py` |
 | `judge_findings` | Credibility-weighted Pool A + Pool B merge | `judge_findings.py` |
@@ -152,7 +161,6 @@ Rust crate behind `yara_scan` (not a subprocess).
 |---|---|---|---|
 | `volatility3` | `vol_pslist/psscan/psxview/malfind` | Volatility Software License (BSD-2-style) | BinaryNotFound |
 | `hayabusa` | `hayabusa_scan` | AGPL-3.0 | BinaryNotFound |
-| `velociraptor` | `vel_collect` | Apache-2.0 | BinaryNotFound |
 | `sleuthkit` (`fls`/`icat`/`mmls`) | `disk_extract_artifacts` (`.e01`/`.dd` content) | IPL-1.0 / CPL-1.0 | disk stays custody-only |
 | `tshark` | `pcap_triage` (preferred) | GPL-2.0 | falls back to zeek, else env-limit |
 | `zeek` | `zeek_summary`, `pcap_triage` (fallback) | BSD-3-Clause | env-limit |
@@ -160,7 +168,7 @@ Rust crate behind `yara_scan` (not a subprocess).
 | `pandoc` | report HTML/PDF render (`render_report.py`) | GPL-2.0 | HTML/PDF render skipped |
 
 Binary resolution order for the Rust server: `$VOLATILITY_BIN` / `$HAYABUSA_BIN` /
-`$VELOCIRAPTOR_BIN` / `$TSHARK_BIN` first, then PATH. A missing binary is an **environment
+`$TSHARK_BIN` first, then PATH. A missing binary is an **environment
 limitation reported as BinaryNotFound**, never evidence-absence.
 
 ---

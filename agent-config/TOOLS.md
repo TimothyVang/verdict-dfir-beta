@@ -4,20 +4,26 @@ The agent has access to two MCP servers, both auto-spawned by Claude Code via `.
 
 | Server | Lang | Tools |
 |---|---|---|
-| `findevil-mcp` | Rust (`services/mcp/`) | 42 typed DFIR tools |
+| `findevil-mcp` | Rust (`services/mcp/`) | 43 typed DFIR tools |
 | `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 14 crypto + ACH + memory + ACP + expert-feedback + accuracy + AI-signature tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
 
 Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the canonical JSON output). Findings cite tool calls by `tool_call_id`. The verifier vetoes any finding that doesn't.
 
 > **Finding-authoring invariant.** Every CONFIRMED execution/intent Finding MUST populate `counter_hypothesis` with the benign explanation considered and discarded (presumption of benignity). Empty on such a Finding is a gate failure under `FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS_FINDING`; the correlator downgrades it and the schema/verifier reject it.
 
-> **This file is the agent read-order catalog of the 46 typed PRODUCT tools** (the only verbs in
-> the audit chain). The *full* set of MCP servers actually registered in `.mcp.json` (incl. the
-> operator-runtime `n8n-mcp`, `playwright`, `puppeteer` that emit no Findings) and the external
-> DFIR binaries + dependency pins are inventoried in
+> **This file is the agent read-order catalog of the 57 typed PRODUCT tools** (43 Rust + 14 Python;
+> the only verbs in the audit chain). The *full* set of MCP servers actually registered in
+> `.mcp.json` (incl. the operator-runtime `n8n-mcp`, `playwright`, `puppeteer` that emit no
+> Findings) and the external DFIR binaries + dependency pins are inventoried in
 > [`docs/reference/mcp-and-tools.md`](../docs/reference/mcp-and-tools.md) and
 > [`docs/reference/dependencies.md`](../docs/reference/dependencies.md). Tool counts here are
 > authoritative — keep them in sync, don't diverge.
+
+> **Auto-engine disk extract classes (Wave A).** After `disk_extract_artifacts`, the deterministic
+> engine now also drives `srum_parse`, `bits_parse`, `wmi_persist_parse`, and `email_parse` /
+> `pst_parse` when those artifact classes are present on the image (SRUDB.dat, BITS qmgr*, WMI
+> OBJECTS.DATA, .eml/.mbox/.pst/.ost). Findings from those lanes start at HYPOTHESIS until
+> multi-class corroboration.
 
 ---
 
@@ -28,16 +34,19 @@ Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the can
 `suricata_eve`, `indx_parse`, `thumbcache_parse`, and `hashset_lookup` are implemented as typed,
 allow-listed, shell-free tools and unit-tested against synthetic fixtures, but they have not yet
 been exercised on real evidence in a committed case run. The committed sample runs prove the core disk/registry/EVTX/MFT/Prefetch/YARA/
-USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` paths.
+USN/Hayabusa/Sysmon/Zeek/PCAP and `vol_*` paths. `browser_history` is fixture-tested
+across its version-2 artifact variants but does not yet have a committed real-evidence receipt.
 
 > **Long-tail tool availability.** `scripts/setup` installs `volatility3`, `hayabusa` (+ Sigma
-> rules), `chainsaw`, `velociraptor`, and `pandoc`/`matplotlib`, plus the long-tail wrappers it can
+> rules), `chainsaw`, and `pandoc`/`matplotlib`, plus the long-tail wrappers it can
 > install cleanly: `indx_parse` (INDXParse) and `plaso_parse` (log2timeline, best-effort pip) go in
 > user-space via `install-dfir-tools.sh`, and `ausearch` (auditd), `nfdump_query` (nfdump), and
 > `suricata_eve` (suricata) are apt-installed by `install.sh` under `--bootstrap` (which
-> `scripts/setup` passes). `ez_parse` (Eric Zimmerman tools, .NET) and `mac_triage` (mac_apt) ship
-> on the SANS SIFT VM and are reported (not auto-installed) elsewhere, since neither has a clean
-> cross-distro user-space installer. Any tool still missing returns a typed `BinaryNotFound` error
+> `scripts/setup` passes). The recommended Docker backend installs and gates `plaso_parse` plus
+> all seven `ez_parse` wrappers with an isolated pre-mount execution check and a runtime integrity
+> manifest. `ez_parse` (Eric Zimmerman tools, .NET) and `mac_triage`
+> (mac_apt) also ship on the SANS SIFT VM and are reported (not auto-installed) for local-host mode,
+> since neither has a clean cross-distro user-space installer. Any tool still missing returns a typed `BinaryNotFound` error
 > and the run continues (graceful skip); it never crashes the server. `scripts/doctor.sh` reports which are
 > present, and the install hint is in each tool's `BinaryNotFound` error message.
 
@@ -74,7 +83,7 @@ Use when: persistence questions (Run/RunOnce, Services, IFEO, AppInit_DLLs), use
 ### yara_scan
 Args: `{case_id, target_path, rules_path, recursive?, limit?}`
 Returns: `{matches[], files_scanned, rules_compiled, scan_errors}`
-Use when: IOC matching. In-process via `yara-x = 1.12.0` (BSD-3-Clause, VirusTotal pure-Rust YARA). Each match shows `{rule_name, namespace, tags, pattern_matches[]}` with offset+length+64-byte hex preview. **Always cite the rule name in findings.** Prefer YARA-Forge `core` tier (curated low-FP); `extended`/`community` tiers without corroboration are FP-prone.
+Use when: IOC matching. In-process via `yara-x = 1.19.0` (BSD-3-Clause, VirusTotal pure-Rust YARA). Each match shows `{rule_name, namespace, tags, pattern_matches[]}` with offset+length+64-byte hex preview. **Always cite the rule name in findings.** Prefer YARA-Forge `core` tier (curated low-FP); `extended`/`community` tiers without corroboration are FP-prone.
 
 ### usnjrnl_query
 Args: `{case_id, usnjrnl_path, since_iso?, until_iso?, reasons[]?, limit?}`
@@ -84,7 +93,7 @@ Use when: tracking filesystem changes the MFT can't show (deleted-file event seq
 ### hayabusa_scan
 Args: `{case_id, evtx_dir, rules_dir?, min_level?, limit?}`
 Returns: `{events[], events_seen, stderr_tail}` where each event is `{timestamp_iso, rule, level, channel, event_id, computer, details}`
-Use when: Sigma-rule sweep over an EVTX directory. Subprocess to `hayabusa` (AGPL — never linked). `min_level` ∈ {informational, low, medium, high, critical}. Pre-compiled Hayabusa rules expected at `~/hayabusa/rules` unless `rules_dir` is overridden. False-positive note: routine admin activity (Sysinternals tools, scheduled WMI, AV updates) trips medium-severity rules; pair every Hayabusa hit with `prefetch_parse` and `evtx_query 4624` cross-corroboration before believing it.
+Use when: Sigma-rule sweep over an EVTX directory. Subprocess to `hayabusa` (AGPL — never linked). `min_level` ∈ {informational, low, medium, high, critical}. Pre-compiled Hayabusa rules expected at `~/hayabusa/rules` unless `rules_dir` is overridden; the recommended Docker backend pins and integrity-seals its complete rule corpus. False-positive note: routine admin activity (Sysinternals tools, scheduled WMI, AV updates) trips medium-severity rules; pair every Hayabusa hit with `prefetch_parse` and `evtx_query 4624` cross-corroboration before believing it.
 
 ### sysmon_network_query
 Args: `{case_id, evtx_path, event_ids?, since_iso?, until_iso?, image_contains?, destination_ip?, destination_port?, limit?}`
@@ -121,15 +130,16 @@ Args: `{case_id, memory_path, pid_filter?: int[], limit?}`
 Returns: `{injections[], injections_seen, stderr_tail}` where each injection is `{pid, image_name, vad_start_hex, vad_end_hex, protection, mz_match: bool, sample_hex}` (64-byte preview)
 Use when: hunting injected code (T1055). `mz_match=true` + RWX `protection` + non-Microsoft-signed parent process = high-confidence injection. Slowest of the vol_* tools — give it a 30-minute timeout on 5GB+ memory images (the orchestrator already does).
 
-### vel_collect
-Args: `{case_id, artifact: str, args?: {str: str}, format?, limit?}`
-Returns: `{rows[], rows_seen, stderr_tail}` — `rows` are free-form (every Velociraptor artifact has its own column shape; typed-here would be hostile)
-Use when: any of Velociraptor's 200+ DFIR artifacts (`Windows.Forensics.Prefetch`, `Generic.Forensic.LocalHashes`, etc.). `artifact` validated against dotted-path pattern, `args` keys validated against `[A-Za-z_][A-Za-z0-9_]*` to block flag injection. Subprocess to `velociraptor` (Apache-2.0; env var `$VELOCIRAPTOR_BIN` first then PATH).
+### Velociraptor collections
+`vel_collect` is intentionally absent from the product MCP: stock Velociraptor catalogs include
+shell, PowerShell, upload, kill, and network-capable artifacts, so a generic artifact trampoline is
+not a read-only forensic boundary. Supply an offline Velociraptor ZIP instead; the deterministic
+engine performs bounded local extraction and redispatches contained artifacts only to typed tools.
 
 ### browser_history
-Args: `{case_id, history_path: str, limit?: int}`
-Returns: `{browser_family, rows[]: {url, title, last_visit_time_iso, visit_count}, rows_seen}`
-Use when: an extracted browser history DB — Chrome/Edge `History` or Firefox `places.sqlite` — is in scope (downloaded-payload URL, phishing visit, C2 panel). Opened read-only + `immutable=1` (no `-wal`/`-journal` write on evidence); browser auto-detected by schema; timestamps normalized to ISO-8601Z from each native epoch (Chrome WebKit µs-since-1601, Firefox µs-since-1970). HONEST SCOPE: a row CONFIRMS a URL was *recorded as visited* at T — a browser-artifact fact, NOT execution, so a single `browser_history` Finding is a legitimate CONFIRMED browser fact and never trips the ≥2-artifact-class rule; intent is a separate `hypothesis:` layer. In-process via `rusqlite` (MIT, vendored SQLite).
+Args: `{case_id, history_path: str, limit?: int}` (`history_path` is the compatibility field for any supported browser DB; `limit` defaults to and cannot exceed 10000)
+Returns: `{schema_version: 2, browser_family, artifact_kind, rows[], rows_seen, truncated}` where `artifact_kind` is `chromium_history | firefox_history | chromium_cookies | chromium_web_data | chromium_login_data` and every row has `record_type: visit | download | cookie_metadata | autofill_metadata | login_metadata`. Version 2 explicitly identifies the mixed tagged-row contract; version 1 was visit-only despite the retained tool and `rows` field names. Visit rows preserve the original `{url, title, last_visit_time_iso, visit_count}` fields and add the source table's stable `url_id`; the other variants expose download state/path/URL metadata, cookie host/name/flags, autofill field-name aggregates, or login origin/realm/account metadata (including stable `login_id`). `truncated=true` means at least one additional matching row existed beyond the global limit.
+Use when: an extracted Chrome/Edge `History` (visits + downloads), Firefox `places.sqlite`, or Chromium `Cookies`, `Web Data`, or `Login Data` is in scope. The schema selects the artifact kind; callers never request a parser mode. Opened read-only + `immutable=1` (no `-wal`/`-journal`/`-shm` write on evidence), globally limited, deterministically ordered using native timestamps, and normalized to UTC ISO-8601Z. The MCP boundary rejects symlinks and requires an exact source/inventory DB to match the current case's canonical path and SHA-256 before and after parsing; typed derived DBs must remain beneath their hash-bound source case. `NotAuthorized` / `IntegrityMismatch` means re-open or correct the case, never bypass the guard. Resource defaults are a 2 GiB DB, 1 MiB SQLite value, 50 million SQLite operations, a 128 MiB SQLite heap, 512 schema entries, and 24 MiB cumulative serialized inner output. Operators may configure the reviewed `FINDEVIL_BROWSER_*` ceilings; output may only be lowered from 24 MiB, and field, heap, and schema settings retain their documented hard caps. `DatabaseTooLarge` / `ResourceLimit` is a loud coverage limitation requiring a narrowed DB or reviewed ceiling change. Supply a completed/checkpointed forensic snapshot: immutable mode deliberately does not merge uncheckpointed records that exist only in a live profile's WAL. **Privacy boundary:** cookie plaintext/encrypted values, autofill values, password blobs, form data, and password notes are never selected or represented. HONEST SCOPE: visits confirm browser records; downloads confirm download metadata, not execution; cookie/autofill/login rows confirm stored metadata, not intent, account compromise, or exfiltration. In-process via `rusqlite` (MIT, vendored SQLite).
 
 ### vol_run
 Args: `{case_id, memory_path, plugin: str, pid?: int, limit?}`
@@ -144,7 +154,7 @@ Use when: decoding a carved Windows artifact. `tool` ∈ `{lecmd, jlecmd, amcach
 ### plaso_parse
 Args: `{case_id, parser: str, artifact_path, limit?}`
 Returns: `{parser, events[]: normalized plaso event objects, events_seen, stderr_tail}`
-Use when: a cross-OS log plaso normalizes (`syslog`, `bash_history`, `zsh_extended_history`, `utmp`, `dpkg`, `selinux`, legacy `winevt`/`msiecf`/`winjob`, `recycle_bin`, `viminfo`, macOS `asl_log`/`macwifi`). `parser` validated against the allow-list before argv. Two-stage fixed-argv run (`log2timeline.py` → `psort.py json_line`); `$PLASO_DIR` then PATH. For modern Windows `.evtx`, prefer the in-process `evtx_query`. **Deterministic-absence degradation:** plaso is an optional subprocess (absent off the SIFT VM). When `log2timeline.py` is not found, the orchestrator records one `course_correction` (`mechanism=tool_failure_resequence`), marks plaso absent for the run, and **early-stops** — INFO2 recycle-bin routes to `ez_parse:rbcmd`; remaining plaso classes (`legacy_evt`/`ie_history`/`scheduled_task`) are skipped with a recorded coverage-degradation note rather than re-issuing the same doomed call per artifact. The skip is an honest coverage gap, not a silent fallback.
+Use when: a cross-OS log plaso normalizes (`syslog`, `bash_history`, `zsh_extended_history`, `utmp`, `dpkg`, `selinux`, legacy `winevt`/`msiecf`/`winjob`, `recycle_bin`, `viminfo`, macOS `asl_log`/`macwifi`). `parser` validated against the allow-list before argv. Two-stage fixed-argv run (`log2timeline.py` → `psort.py json_line`); `$PLASO_DIR` then PATH. For modern Windows `.evtx`, prefer the in-process `evtx_query`. The recommended Docker backend executes both Plaso stages in its isolated pre-mount gate and seals their Python 3.10 runtime/package payload for runtime health checks; local-host and deliberately partial images can still omit them. **Deterministic-absence degradation:** when `log2timeline.py` is not found, the orchestrator records one `course_correction` (`mechanism=tool_failure_resequence`), marks plaso absent for the run, and **early-stops** — INFO2 recycle-bin routes to `ez_parse:rbcmd`; remaining plaso classes (`legacy_evt`/`ie_history`/`scheduled_task`) are skipped with a recorded coverage-degradation note rather than re-issuing the same doomed call per artifact. The skip is an honest coverage gap, not a silent fallback.
 
 ### mac_triage
 Args: `{case_id, module: str, image_path, limit?}`
@@ -197,9 +207,9 @@ Returns: `{format: "olecfb_xp"|"cmmm", entries[]: {index?, cache_entry_hash?, or
 Use when: a carved XP `Thumbs.db` or Vista+ `thumbcache_*.db` / `iconcache_*.db` (Explorer thumbnail cache) is in scope. **Pure Rust, in-process** (`cfb` crate for the XP OLE container; hand-rolled CMMM records for Vista+). Format detected by magic bytes, never filename. HONEST SCOPE: a cache entry CONFIRMS an image *existed and was rendered by Explorer* (surviving file deletion) — it is viewing/presence evidence at cache granularity, never execution and never proof the user opened the file at a specific time; XP catalog `modified_iso` is the cache's own timestamp. Fixture-tested only until exercised on a real image.
 
 ### hashset_lookup
-Args: `{case_id, hashes[] (hex MD5/SHA1/SHA256, ≤10k), hashset_paths?[]: {path, disposition: known_good|known_bad, name?}}`
+Args: `{case_id, hashes[] (hex MD5/SHA1/SHA256, ≤10k)}`. Caller-supplied paths are rejected.
 Returns: `{results[]: {hash, disposition: known_good|known_bad|unknown, matched_sets[]}, sets_loaded[], hashes_checked}`
-Use when: triaging extracted/recovered file hashes against NSRL known-good or operator known-bad sets. **Pure Rust, in-process** — text sets stream (never loaded whole), SQLite sets (NSRL RDS v3 `FILE` schema or generic `hashes(hash)`) open read-only-immutable, parameterized queries only. Defaults to `$FINDEVIL_HASHSET_DIR/known_good/**` + `known_bad/**`; no sets configured degrades to all-`unknown`, never an error. HONEST SCOPE: `known_good` supports demotion/suppression, `known_bad` is a lead requiring corroboration — a hash match alone is never execution evidence. Fixture-tested only; not yet run against a full NSRL RDS download.
+Use when: triaging extracted/recovered file hashes against NSRL known-good or operator known-bad sets. **Pure Rust, in-process** — only `$FINDEVIL_HASHSET_DIR/known_good/**` + `known_bad/**` is enumerated; symlinks and non-regular files fail closed. Text scans have set-count, per-file, aggregate-byte, and per-line ceilings. SQLite sets (NSRL RDS v3 `FILE` schema or generic `hashes(hash)`) open read-only-immutable with no-follow, field-length, VM-operation, and process-heap limits; queries are parameterized only. Operators may lower the hard-clamped defaults with `FINDEVIL_HASHSET_MAX_SETS`, `FINDEVIL_HASHSET_MAX_FILE_BYTES`, `FINDEVIL_HASHSET_MAX_TOTAL_BYTES`, `FINDEVIL_HASHSET_MAX_LINE_BYTES`, `FINDEVIL_HASHSET_SQLITE_MAX_OPS`, `FINDEVIL_HASHSET_SQLITE_MAX_FIELD_BYTES`, and `FINDEVIL_HASHSET_SQLITE_HEAP_MAX_BYTES`. No sets configured degrades to all-`unknown`, never an error. HONEST SCOPE: `known_good` supports demotion/suppression, `known_bad` is a lead requiring corroboration — a hash match alone is never execution evidence. Fixture-tested only; not yet run against a full NSRL RDS download.
 
 ### email_parse
 Args: `{case_id, artifact_path}`
@@ -210,6 +220,11 @@ Use when: a loose `.eml` message or `mbox` archive is in scope (no other tool re
 Args: `{case_id, artifact_path}`
 Returns: `{has_exif, camera_make?, camera_model?, software?, datetime_original?, datetime?, gps_decimal?: [lat, lon], artist?, copyright?, other_fields[], field_count}`
 Use when: a user-content image (JPEG/TIFF/HEIF/…) may carry EXIF — camera/software fingerprint, capture timestamps, and GPS geolocation. **Pure Rust, in-process** (`kamadak-exif`); reads clean ASCII values (never quoted). HONEST SCOPE: metadata is a device/location LEAD (a photo's GPS is where the shot was taken, not where a person was); no pixel bytes leave the tool. Feeds on carved/extracted images.
+
+### setupapi_parse
+Args: `{case_id, artifact_path, limit?}`
+Returns: `{case_id, artifact_path, events[{device, install_time_iso?, sample_line}], events_seen, bytes_read}`
+Use when: extracted `setupapi.dev.log` / `setupapi.app.log` may hold USB or removable-storage install sections when USBSTOR is empty/sparse. **Pure Rust, in-process.** HONEST SCOPE: install sections are connection/registration leads, never data-transfer proof. Sorted/deduped for `verify_finding` replay.
 
 ### bits_parse
 Args: `{case_id, artifact_path}`
@@ -256,19 +271,19 @@ Returns: `{ok: bool, record_count, error}`
 Use when: replaying an audit chain to confirm integrity. Walk every `prev_hash` SHA-256 link; first mismatch reports the seq + field. The `manifest_verify` tool calls this internally.
 
 ### manifest_finalize
-Args: `{case_id, run_id, started_at, audit_log_path, output_path, signer, extra?}`
-Returns: `{leaf_count, merkle_root_hex, signature_payload_sha256}` — the on-disk manifest also has `signature.cert_fingerprint`, `leaves[]`, `finalized_at`
-Use when: closing a case. Builds the rs_merkle tree over every audit-log leaf, signs the canonical body — `signer="ed25519"` (default: real local signature, verifies offline), `"sigstore"` (identity + transparency log; customer-release tier), or `"stub"` (explicit dev placeholder) — and writes `run.manifest.json`. Terminal crypto-custody step under Amendment A5 (the OpenTimestamps + Bitcoin anchor that previously followed was removed — see `docs/cryptographic-attestation.md` for the FRE 902(14) trade-off).
+Args: `{case_id, run_id, started_at, audit_log_path, output_path, signer, extra?, anchor_transparency?}`
+Returns: `{leaf_count, merkle_root_hex, signature_payload_sha256, transparency_requested, transparency_anchored, transparency_kind}` — the on-disk manifest also has `signature.cert_fingerprint`, `leaves[]`, `finalized_at`, and the signed `transparency_anchor_requested` policy.
+Use when: closing a case. Builds the rs_merkle tree over every audit-log leaf, signs the canonical body — `signer="ed25519"` (default: real local signature, verifies offline against an out-of-band trusted public-key fingerprint), `"sigstore"` (identity + transparency log; customer-release tier), or `"stub"` (explicit dev placeholder) — and writes `run.manifest.json`. When `anchor_transparency=true`, the request is committed before signing and `manifest_verify` requires an authenticated Rekor proof; a missing, `kind="none"`, unauthenticated, or invalid proof fails `overall`. The current RFC-3161 fallback is structural-only and cannot satisfy that requested tier without a pinned, verified TSA chain. Legacy/unrequested attached proofs remain non-gating. Terminal crypto-custody step under Amendment A5 (the OpenTimestamps + Bitcoin anchor that previously followed was removed — see `docs/cryptographic-attestation.md` for the FRE 902(14) trade-off).
 
 ### manifest_verify
-Args: `{manifest_path, audit_log_path?}`
-Returns: `{overall: bool, audit_chain_ok, merkle_root_ok, signature_present, ...}`
-Use when: any third party wants offline verification. Replays the audit chain → recomputes the Merkle root from `leaves[]` → checks signature presence and reports `signature_kind` / `signature_verified`. Ed25519 signatures verify cryptographically offline; Sigstore bundles are recorded for identity-policy-aware verification; stub bundles are explicit placeholders. Tampering with `merkle_root_hex` produces a precise diagnostic naming both the declared and rebuilt roots.
+Args: `{manifest_path, audit_log_path?, expected_ed25519_fingerprint?, expected_sigstore_identity?, expected_sigstore_issuer?}`
+Returns: `{overall: bool, audit_chain_ok, merkle_root_ok, signature_present, signature_kind, signature_verified, ...}`
+Use when: any third party wants offline verification. Replays the audit chain → recomputes the Merkle root from `leaves[]` → cryptographically verifies the effective tier. Ed25519 requires the trusted public-key SHA-256 obtained outside the case; the manifest's own fingerprint is never its trust pin. Sigstore requires a full bundle, production roots, and exact trusted identity + OIDC issuer. Stub bundles are explicit unauthenticated placeholders even when their payload envelope is internally consistent. A signed `transparency_anchor_requested=true` commitment makes `transparency_ok` and `overall` fail closed unless an authenticated anchor verifies. Tampering with `merkle_root_hex` produces a precise diagnostic naming both the declared and rebuilt roots.
 
 ### verify_finding
-Args: `{finding, tool_call_index, findevil_mcp_command: list[str]}`
+Args: `{finding, tool_call_index, force_fresh_replay?: bool, downgrade_on_drift?: bool}`
 Returns: `{action, finding_id, reason, replay_tool_name, replay_expected_sha256, replay_actual_sha256, replay_matched, replay_error}`
-Use when: re-running a finding's cited `tool_call_id` to confirm the original output's SHA-256 still matches. The verifier spawns its own short-lived findevil-mcp child process — same binary, same args, same hash, byte-for-byte. Budget 30s/finding per Spec #2 §8.1.
+Use when: re-running a finding's cited `tool_call_id` to confirm the original output's SHA-256 still matches. The verifier spawns its own short-lived findevil-mcp child process from a fixed server-side launcher — callers cannot supply argv, cwd, or environment. Budget 30s/finding per Spec #2 §8.1.
 
 **Fact-fidelity (entailment).** A SHA-match proves the finding points at real, unchanged evidence — NOT that it READ that evidence right. So a CONFIRMED/INFERRED finding MUST declare `asserted_values`: the structured fact(s) it claims, each `{path, expected, match}` where `path` walks the cited tool's output JSON (e.g. `entries[*].values[*].name`, `run_count`) and `match` ∈ `exact | contains | iso_ts | int | record`. After the SHA reproduces, the verifier deterministically **re-extracts** each asserted value from the re-run output; a value that is not actually there — a misread laundered through a valid `tool_call_id` — **rejects** a CONFIRMED finding and **downgrades** a lower tier, the same policy as output drift. The matched evidence value is recorded on the approval, so the chain carries a **server-read fact, not your transcription**. HONEST SCOPE: structured-value fidelity only; an interpretive claim ("this is malicious") has no deterministic ground truth and stays a tiered `hypothesis:` lead.
 

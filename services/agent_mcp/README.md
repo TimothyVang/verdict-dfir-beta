@@ -25,8 +25,8 @@ on session start.
 |---|---|---|
 | `audit_append` | `AuditLog.append` | Append one event to the hash-chained audit log. |
 | `audit_verify` | `AuditLog.verify` | Replay the chain; surface any break. |
-| `manifest_finalize` | `build_manifest` + `write_manifest` | Build, sign, and write `run.manifest.json`. Terminal crypto-custody step under Amendment A5. |
-| `manifest_verify` | `verify_manifest` | Offline verify (chain + Merkle root + sig presence). |
+| `manifest_finalize` | `build_manifest` + `write_manifest` | Build, sign, and write `run.manifest.json`; an opt-in transparency request is committed before the proof is attached. Terminal crypto-custody step under Amendment A5. |
+| `manifest_verify` | `verify_manifest` | Offline verify (chain + Merkle root + tier signature); Ed25519 needs an external trusted fingerprint, Sigstore needs exact identity + issuer policy, and a signed transparency request requires an authenticated anchor. |
 | `verify_finding` | `verifier.reverify_finding` | Re-run the cited tool call; approve/reject/downgrade. |
 | `detect_contradictions` | `contradiction.detect_contradictions` | Pairwise scan Pool A vs Pool B. |
 | `judge_findings` | `judge.judge_findings` | Credibility-weighted merge of pool findings. |

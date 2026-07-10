@@ -25,7 +25,16 @@ import { InvestigationStreamPanel } from "@/components/investigation/Investigati
 import { LiveTimeline } from "@/components/investigation/LiveTimeline";
 import { ReportPanel } from "@/components/investigation/ReportPanel";
 import { StageRail } from "@/components/investigation/StageRail";
-import { VerdictSummary } from "@/components/investigation/VerdictSummary";
+import {
+  VerdictSummary,
+  type AuthenticatedCustodyDisplaySnapshot,
+} from "@/components/investigation/VerdictSummary";
+import {
+  isCustodySnapshotReadyHint,
+  selectionMatchesConnectedCase,
+  selectCustodyDisplayEvents,
+  type BrowserAuditLine,
+} from "@/lib/custody-display";
 import { deriveEvidenceMeta } from "@/lib/evidence-meta";
 import { deriveStageStates } from "@/lib/stage-state";
 import { BODY, BrandMark, Kicker, RuleLine, SerifHeadline, VERDICT } from "@/lib/verdict-ui";
@@ -33,14 +42,7 @@ import { BODY, BrandMark, Kicker, RuleLine, SerifHeadline, VERDICT } from "@/lib
 // Mirror /debug's local AuditLine shape — importing from @/lib/audit-tail
 // would drag node:fs + chokidar into the client bundle. Keep in sync with
 // `apps/web/lib/audit-tail.ts:AuditLine`.
-interface AuditLine {
-  seq: number;
-  kind: string;
-  ts: string;
-  payload: Record<string, unknown>;
-  line_hash?: string;
-  raw_line: string;
-}
+type AuditLine = BrowserAuditLine;
 
 type ConnState = "disconnected" | "connecting" | "live";
 
@@ -48,10 +50,14 @@ const MAX_EVENTS = 500;
 
 export default function DashboardPage() {
   const [casePath, setCasePath] = useState("");
+  const [connectedCasePath, setConnectedCasePath] = useState("");
   const [cases, setCases] = useState<{ path: string; name: string; mtime: number }[]>([]);
   const [events, setEvents] = useState<AuditLine[]>([]);
   const [conn, setConn] = useState<ConnState>("disconnected");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [authenticatedSnapshot, setAuthenticatedSnapshot] =
+    useState<AuthenticatedCustodyDisplaySnapshot | null>(null);
+  const [reportReady, setReportReady] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
   const disconnect = useCallback(() => {
@@ -60,6 +66,10 @@ export default function DashboardPage() {
       esRef.current = null;
     }
     setConn("disconnected");
+    setConnectedCasePath("");
+    setEvents([]);
+    setAuthenticatedSnapshot(null);
+    setReportReady(false);
   }, []);
 
   const connect = useCallback(
@@ -75,6 +85,11 @@ export default function DashboardPage() {
       }
       setErrorMsg(null);
       setConn("connecting");
+      setCasePath(target);
+      setConnectedCasePath(target);
+      setEvents([]);
+      setAuthenticatedSnapshot(null);
+      setReportReady(false);
 
       const url = `/api/audit?case=${encodeURIComponent(target)}`;
       const es = new EventSource(url);
@@ -171,39 +186,41 @@ export default function DashboardPage() {
   // events — surface it so a judge doesn't trust frozen data.
   const showStaleBanner = conn === "disconnected" && events.length > 0;
 
-  // Report readiness is reported up by ReportPanel so the stage rail can light
-  // its terminal "report" stage.
-  const [reportReady, setReportReady] = useState(false);
-
-  // The run has finalized once the terminal attestation beat lands. The engine
-  // records manifest_finalize as a tool CALL (not its own kind) and closes with
-  // verdict_artifact -> verdict_packet, so detect any of those terminal signals.
+  // A verdict_packet is only a readiness hint. Closed/sealed language remains
+  // gated on a fully authenticated joint custody snapshot below.
   const manifestDone = useMemo(
-    () =>
-      events.some(
-        (e) =>
-          e.kind === "verdict_packet" ||
-          e.kind === "verdict_artifact" ||
-          e.kind === "manifest_finalize" ||
-          (e.kind === "tool_call_start" &&
-            (e.payload as { tool?: string }).tool === "manifest_finalize"),
-      ),
+    () => isCustodySnapshotReadyHint(events),
     [events],
+  );
+
+  const custodyAuthenticated = authenticatedSnapshot !== null;
+  const displayEvents = useMemo(
+    () =>
+      selectCustodyDisplayEvents({
+        liveEvents: events,
+        snapshotEvents: authenticatedSnapshot?.events ?? [],
+        custodyAuthenticated,
+        sealObserved: manifestDone,
+      }),
+    [events, authenticatedSnapshot, custodyAuthenticated, manifestDone],
   );
 
   // The connected case dir (deep-link or the connect form), drives the report
   // and timeline fetches.
-  const connectedCase = conn !== "disconnected" || events.length > 0 ? casePath : "";
+  const connectedCase = connectedCasePath;
 
   // Pipeline progression for the stage rail (mission-control glance).
   const stages = useMemo(
-    () => deriveStageStates(events, reportReady),
-    [events, reportReady],
+    () => deriveStageStates(displayEvents, custodyAuthenticated && reportReady),
+    [displayEvents, custodyAuthenticated, reportReady],
   );
 
   // What's under investigation — surfaced as the sticky evidence banner. Pulled
   // from the case_open audit events (path/sha256/size); null until they stream.
-  const evidenceMeta = useMemo(() => deriveEvidenceMeta(events), [events]);
+  const evidenceMeta = useMemo(
+    () => deriveEvidenceMeta(displayEvents),
+    [displayEvents],
+  );
 
   return (
     <main
@@ -270,10 +287,12 @@ export default function DashboardPage() {
         {/* The human-first headline: verdict + plain summary + tallies, above
             the live machine stream. Renders once a case is connected. */}
         <VerdictSummary
+          key={connectedCase || "no-connected-case"}
           events={events}
           caseDir={connectedCase}
           manifestDone={manifestDone}
           evidenceName={evidenceMeta?.name ?? undefined}
+          onAuthenticatedSnapshot={setAuthenticatedSnapshot}
         />
 
         {/* What's under investigation — sticky so it stays in view while the
@@ -307,7 +326,16 @@ export default function DashboardPage() {
             <select
               id="case-select"
               value={casePath}
-              onChange={(e) => setCasePath(e.target.value)}
+              onChange={(e) => {
+                const selected = e.target.value;
+                setCasePath(selected);
+                if (!selectionMatchesConnectedCase(selected, connectedCasePath)) {
+                  setConnectedCasePath("");
+                  setEvents([]);
+                  setAuthenticatedSnapshot(null);
+                  setReportReady(false);
+                }
+              }}
               disabled={conn !== "disconnected"}
               style={{
                 flex: "1 1 260px",
@@ -435,11 +463,12 @@ export default function DashboardPage() {
         `}</style>
         <div className="verdict-mission-grid">
           <div style={{ minWidth: 0 }}>
-            <InvestigationStreamPanel events={events} />
+            <InvestigationStreamPanel events={displayEvents as AuditLine[]} />
             <LiveTimeline
-              events={events}
-              caseDir={connectedCase}
-              manifestDone={manifestDone}
+              events={displayEvents as AuditLine[]}
+              sealObserved={manifestDone}
+              authenticatedVerdict={authenticatedSnapshot?.verdict ?? null}
+              custodyAuthenticated={custodyAuthenticated}
             />
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 24, minWidth: 0 }}>

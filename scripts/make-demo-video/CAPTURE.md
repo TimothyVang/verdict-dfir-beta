@@ -117,13 +117,18 @@ watch it fail. Strongest possible proof for the audit-trail criterion. Not yet w
 or keep it as B-roll.
 
 ```bash
-# Pass: completed run verifies offline (zero deps).
-scripts/trace-finding tmp/auto-runs/<case-id>
+# Pass: independently verify chain, Merkle root, and Ed25519 signature (zero deps).
+# Obtain the fingerprint from the controller/operator through a trusted channel;
+# never copy it from the manifest being tested.
+python3 scripts/manifest-verify-offline.py \
+  tmp/auto-runs/<case-id>/run.manifest.json \
+  --expected-ed25519-fingerprint <trusted-public-key-sha256>
 
 # Fail: tamper one byte, re-verify → precise chain-break diagnostic, overall=false.
 cp -r tmp/auto-runs/<case-id> /tmp/tamper-demo
-# edit one hex char in /tmp/tamper-demo/audit.jsonl, then:
-scripts/trace-finding /tmp/tamper-demo   # exits non-zero, names the broken seq
+# edit one hex char in /tmp/tamper-demo/audit.jsonl, then repeat the standalone
+# verifier command against /tmp/tamper-demo/run.manifest.json; it exits non-zero
+# and names the broken sequence.
 ```
 
 ---

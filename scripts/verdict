@@ -3,8 +3,8 @@
 #
 # This is the single entry point. It replaces the old per-mode launchers
 # (find-evil-auto / find-evil-run / find-evil-live / find-evil-sift): there is
-# one workflow, not five. "Where the tools run" (local host vs. the SANS SIFT
-# VM) is the --sift flag, not a separate command.
+# one workflow, not five. "Where the tools run" is a backend flag, not a
+# separate command; the split-trust Docker backend is the production default.
 #
 # Usage:
 #   scripts/verdict <evidence> [options]
@@ -15,18 +15,22 @@
 #   + report.
 #
 # Options:
+#   --local           run parsers and custody/signing as the current host user;
+#                     requires --acknowledge-reduced-isolation
 #   --sift            run the DFIR tools inside the SANS SIFT VM over SSH
-#                     (default: tools on the local host). Requires the VM to be
+#                     requires --acknowledge-reduced-isolation because parser
+#                     and custody services share the guest trust domain;
+#                     requires the VM to be
 #                     bootstrapped once: bash scripts/sift-vm-bootstrap.sh
 #   --docker          run the DFIR tools inside the findevil-dfir container (the
-#                     container analog of --sift; mutually exclusive with it).
+#                     split-trust production default; mutually exclusive with
+#                     --local/--sift).
 #                     Brings the container up via scripts/run-dfir-container.sh
-#                     (build/pull the image, mount evidence read-only at
-#                     /evidence, build the MCP in-container), swaps in the docker
+#                     (select a reviewed image, build Rust MCP before attaching
+#                     evidence, mount evidence read-only at /evidence), swaps in
 #                     MCP transport (.mcp.json.docker), and hands the engine the
-#                     in-container evidence path. The container is left running
-#                     for reuse; tear it down with
-#                     scripts/run-dfir-container.sh --down.
+#                     in-container evidence path. The case-scoped container is
+#                     removed automatically when the run exits.
 #   --fleet           whole multi-host case in ONE command: per-host
 #                     investigations -> cross-host correlation -> FLEET_REPORT.
 #                     Auto-detected when <evidence> is a folder with hosts/ or
@@ -36,6 +40,12 @@
 #                     (debounced until the copy finishes). Omitting both a path
 #                     and --watch uses the newest file already in evidence/.
 #   --no-dashboard    don't auto-open the web dashboard
+#   --acknowledge-post-verdict-egress
+#                     opt in to n8n action/grounding workflows that may send
+#                     reviewed evidence-derived queries to external services
+#   --acknowledge-reduced-isolation
+#                     required with --local/--sift; acknowledges that native
+#                     parsers share an OS trust domain with custody/signing
 #   --skip-build      assume target/release/findevil-mcp is already built
 #   --dry-run         print each stage without running anything
 #   --keep-sift-staging
@@ -63,6 +73,7 @@
 #         verdict.json, REPORT.{md,html,pdf})
 
 set -euo pipefail
+umask 077
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,11 +82,14 @@ cd "${REPO_ROOT}"
 # project folder so a direct `scripts/verdict` run matches the MCP launchers.
 # shellcheck source=lib/project-env.sh
 source "${REPO_ROOT}/scripts/lib/project-env.sh"
+# shellcheck source=lib/dashboard-capability.sh
+source "${REPO_ROOT}/scripts/lib/dashboard-capability.sh"
 
 DASH="http://localhost:3000"
 EVIDENCE_DIR="${REPO_ROOT}/evidence"
 SIFT=0
 DOCKER=0
+LOCAL=0
 FLEET=0
 NO_DASHBOARD=0
 SKIP_BUILD=0
@@ -88,6 +102,8 @@ CASE_ID_OVERRIDE=""
 PASSTHROUGH=()
 AGENT_MODE=0   # --agent: run the engine under the 3.11 agent venv (host python3 may be 3.10)
 KEEP_SIFT_STAGING=0
+POST_VERDICT_EGRESS_ACK=0
+REDUCED_ISOLATION_ACK=0
 SIFT_STAGING_ROOT=""
 SIFT_STAGING_PARENT=""
 STAGED_REMOTE_PATH=""
@@ -101,16 +117,22 @@ CASE_EVIDENCE_REF_DIR=""
 CASE_DIR_REJECTED_SENTINEL="__VERDICT_CASE_DIR_REJECTED__"
 CASE_DIR_MARKER=".verdict-case-marker"
 RESTORE_MCP=0
+DOCKER_RUNTIME_CONTAINER=""
+DOCKER_RUNTIME_STATE_DIR=""
+DOCKER_BUILD_OUTPUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sift)          SIFT=1; shift ;;
     --docker)        DOCKER=1; shift ;;
+    --local)         LOCAL=1; shift ;;
     --fleet)         FLEET=1; shift ;;
     --no-dashboard)  NO_DASHBOARD=1; shift ;;
     --skip-build)    SKIP_BUILD=1; shift ;;
     --dry-run)       DRY=1; shift ;;
     --keep-sift-staging) KEEP_SIFT_STAGING=1; shift ;;
+    --acknowledge-post-verdict-egress) POST_VERDICT_EGRESS_ACK=1; shift ;;
+    --acknowledge-reduced-isolation) REDUCED_ISOLATION_ACK=1; shift ;;
     --watch)         WATCH=1; shift ;;
     --run-summary)   if [[ $# -lt 2 ]]; then printf '\033[31m[verdict] FAIL:\033[0m --run-summary requires a value\n' >&2; exit 1; fi; RUN_SUMMARY="$2"; shift 2 ;;
     --case-id)       if [[ $# -lt 2 ]]; then printf '\033[31m[verdict] FAIL:\033[0m --case-id requires a value\n' >&2; exit 1; fi; CASE_ID_OVERRIDE="$2"; shift 2 ;;
@@ -138,10 +160,27 @@ warn() { printf '   \033[33m!\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[31m[verdict] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 url_up() { [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null)" != "000" ]]; }
 
-# --sift and --docker both choose "where the DFIR tools run" (VM vs container);
-# they are mutually exclusive backends. Local mode is the default when neither.
-if [[ "${SIFT}" == "1" && "${DOCKER}" == "1" ]]; then
-  fail "--sift and --docker are mutually exclusive — pick one DFIR tool backend"
+# Exactly one backend. Docker is the fail-closed production default: it keeps
+# evidence-facing native parsers away from the host custody/signing process.
+backend_count=$((SIFT + DOCKER + LOCAL))
+if (( backend_count > 1 )); then
+  fail "--local, --sift, and --docker are mutually exclusive — pick one DFIR tool backend"
+fi
+if (( backend_count == 0 )); then
+  DOCKER=1
+fi
+if [[ "${LOCAL}" == "1" || "${SIFT}" == "1" ]]; then
+  reduced_backend="--local"
+  [[ "${SIFT}" == "1" ]] && reduced_backend="--sift"
+  [[ "${REDUCED_ISOLATION_ACK}" == "1" ]] \
+    || fail "${reduced_backend} requires --acknowledge-reduced-isolation: native parsers share an OS trust domain with custody/signing"
+  if [[ "${LOCAL}" == "1" ]]; then
+    warn "using reduced-isolation local parser backend by explicit acknowledgment"
+  else
+    warn "using reduced-isolation SIFT parser backend by explicit acknowledgment"
+  fi
+elif [[ "${REDUCED_ISOLATION_ACK}" == "1" ]]; then
+  fail "--acknowledge-reduced-isolation is only valid with --local or --sift"
 fi
 
 case_root_abs() {
@@ -185,6 +224,7 @@ PY
 ensure_case_root() {
   local case_root="$1"
   case_root_components_safe "${case_root}" || fail "unsafe case root: ${case_root}"
+  chmod 0700 -- "${case_root}" || fail "could not make case root owner-only: ${case_root}"
 }
 
 ensure_case_layout_dir() {
@@ -203,6 +243,7 @@ ensure_case_layout_dir() {
     if [[ ! -e "${path}" ]]; then
       mkdir -- "${path}" || fail "could not create case layout directory: ${path}"
     fi
+    chmod 0700 -- "${path}" || fail "could not make case layout owner-only: ${path}"
   done
 }
 
@@ -217,6 +258,7 @@ initialize_case_layout() {
     "${case_root_real}"/*) ;;
     *) fail "case directory resolved outside case root: ${case_dir}" ;;
   esac
+  chmod 0700 -- "${case_dir_real}" || fail "could not make case directory owner-only: ${case_dir}"
   CASE_STAGING_DIR="${case_dir}/staging"
   CASE_SUMMARY_DIR="${case_dir}/summaries"
   CASE_LOG_DIR="${case_dir}/logs"
@@ -498,12 +540,14 @@ create_owned_case_dir() {
     fail "case dir already exists for --case-id: ${case_dir}"
   fi
   mkdir -- "${case_dir}" || fail "could not create case dir: ${case_dir}"
+  chmod 0700 -- "${case_dir}" || fail "could not make case dir owner-only: ${case_dir}"
   case_dir_real="$(realpath -e -- "${case_dir}")"
   case "${case_dir_real}" in
     "${case_root_real}"/*) ;;
     *) fail "case dir resolved outside case root: ${case_dir}" ;;
   esac
   : >"${case_dir}/${CASE_DIR_MARKER}"
+  chmod 0600 -- "${case_dir}/${CASE_DIR_MARKER}"
 }
 
 reclaim_incomplete_case_dir() {
@@ -533,6 +577,49 @@ restore_mcp_config() {
 }
 
 cleanup_on_exit() {
+  if [[ -n "${DOCKER_RUNTIME_CONTAINER:-}" ]] && command -v docker >/dev/null 2>&1; then
+    FINDEVIL_DFIR_CONTAINER="${DOCKER_RUNTIME_CONTAINER}" \
+      bash "${REPO_ROOT}/scripts/run-dfir-container.sh" --down \
+      >/dev/null 2>&1 || true
+    DOCKER_RUNTIME_CONTAINER=""
+  fi
+  if [[ "${FINDEVIL_DFIR_KEEP_RUNTIME_STATE:-0}" != "1" \
+        && -n "${DOCKER_RUNTIME_STATE_DIR:-}" \
+        && -d "${DOCKER_RUNTIME_STATE_DIR}" \
+        && ! -L "${DOCKER_RUNTIME_STATE_DIR}" \
+        && -f "${DOCKER_RUNTIME_STATE_DIR}/.verdict-runtime-marker" \
+        && ! -L "${DOCKER_RUNTIME_STATE_DIR}/.verdict-runtime-marker" ]]; then
+    runtime_root="${REPO_ROOT}/.project-local/tmp/dfir-runtime"
+    runtime_root_real="$(realpath -e -- "${runtime_root}" 2>/dev/null || true)"
+    runtime_dir_real="$(realpath -e -- "${DOCKER_RUNTIME_STATE_DIR}" 2>/dev/null || true)"
+    runtime_marker_case="$(head -n 1 -- "${DOCKER_RUNTIME_STATE_DIR}/.verdict-runtime-marker" 2>/dev/null || true)"
+    case "${runtime_dir_real}" in
+      "${runtime_root_real}"/*)
+        if [[ -n "${runtime_root_real}" && "${runtime_marker_case}" == "${CASE_ID:-}" ]]; then
+          rm -rf -- "${DOCKER_RUNTIME_STATE_DIR}" 2>/dev/null || true
+        fi
+        ;;
+    esac
+    DOCKER_RUNTIME_STATE_DIR=""
+  fi
+  if [[ -n "${DOCKER_BUILD_OUTPUT_DIR:-}" \
+        && -d "${DOCKER_BUILD_OUTPUT_DIR}" \
+        && ! -L "${DOCKER_BUILD_OUTPUT_DIR}" \
+        && -f "${DOCKER_BUILD_OUTPUT_DIR}/.verdict-build-marker" \
+        && ! -L "${DOCKER_BUILD_OUTPUT_DIR}/.verdict-build-marker" ]]; then
+    build_root="${REPO_ROOT}/.project-local/tmp/dfir-build-output"
+    build_root_real="$(realpath -e -- "${build_root}" 2>/dev/null || true)"
+    build_dir_real="$(realpath -e -- "${DOCKER_BUILD_OUTPUT_DIR}" 2>/dev/null || true)"
+    build_marker_case="$(head -n 1 -- "${DOCKER_BUILD_OUTPUT_DIR}/.verdict-build-marker" 2>/dev/null || true)"
+    case "${build_dir_real}" in
+      "${build_root_real}"/*)
+        if [[ -n "${build_root_real}" && "${build_marker_case}" == "${CASE_ID:-}" ]]; then
+          rm -rf -- "${DOCKER_BUILD_OUTPUT_DIR}" 2>/dev/null || true
+        fi
+        ;;
+    esac
+    DOCKER_BUILD_OUTPUT_DIR=""
+  fi
   restore_mcp_config
   reclaim_incomplete_case_dir
 }
@@ -561,23 +648,44 @@ safe_guest_mounted_evidence_path() {
 # root + an absolute allow-listed root so /api/audit accepts the case path
 # regardless of the dev server's cwd) and open it deep-linked to the case.
 open_dashboard() {
-  local case_dir="$1"
+  local case_dir="$1" dashboard_capability dashboard_exchange browser_base launch_file
+  local dashboard_ed25519_pin=""
   [[ "${NO_DASHBOARD}" == "1" || -z "${case_dir}" ]] && return 0
   if ! url_up "${DASH}"; then
+    dashboard_capability="$(dashboard_capability_rotate)" \
+      || { warn "could not reserve a private dashboard session"; return 0; }
+    dashboard_ed25519_pin="$(dashboard_ed25519_fingerprint "${REPO_ROOT}")" \
+      || { warn "could not derive the trusted dashboard Ed25519 key pin"; return 0; }
+    [[ "${dashboard_ed25519_pin}" =~ ^[0-9a-f]{64}$ ]] \
+      || { warn "custody key produced an invalid public fingerprint"; return 0; }
     log "starting the dashboard (pnpm dev, ~10s)…"
     ( FINDEVIL_REPO_ROOT="${REPO_ROOT}" \
       FINDEVIL_DASHBOARD_EXTRA_ROOTS="$(case_root_abs)" \
-      pnpm --filter @findevil/web dev >/tmp/verdict-dashboard.log 2>&1 & ) \
+      FINDEVIL_DASHBOARD_CAPABILITY="${dashboard_capability}" \
+      FINDEVIL_DASHBOARD_EXCHANGE_FILE="$(dashboard_exchange_file)" \
+      FINDEVIL_ED25519_EXPECTED_FINGERPRINT="${dashboard_ed25519_pin}" \
+      pnpm --filter @findevil/web dev -- --hostname 127.0.0.1 >/tmp/verdict-dashboard.log 2>&1 & ) \
       || warn "could not start dashboard (is pnpm installed?)"
     for _ in $(seq 1 40); do url_up "${DASH}" && break; sleep 1; done
+  else
+    dashboard_capability="$(dashboard_capability_read)" \
+      || { warn "dashboard port is occupied but no private session capability is available"; return 0; }
   fi
   if url_up "${DASH}"; then
-    local target
-    target="${DASH}/?case=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${case_dir}")"
-    command -v xdg-open >/dev/null 2>&1 && xdg-open "${target}" >/dev/null 2>&1 || true
-    ok "dashboard: ${target}"
+    local next_path
+    if ! dashboard_authenticated_probe "${DASH}" "${dashboard_capability}"; then
+      warn "dashboard on ${DASH} did not accept this launcher's private session; refusing to expose the Case"
+      return 0
+    fi
+    dashboard_exchange="$(dashboard_exchange_rotate)" \
+      || { warn "could not reserve a one-time dashboard exchange"; return 0; }
+    browser_base="http://verdict-${dashboard_exchange:0:16}.localhost:3000"
+    next_path="/?case=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${case_dir}")"
+    launch_file="$(dashboard_launch_file "${browser_base}" "${next_path}" "${dashboard_exchange}")"
+    command -v xdg-open >/dev/null 2>&1 && xdg-open "${launch_file}" >/dev/null 2>&1 || true
+    ok "dashboard: ${browser_base}/ (one-time private session opened locally)"
   else
-    warn "dashboard slow to start — open ${DASH}/?case=${case_dir} manually"
+    warn "dashboard slow to start — see /tmp/verdict-dashboard.log (manual unauthenticated Case URLs are disabled)"
   fi
 }
 
@@ -600,7 +708,7 @@ safe_guest_basename() {
 
 safe_case_id() {
   local value="$1"
-  if [[ -z "${value}" || "${value}" == "." || "${value}" == ".." || "${value}" == -* || ! "${value}" =~ ^[[:alnum:]_][[:alnum:]_.+-]*$ ]]; then
+  if [[ -z "${value}" || "${#value}" -gt 128 || "${value}" == "." || "${value}" == ".." || "${value}" == -* || ! "${value}" =~ ^[[:alnum:]_][[:alnum:]_.+-]*$ ]]; then
     fail "unsafe --case-id value: ${value}"
   fi
   printf '%s' "${value}"
@@ -1461,16 +1569,6 @@ for passthrough_arg in "${PASSTHROUGH[@]}"; do
 done
 [[ -n "${CASE_ID_OVERRIDE:-}" ]] && CASE_ID_OVERRIDE="$(safe_case_id "${CASE_ID_OVERRIDE}")"
 [[ -n "${RUN_SUMMARY:-}" ]] && RUN_SUMMARY="$(prepare_requested_run_summary_path "${RUN_SUMMARY}" 0)"
-# SIFT and Docker both run the tools off-host, so (like each other) they reserve
-# the case dir up front and resolve the dashboard after the run. Local mode pins
-# its case dir just before the engine so the dashboard can open LIVE.
-if [[ "${SIFT}" == "1" || "${DOCKER}" == "1" ]]; then
-  CASE_ID="${CASE_ID_OVERRIDE:-auto-$(python3 -c 'import uuid;print(uuid.uuid4())')}"
-  CASE_DIR="$(case_root_abs)/${CASE_ID}"
-  create_owned_case_dir "${CASE_DIR}" "$(case_root_abs)"
-  initialize_case_layout "${CASE_DIR}"
-  trap cleanup_on_exit EXIT INT TERM
-fi
 
 # newest non-placeholder entry (file OR case folder) in a dir; empty if none.
 # -d keeps a dropped directory as the entry itself rather than expanding it.
@@ -1627,8 +1725,20 @@ run_fleet() {
   exit 0
 }
 [[ "${FLEET}" == "1" && "${DOCKER}" == "1" ]] \
-  && fail "--docker is a single-host backend and does not support fleet runs — run per host, or use local/--sift fleet mode"
+  && fail "the Docker production backend is single-host; fleet requires --sift or --local plus --acknowledge-reduced-isolation"
 [[ "${FLEET}" == "1" ]] && run_fleet
+
+# SIFT and Docker reserve the case dir up front and resolve the dashboard after
+# the run. Local mode pins its case dir just before the engine so the dashboard
+# can open LIVE. This happens after fleet detection so a no-flag fleet request
+# fails without leaving an unused single-host case directory behind.
+if [[ "${SIFT}" == "1" || "${DOCKER}" == "1" ]]; then
+  CASE_ID="${CASE_ID_OVERRIDE:-auto-$(python3 -c 'import uuid;print(uuid.uuid4())')}"
+  CASE_DIR="$(case_root_abs)/${CASE_ID}"
+  create_owned_case_dir "${CASE_DIR}" "$(case_root_abs)"
+  initialize_case_layout "${CASE_DIR}"
+  trap cleanup_on_exit EXIT INT TERM
+fi
 
 # 1. preflight ---------------------------------------------------------------
 # Default engine is find_evil_auto (no Claude). Doctor --offline skips Claude
@@ -1653,7 +1763,7 @@ if [[ "${DRY}" == "1" ]]; then
 elif [[ "${SIFT}" == "1" ]]; then
   ok "--sift: the MCP server is built inside the VM by sift-vm-bootstrap; skipping host build"
 elif [[ "${DOCKER}" == "1" ]]; then
-  ok "--docker: the MCP server is built inside the findevil-dfir container by run-dfir-container.sh; skipping host build"
+  ok "--docker: the Rust parser is built in an isolated Docker builder; skipping host Rust build"
 elif [[ "${SKIP_BUILD}" == "1" || -f target/release/findevil-mcp ]]; then
   ok "findevil-mcp present (or --skip-build); skipping build"
 else
@@ -2142,31 +2252,64 @@ fi
 # 3c. Docker backend bring-up (the container analog of SIFT staging) ----------
 # In --docker mode the typed tools run INSIDE the findevil-dfir container, so
 # case_open needs a path the container can see. run-dfir-container.sh builds/pulls
-# the image, starts the long-lived container with this repo bind-mounted at
-# /workspace and the evidence bind-mounted READ-ONLY at /evidence, then builds the
-# MCP servers in-container. The evidence path itself is mounted at /evidence, so
-# that IS the in-container evidence path — rewrite EVIDENCE to it for the engine.
+# the image, builds the Rust MCP in a disposable pre-evidence container, then
+# starts the long-lived runtime with only the parser binary/rule mounted
+# READ-ONLY, private parser state writable, and evidence READ-ONLY at /evidence.
+# Signed case output and Python custody remain host-only. The evidence path is
+# the in-container evidence path —
+# rewrite EVIDENCE to it for the engine.
 # A whole multi-host case folder is refused here (docker is single-host; use the
-# fleet pipeline). Unlike --sift there is no per-run copy staging to clean up
-# (evidence is a read-only bind mount), and the container is left running for
-# reuse (tear down with: scripts/run-dfir-container.sh --down).
+# fleet pipeline). Unlike --sift there is no per-run copy staging to clean up;
+# evidence is a read-only bind and the case-scoped container is removed by the
+# exit trap after finalize (or after any failure).
 if [[ "${DOCKER}" == "1" ]]; then
   if [[ -d "${EVIDENCE}" && ( -d "${EVIDENCE}/hosts" || -d "${EVIDENCE}/disks" ) ]]; then
     fail "--docker: '${EVIDENCE}' is a multi-host case folder — run each host separately, or use local/--sift fleet mode."
   fi
   if [[ "${DRY}" == "1" ]]; then
-    ok "DRY-RUN: bash scripts/run-dfir-container.sh ${ORIGINAL_EVIDENCE}   # build/pull image, start findevil-dfir, mount evidence :ro at /evidence, build MCP in-container"
+    ok "DRY-RUN: FINDEVIL_DFIR_CASE_ID=${CASE_ID} bash scripts/run-dfir-container.sh ${ORIGINAL_EVIDENCE}   # build Rust parser, start capability-free runtime with evidence :ro"
   else
     [[ -e "${ORIGINAL_EVIDENCE}" || -L "${ORIGINAL_EVIDENCE}" ]] \
       || fail "--docker: evidence path not found on this host: ${ORIGINAL_EVIDENCE}"
-    log "--docker: bringing up the findevil-dfir container (build/pull image, mount evidence :ro at /evidence, build MCP in-container)…"
-    bash "${REPO_ROOT}/scripts/run-dfir-container.sh" "${ORIGINAL_EVIDENCE}" \
+    docker_case_token="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "${CASE_ID}")"
+    docker_container_base="${FINDEVIL_DFIR_CONTAINER:-findevil-dfir}"
+    DOCKER_RUNTIME_CONTAINER="${docker_container_base:0:100}-${docker_case_token}"
+    DOCKER_RUNTIME_STATE_DIR="${REPO_ROOT}/.project-local/tmp/dfir-runtime/${CASE_ID}"
+    DOCKER_BUILD_OUTPUT_DIR="${REPO_ROOT}/.project-local/tmp/dfir-build-output/${CASE_ID}"
+    log "--docker: bringing up case-scoped ${DOCKER_RUNTIME_CONTAINER} (reviewed image, pre-evidence locked build, evidence :ro)…"
+    FINDEVIL_DFIR_CASE_ID="${CASE_ID}" \
+      FINDEVIL_DFIR_CONTAINER="${DOCKER_RUNTIME_CONTAINER}" \
+      bash "${REPO_ROOT}/scripts/run-dfir-container.sh" "${ORIGINAL_EVIDENCE}" \
       || fail "--docker: container bring-up failed (see output above)"
     ok "--docker: container ready; evidence mounted read-only at /evidence"
   fi
-  # Evidence is bind-mounted AT /evidence (the path itself, not under it), so the
-  # in-container evidence path the engine hands to case_open is exactly /evidence.
-  EVIDENCE="/evidence"
+  # The launcher records the exact case-scoped path it actually mounted. This
+  # avoids re-statting a mutable host path after bring-up and cannot collide
+  # with another case's handoff.
+  if [[ "${DRY}" == "1" ]]; then
+    EVIDENCE="/evidence"
+  else
+    EVIDENCE_PATH_FILE="${REPO_ROOT}/.project-local/tmp/dfir-runtime/${CASE_ID}/evidence-path"
+    [[ -f "${EVIDENCE_PATH_FILE}" && ! -L "${EVIDENCE_PATH_FILE}" ]] \
+      || fail "--docker: case-scoped evidence-path handoff is missing"
+    if ! EVIDENCE="$(python3 - "${EVIDENCE_PATH_FILE}" <<'PY'
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit(1)
+print(lines[0])
+PY
+    )"; then
+      fail "--docker: invalid case-scoped evidence-path handoff"
+    fi
+    case "${EVIDENCE}" in
+      /evidence|/evidence/*) ;;
+      *) fail "--docker: launcher returned an invalid in-container evidence path" ;;
+    esac
+  fi
+  ok "--docker: engine evidence path inside container: ${EVIDENCE}"
 fi
 
 # 4. investigate -------------------------------------------------------------
@@ -2205,14 +2348,11 @@ else
   # --sift and --docker run the tools off-host, so the engine is NOT in --local
   # mode; it just pins the reserved case id (dashboard resolves after the run).
   if [[ "${DOCKER}" == "1" ]]; then
-    # Select the deterministic engine's docker-exec MCP transport (the parallel
-    # of FIND_EVIL_LOCAL/FIND_EVIL_SIFT): the engine drives findevil-mcp /
-    # findevil-agent-mcp over `docker exec -i <container>`, writes the case dir
-    # to /workspace (the repo bind mount, so it lands on the host), and hands
-    # case_open the in-container /evidence path. Container name is kept in sync
-    # with run-dfir-container.sh's default (FINDEVIL_DFIR_CONTAINER).
+    # Split-trust transport: Rust parsing uses docker exec; Python custody and
+    # signed case output stay on host. The exact case-scoped container is passed
+    # to every parser and verifier replay client.
     export FIND_EVIL_DOCKER=1
-    export FIND_EVIL_DOCKER_CONTAINER="${FINDEVIL_DFIR_CONTAINER:-findevil-dfir}"
+    export FIND_EVIL_DOCKER_CONTAINER="${DOCKER_RUNTIME_CONTAINER}"
   fi
   ENGINE+=(--case-id "${CASE_ID}")
 fi
@@ -2264,11 +2404,12 @@ fi
 # host-side and post-verdict; they read the (synced) verdict.json and write
 # sidecars. NEVER in the signed audit chain; non-fatal; output surfaced so you
 # can see them fire. SIFT runs the DFIR tools in the VM AND the automation here.
-if [[ -n "${CASE_DIR:-}" && -f scripts/n8n_post.py ]]; then
+if [[ "${POST_VERDICT_EGRESS_ACK}" == "1" && -n "${CASE_DIR:-}" && -f scripts/n8n_post.py ]]; then
   log "automation (n8n finding-to-action; post-verdict, not in the audit chain)"
   N8N_LOG="${CASE_LOG_DIR:-/tmp}/verdict-n8n.log"
   N8N_LOG_TMP="$(case_sidecar_tmp "${N8N_LOG}")"
-  if python3 scripts/n8n_post.py "${CASE_DIR}" >"${N8N_LOG_TMP}" 2>&1; then
+  if FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS=1 \
+     python3 scripts/n8n_post.py "${CASE_DIR}" >"${N8N_LOG_TMP}" 2>&1; then
     publish_case_sidecar_tmp "${N8N_LOG_TMP}" "${N8N_LOG}"
     automation_state="$(python3 - "${CASE_DIR}/automation.json" <<'PY' 2>/dev/null || true
 import json, sys
@@ -2293,12 +2434,13 @@ PY
     warn "n8n automation skipped (down or unreachable); details: ${N8N_LOG}"
   fi
 fi
-if [[ -n "${CASE_DIR:-}" && -z "${FINDEVIL_SKIP_GROUNDING:-}" && -f scripts/ground_verdict.py ]]; then
+if [[ "${POST_VERDICT_EGRESS_ACK}" == "1" && -n "${CASE_DIR:-}" && -z "${FINDEVIL_SKIP_GROUNDING:-}" && -f scripts/ground_verdict.py ]]; then
   if curl -fsS --max-time 3 http://127.0.0.1:5678/healthz >/dev/null 2>&1; then
     log "grounding (anti-hallucination sidecar; post-verdict, not in the audit chain)"
     GROUNDING_LOG="${CASE_LOG_DIR:-/tmp}/verdict-grounding.log"
     GROUNDING_LOG_TMP="$(case_sidecar_tmp "${GROUNDING_LOG}")"
-    if python3 scripts/ground_verdict.py "${CASE_DIR}" >"${GROUNDING_LOG_TMP}" 2>&1 \
+    if FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS=1 \
+       python3 scripts/ground_verdict.py "${CASE_DIR}" >"${GROUNDING_LOG_TMP}" 2>&1 \
        && python3 scripts/ground_actions.py "${CASE_DIR}" >>"${GROUNDING_LOG_TMP}" 2>&1; then
       publish_case_sidecar_tmp "${GROUNDING_LOG_TMP}" "${GROUNDING_LOG}"
       ok "grounding written — ${CASE_DIR}/grounding.json"
@@ -2309,6 +2451,9 @@ if [[ -n "${CASE_DIR:-}" && -z "${FINDEVIL_SKIP_GROUNDING:-}" && -f scripts/grou
   else
     warn "grounding skipped (n8n/browserless not reachable at http://127.0.0.1:5678)"
   fi
+fi
+if [[ "${POST_VERDICT_EGRESS_ACK}" != "1" ]]; then
+  ok "post-verdict network automation disabled (default; use --acknowledge-post-verdict-egress to opt in)"
 fi
 
 echo

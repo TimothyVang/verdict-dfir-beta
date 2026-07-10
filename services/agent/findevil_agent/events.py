@@ -53,7 +53,7 @@ class ToolCallStart(_BaseEvent):
     event_type: Literal["ToolCallStart"] = "ToolCallStart"
     tool_name: str
     tool_call_id: str
-    input_hash: str  # SHA-256 hex of JCS-canonicalized input
+    input_hash: str  # SHA-256 hex of the producer's canonical input bytes
     pool: Literal["A", "B", "shared"] | None = None
 
 

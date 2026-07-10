@@ -33,7 +33,7 @@ agent or tools it uses.
 | **R4 — Corroboration** | Execution / exfiltration claims require **≥2 independent artifact classes**; single-source claims are downgraded. Detector hits (Hayabusa/Sigma/YARA/malfind) are **leads** until corroborated. | One artifact is not a story. |
 | **R5 — Scoped confidence** | Every Finding carries a tier — **CONFIRMED > INFERRED > HYPOTHESIS** — set by an explicit epistemic rule. Case verdicts are scoped: `SUSPICIOUS` / `INDETERMINATE` / `NO_EVIL`. | `NO_EVIL` means "no reportable finding in the artifacts examined," **never** a clean bill of health. |
 | **R6 — Coverage boundary** | A coverage manifest enumerates per-artifact-class status: available / attempted / parsed / failed / unsupported / not-supplied. | The strongest claim is "the cited artifacts were examined through replayable tools," not "the system is clean." |
-| **R7 — Custody** | The run seals into a hash-chained audit log → Merkle root over canonical tool outputs → a signed manifest, verifiable offline with no network and no trust in the producer. | Framed for **FRE 902(14)** self-authentication; flip one byte and verification fails and names the moved record. |
+| **R7 — Custody** | The run seals into a hash-chained audit log → Merkle root over canonical tool outputs → a signed manifest, verifiable offline with no network, no trust in the producer, and signer trust established independently of the case (an Ed25519 key fingerprint or Sigstore identity + issuer). | Supplies technical digital-identification support for **FRE 902(14)**; qualified-person certification + notice remain external. Under an authenticated signature tier, flip one byte and verification fails and names the moved record. |
 | **R8 — Read-only** | Evidence is hashed before access and never modified; the tool surface is read-only (no shell-escape). | The evidence you prove against is the evidence you received. |
 
 ## Provability levels (score any finding or system)
@@ -56,16 +56,22 @@ A conformant Case produces, at minimum:
 - `verdict.json` — Findings, each with tier (R5) and citation (R1).
 - `coverage_manifest.json` — the per-class scope ledger (R6).
 - `run.manifest.json` — the signed manifest (R7).
-- `manifest_verify.json` — the offline verification result; **must report `overall: true`**.
+- `manifest_verify.json` — the product-verifier receipt; **must report `overall: true`
+  and `signature_verified: true` for an authenticated Ed25519 or Sigstore tier**.
 - `audit.jsonl` — the hash-chained record (R7).
 
-If `manifest_verify.json` is missing or `overall` is not `true`, the Case is **INCOMPLETE / CUSTODY
-INVALID** and must not be described as signed or defensible.
+If `manifest_verify.json` is missing, `overall` is not `true`, or a purported
+cryptographic tier lacks `signature_verified: true`, the Case is **INCOMPLETE /
+CUSTODY INVALID** and must not be described as signed or defensible. The receipt
+is not itself an independent trust root: a third party re-runs the verifier with
+the signer policy obtained outside the case. A payload-bound stub may demonstrate
+internal envelope consistency, but it does not satisfy R7 authentication.
 
 ## Legal framing (honest)
 
-The custody model is built **for** FRE 902(14) self-authenticating evidence and for the
-repeatability/transparency that Daubert/Frye-style scrutiny expects. This standard makes a finding
+The custody model is built to support the digital-identification process contemplated by
+FRE 902(14) and the repeatability/transparency that Daubert/Frye-style scrutiny expects.
+Qualified-person certification and Rule 902(11) notice remain external. This standard makes a finding
 *more defensible and independently checkable*. It does **not** guarantee a court admits it —
 admissibility is a judicial determination, not a property a tool can assert.
 

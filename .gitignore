@@ -34,6 +34,15 @@ log2timeline-*.log.gz
 psort-*.log
 psort-*.log.gz
 
+# Package-local custody residues when a Case is finalized with CWD under
+# services/agent_mcp/ (sample runs live under docs/sample-run/ and
+# docs/release-evidence/; web fixtures under apps/web/__tests__/fixtures/).
+# A literal path named "..." also landed here once and breaks Windows
+# checkout (Git for Windows rejects the path as invalid).
+/services/agent_mcp/run.manifest.json
+/services/agent_mcp/audit.jsonl
+/services/agent_mcp/...
+
 # Rust
 target/
 **/*.rs.bk

@@ -17,8 +17,12 @@ non-zero on any failure. Mirrors the other scripts/*-smoke.py gates.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
+import stat
+import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -59,6 +63,267 @@ def load_ground_verdict():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def load_script_module(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / filename)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def offline_n8n_security_checks(gv) -> None:
+    """Lock the optional automation boundary without requiring Docker or n8n."""
+    print("[offline] n8n authentication + SSRF/resource boundary")
+    sec = load_script_module("n8n_security", "n8n_security.py")
+    setup_n8n = load_script_module("setup_n8n_security", "setup-n8n.py")
+    setup_grounding = load_script_module(
+        "setup_grounding_security", "setup-grounding-workflow.py"
+    )
+    n8n_post = load_script_module("n8n_post_security", "n8n_post.py")
+
+    check(
+        sec.validate_loopback_http_url(
+            "http://127.0.0.1:5678/webhook/findevil-grounding"
+        ).startswith("http://127.0.0.1:5678/"),
+        "grounding webhook accepts an explicit loopback endpoint",
+    )
+    for unsafe in (
+        "http://example.com/webhook/findevil-grounding",
+        "http://user:pass@127.0.0.1:5678/webhook/findevil-grounding",
+        "file:///etc/passwd",
+    ):
+        try:
+            sec.validate_loopback_http_url(unsafe)
+        except ValueError:
+            pass
+        else:
+            check(False, f"local webhook rejects unsafe URL {unsafe!r}")
+
+    for unsafe in (
+        "http://127.0.0.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/",
+        "http://user:pass@example.com/",
+        "file:///etc/passwd",
+    ):
+        try:
+            sec.validate_public_http_url(unsafe, resolve=False)
+        except ValueError:
+            pass
+        else:
+            check(False, f"public fetch rejects unsafe URL {unsafe!r}")
+
+    with tempfile.TemporaryDirectory() as td:
+        secret_file = Path(td) / "webhook-secret"
+        secret = sec.ensure_private_secret(secret_file, minimum_bytes=32)
+        check(len(secret.encode()) >= 32, "webhook capability has >=256 bits")
+        check(
+            stat.S_IMODE(secret_file.stat().st_mode) == 0o600,
+            "webhook capability file is mode 0600",
+        )
+        secret_file.chmod(0o644)
+        try:
+            sec.read_private_secret(secret_file, minimum_bytes=32)
+        except PermissionError:
+            pass
+        else:
+            check(False, "world-readable webhook capability fails closed")
+        sec.harden_private_file(secret_file)
+        check(
+            sec.read_private_secret(secret_file, minimum_bytes=32) == secret,
+            "owned legacy secret permissions can be migrated safely to 0600",
+        )
+
+    docker_cmd = setup_n8n.build_n8n_docker_command()
+    rendered = " ".join(docker_cmd)
+    check("127.0.0.1:5678:5678" in docker_cmd, "n8n publishes on loopback only")
+    check("@sha256:" in docker_cmd[-1], "n8n image is pinned by digest")
+    for expected in (
+        "N8N_PAYLOAD_SIZE_MAX=1",
+        "N8N_CONCURRENCY_PRODUCTION_LIMIT=2",
+        "EXECUTIONS_TIMEOUT=180",
+        "N8N_BLOCK_ENV_ACCESS_IN_NODE=true",
+    ):
+        check(expected in rendered, f"n8n container enforces {expected}")
+
+    workflow = setup_grounding.build_workflow("credential-id")
+    webhook = workflow["nodes"][0]
+    check(
+        webhook["parameters"].get("authentication") == "headerAuth",
+        "grounding webhook requires n8n header authentication",
+    )
+    check(
+        webhook.get("credentials", {}).get("httpHeaderAuth", {}).get("id")
+        == "credential-id",
+        "grounding webhook references the provisioned encrypted credential",
+    )
+    credential_calls = []
+    original_req = setup_grounding.req
+
+    def fake_credential_req(method, url, body=None, key=None):
+        credential_calls.append((method, url, body, key))
+        if method == "GET":
+            return 200, {
+                "data": [
+                    {
+                        "id": "old-id",
+                        "name": setup_grounding.WEBHOOK_CREDENTIAL_NAME,
+                    }
+                ]
+            }
+        if method == "DELETE":
+            return 204, {}
+        return 200, {"id": "new-id"}
+
+    setup_grounding.req = fake_credential_req
+    try:
+        created_id = setup_grounding.ensure_webhook_credential("api-key", "s" * 43)
+    finally:
+        setup_grounding.req = original_req
+    check(created_id == "new-id", "webhook credential provisioning returns its id")
+    create_body = next(call[2] for call in credential_calls if call[0] == "POST")
+    check(
+        create_body
+        == {
+            "name": setup_grounding.WEBHOOK_CREDENTIAL_NAME,
+            "type": "httpHeaderAuth",
+            "data": {
+                "name": setup_grounding.WEBHOOK_HEADER,
+                "value": "s" * 43,
+            },
+        },
+        "webhook capability is provisioned through n8n's credential store",
+    )
+    check(
+        "s" * 43 not in json.dumps(workflow),
+        "webhook capability is absent from the workflow definition",
+    )
+    research_js = setup_grounding.RESEARCH_JS
+    for marker in (
+        "MAX_BODY_BYTES",
+        "MAX_TECHNIQUES",
+        "MAX_QUERIES",
+        "MAX_QUERY_CHARS",
+        "validatePublicUrl",
+        "maxRedirects: 0",
+    ):
+        check(marker in research_js, f"workflow embeds {marker} guard")
+    check(
+        "body: JSON.stringify({ url: u" not in research_js,
+        "open-web result URLs are never handed to browserless",
+    )
+    check(
+        not hasattr(setup_grounding, "build_browserless_docker_command"),
+        "grounding bootstrap exposes no browserless URL-fetch service",
+    )
+    check(
+        all("@sha256:" in image for image in setup_grounding.CONTAINER_IMAGES),
+        "grounding helper images are pinned by digest",
+    )
+    check(
+        "-p" not in setup_grounding.build_searxng_docker_command(),
+        "SearXNG is reachable only on the private Docker network",
+    )
+
+    req = gv.build_webhook_request(
+        {"case_id": "smoke", "techniques": [], "queries": []}, "s" * 43
+    )
+    check(
+        req.get_header("X-findevil-grounding-token") == "s" * 43,
+        "grounding caller sends the private webhook capability header",
+    )
+    check(
+        any(
+            handler.__class__.__name__ == "_NoRedirect"
+            for handler in gv._PUBLIC_OPENER.handlers
+        )
+        and gv.MAX_NVD_RESPONSE_BYTES == 4 * 1024 * 1024,
+        "NVD client disables redirects and caps response bytes",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        oversized_json = Path(td) / "oversized.json"
+        oversized_json.write_bytes(b"{" + b"x" * 16 + b"}")
+        try:
+            gv._read_bounded_json_object(oversized_json, 8)
+        except SystemExit:
+            pass
+        else:
+            check(False, "standalone grounding rejects oversized verdict JSON")
+    action_req = n8n_post.build_webhook_request(
+        {"case_id": "smoke", "verdict": "INDETERMINATE", "findings": []},
+        "s" * 43,
+    )
+    check(
+        action_req.get_header("X-findevil-grounding-token") == "s" * 43,
+        "legacy action caller also requires the private capability header",
+    )
+    check(
+        any(
+            handler.__class__.__name__ == "_NoRedirect"
+            for handler in n8n_post._OPENER.handlers
+        ),
+        "legacy action caller disables redirects",
+    )
+    try:
+        n8n_post.build_webhook_request(
+            {"blob": "x" * (n8n_post.MAX_PAYLOAD_BYTES + 1)}, "s" * 43
+        )
+    except ValueError:
+        pass
+    else:
+        check(False, "legacy action caller rejects oversized payloads")
+
+    with tempfile.TemporaryDirectory() as td:
+        case = Path(td) / "case"
+        case.mkdir()
+        (case / "verdict.json").write_text(
+            json.dumps(
+                {
+                    "case_id": "retired-workflow",
+                    "verdict": "INDETERMINATE",
+                    "findings": [],
+                }
+            )
+        )
+        capability = Path(td) / "capability"
+        sec.ensure_private_secret(capability, minimum_bytes=32)
+
+        class RetiredWorkflowOpener:
+            def open(self, request, timeout):
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    404,
+                    "not found",
+                    {},
+                    io.BytesIO(b"not found"),
+                )
+
+        old_secret_file = n8n_post.WEBHOOK_SECRET_FILE
+        old_opener = n8n_post._OPENER
+        old_argv = sys.argv
+        old_ack = os.environ.get("FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS")
+        n8n_post.WEBHOOK_SECRET_FILE = capability
+        n8n_post._OPENER = RetiredWorkflowOpener()
+        sys.argv = ["n8n_post.py", str(case)]
+        os.environ["FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS"] = "1"
+        try:
+            action_rc = n8n_post.main()
+        finally:
+            n8n_post.WEBHOOK_SECRET_FILE = old_secret_file
+            n8n_post._OPENER = old_opener
+            sys.argv = old_argv
+            if old_ack is None:
+                os.environ.pop("FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS", None)
+            else:
+                os.environ["FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS"] = old_ack
+        action_record = json.loads((case / "automation.json").read_text())
+        check(action_rc == 0, "retired action workflow is a nonfatal sidecar outcome")
+        check(
+            action_record.get("automation_supported") is False
+            and "retired or unavailable" in action_record.get("reason", ""),
+            "retired action workflow is recorded honestly, never as successful",
+        )
 
 
 def offline_checks(gv) -> None:
@@ -227,10 +492,16 @@ def offline_checks(gv) -> None:
                 }
             ],
         }
+        prior_ack = os.environ.get("FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS")
+        os.environ["FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS"] = "1"
         try:
             rc = gv.main([str(case)])
         finally:
             gv.call_workflow = orig
+            if prior_ack is None:
+                os.environ.pop("FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS", None)
+            else:
+                os.environ["FINDEVIL_ACKNOWLEDGE_POST_VERDICT_EGRESS"] = prior_ack
 
         after = {f: sha(case / f) for f in ("audit.jsonl", "run.manifest.json")}
         check(rc == 0, "helper run returns 0 against temp case")
@@ -529,6 +800,11 @@ def offline_boundary_checks() -> None:
             not any(t in pkg for t in ("api-keys", "grounding", "searxng")),
             "package-devpost.sh never bundles keys / grounding / searxng",
         )
+    doctor = read("scripts/doctor.sh").lower()
+    check(
+        "127.0.0.1:3000/content" not in doctor,
+        "doctor never probes or recommends the removed browserless SSRF surface",
+    )
 
 
 def webhook_up() -> bool:
@@ -539,7 +815,7 @@ def webhook_up() -> bool:
         return False
 
 
-def live_checks() -> None:
+def live_checks(gv) -> None:
     print(f"[live] anti-hallucination contract via {WEBHOOK}")
     payload = {
         "case_id": "smoke",
@@ -549,10 +825,13 @@ def live_checks() -> None:
             {"id": "not-a-technique", "claim": "garbage"},
         ],
     }
-    req = urllib.request.Request(
-        WEBHOOK, data=json.dumps(payload).encode(), method="POST"
-    )
-    req.add_header("Content-Type", "application/json")
+    try:
+        secret = gv.read_private_secret(gv.WEBHOOK_SECRET_FILE, minimum_bytes=32)
+        req = gv.build_webhook_request(payload, secret)
+    except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
+        failures.append(f"webhook auth unavailable: {exc}")
+        print(f"  FAIL: webhook auth unavailable: {exc}")
+        return
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read().decode())
@@ -594,6 +873,7 @@ def live_checks() -> None:
 
 def main() -> int:
     gv = load_ground_verdict()
+    offline_n8n_security_checks(gv)
     offline_checks(gv)
     offline_ioc_checks(gv)
     offline_openweb_checks(gv)
@@ -602,7 +882,7 @@ def main() -> int:
     offline_actions_checks()
     offline_boundary_checks()
     if webhook_up():
-        live_checks()
+        live_checks(gv)
     else:
         print(
             f"[live] SKIP: n8n not reachable at {N8N_HEALTH} "

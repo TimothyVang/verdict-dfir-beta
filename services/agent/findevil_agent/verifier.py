@@ -44,6 +44,11 @@ from findevil_agent.replay import (
     missing_replay_artifact,
     replay_tool_call,
 )
+from findevil_agent.resource_limits import (
+    MAX_TOOL_CALL_INDEX_ENTRIES,
+    MAX_VERIFY_BATCH,
+    require_collection_limit,
+)
 
 
 def _path_arguments(arguments: dict[str, Any]) -> list[str]:
@@ -388,6 +393,8 @@ def verify_findings(
     cache/concurrency primitives can pass a ``ReplayPool`` built over
     that client; the default path remains serial and minimal.
     """
+    require_collection_limit("findings", findings, MAX_VERIFY_BATCH)
+    require_collection_limit("tool_call_index", tool_call_index, MAX_TOOL_CALL_INDEX_ENTRIES)
     out: list[tuple[Finding, VerifierAction, CallReplay | None]] = []
     for finding in findings:
         action, replay = reverify_finding(

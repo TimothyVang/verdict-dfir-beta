@@ -32,7 +32,7 @@ export type JsonValue =
 
 /**
  * The audit-record fields that are hashed into the chain — the on-disk line is
- * exactly the JCS canonicalization of these five keys (see
+ * exactly the VERDICT canonical JSON v1 encoding of these five keys (see
  * audit_log.py:AuditRecord.to_canonical_dict). Selecting them explicitly
  * mirrors the Python "content fields" selection and strips any non-content key
  * (for example a display-only `line_hash`) before canonicalizing.
@@ -76,35 +76,69 @@ export interface CustodyVerification {
   leafCountOk: boolean | string;
   /** A signature bundle is present in the manifest. */
   signaturePresent: boolean;
+  /** Declared payload digest matches the canonical signed manifest body. */
+  signaturePayloadOk: boolean | string;
   /** Which signer sealed the run: "ed25519" | "sigstore" | "stub". */
   signatureKind: string;
   /**
    * Honest cryptographic-verification status. True only for an Ed25519 bundle
    * that verifies offline; stub/sigstore return an explicit reason string.
-   * Advisory — does not gate `overall` (mirrors verify_manifest).
    */
   signatureVerified: boolean | string;
+  /** Requested transparency-anchor policy, including authenticated proof. */
+  transparencyOk: boolean | string;
+  /** Exact verdict.json bytes match one current-case signed audit commitment. */
+  verdictArtifactOk: boolean | string;
+  /** SHA-256 of the jointly fetched verdict bytes, when available. */
+  verdictSha256: string;
+  /** Parsed verdict payload, exposed only when the artifact binding passes. */
+  verdict: Record<string, JsonValue> | null;
   /**
-   * Presence-based overall, mirroring verify_manifest: chain + Merkle + leaf
-   * count verify and a signature is present, and no NON-advisory signature
-   * (a present ed25519/unknown bundle) failed verification.
+   * Authenticated browser result: chain + Merkle + leaf count + payload digest
+   * and a cryptographic signature all pass. This is deliberately stricter than
+   * development-tier structural verification: a stub never passes, and Sigstore
+   * cannot pass in this browser without full identity-policy verification.
    */
   overall: boolean;
 }
 
 const SHA256_HEX = /^[0-9a-fA-F]{64}$/;
 const ZERO_ROOT = "00".repeat(32);
-const ADVISORY_SIGNER_KINDS = new Set(["stub", "sigstore"]);
 
 // ---------------------------------------------------------------------------
-// Canonicalization — RFC-8785-compatible JCS, byte-for-byte matching the
-// Python writer (json.dumps(sort_keys=True, separators=(",", ":"),
-// ensure_ascii=True)). Validated against every committed sample-run audit
-// tail + manifest in __tests__.
+// Canonicalization — a browser mirror of VERDICT canonical JSON v1 for the
+// finite JSON subset that JavaScript can represent without losing numeric
+// spelling. Audit-chain hashes use raw line bytes; this helper is used for the
+// signed manifest body and validated against committed fixtures. It is not JCS.
 // ---------------------------------------------------------------------------
 
-/** Return the canonical JSON string for `value`, matching canonicalize_json. */
+/** Return VERDICT canonical JSON v1 text for a JavaScript JSON value. */
 export function canonicalizeJson(value: JsonValue): string {
+  assertPortableJsonNumbers(value);
+  return canonicalizeJsonUnchecked(value);
+}
+
+/** Refuse numbers whose parsed JavaScript value cannot preserve a JSON integer. */
+function assertPortableJsonNumbers(value: JsonValue): void {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("cannot canonicalize a non-finite number");
+    }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error("cannot canonicalize an unsafe JSON integer");
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) assertPortableJsonNumbers(item);
+    return;
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const item of Object.values(value)) assertPortableJsonNumbers(item);
+  }
+}
+
+function canonicalizeJsonUnchecked(value: JsonValue): string {
   if (value === null) return "null";
   switch (typeof value) {
     case "boolean":
@@ -115,13 +149,13 @@ export function canonicalizeJson(value: JsonValue): string {
       return encodeString(value);
     case "object": {
       if (Array.isArray(value)) {
-        return "[" + value.map(canonicalizeJson).join(",") + "]";
+        return "[" + value.map(canonicalizeJsonUnchecked).join(",") + "]";
       }
       // Sort keys ascending. Keys in this domain are ASCII identifiers, for
       // which UTF-16 lexicographic order equals Python's code-point order.
       const keys = Object.keys(value).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
       const parts = keys.map(
-        (k) => encodeString(k) + ":" + canonicalizeJson(value[k]),
+        (k) => encodeString(k) + ":" + canonicalizeJsonUnchecked(value[k]),
       );
       return "{" + parts.join(",") + "}";
     }
@@ -131,11 +165,6 @@ export function canonicalizeJson(value: JsonValue): string {
 }
 
 function canonicalizeNumber(value: number): string {
-  if (!Number.isFinite(value)) {
-    // Python's json would emit Infinity/NaN (non-standard); our records never
-    // contain them. Refuse rather than emit something the verifier can't match.
-    throw new Error("cannot canonicalize a non-finite number");
-  }
   return String(value);
 }
 
@@ -217,7 +246,18 @@ async function hashLine(rawLine: string): Promise<string> {
 
 /** Split an audit.jsonl blob into non-empty lines (matching the writer). */
 export function splitAuditLines(text: string): string[] {
-  return text.split(/\r?\n/).filter((line) => line.length > 0);
+  // Split only on the byte the Python writer emits. A CR is evidence bytes,
+  // not a line-ending convenience: stripping it would let LF->CRLF tampering
+  // verify against hashes computed over different bytes.
+  if (text.length === 0) return [];
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] !== "") {
+    // Preserve a synthetic invalid physical record so foldAuditChain rejects a
+    // non-empty file that lacks the writer's required terminal LF.
+    return [...lines, ""];
+  }
+  lines.pop(); // consume exactly one required terminal LF
+  return lines; // all other empty physical records remain and fail parsing
 }
 
 /** Parse one raw line into a ParsedAuditRecord, or null when malformed. */
@@ -230,9 +270,23 @@ export function parseAuditRecord(rawLine: string): ParsedAuditRecord | null {
   }
   if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
   const record = obj as Record<string, JsonValue>;
+  try {
+    assertPortableJsonNumbers(record);
+    if (canonicalizeJson(extractContentRecord(record)) !== rawLine) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
   const seq = record.seq;
   const prevHash = record.prev_hash;
-  if (typeof seq !== "number" || typeof prevHash !== "string") return null;
+  if (
+    typeof seq !== "number" ||
+    !Number.isSafeInteger(seq) ||
+    typeof prevHash !== "string"
+  ) {
+    return null;
+  }
   const payload =
     typeof record.payload === "object" &&
     record.payload !== null &&
@@ -378,11 +432,18 @@ function stringField(value: JsonValue | undefined): string {
  * Honest signature status, mirroring manifest.py:_signature_verified. Never
  * returns true for a stub (a deterministic placeholder, not proof) and never
  * claims to have cryptographically checked a sigstore bundle it cannot verify
- * offline without an expected identity.
+ * offline without an expected identity. Sigstore therefore fails `overall` in
+ * this browser implementation instead of being treated as presence evidence.
  */
 export async function verifyManifestSignature(
   manifest: Record<string, JsonValue>,
-): Promise<{ present: boolean; kind: string; verified: boolean | string }> {
+  expectedEd25519Fingerprint?: string,
+): Promise<{
+  present: boolean;
+  kind: string;
+  payloadOk: boolean | string;
+  verified: boolean | string;
+}> {
   const sig =
     typeof manifest.signature === "object" &&
     manifest.signature !== null &&
@@ -392,12 +453,42 @@ export async function verifyManifestSignature(
   const present = Boolean(sig.bundle_b64 && sig.payload_sha256);
   const kind = typeof sig.kind === "string" ? sig.kind : "stub";
   if (!present) {
-    return { present, kind, verified: "no signature bundle present" };
+    const reason = "no signature bundle present";
+    return { present, kind, payloadOk: reason, verified: reason };
+  }
+  // Object.fromEntries defines own data properties, including `__proto__`.
+  // Assigning attacker-controlled keys into `{}` invokes the legacy prototype
+  // setter and can silently omit an unsigned top-level key from the body.
+  const body = Object.fromEntries(
+    Object.entries(manifest).filter(
+      ([key]) => key !== "signature" && key !== "transparency_log",
+    ),
+  ) as Record<string, JsonValue>;
+  let bodyBytes: Uint8Array;
+  try {
+    bodyBytes = new TextEncoder().encode(canonicalizeJson(body));
+  } catch (err) {
+    const reason = `${kind} manifest body rejected: ${errorMessage(err)}`;
+    return { present, kind, payloadOk: reason, verified: reason };
+  }
+  const declaredPayload = String(sig.payload_sha256 ?? "").toLowerCase();
+  const actualPayload = await sha256Hex(bodyBytes);
+  if (!SHA256_HEX.test(declaredPayload) || declaredPayload !== actualPayload) {
+    const reason =
+      `${kind} signature payload digest FAILED: canonical manifest body ` +
+      "does not match signature.payload_sha256";
+    return {
+      present,
+      kind,
+      payloadOk: reason,
+      verified: `${kind} verification blocked: ${reason}`,
+    };
   }
   if (kind === "stub") {
     return {
       present,
       kind,
+      payloadOk: true,
       verified:
         "stub signature: deterministic dev/offline placeholder, not cryptographic proof",
     };
@@ -406,50 +497,93 @@ export async function verifyManifestSignature(
     return {
       present,
       kind,
+      payloadOk: true,
       verified:
-        "sigstore bundle present and recorded; offline cryptographic verification " +
-        "requires the verifier to supply the expected signer identity (deployment policy)",
+        "sigstore browser verification unavailable: full verification requires " +
+        "an exact trusted signer identity and exact OIDC issuer against production " +
+        "Fulcio/Rekor roots",
     };
   }
   if (kind === "ed25519") {
-    return { present, kind, verified: await verifyEd25519(sig, manifest) };
+    return {
+      present,
+      kind,
+      payloadOk: true,
+      verified: await verifyEd25519(
+        sig,
+        bodyBytes,
+        expectedEd25519Fingerprint,
+      ),
+    };
   }
-  return { present, kind, verified: `unknown signer kind '${kind}'` };
+  return {
+    present,
+    kind,
+    payloadOk: true,
+    verified: `unknown signer kind '${kind}'`,
+  };
 }
 
 async function verifyEd25519(
   sig: Record<string, JsonValue>,
-  manifest: Record<string, JsonValue>,
+  bodyBytes: Uint8Array,
+  expectedFingerprint?: string,
 ): Promise<boolean | string> {
-  let publicKeyB64: string;
-  let signatureB64: string;
+  let publicKey: Uint8Array;
+  let signature: Uint8Array;
+  let bundledFingerprint: string;
   try {
     const bundleJson = new TextDecoder().decode(
       base64ToBytes(String(sig.bundle_b64 ?? "")),
     );
-    const bundle = JSON.parse(bundleJson) as Record<string, JsonValue>;
-    publicKeyB64 = String(bundle.public_key_b64);
-    signatureB64 = String(bundle.signature_b64);
+    const parsed = JSON.parse(bundleJson) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("bundle JSON is not an object");
+    }
+    const bundle = parsed as Record<string, JsonValue>;
     if (!bundle.public_key_b64 || !bundle.signature_b64) {
       throw new Error("missing public_key_b64 / signature_b64");
     }
+    publicKey = base64ToBytes(String(bundle.public_key_b64));
+    signature = base64ToBytes(String(bundle.signature_b64));
+    bundledFingerprint = String(bundle.cert_fingerprint ?? "").toLowerCase();
   } catch (err) {
     return `ed25519 bundle malformed: ${errorMessage(err)}`;
   }
 
-  // Reconstruct the exact bytes that were signed: the canonical manifest body
-  // with the `signature` field removed (mirror of build_manifest, which signs
-  // canonicalize_json(body without signature)).
-  const body: Record<string, JsonValue> = {};
-  for (const [key, val] of Object.entries(manifest)) {
-    if (key !== "signature") body[key] = val;
+  if (publicKey.length !== 32 || signature.length !== 64) {
+    return "ed25519 bundle malformed: key/signature length is invalid";
   }
-  const bodyBytes = new TextEncoder().encode(canonicalizeJson(body));
+  const actualFingerprint = await sha256Hex(publicKey);
+  const outerFingerprint = String(sig.cert_fingerprint ?? "").toLowerCase();
+  if (outerFingerprint !== actualFingerprint) {
+    return "ed25519 public-key fingerprint does not match signature metadata";
+  }
+  if (bundledFingerprint !== actualFingerprint) {
+    return "ed25519 public-key fingerprint does not match signer bundle";
+  }
+  const trustedFingerprint = expectedFingerprint?.trim().toLowerCase() ?? "";
+  if (!trustedFingerprint) {
+    return (
+      "ed25519 verification requires an externally trusted public-key " +
+      "fingerprint"
+    );
+  }
+  if (!SHA256_HEX.test(trustedFingerprint)) {
+    return "expected Ed25519 fingerprint is not a SHA-256 digest";
+  }
+  if (trustedFingerprint !== actualFingerprint) {
+    return "ed25519 public key does not match the trusted fingerprint";
+  }
+  const strictError = validateStrictEd25519Inputs(publicKey, signature);
+  if (strictError !== null) {
+    return `ed25519 signature inputs rejected: ${strictError}`;
+  }
 
   try {
     const key = await crypto.subtle.importKey(
       "raw",
-      base64ToBytes(publicKeyB64) as BufferSource,
+      publicKey as BufferSource,
       { name: "Ed25519" },
       false,
       ["verify"],
@@ -457,7 +591,7 @@ async function verifyEd25519(
     const ok = await crypto.subtle.verify(
       { name: "Ed25519" },
       key,
-      base64ToBytes(signatureB64) as BufferSource,
+      signature as BufferSource,
       bodyBytes as BufferSource,
     );
     return ok
@@ -468,8 +602,369 @@ async function verifyEd25519(
   }
 }
 
+type EdwardsPoint = readonly [bigint, bigint];
+
+const ED_P = (1n << 255n) - 19n;
+const ED_L =
+  (1n << 252n) + 27742317777372353535851937790883648493n;
+const ED_D = mod(-121665n * modInverse(121666n, ED_P), ED_P);
+const ED_I = modPow(2n, (ED_P - 1n) / 4n, ED_P);
+const ED_IDENTITY: EdwardsPoint = [0n, 1n];
+
+/** Validate canonical scalar/point encodings and exact prime-order membership. */
+function validateStrictEd25519Inputs(
+  publicKey: Uint8Array,
+  signature: Uint8Array,
+): string | null {
+  if (publicKey.length !== 32) return "public key must be exactly 32 bytes";
+  if (signature.length !== 64) return "signature must be exactly 64 bytes";
+  if (littleEndianToBigInt(signature.slice(32)) >= ED_L) {
+    return "signature scalar S is non-canonical";
+  }
+  let pointA: EdwardsPoint;
+  let pointR: EdwardsPoint;
+  try {
+    pointA = decodeEdwardsPoint(publicKey);
+    pointR = decodeEdwardsPoint(signature.slice(0, 32));
+  } catch (err) {
+    return errorMessage(err);
+  }
+  if (!hasPrimeOrder(pointA)) {
+    return "public key is not a non-identity prime-order point";
+  }
+  if (!hasPrimeOrder(pointR)) {
+    return "signature R is not a non-identity prime-order point";
+  }
+  return null;
+}
+
+function decodeEdwardsPoint(encodedBytes: Uint8Array): EdwardsPoint {
+  if (encodedBytes.length !== 32) {
+    throw new Error("encoded Ed25519 point must be exactly 32 bytes");
+  }
+  const encoded = littleEndianToBigInt(encodedBytes);
+  const sign = encoded >> 255n;
+  const y = encoded & ((1n << 255n) - 1n);
+  if (y >= ED_P) throw new Error("non-canonical Ed25519 point encoding");
+  let x = recoverEdwardsX(y);
+  if (x === 0n && sign !== 0n) {
+    throw new Error("non-canonical Ed25519 x=0 sign encoding");
+  }
+  if ((x & 1n) !== sign) x = ED_P - x;
+  const point: EdwardsPoint = [x, y];
+  if (!edwardsPointOnCurve(point)) {
+    throw new Error("encoded Ed25519 point is not on the curve");
+  }
+  if (!bytesEqual(encodeEdwardsPoint(point), encodedBytes)) {
+    throw new Error("non-canonical Ed25519 point encoding");
+  }
+  return point;
+}
+
+function recoverEdwardsX(y: bigint): bigint {
+  const denominator = mod(ED_D * y * y + 1n, ED_P);
+  if (denominator === 0n) {
+    throw new Error("Ed25519 point has no affine x coordinate");
+  }
+  const xx = mod((y * y - 1n) * modInverse(denominator, ED_P), ED_P);
+  let x = modPow(xx, (ED_P + 3n) / 8n, ED_P);
+  if (mod(x * x - xx, ED_P) !== 0n) x = mod(x * ED_I, ED_P);
+  if (mod(x * x - xx, ED_P) !== 0n) {
+    throw new Error("encoded Ed25519 point is not on the curve");
+  }
+  if ((x & 1n) !== 0n) x = ED_P - x;
+  return x;
+}
+
+function edwardsPointOnCurve([x, y]: EdwardsPoint): boolean {
+  return mod(-x * x + y * y - 1n - ED_D * x * x * y * y, ED_P) === 0n;
+}
+
+function encodeEdwardsPoint([x, y]: EdwardsPoint): Uint8Array {
+  return bigIntToLittleEndian(y | ((x & 1n) << 255n), 32);
+}
+
+function addEdwardsPoints(
+  [x1, y1]: EdwardsPoint,
+  [x2, y2]: EdwardsPoint,
+): EdwardsPoint {
+  const product = mod(ED_D * x1 * x2 * y1 * y2, ED_P);
+  const x3 = mod(
+    (x1 * y2 + x2 * y1) * modInverse(1n + product, ED_P),
+    ED_P,
+  );
+  const y3 = mod(
+    (y1 * y2 + x1 * x2) * modInverse(1n - product, ED_P),
+    ED_P,
+  );
+  return [x3, y3];
+}
+
+function scalarMultiplyEdwards(
+  point: EdwardsPoint,
+  scalar: bigint,
+): EdwardsPoint {
+  let result = ED_IDENTITY;
+  let addend = point;
+  let remaining = scalar;
+  while (remaining > 0n) {
+    if ((remaining & 1n) !== 0n) result = addEdwardsPoints(result, addend);
+    addend = addEdwardsPoints(addend, addend);
+    remaining >>= 1n;
+  }
+  return result;
+}
+
+function hasPrimeOrder(point: EdwardsPoint): boolean {
+  return (
+    !pointsEqual(point, ED_IDENTITY) &&
+    pointsEqual(scalarMultiplyEdwards(point, ED_L), ED_IDENTITY)
+  );
+}
+
+function mod(value: bigint, modulus: bigint): bigint {
+  const reduced = value % modulus;
+  return reduced >= 0n ? reduced : reduced + modulus;
+}
+
+function modInverse(value: bigint, modulus: bigint): bigint {
+  return modPow(mod(value, modulus), modulus - 2n, modulus);
+}
+
+function modPow(base: bigint, exponent: bigint, modulus: bigint): bigint {
+  let result = 1n;
+  let factor = mod(base, modulus);
+  let remaining = exponent;
+  while (remaining > 0n) {
+    if ((remaining & 1n) !== 0n) result = (result * factor) % modulus;
+    factor = (factor * factor) % modulus;
+    remaining >>= 1n;
+  }
+  return result;
+}
+
+function littleEndianToBigInt(bytes: Uint8Array): bigint {
+  let value = 0n;
+  for (let index = bytes.length - 1; index >= 0; index -= 1) {
+    value = (value << 8n) | BigInt(bytes[index]);
+  }
+  return value;
+}
+
+function bigIntToLittleEndian(value: bigint, length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let remaining = value;
+  for (let index = 0; index < length; index += 1) {
+    bytes[index] = Number(remaining & 0xffn);
+    remaining >>= 8n;
+  }
+  return bytes;
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function pointsEqual(left: EdwardsPoint, right: EdwardsPoint): boolean {
+  return left[0] === right[0] && left[1] === right[1];
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// ---------------------------------------------------------------------------
+// Bound verdict artifact.
+// ---------------------------------------------------------------------------
+
+export interface VerdictArtifactInputs {
+  records: readonly ParsedAuditRecord[];
+  manifest: Record<string, JsonValue>;
+  verdictText: string | undefined;
+}
+
+export interface VerdictArtifactVerification {
+  ok: boolean | string;
+  sha256: string;
+  verdict: Record<string, JsonValue> | null;
+}
+
+function verdictBasename(value: JsonValue | undefined): boolean {
+  if (typeof value !== "string" || value.length === 0) return false;
+  const parts = value.replaceAll("\\", "/").split("/");
+  return parts[parts.length - 1] === "verdict.json";
+}
+
+function objectField(
+  value: JsonValue | undefined,
+): Record<string, JsonValue> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, JsonValue>)
+    : null;
+}
+
+/** Bind exact verdict bytes to one audit record and the signed Case identity. */
+export async function verifyVerdictArtifactBinding(
+  inputs: VerdictArtifactInputs,
+): Promise<VerdictArtifactVerification> {
+  const fail = (reason: string, sha256 = ""): VerdictArtifactVerification => ({
+    ok: reason,
+    sha256,
+    verdict: null,
+  });
+  if (typeof inputs.verdictText !== "string") {
+    return fail("verdict.json is missing from the joint custody snapshot");
+  }
+
+  const verdictBytes = new TextEncoder().encode(inputs.verdictText);
+  const actualSha256 = await sha256Hex(verdictBytes);
+  const commitments = inputs.records.filter(
+    (record) => record.kind === "verdict_artifact",
+  );
+  if (commitments.length !== 1) {
+    return fail(
+      `expected exactly one verdict_artifact record, found ${commitments.length}`,
+      actualSha256,
+    );
+  }
+  const commitment = commitments[0].payload;
+  if (!verdictBasename(commitment.path)) {
+    return fail("verdict_artifact does not point at verdict.json", actualSha256);
+  }
+  const declaredSha256 = commitment.sha256;
+  if (
+    typeof declaredSha256 !== "string" ||
+    !SHA256_HEX.test(declaredSha256) ||
+    declaredSha256.toLowerCase() !== actualSha256
+  ) {
+    return fail("verdict_artifact sha256 does not match verdict.json", actualSha256);
+  }
+  if (
+    !Number.isSafeInteger(commitment.byte_count) ||
+    commitment.byte_count !== verdictBytes.byteLength
+  ) {
+    return fail("verdict_artifact byte_count does not match verdict.json", actualSha256);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(inputs.verdictText);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("verdict.json must be an object");
+    }
+    assertPortableJsonNumbers(parsed as JsonValue);
+  } catch (err) {
+    return fail(`verdict.json rejected: ${errorMessage(err)}`, actualSha256);
+  }
+  const verdict = parsed as Record<string, JsonValue>;
+  const manifestCaseId = inputs.manifest.case_id;
+  const verdictCaseId = verdict.case_id;
+  if (
+    typeof manifestCaseId !== "string" ||
+    manifestCaseId.length === 0 ||
+    verdictCaseId !== manifestCaseId
+  ) {
+    return fail("verdict.json case_id does not match the signed manifest", actualSha256);
+  }
+  const manifestRunId = inputs.manifest.run_id;
+  if (
+    typeof manifestRunId !== "string" ||
+    manifestRunId.length === 0 ||
+    verdict.run_id !== manifestRunId
+  ) {
+    return fail("verdict.json run_id does not match the signed manifest", actualSha256);
+  }
+
+  const extra = objectField(inputs.manifest.extra);
+  const rawPacket = extra?.packet_attestation;
+  if (rawPacket !== undefined) {
+    const packet = objectField(rawPacket);
+    if (!packet) {
+      return fail("manifest packet_attestation is malformed", actualSha256);
+    }
+    if (
+      !verdictBasename(packet.verdict_artifact_path) ||
+      typeof packet.verdict_artifact_sha256 !== "string" ||
+      packet.verdict_artifact_sha256.toLowerCase() !== actualSha256 ||
+      !Number.isSafeInteger(packet.verdict_artifact_bytes) ||
+      packet.verdict_artifact_bytes !== verdictBytes.byteLength
+    ) {
+      return fail(
+        "manifest packet_attestation conflicts with verdict.json",
+        actualSha256,
+      );
+    }
+  }
+
+  return { ok: true, sha256: actualSha256, verdict };
+}
+
+// ---------------------------------------------------------------------------
+// Signed transparency-anchor request policy.
+// ---------------------------------------------------------------------------
+
+/**
+ * Enforce the signed anchor-request commitment without overstating browser
+ * capabilities. Legacy/missing and explicit `false` remain compatible. A
+ * requested proof cannot pass here because the browser does not carry the
+ * production Sigstore roots plus exact identity/issuer policy needed to
+ * authenticate Rekor, and RFC-3161 is not authenticated without a TSA chain.
+ */
+export function verifyTransparencyAnchor(
+  manifest: Record<string, JsonValue>,
+): boolean | string {
+  const requested = manifest.transparency_anchor_requested;
+  if (requested === undefined || requested === false) return true;
+  if (typeof requested !== "boolean") {
+    return "transparency_anchor_requested must be a JSON boolean";
+  }
+
+  const rawAnchor = manifest.transparency_log;
+  if (
+    typeof rawAnchor !== "object" ||
+    rawAnchor === null ||
+    Array.isArray(rawAnchor) ||
+    Object.keys(rawAnchor).length === 0
+  ) {
+    return "authenticated transparency anchor was requested but transparency_log is missing";
+  }
+  const anchor = rawAnchor as Record<string, JsonValue>;
+  if (anchor.anchored !== true) {
+    return "requested transparency_log is not marked as successfully anchored";
+  }
+  const kind = typeof anchor.kind === "string" ? anchor.kind : "";
+  if (kind !== "rekor") {
+    return `requested transparency anchor kind '${kind || "unknown"}' is unsupported in the browser`;
+  }
+
+  const subject =
+    typeof anchor.subject === "object" &&
+    anchor.subject !== null &&
+    !Array.isArray(anchor.subject)
+      ? (anchor.subject as Record<string, JsonValue>)
+      : {};
+  const subjectRoot = stringField(subject.merkle_root_sha256);
+  const manifestRoot = stringField(manifest.merkle_root_hex);
+  if (!SHA256_HEX.test(subjectRoot) || subjectRoot !== manifestRoot) {
+    return "requested Rekor anchor subject does not match the manifest Merkle root";
+  }
+  const rekor =
+    typeof anchor.rekor === "object" &&
+    anchor.rekor !== null &&
+    !Array.isArray(anchor.rekor)
+      ? (anchor.rekor as Record<string, JsonValue>)
+      : {};
+  if (typeof rekor.bundle_b64 !== "string" || rekor.bundle_b64.length === 0) {
+    return "requested Rekor anchor is missing its full Sigstore bundle";
+  }
+  return (
+    "requested Rekor anchor is unsupported in the browser: authenticated " +
+    "verification requires production Rekor roots and exact signer identity/OIDC issuer policy"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +976,10 @@ export interface CustodyInputs {
   auditText: string;
   /** Parsed run.manifest.json object. */
   manifest: Record<string, JsonValue>;
+  /** Verbatim verdict.json contents from the same stable snapshot. */
+  verdictText?: string;
+  /** Trusted key pin supplied outside the case artifacts. */
+  expectedEd25519Fingerprint?: string;
 }
 
 /**
@@ -491,7 +990,7 @@ export interface CustodyInputs {
 export async function verifyCustodyChain(
   inputs: CustodyInputs,
 ): Promise<CustodyVerification> {
-  const { auditText, manifest } = inputs;
+  const { auditText, manifest, verdictText, expectedEd25519Fingerprint } = inputs;
   const fold = await foldAuditChain(splitAuditLines(auditText));
 
   let auditChainOk = fold.ok;
@@ -543,16 +1042,31 @@ export async function verifyCustodyChain(
       ? true
       : `leaf_count ${String(declaredLeafCount)} != actual ${actualLeafCount}`;
 
-  const { present, kind, verified } = await verifyManifestSignature(manifest);
+  const { present, kind, payloadOk, verified } =
+    await verifyManifestSignature(manifest, expectedEd25519Fingerprint);
+  const transparencyOk = verifyTransparencyAnchor(manifest);
+  const verdictArtifact =
+    fold.ok === true
+      ? await verifyVerdictArtifactBinding({
+          records: fold.records,
+          manifest,
+          verdictText,
+        })
+      : {
+          ok: "verdict binding blocked because the audit chain did not verify",
+          sha256: "",
+          verdict: null,
+        };
 
-  const sigFailed =
-    present && !ADVISORY_SIGNER_KINDS.has(kind) && verified !== true;
   const overall =
     auditChainOk === true &&
     merkleRootOk === true &&
     leafCountOk === true &&
     present &&
-    !sigFailed;
+    payloadOk === true &&
+    verified === true &&
+    transparencyOk === true &&
+    verdictArtifact.ok === true;
 
   return {
     available: true,
@@ -560,8 +1074,13 @@ export async function verifyCustodyChain(
     merkleRootOk,
     leafCountOk,
     signaturePresent: present,
+    signaturePayloadOk: payloadOk,
     signatureKind: kind,
     signatureVerified: verified,
+    transparencyOk,
+    verdictArtifactOk: verdictArtifact.ok,
+    verdictSha256: verdictArtifact.sha256,
+    verdict: verdictArtifact.verdict,
     overall,
   };
 }

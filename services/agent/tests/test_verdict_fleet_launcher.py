@@ -1,6 +1,8 @@
 """scripts/verdict --fleet: one command for a multi-host case folder.
 
 Offline and fast: --dry-run prints the stage plan without running anything.
+Fleet execution is a reduced-isolation local/SIFT capability; the production
+Docker backend is deliberately single-host.
 """
 
 from __future__ import annotations
@@ -32,7 +34,17 @@ def _case_root(tmp_path: Path) -> Path:
 class TestFleetMode:
     def test_multi_host_folder_auto_enters_fleet_mode(self, tmp_path: Path) -> None:
         root = _case_root(tmp_path)
-        proc = _run([str(root), "--dry-run", "--no-dashboard", "--skip-build"], tmp_path)
+        proc = _run(
+            [
+                str(root),
+                "--local",
+                "--acknowledge-reduced-isolation",
+                "--dry-run",
+                "--no-dashboard",
+                "--skip-build",
+            ],
+            tmp_path,
+        )
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
         # All three stages are named in the plan.
@@ -42,10 +54,29 @@ class TestFleetMode:
 
     def test_explicit_fleet_flag(self, tmp_path: Path) -> None:
         root = _case_root(tmp_path)
-        proc = _run([str(root), "--fleet", "--dry-run", "--no-dashboard"], tmp_path)
+        proc = _run(
+            [
+                str(root),
+                "--fleet",
+                "--local",
+                "--acknowledge-reduced-isolation",
+                "--dry-run",
+                "--no-dashboard",
+            ],
+            tmp_path,
+        )
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
         assert "run-whole-case-local" in out
+
+    def test_fleet_rejects_single_host_docker_backend(self, tmp_path: Path) -> None:
+        root = _case_root(tmp_path)
+        proc = _run([str(root), "--fleet", "--dry-run", "--no-dashboard"], tmp_path)
+        out = proc.stdout + proc.stderr
+
+        assert proc.returncode != 0
+        assert "Docker production backend is single-host" in out
+        assert "--acknowledge-reduced-isolation" in out
 
     def test_single_file_evidence_does_not_enter_fleet_mode(self, tmp_path: Path) -> None:
         evidence = tmp_path / "memory.img"

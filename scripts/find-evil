@@ -3,16 +3,19 @@
 #
 # Per Amendment A2 the Product is Claude Code invoked in this repo,
 # with two MCP servers registered via .mcp.json (findevil-mcp Rust +
-# findevil-agent-mcp Python). The judge can run this script OR
-# `claude` directly (in cwd) — the two are equivalent. The CLI binary
+# findevil-agent-mcp Python). A bare `claude` launch is equivalent only when
+# the operator explicitly sets FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1;
+# otherwise evidence-facing tool output fails closed. The CLI binary
 # is `claude` (Anthropic's official Claude Code CLI, installed via
 # https://docs.anthropic.com/en/docs/claude-code/install). It used
 # to be aliased `claude-code` in some environments; the current and
 # canonical binary name is `claude`. Per `claude --help`, the CLI
 # does not take a positional path arg — it uses cwd for the project.
 #
-# This wrapper exists only to give the SANS judge a memorable command
-# matching the project name and to ensure the cwd is right.
+# This wrapper gives the SANS judge a memorable command, pins the project cwd,
+# and obtains explicit consent before parsed evidence enters Claude's model
+# context. Raw evidence remains behind the typed MCP boundary, but parsed rows,
+# hashes, filenames, and custody metadata are still evidence-derived data.
 
 set -euo pipefail
 
@@ -31,4 +34,36 @@ if [[ ! -f "${REPO}/.mcp.json" ]]; then
   exit 1
 fi
 
-exec claude "$@"
+ACKNOWLEDGED=0
+CLAUDE_ARGS=()
+for arg in "$@"; do
+  case "${arg}" in
+    --acknowledge-evidence-egress)
+      ACKNOWLEDGED=1
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: scripts/find-evil --acknowledge-evidence-egress [claude options]
+
+Starts interactive Claude Code with VERDICT's MCP servers. The acknowledgment
+confirms that parsed evidence-derived output (not raw source files) may enter
+the selected cloud model context. For a zero-LLM local run, use:
+
+  scripts/verdict <evidence>
+EOF
+      exit 0
+      ;;
+    *)
+      CLAUDE_ARGS+=("${arg}")
+      ;;
+  esac
+done
+
+if [[ "${ACKNOWLEDGED}" != "1" ]]; then
+  echo "error: interactive Claude analysis can send parsed evidence-derived output to a cloud model." >&2
+  echo "Re-run with --acknowledge-evidence-egress, or use scripts/verdict <evidence> for the zero-LLM local engine." >&2
+  exit 2
+fi
+
+export FINDEVIL_ACKNOWLEDGE_PARSED_EVIDENCE_EGRESS=1
+exec claude "${CLAUDE_ARGS[@]}"

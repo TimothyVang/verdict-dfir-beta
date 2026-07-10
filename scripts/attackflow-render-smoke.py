@@ -26,6 +26,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 ATTACKFLOW_PARENT = REPO / "services" / "agent" / "findevil_agent"
+BROWSER_TMP = REPO / ".project-local" / "tmp" / "browser"
 
 CHROME_CANDIDATES = [
     "google-chrome",
@@ -263,14 +264,21 @@ def _drive(chrome: str, html_path: Path, label: str) -> bool:
     # A FRESH profile per launch. A shared/reused --user-data-dir races on
     # Chrome's SingletonLock across the sequential launches, and a launch that
     # loses the race dumps a DOM whose harness never ran ("no result title").
-    # Keep it under a short base dir (~/.cache) so the control socket path stays
-    # under the 108-char unix-socket limit.
-    profile = Path(tempfile.mkdtemp(prefix="afrs-", dir=str(Path.home() / ".cache")))
+    # Keep it under a short project-contained base so the control socket path
+    # stays under the 108-char Unix-socket limit without leaking state to HOME.
+    BROWSER_TMP.mkdir(parents=True, exist_ok=True, mode=0o700)
+    profile = Path(tempfile.mkdtemp(prefix="afrs-", dir=str(BROWSER_TMP)))
     cmd = [
         chrome,
         "--headless=new",
-        "--no-sandbox",
         "--disable-gpu",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-sync",
+        "--host-resolver-rules=MAP * ~NOTFOUND",
+        "--proxy-server=http://127.0.0.1:9",
+        "--proxy-bypass-list=<-loopback>",
         # A definite viewport so the histogram SVG lays out with a real,
         # non-zero client width. Headless without this can size an inline SVG at
         # ~0 width, and the brush handler maps clientX through
@@ -285,19 +293,45 @@ def _drive(chrome: str, html_path: Path, label: str) -> bool:
     # Chrome's control socket lives under TMPDIR; the project's contained TMPDIR is a
     # very deep path that overflows the 108-char unix-socket limit and silently kills
     # the launch. Point it (and the profile) at a short dir so headless Chrome starts.
-    env = {**os.environ, "TMPDIR": str(Path.home() / ".cache")}
+    directory_fd: int | None = None
+    pass_fds: tuple[int, ...] = ()
+    short_tmp = str(BROWSER_TMP)
+    if os.name == "posix":
+        directory_fd = os.open(
+            BROWSER_TMP,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        # Keep Chrome's Unix-domain control socket name under the 108-byte
+        # kernel ceiling while the socket itself still lives in the contained
+        # project directory. The descriptor is inherited only by this launch.
+        short_tmp = f"/proc/self/fd/{directory_fd}"
+        pass_fds = (directory_fd,)
+    env = {**os.environ, "TMPDIR": short_tmp}
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env)
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=env,
+            pass_fds=pass_fds,
+        )
     except (subprocess.SubprocessError, OSError) as exc:
         print(f"FAIL: chrome failed for {label}: {exc}")
         return False
     finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
         shutil.rmtree(profile, ignore_errors=True)
     title = _title_from_dom(r.stdout)
     if title.startswith("RENDERSMOKE:OK"):
         print(f"  {label}: {title}")
         return True
-    print(f"FAIL: {label}: {title or '(no result title — page did not run)'}")
+    stderr_tail = "\n".join(r.stderr.splitlines()[-8:])
+    detail = title or "(no result title — page did not run)"
+    print(f"FAIL: {label}: {detail} (chrome exit={r.returncode})")
+    if stderr_tail:
+        print(stderr_tail)
     return False
 
 
@@ -307,6 +341,9 @@ def main() -> int:
         print(
             "SKIP: no Chrome/Chromium found (render/interaction checks need a browser)"
         )
+        return 0
+    if callable(getattr(os, "geteuid", None)) and os.geteuid() == 0:
+        print("SKIP: refusing to disable Chromium's sandbox for a root render")
         return 0
     print(f"chrome: {chrome}")
 

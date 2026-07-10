@@ -19,8 +19,8 @@ Files:
 |------|------------|
 | `audit.jsonl` | Hash-chained process + tool-call record (the Merkle leaf source) |
 | `verdict.json` | Scoped Verdict and the single Finding |
-| `run.manifest.json` | Signed manifest (ed25519, offline-integrity only) |
-| `manifest_verify.json` | Offline verification result (`overall: true`) |
+| `run.manifest.json` | Ed25519-signed manifest; authentication requires the trusted public-key fingerprint supplied outside this manifest |
+| `manifest_verify.json` | Product-verifier receipt (`overall: true`); the independent command below re-derives it instead of trusting the receipt |
 
 The verdict is `SUSPICIOUS` and the run is **not** customer-releasable: the signer
 is `ed25519` (integrity, not identity) and expert sign-off is still required, so the
@@ -52,11 +52,19 @@ string keeps custody valid.
 # 1. Trace the verdict to its tool execution and Merkle leaves (exit 0 == OK)
 scripts/trace-finding docs/release-evidence/sample-run
 
-# 2. Confirm the offline verification result is overall: true
-python3 -c "import json;print(json.load(open('docs/release-evidence/sample-run/manifest_verify.json'))['overall'])"
+# 2. Independently re-derive chain, Merkle root, and strict Ed25519 verification.
+# This public fixture's trusted pin is recorded in the reviewed repository gate;
+# copying signature.cert_fingerprint from the manifest under test would NOT count.
+python3 scripts/manifest-verify-offline.py \
+  docs/release-evidence/sample-run/run.manifest.json \
+  --expected-ed25519-fingerprint b98df1a9d09da3741e295d7da21b9b675287adfb36b10ca17c280e2a1fee0f54 \
+  --check
 
 # 3. Confirm no local path leaked into the fixture
 grep -rI '/home' docs/release-evidence/sample-run/   # prints nothing
 ```
 
-`scripts/sample-run-trace-smoke.py` runs all three checks as a regression gate.
+`scripts/sample-run-trace-smoke.py` checks the trace, stored receipt, and path
+hygiene. The separate `manifest-verify-offline-smoke` entry in
+`scripts/run-all-smokes.sh` runs the cryptographic command above with the trusted
+fixture pin; reading `manifest_verify.json` alone is not independent verification.

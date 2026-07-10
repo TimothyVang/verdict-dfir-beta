@@ -47,46 +47,45 @@ frnsc-prefetch = "=0.13.3"
 forensic-rs = "=0.13"
 
 # omerbenamram's Master File Table parser — MIT, 100% safe Rust.
-# Used by the `mft_timeline` tool. Pinned to 0.6.1 because 0.7+
-# requires rustc 1.90 and our toolchain is locked at 1.88 per
-# `rust-toolchain.toml` (Spec/code divergence: edition-2024 deps
-# already forced 1.83 → 1.88; bumping again is a separate decision).
-mft = "=0.6.1"
+# Used by the `mft_timeline` tool. The tool preflights record sizing and
+# update-sequence metadata before handing attacker-controlled bytes to 0.7.
+mft = "=0.7.0"
 
 # Windows Registry hive parsing for `registry_query` is handled in-tree by
 # `src/tools/regf.rs` (no external crate). frnsc-hive only implemented the
 # modern `lh` subkey-list cell and panicked `unimplemented!()` on the
 # `lf`/`li`/`ri` cells used by Windows XP-era hives; notatin (the Apache-2.0
-# alternative) doesn't build under the pinned rustc 1.88. The in-tree reader
+# alternative) did not build under the previous rustc line. The in-tree reader
 # handles all four subkey-list types + resident/non-resident/`db` values.
 
 # yara-x — BSD-3-Clause, pure-Rust YARA implementation (VirusTotal).
-# Used by `yara_scan` for malware/IOC scanning. Pinned to 1.12.0 +
-# its sub-crates because the top-level pin alone doesn't constrain
-# yara-x-{macros,parser,proto}; they get pulled at latest which now
-# requires rustc 1.89 (we're at 1.88).
-yara-x = "=1.12.0"
-yara-x-macros = "=1.12.0"
-yara-x-parser = "=1.12.0"
-yara-x-proto = "=1.12.0"
+# Used by `yara_scan` for malware/IOC scanning. Pin all sibling crates to the
+# same 1.19 release; that line uses Wasmtime 43 instead of vulnerable 38.x.
+yara-x = "=1.19.0"
+yara-x-macros = "=1.19.0"
+yara-x-parser = "=1.19.0"
+yara-x-proto = "=1.19.0"
 
-# usnjrnl-forensic — MIT, NTFS USN Journal parser with full-path
-# reconstruction via journal rewind. Used by `usnjrnl_query` to
-# detect file create/delete/rename activity over an incident window.
-usnjrnl-forensic = "=0.7.3"
+# ntfs-core — Apache-2.0, pure-Rust USN record decoder. A small local
+# streaming adapter feeds it carved `$UsnJrnl:$J` records without importing
+# the upstream reporting stack or its unrelated, older SQLite dependency.
+ntfs-core = "=0.6.0"
 
-# rusqlite (MIT) parses browser-history SQLite DBs (Chrome/Edge `History`,
-# Firefox `places.sqlite`) read-only in the `browser_history` tool. `bundled`
+# rusqlite (MIT) parses browser SQLite DBs (Chrome/Edge `History`, Firefox
+# `places.sqlite`, Chromium Cookies/Web Data/Login Data) read-only in the
+# `browser_history` tool. `bundled`
 # vendors SQLite from source so a judge's fresh build needs no system
-# libsqlite3-dev (fully reproducible). Already resolved at 0.32.1 in the lock.
-rusqlite = { version = "=0.32.1", features = ["bundled"] }
+# libsqlite3-dev (fully reproducible). 0.39.0 resolves libsqlite3-sys 0.37.0,
+# bundling SQLite 3.51.3 above the 3.50.3 fix floor for CVE-2025-7709's
+# attacker-controlled corrupt-FTS-index path on the supported Rust toolchain.
+rusqlite = { version = "=0.39.0", features = ["bundled", "hooks", "limits"] }
 
 # cfb — MIT, pure-Rust Compound File Binary (OLE2/CFB) reader.
 # Used by `thumbcache_parse` to read XP-era `Thumbs.db` thumbnail caches
 # (the `Catalog` stream + per-index thumbnail streams). Runtime use is
 # read-only; the crate's write face is used only by tests to synthesize
 # fixtures. Pinned exact per the spec's library pin discipline; MSRV 1.74
-# (toolchain is pinned at 1.88).
+# (toolchain is pinned at 1.91).
 cfb = "=0.14.0"
 
 # kamadak-exif — BSD-2/Apache-2, pure-Rust EXIF metadata reader. Used by
@@ -120,8 +119,17 @@ schemars = { version = "1", features = ["preserve_order"] }
 # thiserror for structured, documented error types.
 thiserror = "2"
 
+# Safe O_NOFOLLOW constants for race-resistant opens of native-parser output.
+# The crate remains `forbid(unsafe_code)`; only libc's platform constants are used.
+libc = "0.2"
+
+# Normalize the `\\?\` verbatim prefix that `std::fs::canonicalize` prepends on
+# Windows, which the evidence-authorization path logic does not otherwise accept.
+# A no-op passthrough to `fs::canonicalize` on Unix. See `crate::pathnorm`.
+dunce = "=1.0.5"
+
 # Async runtime. Used by tool modules that benefit from async
-# subprocess management (vol_*, hayabusa_scan, vel_collect) and by
+# subprocess management (vol_*, hayabusa_scan) and by
 # the stdio reader in `src/server.rs`.  Originally added in
 # anticipation of rmcp; the hand-rolled server uses it directly.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
@@ -138,12 +146,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # attaches `output_sha256` hex to every successful response's `_meta`.
 hex = "0.4"
 
+# Safe process-group syscalls (getpgrp / killpg) for the non-Linux whole-tree
+# subprocess reaper in `tools::proc_runner`. Linux reaps via `/proc`, so this is
+# only pulled in on BSD/macOS, where `/proc` does not exist. rustix is already
+# in the dependency graph transitively; it keeps the crate `forbid(unsafe_code)`.
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+rustix = { version = "0.38", features = ["process"] }
+
 [dev-dependencies]
 # tempfile for per-test scratch dirs.
 tempfile = "3"
 # rusqlite in tests builds the Chrome/Firefox history fixtures the
 # browser_history smoke parses (same pin as the runtime dep).
-rusqlite = { version = "=0.32.1", features = ["bundled"] }
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+# dunce mirrors the product's `pathnorm::canonicalize` so path assertions can
+# compare against the same Windows `\\?\`-normalized form the tools persist
+# (same pin as the runtime dep).
+dunce = "=1.0.5"
 
 [lints]
 workspace = true

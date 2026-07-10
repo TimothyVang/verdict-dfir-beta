@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime
@@ -45,6 +46,32 @@ except ModuleNotFoundError:  # pragma: no cover - figure rendering needs matplot
     FancyArrowPatch = FancyBboxPatch = None  # type: ignore[assignment,misc]
 
 from report_entailment import entailment_evidence_lines  # noqa: E402
+from report_render_security import (  # noqa: E402
+    MAX_AUDIT_EMBED_BYTES,
+    MAX_CASE_ARTIFACT_BYTES,
+    MAX_REPORT_HTML_BYTES,
+    MAX_REPORT_MARKDOWN_BYTES,
+    MAX_REPORT_PDF_BYTES,
+    CHROMIUM_RENDER_TIMEOUT_SECONDS,
+    PANDOC_RENDER_TIMEOUT_SECONDS,
+    chromium_pdf_args,
+    chromium_profile,
+    ensure_safe_output_directory,
+    ensure_safe_report_output,
+    load_self_contained_css,
+    markdown_code,
+    markdown_text,
+    publish_report_output,
+    read_regular_file_no_follow,
+    read_text_regular_file_no_follow,
+    regular_file_size_no_follow,
+    report_render_workspace,
+    require_text_regular_file_no_follow,
+    save_matplotlib_figure,
+    secure_chromium_available,
+    secure_report_html,
+    write_report_text_no_follow,
+)
 
 
 def _resolve_tool(env_var: str, *fallback_names: str) -> str | None:
@@ -259,7 +286,7 @@ def fig_audit_chain(
     arrow(2.0, 1.2, 4.5, 0.9)
     arrow(8.0, 1.2, 5.5, 0.9)
 
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
 
 
@@ -336,7 +363,7 @@ def fig_psscan_timeline(psscan: list[dict[str, Any]], out: Path) -> None:
         fontsize=8,
     )
     fig.tight_layout()
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
 
 
@@ -375,7 +402,7 @@ def fig_timeline_overview(events: list[dict[str, Any]], out: Path) -> bool:
             fontsize=11,
             color="#777",
         )
-        fig.savefig(out)
+        save_matplotlib_figure(fig, out)
         plt.close(fig)
         return False
 
@@ -412,7 +439,7 @@ def fig_timeline_overview(events: list[dict[str, Any]], out: Path) -> bool:
         fontsize=8,
     )
     fig.tight_layout()
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
     return True
 
@@ -482,7 +509,7 @@ def fig_entity_timeline(events: list[dict[str, Any]], out: Path) -> bool:
         fontsize=8,
     )
     fig.tight_layout()
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
     return True
 
@@ -501,7 +528,7 @@ def fig_attack_story_timeline(attack_story: dict[str, Any], out: Path) -> bool:
             fontsize=11,
             color="#777",
         )
-        fig.savefig(out)
+        save_matplotlib_figure(fig, out)
         plt.close(fig)
         return False
 
@@ -547,7 +574,7 @@ def fig_attack_story_timeline(attack_story: dict[str, Any], out: Path) -> bool:
         )
     ax.set_title("How they got hacked - evidence-bound attack story")
     fig.tight_layout()
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
     return True
 
@@ -578,7 +605,7 @@ def fig_process_view_comparison(tool_calls: list[dict[str, Any]], out: Path) -> 
     ax.set_title("Memory process-view comparison by typed tool output")
     ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out)
+    save_matplotlib_figure(fig, out)
     plt.close(fig)
     return True
 
@@ -605,22 +632,18 @@ def _fmt_ts(value: Any) -> str:
 
 
 def md_cell(value: Any) -> str:
-    if isinstance(value, list):
-        value = ", ".join(str(v) for v in value)
-    text = escape(str(value or ""), quote=False)
-    for old, new in (
-        ("\\", "\\\\"),
-        ("`", "'"),
-        ("\r", " "),
-        ("\n", " "),
-        ("|", "\\|"),
-        ("[", "\\["),
-        ("]", "\\]"),
-        ("(", "\\("),
-        (")", "\\)"),
-    ):
-        text = text.replace(old, new)
-    return text
+    return markdown_text(value)
+
+
+def md_code(value: Any) -> str:
+    return markdown_code(value)
+
+
+_SAFE_TOOL_CALL_ID_RE = re.compile(
+    r"(?:tc-[A-Za-z0-9][A-Za-z0-9_-]{0,126}|"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\Z"
+)
 
 
 def confirmed_reverify_affordance(finding: dict[str, Any]) -> list[str]:
@@ -636,13 +659,10 @@ def confirmed_reverify_affordance(finding: dict[str, Any]) -> list[str]:
     if str(finding.get("confidence", "")).strip().upper() != "CONFIRMED":
         return []
     tcid = str(finding.get("tool_call_id") or "").strip()
-    if not tcid or tcid.lower() == "n/a":
+    if not _SAFE_TOOL_CALL_ID_RE.fullmatch(tcid):
         return []
-    # Keep the id safe inside a backtick code span; tool_call_ids are audit-chain
-    # identifiers, so this only guards against an accidental span break.
-    safe_tcid = tcid.replace("`", "'")
     return [
-        f"- re-verify offline: `grep {safe_tcid} audit.jsonl` — runs against the "
+        f"- re-verify offline: `grep -F -- {tcid} audit.jsonl` — runs against the "
         "embedded audit.jsonl in this report (see Offline Re-Verification below).",
     ]
 
@@ -756,9 +776,9 @@ def build_readiness_section(
     failed_lines = "\n".join(f"* {md_cell(item)}" for item in failed)
     return (
         "\n## Readiness State\n\n"
-        f"* Packet state: `{md_cell(packet_state)}`\n"
+        f"* Packet state: `{md_code(packet_state)}`\n"
         f"* Ready for expert review/signoff: `{ready_for_expert}`\n"
-        f"* Expert-review status: `{md_cell(expert_decision)}`\n"
+        f"* Expert-review status: `{md_code(expert_decision)}`\n"
         f"* Ready for customer PDF: `{ready_for_pdf}`\n"
         f"* Customer releasable: `{customer_releasable}`\n\n"
         "### Blockers\n\n"
@@ -783,7 +803,7 @@ def build_coverage_manifest_section(coverage_manifest: dict[str, Any] | None) ->
         rows.append(
             "| {artifact_class} | `{status}` | {available} | {attempted} | {parsed} | {failed} | {unsupported} | {not_supplied} | {parse_errors} | {records_seen} | {rows_returned} | `{tools}` |".format(
                 artifact_class=md_cell(row.get("artifact_class", "?")),
-                status=md_cell(row.get("status", "")),
+                status=md_code(row.get("status", "")),
                 available="yes" if row.get("available") else "no",
                 attempted="yes" if row.get("attempted") else "no",
                 parsed="yes" if row.get("parsed") else "no",
@@ -793,7 +813,7 @@ def build_coverage_manifest_section(coverage_manifest: dict[str, Any] | None) ->
                 parse_errors=md_cell(row.get("parse_errors", 0)),
                 records_seen=md_cell(row.get("records_seen", 0)),
                 rows_returned=md_cell(row.get("rows_returned", 0)),
-                tools=md_cell(row.get("tools_attempted", [])),
+                tools=md_code(row.get("tools_attempted", [])),
             )
         )
     status_counts = summary.get("status_counts", {})
@@ -812,7 +832,7 @@ def build_coverage_manifest_section(coverage_manifest: dict[str, Any] | None) ->
             "\n### Unsupported Artifact Samples\n\n"
             "These paths were inventoried or observed but no typed parser processed "
             "them in this run.\n\n"
-            + "\n".join(f"* `{md_cell(sample)}`" for sample in unsupported_samples)
+            + "\n".join(f"* `{md_code(sample)}`" for sample in unsupported_samples)
             + "\n\n"
         )
     return (
@@ -820,11 +840,11 @@ def build_coverage_manifest_section(coverage_manifest: dict[str, Any] | None) ->
         f"{md_cell(coverage_manifest.get('truth_boundary', ''))}\n\n"
         "This table is the explicit anti-overclaim record for the run. "
         "`not_supplied`, `unsupported`, `failed`, and `partial` rows are scope gaps, not clean findings.\n\n"
-        f"* Artifact classes recorded: `{summary.get('artifact_classes_recorded', 0)}`\n"
-        f"* Attempted: `{summary.get('attempted', 0)}`; parsed: `{summary.get('parsed', 0)}`; failed: `{summary.get('failed', 0)}`\n"
-        f"* Unsupported: `{summary.get('unsupported', 0)}`; not supplied: `{summary.get('not_supplied', 0)}`\n"
-        f"* ATT&CK blind spots: `{summary.get('attack_blind_spot_count', 0)}`\n"
-        f"* Status counts: `{md_cell(status_counts)}`\n\n"
+        f"* Artifact classes recorded: `{md_code(summary.get('artifact_classes_recorded', 0))}`\n"
+        f"* Attempted: `{md_code(summary.get('attempted', 0))}`; parsed: `{md_code(summary.get('parsed', 0))}`; failed: `{md_code(summary.get('failed', 0))}`\n"
+        f"* Unsupported: `{md_code(summary.get('unsupported', 0))}`; not supplied: `{md_code(summary.get('not_supplied', 0))}`\n"
+        f"* ATT&CK blind spots: `{md_code(summary.get('attack_blind_spot_count', 0))}`\n"
+        f"* Status counts: `{md_code(status_counts)}`\n\n"
         + "\n".join(rows)
         + "\n\n"
         + unsupported_samples_section
@@ -1050,7 +1070,7 @@ def build_bluf_section(
     groups = host_groups or []
     if len(groups) > 1:
         spans = "; ".join(
-            f"{g.get('host')} ({str(g.get('top_confidence', '')).lower()})"
+            f"{md_cell(g.get('host'))} ({md_cell(str(g.get('top_confidence', '')).lower())})"
             for g in groups
         )
         parts.append(
@@ -1118,11 +1138,11 @@ def build_host_sections(
         srcs = ", ".join(group.get("evidence_sources", []) or [])
         parts.append(f"### {md_cell(host)}\n\n")
         parts.append(
-            f"*{group.get('finding_count', len(host_beats))} finding(s) — "
-            f"{counts.get('CONFIRMED', 0)} confirmed, {counts.get('INFERRED', 0)} "
-            f"inferred, {counts.get('HYPOTHESIS', 0)} hypothesis · "
-            f"{group.get('event_count', 0)} events · "
-            f"{_fmt_window(group.get('first_seen'), group.get('last_seen'))}"
+            f"*{md_cell(group.get('finding_count', len(host_beats)))} finding(s) — "
+            f"{md_cell(counts.get('CONFIRMED', 0))} confirmed, {md_cell(counts.get('INFERRED', 0))} "
+            f"inferred, {md_cell(counts.get('HYPOTHESIS', 0))} hypothesis · "
+            f"{md_cell(group.get('event_count', 0))} events · "
+            f"{md_cell(_fmt_window(group.get('first_seen'), group.get('last_seen')))}"
             + (f" · source: {md_cell(srcs)}" if srcs else "")
             + "*\n\n"
         )
@@ -1136,15 +1156,15 @@ def build_host_sections(
             cve_txt = f" — {', '.join(cves)}" if cves else ""
             parts.append(
                 f"**{md_cell(beat.get('phase', 'Finding'))}: {md_cell(named)}"
-                f"{md_cell(cve_txt)}** `[{md_cell(beat.get('confidence', ''))}]` "
-                f"`{md_cell(beat.get('tool_call_id', ''))}`\n\n"
+                f"{md_cell(cve_txt)}** `[{md_code(beat.get('confidence', ''))}]` "
+                f"`{md_code(beat.get('tool_call_id', ''))}`\n\n"
             )
             if beat.get("analyst_note"):
                 parts.append(f"{md_cell(beat['analyst_note'])}\n\n")
             if beat.get("next_pivot"):
                 parts.append(f"*Next:* {md_cell(beat['next_pivot'])}\n\n")
             if beat.get("hunt"):
-                parts.append(f"*Hunt:* `{beat['hunt']}`\n\n")
+                parts.append(f"*Hunt:* `{md_code(beat['hunt'])}`\n\n")
         finding_ids = {str(fid) for fid in (group.get("finding_ids", []) or [])}
         host_events = [
             event
@@ -1171,7 +1191,7 @@ def build_host_sections(
                     f"| {md_cell(_fmt_ts(event.get('timestamp_utc')))} "
                     f"| {md_cell((event.get('summary') or '')[:80])} "
                     f"| {md_cell(_format_account_display(ent) or '—')} "
-                    f"| `{md_cell(event.get('tool_call_id', ''))}` |\n"
+                    f"| `{md_code(event.get('tool_call_id', ''))}` |\n"
                 )
             parts.append("\n")
     return "".join(parts)
@@ -1251,7 +1271,7 @@ def build_timeline_of_events_section(
                     ip=md_cell(
                         _entity_cell(entities, "source_ip", "destination_ip") or "—"
                     ),
-                    tcid=md_cell(event.get("tool_call_id") or "?"),
+                    tcid=md_code(event.get("tool_call_id") or "?"),
                 )
             )
         table_block = "### Key Events\n\n" + "\n".join(rows) + "\n\n"
@@ -1340,7 +1360,7 @@ def build_detailed_event_timeline_section(
                     if event.get("linked_finding_ids")
                     else "—"
                 ),
-                tcid=md_cell(event.get("tool_call_id", "?")),
+                tcid=md_code(event.get("tool_call_id", "?")),
             )
         )
     fig_block = ""
@@ -1387,7 +1407,7 @@ def build_cast_of_characters_section(entity_index: dict[str, Any] | None) -> str
             lines.append(
                 "| {value} | {count} | {first} | {last} | {findings} |".format(
                     value=md_cell(row.get("value", "")),
-                    count=row.get("event_count", 0),
+                    count=md_cell(row.get("event_count", 0)),
                     first=md_cell(_fmt_ts(row.get("first_seen")) or "—"),
                     last=md_cell(_fmt_ts(row.get("last_seen")) or "—"),
                     findings=md_cell(row.get("linked_finding_ids") or []) or "—",
@@ -1504,15 +1524,16 @@ def render_self_correction_section(
         return ""
     blocks: list[str] = []
     for rev in revisions[:20]:
-        from_v = md_cell(rev.get("from_verdict", "?"))
-        to_v = md_cell(rev.get("to_verdict", "?"))
-        trigger = md_cell(rev.get("trigger_tool_call_id", "n/a"))
+        from_v = md_code(rev.get("from_verdict", "?"))
+        to_v = md_code(rev.get("to_verdict", "?"))
+        trigger = md_code(rev.get("trigger_tool_call_id", "n/a"))
         mechanism = rev.get("mechanism", "")
         verification = _SELF_CORRECTION_MECHANISM_LABEL.get(
             mechanism, md_cell(str(mechanism) or "an audited self-check")
         )
         reason = md_cell(rev.get("reason", "")) or "no per-flip reason recorded"
-        finding = md_cell(rev.get("finding_id", "n/a"))
+        finding = md_code(rev.get("finding_id", "n/a"))
+        mechanism_code = md_code(str(mechanism))
         blocks.append(
             f"### Self-Correction — Finding `{finding}`\n\n"
             f"* **Initial Finding:** held at `{from_v}` confidence before the "
@@ -1521,7 +1542,7 @@ def render_self_correction_section(
             f"`tool_call_id`: `{trigger}`).\n"
             f"* **What It Revealed:** {reason}\n"
             f"* **Correction Applied:** confidence revised `{from_v}` -> `{to_v}` "
-            f"via `{md_cell(str(mechanism))}`.\n"
+            f"via `{mechanism_code}`.\n"
         )
     omitted_rev = ""
     if len(revisions) > 20:
@@ -1537,6 +1558,29 @@ def render_self_correction_section(
         "`tool_call_id`) and are offline-verifiable via `manifest_verify` chain "
         "replay — they are the audited record of VERDICT correcting itself, not a "
         "narrative claim.\n\n" + "\n".join(blocks) + omitted_rev + "\n"
+    )
+
+
+def manifest_verification_command(signature_kind: str, manifest_argument: str) -> str:
+    policy = {
+        "ed25519": (
+            ", expected_ed25519_fingerprint=" "'TRUSTED_SHA256_FROM_OUTSIDE_THE_CASE'"
+        ),
+        "sigstore": (
+            ", expected_sigstore_identity="
+            "'TRUSTED_SIGSTORE_IDENTITY_FROM_OUTSIDE_THE_CASE', "
+            "expected_sigstore_issuer="
+            "'TRUSTED_SIGSTORE_ISSUER_FROM_OUTSIDE_THE_CASE'"
+        ),
+    }.get(signature_kind, "")
+    python = (
+        "import sys; from pathlib import Path; "
+        "from findevil_agent.crypto.manifest import verify_manifest; "
+        f"print(verify_manifest(Path(sys.argv[1]), audit_log_path=Path(sys.argv[2]){policy}))"
+    )
+    return (
+        f'uv run --directory services/agent python -c "{python}" '
+        f"{manifest_argument} PATH/TO/audit.jsonl"
     )
 
 
@@ -1582,15 +1626,26 @@ def write_markdown(
     reason_codes: list[str] | None = None,
 ) -> Path:
     md = case_dir / "REPORT.md"
-    fa = manifest["audit_log_final_hash"]
-    mr = manifest["merkle_root_hex"]
-    sig = manifest["signature"]["payload_sha256"]
-    cf = manifest["signature"]["cert_fingerprint"]
+    internal_md = case_dir / "REPORT-internal.md"
+    # Fail before constructing either packet so a hostile pre-existing link is
+    # never opened or partially overwritten.
+    ensure_safe_report_output(md)
+    ensure_safe_report_output(internal_md)
+    fa = md_code(manifest["audit_log_final_hash"])
+    mr = md_code(manifest["merkle_root_hex"])
+    sig = md_code(manifest["signature"]["payload_sha256"])
+    cf = md_code(manifest["signature"]["cert_fingerprint"])
     sig_kind = str(manifest["signature"].get("kind") or "stub")
     sig_label = {
         "sigstore": "Sigstore signature",
         "ed25519": "Ed25519 signature",
-    }.get(sig_kind, f"Signature ({sig_kind})")
+    }.get(sig_kind, f"Signature ({md_cell(sig_kind)})")
+    verify_command = manifest_verification_command(
+        sig_kind, "PATH/TO/run.manifest.json"
+    )
+    tamper_verify_command = manifest_verification_command(
+        sig_kind, '"${TAMPER_MANIFEST}"'
+    )
 
     # The executive narrative (headline / summary / assessment / certainty / key
     # findings) lives entirely in the Bottom Line Up Front above. This block only
@@ -1616,19 +1671,19 @@ def write_markdown(
         rows = ["| Check | Status | Summary |", "|---|---|---|"]
         for check in report_qa.get("checks", []):
             rows.append(
-                f"| `{md_cell(check.get('check_id', ''))}` | "
+                f"| `{md_code(check.get('check_id', ''))}` | "
                 f"{md_cell(check.get('status', ''))} | "
                 f"{md_cell(check.get('summary', ''))} |"
             )
         qa_section = (
             "\n## QA / Expert Signoff\n\n"
-            f"* Overall QA status: `{report_qa.get('status', '?')}`\n"
-            f"* Packet state: `{report_qa.get('packet_state', 'unknown')}`\n"
-            f"* Ready for expert signoff: `{report_qa.get('ready_for_expert_signoff', False)}`\n"
-            f"* Customer-release candidate from automated QA: `{report_qa.get('customer_release_candidate', False)}`\n"
-            f"* Customer releasable after expert approval: `{report_qa.get('customer_releasable', False)}`\n"
-            f"* Expert decision: `{report_qa.get('expert_decision', 'pending')}`\n"
-            f"* Expert review estimate: `{report_qa.get('recommended_expert_review_time', 'unknown')}`\n"
+            f"* Overall QA status: `{md_code(report_qa.get('status', '?'))}`\n"
+            f"* Packet state: `{md_code(report_qa.get('packet_state', 'unknown'))}`\n"
+            f"* Ready for expert signoff: `{md_code(report_qa.get('ready_for_expert_signoff', False))}`\n"
+            f"* Customer-release candidate from automated QA: `{md_code(report_qa.get('customer_release_candidate', False))}`\n"
+            f"* Customer releasable after expert approval: `{md_code(report_qa.get('customer_releasable', False))}`\n"
+            f"* Expert decision: `{md_code(report_qa.get('expert_decision', 'pending'))}`\n"
+            f"* Expert review estimate: `{md_code(report_qa.get('recommended_expert_review_time', 'unknown'))}`\n"
             "* Signoff question: `Would I send this report to a company without rewriting it?`\n\n"
             + "\n".join(rows)
             + "\n\n"
@@ -1640,7 +1695,7 @@ def write_markdown(
         rows = ["| Rule | Severity | Requirement |", "|---|---|---|"]
         for rule in rules[:8]:
             rows.append(
-                f"| `{md_cell(rule.get('id', ''))}` | "
+                f"| `{md_code(rule.get('id', ''))}` | "
                 f"{md_cell(rule.get('severity', ''))} | "
                 f"{md_cell(rule.get('requirement', ''))} |"
             )
@@ -1660,13 +1715,13 @@ def write_markdown(
             "This gate is written after `manifest_finalize` and `manifest_verify`; "
             "it is a post-finalize linkage artifact, not a replacement for the "
             "audited `verdict.json` hash committed before manifest finalization.\n\n"
-            f"* QA status: `{md_cell(release_gate.get('qa_status', 'unknown'))}`\n"
-            f"* Packet state: `{md_cell(release_gate.get('packet_state', 'unknown'))}`\n"
-            f"* Manifest verified: `{release_gate.get('manifest_verified', False)}`\n"
-            f"* Manifest signature present: `{release_gate.get('manifest_signature_present', False)}`\n"
-            f"* Signer: `{md_cell(release_gate.get('signer', 'unknown'))}`\n"
-            f"* Expert approved: `{release_gate.get('expert_approved', False)}`\n"
-            f"* Customer releasable: `{release_gate.get('customer_releasable', False)}`\n"
+            f"* QA status: `{md_code(release_gate.get('qa_status', 'unknown'))}`\n"
+            f"* Packet state: `{md_code(release_gate.get('packet_state', 'unknown'))}`\n"
+            f"* Manifest verified: `{md_code(release_gate.get('manifest_verified', False))}`\n"
+            f"* Manifest signature present: `{md_code(release_gate.get('manifest_signature_present', False))}`\n"
+            f"* Signer: `{md_code(release_gate.get('signer', 'unknown'))}`\n"
+            f"* Expert approved: `{md_code(release_gate.get('expert_approved', False))}`\n"
+            f"* Customer releasable: `{md_code(release_gate.get('customer_releasable', False))}`\n"
             "\n### Release Blockers\n\n"
             + (blocker_lines or "* No release blockers recorded.")
             + "\n\n"
@@ -1682,19 +1737,19 @@ def write_markdown(
         replay_chip = ""
         if replay_artifact:
             replay_chip = (
-                f", replay: {replay_artifact.get('drift_class', 'unknown')}"
+                f", replay: {md_cell(replay_artifact.get('drift_class', 'unknown'))}"
                 f" ({'match' if replay_artifact.get('matched') else 'no match'})"
             )
             replay_rows.append(
                 "| {finding} | `{tool}` | `{drift}` | {matched} | `{expected}` | `{actual}` |".format(
                     finding=md_cell(f.get("finding_id", f"#{i}")),
-                    tool=md_cell(replay_artifact.get("tool_name", "")),
-                    drift=md_cell(replay_artifact.get("drift_class", "")),
+                    tool=md_code(replay_artifact.get("tool_name", "")),
+                    drift=md_code(replay_artifact.get("drift_class", "")),
                     matched="yes" if replay_artifact.get("matched") else "no",
-                    expected=md_cell(
+                    expected=md_code(
                         str(replay_artifact.get("expected_sha256") or "")[:12]
                     ),
-                    actual=md_cell(
+                    actual=md_code(
                         str(replay_artifact.get("actual_sha256") or "")[:12]
                     ),
                 )
@@ -1708,17 +1763,17 @@ def write_markdown(
                     finding=md_cell(
                         str(f.get("finding_id", f"#{i}")) + " (corroboration)"
                     ),
-                    tool=md_cell(corr.get("tool_name", "")),
-                    drift=md_cell(corr.get("drift_class", "")),
+                    tool=md_code(corr.get("tool_name", "")),
+                    drift=md_code(corr.get("drift_class", "")),
                     matched="yes" if corr.get("matched") else "no",
-                    expected=md_cell(str(corr.get("expected_sha256") or "")[:12]),
-                    actual=md_cell(str(corr.get("actual_sha256") or "")[:12]),
+                    expected=md_code(str(corr.get("expected_sha256") or "")[:12]),
+                    actual=md_code(str(corr.get("actual_sha256") or "")[:12]),
                 )
             )
         findings_md_lines.append(
-            f"### Finding {i} — confidence: {f.get('confidence', '?')}, "
-            f"pool: {f.get('pool_origin', '?')}, "
-            f"MITRE: {f.get('mitre_technique') or 'n/a'}{replay_chip}"
+            f"### Finding {i} — confidence: {md_cell(f.get('confidence', '?'))}, "
+            f"pool: {md_cell(f.get('pool_origin', '?'))}, "
+            f"MITRE: {md_cell(f.get('mitre_technique') or 'n/a')}{replay_chip}"
         )
         findings_md_lines.append("")
         findings_md_lines.append(md_cell(f.get("description", "")) + "\n")
@@ -1727,11 +1782,11 @@ def write_markdown(
         # cannot let the model's spelling reach the reader as the fact.
         findings_md_lines.extend(entailment_evidence_lines(f))
         findings_md_lines.append(
-            f"- `tool_call_id`: `{md_cell(f.get('tool_call_id', 'n/a'))}`"
+            f"- `tool_call_id`: `{md_code(f.get('tool_call_id', 'n/a'))}`"
         )
         findings_md_lines.extend(confirmed_reverify_affordance(f))
         findings_md_lines.append(
-            f"- artifact: `{md_cell(display_artifact_path(f.get('artifact_path')))}`"
+            f"- artifact: `{md_code(display_artifact_path(f.get('artifact_path')))}`"
         )
         caveat = {
             "CONFIRMED": "Confirmed — the cited tool output is reproducible; this does "
@@ -1790,12 +1845,12 @@ def write_markdown(
                 "| {finding} | `{tool}` | `{confidence}` | `{mitre}` | {description} | "
                 "{reason} | `{effect}` | {action} |".format(
                     finding=md_cell(lead.get("finding_id", "")),
-                    tool=md_cell(lead.get("tool_call_id", "")),
-                    confidence=md_cell(lead.get("confidence", "")),
-                    mitre=md_cell(lead.get("mitre_technique", "") or "n/a"),
+                    tool=md_code(lead.get("tool_call_id", "")),
+                    confidence=md_code(lead.get("confidence", "")),
+                    mitre=md_code(lead.get("mitre_technique", "") or "n/a"),
                     description=md_cell(lead.get("description", "")),
                     reason=md_cell(lead.get("verifier_reason", "")),
-                    effect=md_cell(
+                    effect=md_code(
                         lead.get("verdict_effect", "excluded_from_final_findings")
                     ),
                     action=md_cell(lead.get("analyst_action", "")),
@@ -1833,16 +1888,16 @@ def write_markdown(
         for check in completeness.get("checks", []):
             rows.append(
                 "| {artifact_class} | {available} | {touched} | `{tools}` | {impact} |".format(
-                    artifact_class=check.get("artifact_class", "?"),
+                    artifact_class=md_cell(check.get("artifact_class", "?")),
                     available="yes" if check.get("available") else "no",
                     touched="yes" if check.get("touched") else "no",
-                    tools=", ".join(check.get("tools", [])) or "none",
-                    impact=check.get("confidence_impact", ""),
+                    tools=md_code(", ".join(check.get("tools", [])) or "none"),
+                    impact=md_cell(check.get("confidence_impact", "")),
                 )
             )
         completeness_section = (
             "\n## Evidence Coverage\n\n"
-            f"{completeness.get('summary', '')}\n\n" + "\n".join(rows) + "\n\n"
+            f"{md_cell(completeness.get('summary', ''))}\n\n" + "\n".join(rows) + "\n\n"
         )
 
     attack_section = ""
@@ -1873,11 +1928,13 @@ def write_markdown(
             gap = row.get("gap") or row.get("analyst_value", "")
             rows.append(
                 f"| {md_cell(technique)} | {md_cell(row.get('tactic', ''))} | "
-                f"{md_cell(status)} | `{md_cell(tools)}` | {md_cell(gap)} |"
+                f"{md_cell(status)} | `{md_code(tools)}` | {md_cell(gap)} |"
             )
         attack_section = (
             "\n## MITRE ATT&CK Coverage\n\n"
-            f"{attack_coverage.get('summary', '')}\n\n" + "\n".join(rows) + "\n\n"
+            f"{md_cell(attack_coverage.get('summary', ''))}\n\n"
+            + "\n".join(rows)
+            + "\n\n"
         )
 
     practitioner_section = ""
@@ -1892,7 +1949,7 @@ def write_markdown(
                 f"| {md_cell(_lane_label(lane, row))} | "
                 f"{md_cell(row.get('status', ''))} | "
                 f"{md_cell(row.get('artifact_classes_seen', [])) or 'none'} | "
-                f"`{md_cell(row.get('tools_run', [])) or 'none'}` | "
+                f"`{md_code(row.get('tools_run', [])) or 'none'}` | "
                 f"{md_cell(row.get('attck_data_sources_seen', [])) or 'none'} | "
                 f"{md_cell(row.get('coverage_gaps', [])) or 'none'} |"
             )
@@ -1921,16 +1978,16 @@ def write_markdown(
             process = observable.get("process", {})
             region = observable.get("memory_region", {})
             rows.append(
-                f"| `{md_cell(observable.get('observable_id', ''))}` | "
+                f"| `{md_code(observable.get('observable_id', ''))}` | "
                 f"{md_cell(process.get('image_name', ''))} pid={md_cell(process.get('pid', ''))} | "
                 f"{md_cell(region.get('vad_start_hex', ''))}-{md_cell(region.get('vad_end_hex', ''))} {md_cell(region.get('protection', ''))} | "
                 f"{md_cell(observable.get('labels', []))} | "
-                f"`{md_cell(observable.get('tool_call_id', ''))}` |"
+                f"`{md_code(observable.get('tool_call_id', ''))}` |"
             )
         ioc_rows = ["| Type | Values |", "|---|---|"]
         for key, values in aggregate_iocs.items():
             if values:
-                ioc_rows.append(f"| {md_cell(key)} | `{md_cell(values[:10])}` |")
+                ioc_rows.append(f"| {md_cell(key)} | `{md_code(values[:10])}` |")
         ioc_table = (
             "\n".join(ioc_rows)
             if len(ioc_rows) > 2
@@ -1939,12 +1996,12 @@ def write_markdown(
         malware_section = (
             "\n## Malware Triage\n\n"
             "This section is malware triage only. It does not identify who operated the code, execution, or intent. Single-source malfind/YARA/string indicators require corroboration before response claims.\n\n"
-            f"* Scope: `{malware_triage.get('scope', 'triage_only')}`\n"
-            f"* Observables: {summary.get('observable_count', 0)}\n"
-            f"* IOCs extracted: {summary.get('ioc_count', 0)}\n"
-            f"* malfind injections: {summary.get('malfind_injection_count', 0)}\n"
-            f"* YARA matches: {summary.get('yara_match_count', 0)}\n"
-            f"* Verdict contribution: `{summary.get('verdict_contribution', 'none')}`\n\n"
+            f"* Scope: `{md_code(malware_triage.get('scope', 'triage_only'))}`\n"
+            f"* Observables: {md_cell(summary.get('observable_count', 0))}\n"
+            f"* IOCs extracted: {md_cell(summary.get('ioc_count', 0))}\n"
+            f"* malfind injections: {md_cell(summary.get('malfind_injection_count', 0))}\n"
+            f"* YARA matches: {md_cell(summary.get('yara_match_count', 0))}\n"
+            f"* Verdict contribution: `{md_code(summary.get('verdict_contribution', 'none'))}`\n\n"
             + "\n".join(rows)
             + "\n\n### Extracted IOC Leads\n\n"
             + ioc_table
@@ -1955,20 +2012,21 @@ def write_markdown(
     if evtx_summary:
         top = (
             ", ".join(
-                f"EID {row.get('event_id')} x{row.get('count')}"
+                f"EID {md_cell(row.get('event_id'))} x{md_cell(row.get('count'))}"
                 for row in evtx_summary.get("top_event_ids", [])[:5]
             )
             or "none"
         )
-        channels = ", ".join(evtx_summary.get("channels", [])) or "none"
+        channels = md_cell(", ".join(evtx_summary.get("channels", [])) or "none")
         evtx_section = (
             "\n## Windows Event Log Summary\n\n"
-            f"* Records seen: {evtx_summary.get('records_seen', 0)}\n"
-            f"* Rows returned: {evtx_summary.get('row_count', 0)}\n"
-            f"* Parse errors: {evtx_summary.get('parse_errors', 0)}\n"
+            f"* Records seen: {md_cell(evtx_summary.get('records_seen', 0))}\n"
+            f"* Rows returned: {md_cell(evtx_summary.get('row_count', 0))}\n"
+            f"* Parse errors: {md_cell(evtx_summary.get('parse_errors', 0))}\n"
             f"* Channels: {channels}\n"
             f"* Top Event IDs: {top}\n"
-            f"* Verdict contribution: {evtx_summary.get('verdict_contribution', 'none')} — {evtx_summary.get('reason', '')}\n\n"
+            f"* Verdict contribution: {md_cell(evtx_summary.get('verdict_contribution', 'none'))} — "
+            f"{md_cell(evtx_summary.get('reason', ''))}\n\n"
         )
 
     actions_section = ""
@@ -2061,14 +2119,14 @@ def write_markdown(
             lines.extend(
                 [
                     f"### {md_cell(card.get('title', 'Evidence card'))}",
-                    f"* Card: `{md_cell(card.get('card_id', '?'))}`",
-                    f"* Linked findings: `{md_cell(card.get('linked_finding_ids', []))}`",
-                    f"* Tool call: `{md_cell(card.get('tool_call_id', '?'))}`",
-                    f"* Source records: `{md_cell(card.get('source_record_refs', []))}`",
-                    f"* Confidence: `{md_cell(card.get('confidence', '?'))}`",
-                    f"* Citations: `{md_cell(card.get('citation_ids', []))}`",
+                    f"* Card: `{md_code(card.get('card_id', '?'))}`",
+                    f"* Linked findings: `{md_code(card.get('linked_finding_ids', []))}`",
+                    f"* Tool call: `{md_code(card.get('tool_call_id', '?'))}`",
+                    f"* Source records: `{md_code(card.get('source_record_refs', []))}`",
+                    f"* Confidence: `{md_code(card.get('confidence', '?'))}`",
+                    f"* Citations: `{md_code(card.get('citation_ids', []))}`",
                     f"* Why suspicious/relevant: {md_cell(card.get('why_suspicious', ''))}",
-                    f"* Snippet: `{md_cell(card.get('snippet', ''))}`",
+                    f"* Snippet: `{md_code(card.get('snippet', ''))}`",
                     f"* Caveats: {md_cell(card.get('caveats', []))}",
                     "",
                 ]
@@ -2083,7 +2141,7 @@ def write_markdown(
         ]
         for source in bibliography:
             rows.append(
-                f"| `{md_cell(source.get('citation_id', ''))}` | "
+                f"| `{md_code(source.get('citation_id', ''))}` | "
                 f"{md_cell(source.get('title', ''))} | "
                 f"{md_cell(source.get('url', ''))} | "
                 f"{md_cell(source.get('supports', []))} |"
@@ -2104,24 +2162,25 @@ def write_markdown(
     # .html / .pdf. The full path is preserved in verdict.json for operational use.
     evidence_display = Path(evidence).name if evidence and evidence != "?" else evidence
 
-    md.write_text(
+    write_report_text_no_follow(
+        md,
         f"""[VERDICT · DFIR Case File]{{.kicker}}
 
 # VERDICT — Forensic Investigation Report
 
 [Show Me the Evidence · signed, replayable chain of custody]{{.tagline}}
 
-**Case ID:** `{manifest["case_id"]}`
-**Run ID:** `{manifest["run_id"]}`
-**Started:** {manifest["started_at"]}
-**Finalized:** {manifest["finalized_at"]}
-**Evidence:** `{md_cell(evidence_display)}`
-**Verdict:** **{verdict}**
+**Case ID:** `{md_code(manifest["case_id"])}`
+**Run ID:** `{md_code(manifest["run_id"])}`
+**Started:** {md_cell(manifest["started_at"])}
+**Finalized:** {md_cell(manifest["finalized_at"])}
+**Evidence:** `{md_code(evidence_display)}`
+**Verdict:** **{md_cell(verdict)}**
 
 > **Cryptographic attestation:**
 > Merkle root `{mr}`
 > Audit log final hash `{fa}`
-> {sig_label} SHA-256 `{sig}`
+> {md_cell(sig_label)} SHA-256 `{sig}`
 > Cert fingerprint `{cf}`
 
 ---
@@ -2207,26 +2266,29 @@ library or the `manifest_verify` MCP tool. There is no standalone
 `manifest_verify` shell command in this repo.
 
 ```bash
-uv run --directory services/agent python -c "from pathlib import Path; from findevil_agent.crypto.manifest import verify_manifest; print(verify_manifest(Path('PATH/TO/run.manifest.json'), audit_log_path=Path('PATH/TO/audit.jsonl')))"
-# returns overall=True if the audit chain, Merkle root, leaf count, and signature presence validate
+{verify_command}
+# returns overall=True only when chain, Merkle, leaf count, payload digest, and tier signature rules validate
 ```
 
 The verifier rebuilds:
 1. The audit chain by walking `prev_hash` SHA-256 links (catches backdated edits).
 2. The Merkle tree from the manifest's `leaves[]` array (catches selective redaction).
-3. The signature bundle recorded in the manifest. Ed25519 signatures verify
-   offline in `manifest_verify`; Sigstore bundles are recorded for
-   identity-policy-aware verification by a party that supplies the expected
-   signer identity.
+3. The manifest payload digest and signature bundle. Ed25519 signatures verify
+   offline in `manifest_verify`; Sigstore passes only when the verifier is given
+   both the explicitly trusted signer identity and exact OIDC issuer, and the bundle
+   cryptographically verifies against it. A Sigstore label or bundle alone is
+   not authentication.
 
 A tamper test against this manifest's `merkle_root_hex` was not run automatically.
-To execute it, copy the manifest, overwrite `merkle_root_hex` with `ff` repeated
-32 times, then run the same Python verification command against the tampered copy.
+To execute it, create a fresh private temporary directory, write an exclusive
+no-follow copy with `merkle_root_hex` overwritten by `ff` repeated 32 times,
+then run the same tier-specific verifier against that copy.
 
 ```bash
-python -c "import shutil;shutil.copyfile('run.manifest.json','run.manifest.tamper.json')"
-python -c "import json,pathlib;p=pathlib.Path('run.manifest.tamper.json');d=json.loads(p.read_text());d['merkle_root_hex']='ff'*32;p.write_text(json.dumps(d,indent=2,sort_keys=True))"
-uv run --directory services/agent python -c "from pathlib import Path; from findevil_agent.crypto.manifest import verify_manifest; print(verify_manifest(Path('PATH/TO/run.manifest.tamper.json'), audit_log_path=Path('PATH/TO/audit.jsonl')))"
+TAMPER_DIR="$(mktemp -d)"
+TAMPER_MANIFEST="${{TAMPER_DIR}}/run.manifest.tamper.json"
+python -c "import json,os,pathlib,sys; d=json.loads(pathlib.Path('run.manifest.json').read_text()); d['merkle_root_hex']='ff'*32; flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_NOFOLLOW',0); fd=os.open(sys.argv[1],flags,0o600); f=os.fdopen(fd,'w'); json.dump(d,f,indent=2,sort_keys=True); f.close()" "${{TAMPER_MANIFEST}}"
+{tamper_verify_command}
 ```
 
 ---
@@ -2237,22 +2299,21 @@ quantitative claim above is independently verifiable from the artifacts in this
 directory (`audit.jsonl`, `run.manifest.json`, `verdict.json`). The automated
 QA / expert-signoff gates for this run are in the companion `REPORT-internal` packet.*
 """,
-        encoding="utf-8",
     )
 
     # The QA / expert-signoff gates are the product's internal expert-review packet,
     # not customer narrative — they ship as a companion file so the shared report
     # ends with the forensic content.
-    internal_md = case_dir / "REPORT-internal.md"
-    internal_md.write_text(
+    write_report_text_no_follow(
+        internal_md,
         f"""[VERDICT · Internal QA & Release Gates]{{.kicker}}
 
 # VERDICT — Internal QA & Release Gates
 
 [Expert-signoff packet · not customer narrative]{{.tagline}}
 
-**Case ID:** `{md_cell(manifest.get("case_id", "unknown"))}`
-**Run ID:** `{md_cell(manifest.get("run_id", "unknown"))}`
+**Case ID:** `{md_code(manifest.get("case_id", "unknown"))}`
+**Run ID:** `{md_code(manifest.get("run_id", "unknown"))}`
 **Verdict:** **{md_cell(verdict)}**
 
 > These sections are the automated expert-review packet's internal gates. They are
@@ -2266,7 +2327,6 @@ QA / expert-signoff gates for this run are in the companion `REPORT-internal` pa
 {release_gate_section}
 {readiness_section}
 """,
-        encoding="utf-8",
     )
     return md
 
@@ -2408,7 +2468,49 @@ def _emit_attack_flow(case_dir: "Path") -> str:
             sys.path.insert(0, str(attackflow_parent))
         from attackflow import emit as _emit
 
-        return _emit(Path(case_dir)).html_snippet
+        case_dir = Path(case_dir)
+        verdict_snapshot = require_text_regular_file_no_follow(
+            case_dir / "verdict.json", max_bytes=MAX_CASE_ARTIFACT_BYTES
+        )
+        with report_render_workspace(case_dir) as workspace:
+            write_report_text_no_follow(workspace / "verdict.json", verdict_snapshot)
+            for optional_name in ("psscan.json", "pslist.json"):
+                snapshot = read_text_regular_file_no_follow(
+                    case_dir / optional_name, max_bytes=MAX_CASE_ARTIFACT_BYTES
+                )
+                if snapshot is not None:
+                    write_report_text_no_follow(workspace / optional_name, snapshot)
+            emitted = _emit(workspace)
+
+            output_dir = case_dir / "attack-flow"
+            try:
+                output_metadata = output_dir.lstat()
+            except FileNotFoundError:
+                output_dir.mkdir(mode=0o700)
+            else:
+                if not stat.S_ISDIR(output_metadata.st_mode):
+                    raise ValueError("unsafe attack-flow output directory")
+
+            published: list[tuple[Path, str]] = []
+            for source in emitted.paths:
+                if (
+                    source.parent != emitted.out_dir
+                    or source.name != Path(source.name).name
+                ):
+                    raise ValueError("unsafe attack-flow output name")
+                target = output_dir / source.name
+                ensure_safe_report_output(target)
+                published.append(
+                    (
+                        target,
+                        require_text_regular_file_no_follow(
+                            source, max_bytes=MAX_REPORT_HTML_BYTES
+                        ),
+                    )
+                )
+            for target, content in published:
+                write_report_text_no_follow(target, content)
+            return emitted.html_snippet
     except Exception as exc:  # noqa: BLE001 - viz must never break the report
         try:
             print(f"[attack-flow] skipped: {exc}", file=sys.stderr)
@@ -2423,10 +2525,16 @@ def render_html_pdf(
     case_dir = md_path.parent
     html = case_dir / f"{md_path.stem}.html"
     pdf = case_dir / f"{md_path.stem}.pdf"
+    pdf_fallback = pdf.with_suffix(".new.pdf")
+
+    ensure_safe_report_output(html)
+    if CHROME is not None:
+        ensure_safe_report_output(pdf)
+        ensure_safe_report_output(pdf_fallback)
 
     style_path = Path(__file__).resolve().parent / "_report_style.css"
     if not style_path.exists():
-        style_path.write_text(_DEFAULT_CSS, encoding="utf-8")
+        raise FileNotFoundError(f"report stylesheet is missing: {style_path}")
 
     if PANDOC is None:
         print(
@@ -2434,98 +2542,123 @@ def render_html_pdf(
         )
         return html, None
 
-    subprocess.run(
-        [
-            PANDOC,
-            str(md_path),
-            "--from",
-            "markdown-raw_html-raw_tex",
-            "--standalone",
-            "--embed-resources",
-            "--css",
-            str(style_path),
-            "-o",
-            str(html),
-        ],
-        check=True,
-        capture_output=True,
+    markdown_snapshot = require_text_regular_file_no_follow(
+        md_path, max_bytes=MAX_REPORT_MARKDOWN_BYTES
     )
+    with report_render_workspace(case_dir) as workspace:
+        pandoc_input = workspace / "input.md"
+        pandoc_html = workspace / "output.html"
+        write_report_text_no_follow(pandoc_input, markdown_snapshot)
+        subprocess.run(
+            [
+                PANDOC,
+                str(pandoc_input),
+                "--from",
+                "markdown-raw_html-raw_tex",
+                "--to",
+                "html5",
+                "--sandbox",
+                "--standalone",
+                "-o",
+                str(pandoc_html),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=PANDOC_RENDER_TIMEOUT_SECONDS,
+        )
+        text = require_text_regular_file_no_follow(
+            pandoc_html, max_bytes=MAX_REPORT_HTML_BYTES
+        )
 
-    # Inject bespoke figure HTML into the placeholder divs, then color-code the
-    # confidence/verdict keywords (both best-effort, never fatal to the render).
-    try:
-        text = html.read_text(encoding="utf-8")
-        if figures:
-            text = _inject_figures(text, figures)
-        # Embed the hash-chained audit.jsonl (base64) so the report self-verifies
-        # offline; presentation-only, never alters findings/verdict/custody.
-        audit_path = case_dir / "audit.jsonl"
-        if audit_path.exists():
-            text = inject_offline_audit_embed(
-                text, audit_path.read_text(encoding="utf-8")
-            )
-        if extra_html:
-            # Lead with it: insert right after the report title (first </h1>) so the
-            # at-a-glance attack-flow summary opens the report instead of trailing it.
-            # Fall back to just-inside <body>, else prepend. (pandoc runs with
-            # -raw_html, so this must be spliced into the rendered HTML, not the md.)
-            h1 = text.find("</h1>")
-            if h1 != -1:
-                pos = h1 + len("</h1>")
-                text = text[:pos] + "\n" + extra_html + "\n" + text[pos:]
+    # Inject only renderer-authored markup, then apply the final resource/CSP
+    # boundary. The public HTML is published atomically only after sanitization.
+    if figures:
+        text = _inject_figures(text, figures)
+    audit_path = case_dir / "audit.jsonl"
+    audit_bytes = read_regular_file_no_follow(
+        audit_path, max_bytes=MAX_AUDIT_EMBED_BYTES
+    )
+    trusted_audit_sha256: str | None = None
+    if audit_bytes is not None:
+        trusted_audit_sha256 = hashlib.sha256(audit_bytes).hexdigest()
+        text = inject_offline_audit_embed(
+            text, audit_bytes.decode("utf-8", errors="strict")
+        )
+    if extra_html:
+        h1 = text.find("</h1>")
+        if h1 != -1:
+            pos = h1 + len("</h1>")
+            text = text[:pos] + "\n" + extra_html + "\n" + text[pos:]
+        else:
+            body = text.find("<body")
+            if body != -1:
+                bend = text.find(">", body) + 1
+                text = text[:bend] + "\n" + extra_html + "\n" + text[bend:]
             else:
-                body = text.find("<body")
-                if body != -1:
-                    bend = text.find(">", body) + 1
-                    text = text[:bend] + "\n" + extra_html + "\n" + text[bend:]
-                else:
-                    text = extra_html + "\n" + text
-        html.write_text(_colorize_html(text), encoding="utf-8")
-    except Exception:
-        pass
+                text = extra_html + "\n" + text
+    text = _colorize_html(text)
+    text = secure_report_html(
+        text,
+        case_dir=case_dir,
+        css_text=load_self_contained_css(style_path),
+        trusted_audit_sha256=trusted_audit_sha256,
+    )
+    write_report_text_no_follow(html, text)
 
     pdf_out: Path | None = None
     if CHROME is not None:
-        # Chrome can't overwrite a PDF that's open in a viewer (Windows
-        # locks the file). Render to a sibling .new.pdf first; if the
-        # final rename fails, the rendered output still survives and
-        # the user gets a clear message naming both paths.
-        pdf_tmp = pdf.with_suffix(".new.pdf")
-        try:
-            html_url = html.resolve().as_uri()
-            subprocess.run(
-                [
-                    CHROME,
-                    "--headless",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--print-to-pdf=" + str(pdf_tmp),
-                    "--print-to-pdf-no-header",
-                    "--virtual-time-budget=10000",
-                    html_url,
-                ],
-                capture_output=True,
-                timeout=120,
+        if not secure_chromium_available():
+            print(
+                "  WARN: refusing PDF render as root because Chromium's secure "
+                "sandbox is unavailable; HTML remains available"
             )
-            if pdf_tmp.exists() and pdf_tmp.stat().st_size > 1000:
-                try:
-                    pdf_tmp.replace(pdf)
-                    pdf_out = pdf
-                except OSError:
-                    # Target locked (likely open in a viewer). Keep the
-                    # rendered .new.pdf so the operator can see it.
-                    print(
-                        f"  WARN: could not overwrite {pdf} (likely open "
-                        f"in a viewer); rendered output left at {pdf_tmp}"
+            return html, None
+        try:
+            with report_render_workspace(case_dir) as workspace:
+                chrome_html = workspace / "input.html"
+                pdf_tmp = workspace / "output.pdf"
+                write_report_text_no_follow(chrome_html, text)
+                with chromium_profile(workspace) as profile:
+                    completed = subprocess.run(
+                        chromium_pdf_args(
+                            CHROME,
+                            html_path=chrome_html,
+                            pdf_path=pdf_tmp,
+                            user_data_dir=profile,
+                        ),
+                        capture_output=True,
+                        timeout=CHROMIUM_RENDER_TIMEOUT_SECONDS,
                     )
-                    pdf_out = pdf_tmp
-        except Exception:
-            pass
+                pdf_size = regular_file_size_no_follow(
+                    pdf_tmp, min_bytes=1001, max_bytes=MAX_REPORT_PDF_BYTES
+                )
+                if completed.returncode == 0 and pdf_size is not None:
+                    try:
+                        publish_report_output(pdf_tmp, pdf)
+                        pdf_out = pdf
+                    except ValueError:
+                        raise
+                    except OSError:
+                        # Windows viewers can lock the final PDF. Preserve the
+                        # established sibling fallback without ever following it.
+                        publish_report_output(pdf_tmp, pdf_fallback)
+                        print(
+                            f"  WARN: could not overwrite {pdf} (likely open "
+                            f"in a viewer); rendered output left at {pdf_fallback}"
+                        )
+                        pdf_out = pdf_fallback
+                else:
+                    print(
+                        "  WARN: secure Chromium PDF render failed; HTML remains available"
+                    )
+        except ValueError:
+            raise
+        except Exception as exc:
+            print(f"  WARN: secure Chromium PDF render failed: {exc}")
     return html, pdf_out
 
 
 _DEFAULT_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=Archivo+Narrow:wght@600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
 :root { --paper:#f5f1e8; --surface:#fdfcf8; --inset:#ece6da; --ink:#12131a;
   --muted:#6b6459; --faint:#9a9384; --hairline:#d8d2c6; --accent:#4d5dff;
   --accent-light:#4453d6; --alert:#ff6257; --alert-text:#cf3b26; --confirmed:#73d9c2; --confirmed-text:#268a72;
@@ -2599,6 +2732,24 @@ hr { border:none; border-top:1px solid var(--hairline); margin:2.4em 0; }
 # ---------------------------------------------------------------------------
 
 
+def _read_optional_case_json(path: Path) -> Any | None:
+    text = read_text_regular_file_no_follow(path, max_bytes=MAX_CASE_ARTIFACT_BYTES)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _read_required_case_json(path: Path) -> Any:
+    text = require_text_regular_file_no_follow(path, max_bytes=MAX_CASE_ARTIFACT_BYTES)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid required report JSON: {path.name}") from exc
+
+
 def render_report(
     case_dir: Path,
     manifest: dict[str, Any],
@@ -2611,12 +2762,14 @@ def render_report(
 ) -> Path:
     case_dir = Path(case_dir)
     fig_dir = case_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
+    ensure_safe_output_directory(fig_dir)
 
     audit = []
-    audit_path = case_dir / "audit.jsonl"
-    if audit_path.exists():
-        for line in audit_path.read_text().splitlines():
+    audit_text = read_text_regular_file_no_follow(
+        case_dir / "audit.jsonl", max_bytes=MAX_CASE_ARTIFACT_BYTES
+    )
+    if audit_text is not None:
+        for line in audit_text.splitlines():
             line = line.strip()
             if line:
                 try:
@@ -2627,23 +2780,13 @@ def render_report(
     fig_audit_chain(audit, manifest, fig_dir / "chain_of_custody.png")
 
     has_psscan = False
-    psscan_path = case_dir / "psscan.json"
-    if psscan_path.exists():
-        try:
-            psscan = json.loads(psscan_path.read_text())
-            if isinstance(psscan, list) and psscan:
-                fig_psscan_timeline(psscan, fig_dir / "psscan_timeline.png")
-                has_psscan = True
-        except json.JSONDecodeError:
-            pass
+    psscan = _read_optional_case_json(case_dir / "psscan.json")
+    if isinstance(psscan, list) and psscan:
+        fig_psscan_timeline(psscan, fig_dir / "psscan_timeline.png")
+        has_psscan = True
 
-    verdict_obj = {}
-    verdict_path = case_dir / "verdict.json"
-    if verdict_path.exists():
-        try:
-            verdict_obj = json.loads(verdict_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            verdict_obj = {}
+    loaded_verdict = _read_optional_case_json(case_dir / "verdict.json")
+    verdict_obj = loaded_verdict if isinstance(loaded_verdict, dict) else {}
 
     attack_flow_html = _emit_attack_flow(case_dir)
 
@@ -2657,24 +2800,18 @@ def render_report(
             verdict_obj.get("verdict_revisions") or []
         ) or verdict_revisions_from_audit(audit)
 
-    final_release_gate = {}
-    final_gate_path = case_dir / "customer_release_gate.final.json"
-    if final_gate_path.exists():
-        try:
-            final_release_gate = json.loads(final_gate_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            final_release_gate = {}
+    loaded_final_gate = _read_optional_case_json(
+        case_dir / "customer_release_gate.final.json"
+    )
+    final_release_gate = (
+        loaded_final_gate if isinstance(loaded_final_gate, dict) else {}
+    )
 
     coverage_manifest = verdict_obj.get("coverage_manifest", {})
     if not coverage_manifest:
-        coverage_manifest_path = case_dir / "coverage_manifest.json"
-        if coverage_manifest_path.exists():
-            try:
-                loaded = json.loads(coverage_manifest_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    coverage_manifest = loaded
-            except json.JSONDecodeError:
-                coverage_manifest = {}
+        loaded = _read_optional_case_json(case_dir / "coverage_manifest.json")
+        if isinstance(loaded, dict):
+            coverage_manifest = loaded
 
     practitioner_coverage = verdict_obj.get("attck_practitioner_coverage", {})
     has_process_view_fig = fig_process_view_comparison(
@@ -2708,19 +2845,19 @@ def render_report(
     ):
         timeline = normalized_timeline["events"]
     else:
-        timeline_path = case_dir / "timeline.json"
-        if timeline_path.exists():
-            try:
-                loaded_timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_timeline, list):
-                    timeline = loaded_timeline
-                elif isinstance(loaded_timeline, dict) and isinstance(
-                    loaded_timeline.get("events"), list
-                ):
-                    timeline = loaded_timeline["events"]
-            except json.JSONDecodeError:
-                timeline = []
-    timeline_csv_exists = (case_dir / "timeline.csv").exists()
+        loaded_timeline = _read_optional_case_json(case_dir / "timeline.json")
+        if isinstance(loaded_timeline, list):
+            timeline = loaded_timeline
+        elif isinstance(loaded_timeline, dict) and isinstance(
+            loaded_timeline.get("events"), list
+        ):
+            timeline = loaded_timeline["events"]
+    timeline_csv_exists = (
+        regular_file_size_no_follow(
+            case_dir / "timeline.csv", max_bytes=MAX_CASE_ARTIFACT_BYTES
+        )
+        is not None
+    )
     # The time-scatter figures are replaced by native HTML/CSS figures (built
     # below and injected into REPORT.html); no longer generated.
     has_timeline_fig = False
@@ -2790,8 +2927,10 @@ def main() -> int:
     )
     args = p.parse_args()
     case_dir = Path(args.case_dir)
-    manifest = json.loads((case_dir / "run.manifest.json").read_text())
-    verdict_obj = json.loads((case_dir / "verdict.json").read_text())
+    manifest = _read_required_case_json(case_dir / "run.manifest.json")
+    verdict_obj = _read_required_case_json(case_dir / "verdict.json")
+    if not isinstance(manifest, dict) or not isinstance(verdict_obj, dict):
+        raise ValueError("required report artifacts must contain JSON objects")
     merged = verdict_obj.get("findings", [])
     summary = verdict_obj.get("findings_summary", {})
     out = render_report(

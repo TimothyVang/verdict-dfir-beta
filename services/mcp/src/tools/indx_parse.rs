@@ -32,12 +32,18 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+const HARD_TIMEOUT: Duration = Duration::from_secs(3_600);
+const TIMEOUT_ENV: &str = "FINDEVIL_INDX_TIMEOUT_SECS";
 
 /// The literal field delimiter `INDXParse.py` writes between columns
 /// in both its header line and its data rows (`entry_dir_csv`):
@@ -124,13 +130,20 @@ pub fn indx_parse(input: &IndxParseInput) -> Result<IndxParseOutput, IndxError> 
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
 
     let args = build_indx_args(&input.indx_path);
-    let proc = Command::new(&binary).args(&args).output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
+    let mut cmd = Command::new(&binary);
+    cmd.args(&args);
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|err| {
+        if matches!(&err, RunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound)
+        {
             IndxError::BinaryNotFound
         } else {
             IndxError::SubprocessFailed {
                 exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
+                stderr: err.to_string(),
             }
         }
     })?;

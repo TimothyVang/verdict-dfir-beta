@@ -4,12 +4,22 @@
 
 The dashboard is an operator aid only. It tails local case output and never creates Findings or evidence.
 
+The supported `dev` and `start` scripts bind to `127.0.0.1` only. The operator
+launchers also generate a private per-server capability and exchange it once,
+through an owner-only local HTML form, for an HttpOnly API session on a random
+`*.localhost` host. APIs fail closed when the capability is absent. Use
+`scripts/verdict` or `scripts/codex-dashboard.sh` rather than opening a bare dev
+URL. Do not bind the app to `0.0.0.0` or publish it through a proxy; any
+intentional remote deployment requires a separate authenticated access-control
+and TLS design.
+
 ## Run locally
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm --filter @findevil/web dev
-# open http://localhost:3000
+# the launcher opens a private random-host session in the browser
+scripts/codex-dashboard.sh
 ```
 
 The Codex operator wrapper lives at:

@@ -15,17 +15,23 @@
 //! finding** — see `docs/false-positives.md`. A pslist=0 + psscan>0
 //! result is the textbook MITRE ATT&CK T1014 (Rootkit) signature.
 //!
-//! Volatility invocation: `<vol> -f <memory> -r json -q windows.psscan`.
+//! Volatility invocation: `<vol> --offline -f <memory> -r json -q windows.psscan`.
 //! Output schema is identical to pslist for shared fields.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
+
 const DEFAULT_LIMIT: usize = 10_000;
+const TIMEOUT_ENV: &str = "FINDEVIL_VOL_TIMEOUT_SECS";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +110,12 @@ pub enum VolPsscanError {
     #[error("volatility exited {exit_code}: {stderr}")]
     SubprocessFailed { exit_code: i32, stderr: String },
 
+    #[error("volatility exceeded its {seconds} s time budget and was killed")]
+    Timeout { seconds: u64 },
+
+    #[error("volatility {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit { stream: String, limit: usize },
+
     #[error("could not parse volatility JSON output: {0}")]
     OutputParse(String),
 }
@@ -129,23 +141,17 @@ pub fn vol_psscan(input: &VolPsscanInput) -> Result<VolPsscanOutput, VolPsscanEr
     let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
 
     let mut cmd = Command::new(&binary);
-    cmd.arg("-f")
-        .arg(&input.memory_path)
-        .arg("-r")
-        .arg("json")
-        .arg("-q")
-        .arg("windows.psscan");
+    cmd.args(crate::tools::vol_run::build_vol_args(
+        &input.memory_path,
+        "windows.psscan",
+        None,
+    ));
 
-    let proc = cmd.output().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            VolPsscanError::BinaryNotFound
-        } else {
-            VolPsscanError::SubprocessFailed {
-                exit_code: -1,
-                stderr: format!("spawn failed: {err}"),
-            }
-        }
-    })?;
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(map_run_error)?;
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -163,6 +169,45 @@ pub fn vol_psscan(input: &VolPsscanInput) -> Result<VolPsscanOutput, VolPsscanEr
         limit,
         stderr_tail,
     )
+}
+
+fn map_run_error(error: RunError) -> VolPsscanError {
+    match error {
+        RunError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            VolPsscanError::BinaryNotFound
+        }
+        RunError::Timeout(duration) => VolPsscanError::Timeout {
+            seconds: duration.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => VolPsscanError::OutputLimit {
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::Spawn(error) => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("spawn failed: {error}"),
+        },
+        RunError::Io(error) => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("io error: {error}"),
+        },
+        RunError::PipeStillOpen { streams } => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => VolPsscanError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "volatility output reader thread panicked".to_string(),
+        },
+    }
 }
 
 fn resolve_binary() -> Result<PathBuf, VolPsscanError> {

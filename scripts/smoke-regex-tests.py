@@ -105,9 +105,15 @@ DIVERGENCE_CASES = [
         1,
     ),
     (
-        "31 typed Rust is correct",
+        "44 typed Rust active drift",
         2,
-        "wraps 31 typed Rust MCP tools",
+        "wraps 44 typed Rust MCP tools",
+        1,
+    ),
+    (
+        "43 typed Rust is current",
+        2,
+        "wraps 43 typed Rust MCP tools",
         0,
     ),
     (
@@ -841,6 +847,7 @@ def _run_tool_count_guard_cases(tool_count_guard) -> list[tuple[str, str]]:
         root = Path(tmp_dir)
         (root / "services/mcp/src").mkdir(parents=True)
         (root / "services/agent_mcp/findevil_agent_mcp/tools").mkdir(parents=True)
+        (root / "agent-config").mkdir()
         (root / "docs").mkdir()
         (root / "scripts/make-demo-video/src/components").mkdir(parents=True)
 
@@ -867,14 +874,44 @@ def _run_tool_count_guard_cases(tool_count_guard) -> list[tuple[str, str]]:
             ),
             encoding="utf-8",
         )
+        python_spec = (
+            root / "services/agent_mcp/findevil_agent_mcp/tools/audit_append.py"
+        )
+        good_python_spec = 'SPEC = ToolSpec(name="audit_append")\n'
+        python_spec.write_text(good_python_spec, encoding="utf-8")
         good_docs = {
             "CLAUDE.md": "3 product tools: 2 Rust tools + 1 Python tool.\n",
             "README.md": "3 product tools: 2 Rust DFIR + 1 Python.\n",
             "INSTALL.md": "3 product tools: findevil-mcp has 2 DFIR tools; findevil-agent-mcp has 1 Python tool.\n",
             "docs/architecture.md": "Tool count: 3 (2 Rust DFIR + 1 Python).\n",
             "docs/reference/mcp-and-tools.md": "3 product tools: 2 Rust tools + 1 Python tool.\n",
+            "agent-config/PLAYBOOK.md": textwrap.dedent(
+                """
+                ## Tool inventory (3 product tools)
+                ### Rust `findevil-mcp` (2 Rust tools)
+                | Tool | What | Runs for |
+                |---|---|---|
+                | `case_open` | Open case | every run |
+                | `evtx_query` | Parse EVTX | evtx |
+                ### Python `findevil-agent-mcp` (1 Python tool)
+                | Tool | What | When |
+                |---|---|---|
+                | `audit_append` | Append audit | every call |
+                ---
+                """
+            ),
             "scripts/make-demo-video/src/components/ArchPoster.tsx": "const total = 3; const rust = 2; const python = 1;\n",
         }
+        # Keep this synthetic repository aligned with every required guard
+        # surface. New monitored docs should exercise the happy path here
+        # automatically instead of turning the regex smoke into a stale list of
+        # filenames; inventory-bearing docs still use their explicit fixture.
+        for rule in tool_count_guard.DOC_RULES:
+            if not rule.optional:
+                good_docs.setdefault(
+                    rule.path,
+                    "3 product tools: 2 Rust tools + 1 Python tool.\n",
+                )
         for rel, text in good_docs.items():
             path = root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -892,6 +929,153 @@ def _run_tool_count_guard_cases(tool_count_guard) -> list[tuple[str, str]]:
                     "; ".join(errors),
                 )
             )
+
+        python_spec.write_text(
+            'SPEC = ToolSpec(name="renamed_audit_append")\n', encoding="utf-8"
+        )
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any(
+            "Python inventory missing registered tools: renamed_audit_append" in error
+            for error in errors
+        ):
+            failures.append(
+                (
+                    "tool-count guard reads Python SPEC.name instead of module filename",
+                    f"expected mismatched SPEC.name failure, got {errors!r}",
+                )
+            )
+        python_spec.write_text(good_python_spec, encoding="utf-8")
+
+        playbook = root / "agent-config/PLAYBOOK.md"
+        good_playbook = playbook.read_text(encoding="utf-8")
+
+        swapped_playbook = (
+            good_playbook.replace(
+                "| `case_open` | Open case | every run |",
+                "| `__swap_placeholder` | Open case | every run |",
+            )
+            .replace(
+                "| `audit_append` | Append audit | every call |",
+                "| `case_open` | Append audit | every call |",
+            )
+            .replace(
+                "| `__swap_placeholder` | Open case | every run |",
+                "| `audit_append` | Open case | every run |",
+            )
+        )
+        playbook.write_text(swapped_playbook, encoding="utf-8")
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any(
+            "Rust inventory missing registered tools: case_open" in error
+            for error in errors
+        ) or not any(
+            "Python inventory missing registered tools: audit_append" in error
+            for error in errors
+        ):
+            failures.append(
+                (
+                    "tool-count guard rejects tools swapped between server inventories",
+                    f"expected server ownership mismatch, got {errors!r}",
+                )
+            )
+
+        playbook.write_text(
+            good_playbook.replace("3 product tools", "4 product tools"),
+            encoding="utf-8",
+        )
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any("agent-config/PLAYBOOK.md" in error for error in errors):
+            failures.append(
+                (
+                    "tool-count guard rejects stale PLAYBOOK count",
+                    f"expected PLAYBOOK.md mismatch, got {errors!r}",
+                )
+            )
+        playbook.write_text(
+            good_playbook.replace("| `evtx_query` | Parse EVTX | evtx |\n", ""),
+            encoding="utf-8",
+        )
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any(
+            "inventory missing registered tools: evtx_query" in error
+            for error in errors
+        ):
+            failures.append(
+                (
+                    "tool-count guard rejects incomplete PLAYBOOK inventory",
+                    f"expected missing PLAYBOOK tool, got {errors!r}",
+                )
+            )
+        playbook.write_text(good_playbook, encoding="utf-8")
+
+        playbook.write_text(
+            good_playbook.replace(
+                "| `evtx_query` | Parse EVTX | evtx |",
+                "| `evtx_query` | Parse EVTX | evtx |\n"
+                "| `ghost_tool` | Not registered | never |",
+            ),
+            encoding="utf-8",
+        )
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any(
+            "inventory lists unregistered tools: ghost_tool" in error
+            for error in errors
+        ):
+            failures.append(
+                (
+                    "tool-count guard rejects unexpected PLAYBOOK inventory rows",
+                    f"expected unregistered PLAYBOOK tool, got {errors!r}",
+                )
+            )
+        playbook.write_text(good_playbook, encoding="utf-8")
+
+        python_registry = (
+            root / "services/agent_mcp/findevil_agent_mcp/tools/__init__.py"
+        )
+        good_python_registry = python_registry.read_text(encoding="utf-8")
+        python_registry.write_text(
+            good_python_registry.replace(
+                '    "audit_append",',
+                '    "audit_append",\n    "audit_append",',
+            ),
+            encoding="utf-8",
+        )
+        errors = tool_count_guard.validate_counts(
+            root,
+            expected_rust=2,
+            expected_python=1,
+        )
+        if not any(
+            "Python registry duplicates tool names: audit_append" in error
+            for error in errors
+        ):
+            failures.append(
+                (
+                    "tool-count guard rejects duplicate registry names",
+                    f"expected duplicate Python tool failure, got {errors!r}",
+                )
+            )
+        python_registry.write_text(good_python_registry, encoding="utf-8")
 
         (root / "README.md").write_text(
             "4 product tools: 2 Rust DFIR + 2 Python.\n",
@@ -1037,7 +1221,7 @@ def main() -> int:
         all_failures.append(("sample-run doc policies", label, err))
 
     tool_count_failures = _run_tool_count_guard_cases(tool_count_guard)
-    tool_count_total = 3
+    tool_count_total = 5
     print(
         f"tool-count guard policies:   "
         f"{tool_count_total - len(tool_count_failures)} / {tool_count_total} passed"

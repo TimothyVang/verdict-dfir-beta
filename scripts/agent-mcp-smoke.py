@@ -36,8 +36,11 @@ Exit code: 0 on full success, 1 on the first assertion failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -49,6 +52,16 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 AGENT_MCP_DIR = REPO / "services" / "agent_mcp"
+CONTROLLER_ONLY_TOOLS = frozenset(
+    {
+        "audit_append",
+        "expert_miss_capture",
+        "manifest_finalize",
+        "manifest_verify",
+        "memory_remember",
+        "pool_handoff",
+    }
+)
 
 # The fact-fidelity gate is production-default-ON (Stage A). This smoke exercises
 # the audit/crypto chain over hand-crafted synthetic Findings, not the gate, so
@@ -71,10 +84,18 @@ def log(msg: str) -> None:
 
 
 class StdioClient:
-    def __init__(self, cmd: list[str]) -> None:
+    def __init__(
+        self,
+        cmd: list[str],
+        *,
+        env_overrides: dict[str, str],
+        controller_capability: str,
+    ) -> None:
         env = os.environ.copy()
+        env.update(env_overrides)
         env["PYTHONUNBUFFERED"] = "1"
         env["FINDEVIL_LOG_LEVEL"] = "WARNING"
+        self._controller_capability = controller_capability
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -144,11 +165,20 @@ class StdioClient:
         return resp["result"]
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        result = self.call("tools/call", {"name": name, "arguments": arguments})
+        authorized_arguments = dict(arguments)
+        if name in CONTROLLER_ONLY_TOOLS:
+            authorized_arguments["_controller_capability"] = self._controller_capability
+        result = self.call(
+            "tools/call", {"name": name, "arguments": authorized_arguments}
+        )
         content = result.get("content") or []
         if not content:
             fatal(f"empty content from {name}")
-        body = json.loads(content[0]["text"])
+        raw_text = content[0].get("text")
+        try:
+            body = json.loads(raw_text)
+        except (TypeError, json.JSONDecodeError) as exc:
+            fatal(f"{name} returned non-JSON content {raw_text!r}: {exc}")
         if (
             isinstance(body, dict)
             and "error" in body
@@ -178,6 +208,36 @@ def _now_iso() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _prepare_reservation(
+    case_dir: Path,
+    *,
+    case_id: str,
+    run_id: str,
+    started_at: str,
+    signer: str,
+    controller_capability: str,
+) -> dict[str, str]:
+    """Create a private smoke Case and its launcher-owned custody contract."""
+    case_dir.mkdir(parents=True, exist_ok=True)
+    case_dir.chmod(0o700)
+    marker = case_dir / ".verdict-case-marker"
+    marker.write_text(case_id + "\n", encoding="utf-8")
+    marker.chmod(0o600)
+    return {
+        "FINDEVIL_CUSTODY_BOUNDARY": "reserved_case",
+        "FINDEVIL_ACTIVE_CASE_DIR": str(case_dir),
+        "FINDEVIL_ACTIVE_CASE_ID": case_id,
+        "FINDEVIL_ACTIVE_RUN_ID": run_id,
+        "FINDEVIL_ACTIVE_STARTED_AT": started_at,
+        "FINDEVIL_ACTIVE_SIGNER": signer,
+        "FINDEVIL_CONTROLLER_CAPABILITY": controller_capability,
+        "FINDEVIL_MEMORY_STORE": str(case_dir / "memory.sqlite"),
+        "FINDEVIL_EXPERT_MISS_LEDGER": str(case_dir / "expert_misses.jsonl"),
+        "FINDEVIL_ALLOW_STUB_SIGNER": "1",
+        "FINDEVIL_OUTPUT_ROUTE": "local_controller",
+    }
 
 
 def _finding(
@@ -230,6 +290,44 @@ def latest_auto_run() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _resolve_real_case_dir(requested: str) -> Path:
+    if requested == "<latest>":
+        latest = latest_auto_run()
+        if latest is None:
+            fatal(
+                "no auto-run dir found under tmp/auto-runs/ — "
+                "run scripts/find-evil-auto first"
+            )
+        return latest
+    raw = Path(requested)
+    candidates = (raw,) if raw.is_absolute() else (REPO / raw, raw)
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.resolve()
+    fatal(
+        f"--real-evidence path is not a directory: {requested} "
+        f"(also tried {REPO / raw})"
+    )
+    raise AssertionError("fatal() does not return")
+
+
+def _copy_real_case_for_replay(source: Path, destination: Path) -> str:
+    """Copy only signed replay inputs so the source Case stays untouched."""
+    required_names = ("audit.jsonl", "run.manifest.json", "verdict.json")
+    for name in required_names:
+        source_file = source / name
+        if not source_file.is_file():
+            fatal(f"missing required file in case_dir: {source_file}")
+    verdict = json.loads((source / "verdict.json").read_text(encoding="utf-8"))
+    case_id = str(verdict.get("case_id") or f"real-replay-{uuid.uuid4()}")
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in required_names:
+        target = destination / name
+        shutil.copyfile(source / name, target)
+        target.chmod(0o600)
+    return case_id
+
+
 def real_evidence_flow(client: StdioClient, case_dir: Path) -> int:
     """Drive the agent_mcp surface against a real find-evil-auto case dir.
 
@@ -259,31 +357,25 @@ def real_evidence_flow(client: StdioClient, case_dir: Path) -> int:
     log(f"  -> chain verifies, {av['record_count']} records")
 
     # ---- 2. manifest_verify on the recorded manifest ------------------
-    # The manifest's `audit_log_path` is the path AS SEEN by the agent
-    # at investigation time. find-evil-auto runs the agent inside the
-    # SIFT VM; the path is /home/sansforensics/.../audit.jsonl over
-    # there. Locally the same audit.jsonl is mirrored at <case_dir>/
-    # audit.jsonl. Rewrite the manifest in-place to the local path,
-    # verify, then restore — surgical, doesn't mutate the on-disk
-    # cryptographic record long-term.
+    # The manifest's signed `audit_log_path` can name the path as seen by the
+    # original transport. Verify the copied chain through the explicit replay
+    # override; never rewrite the signed manifest body.
     log("manifest_verify: replay the recorded manifest...")
-    original = manifest_path.read_text(encoding="utf-8")
-    loaded = json.loads(original)
+    loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
     saved_audit_log_path = loaded.get("audit_log_path")
-    loaded["audit_log_path"] = str(audit_path)
-    manifest_path.write_text(
-        json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    mv = client.call_tool(
+        "manifest_verify",
+        {
+            "manifest_path": str(manifest_path),
+            "audit_log_path": str(audit_path),
+        },
     )
-    try:
-        mv = client.call_tool("manifest_verify", {"manifest_path": str(manifest_path)})
-    finally:
-        manifest_path.write_text(original, encoding="utf-8")
 
     if not mv["overall"]:
-        fatal(f"recorded manifest did NOT verify (after path rewrite): {mv}")
+        fatal(f"recorded manifest did NOT verify against the replay copy: {mv}")
     log(
         "  -> overall=True  audit_chain={a}  merkle={m}  sig_present={s} "
-        "(audit_log_path rewritten {orig!r} -> local copy)".format(
+        "(signed audit_log_path={orig!r}; verified through replay override)".format(
             a=mv["audit_chain_ok"],
             m=mv["merkle_root_ok"],
             s=mv["signature_present"],
@@ -360,19 +452,21 @@ def real_evidence_flow(client: StdioClient, case_dir: Path) -> int:
     return 0
 
 
-def synthetic_flow(client: StdioClient) -> int:
-    case_id = f"smoke-{uuid.uuid4()}"
-    run_id = f"run-{int(time.time())}"
-    workdir = REPO / "tmp" / "smoke" / case_id
-    workdir.mkdir(parents=True, exist_ok=True)
+def synthetic_flow(
+    client: StdioClient,
+    *,
+    case_id: str,
+    run_id: str,
+    workdir: Path,
+    started_at: str,
+) -> int:
     audit_path = workdir / "audit.jsonl"
     manifest_path = workdir / "run.manifest.json"
-    started_at = _now_iso()
 
     try:
         # ---- 1. audit_append a representative tool-call sequence -------
         # (initialize + tools/list happened in main() before dispatch.)
-        log("audit_append: chaining 12 records...")
+        log("audit_append: chaining representative parser records...")
         records = [
             (
                 "agent_message",
@@ -389,23 +483,6 @@ def synthetic_flow(client: StdioClient) -> int:
             ("tool_call_output", {"tool_call_id": "tc-3", "output_hash": "c" * 64}),
             ("tool_call_start", {"tool_call_id": "tc-4", "tool": "mft_timeline"}),
             ("tool_call_output", {"tool_call_id": "tc-4", "output_hash": "d" * 64}),
-            (
-                "finding_approved",
-                {
-                    "finding_id": "f-A-1",
-                    "tool_call_id": "tc-2",
-                    "confidence": "CONFIRMED",
-                },
-            ),
-            (
-                "finding_approved",
-                {
-                    "finding_id": "f-B-1",
-                    "tool_call_id": "tc-3",
-                    "confidence": "INFERRED",
-                },
-            ),
-            ("agent_message", {"role": "judge", "content": "merge complete"}),
         ]
         for kind, payload in records:
             client.call_tool(
@@ -420,29 +497,62 @@ def synthetic_flow(client: StdioClient) -> int:
             fatal(f"audit chain replay failed: {v}")
         log(f"  -> chain verifies, {v['record_count']} records")
 
-        # ---- 4a. pool_handoff: verifier -> judge (IBM-ACP, A3 §2.3) ---
-        # Writes a kind="acp_handoff" line into the same chain. Proves
-        # the new envelope shape lands without breaking audit_verify.
-        log("pool_handoff: verifier -> judge structured handoff (A3 §2.3)...")
-        ph = client.call_tool(
-            "pool_handoff",
-            {
-                "audit_path": str(audit_path),
-                "from_role": "verifier",
-                "to_role": "judge",
-                "payload": {
-                    "finding_id": "f-A-1",
-                    "action": "approved",
-                    "replay_record_sha256": "a" * 64,
+        # ---- 4a. verifier replay + pool handoff (IBM-ACP, A3 §2.3) ----
+        # Exercise the same controller-authenticated prerequisites that the
+        # production manifest workflow requires for every approved Finding.
+        log("verifier replay + handoff: authenticate both Findings...")
+        for finding_id, replay_sha in (("f-A-1", "a" * 64), ("f-B-1", "b" * 64)):
+            client.call_tool(
+                "audit_append",
+                {
+                    "path": str(audit_path),
+                    "kind": "verifier_action",
+                    "payload": {
+                        "finding_id": finding_id,
+                        "action": "approved",
+                        "replay_matched": True,
+                        "replay_artifact": {"entailment": {"passed": True}},
+                    },
                 },
-            },
-        )
-        if ph["acp_version"] != "1.0" or ph["from_role"] != "verifier":
-            fatal(f"pool_handoff returned unexpected envelope: {ph}")
-        log(
-            f"  -> acp v{ph['acp_version']} from={ph['from_role']} to={ph['to_role']} "
-            f"corr={ph['correlation_id'][:8]}..."
-        )
+            )
+            ph = client.call_tool(
+                "pool_handoff",
+                {
+                    "audit_path": str(audit_path),
+                    "from_role": "verifier",
+                    "to_role": "judge",
+                    "correlation_id": finding_id,
+                    "payload": {
+                        "finding_id": finding_id,
+                        "action": "approved",
+                        "replay_record_sha256": replay_sha,
+                    },
+                },
+            )
+            if (
+                ph["acp_version"] != "1.0"
+                or ph["from_role"] != "verifier"
+                or ph["correlation_id"] != finding_id
+            ):
+                fatal(f"pool_handoff returned unexpected envelope: {ph}")
+
+        for finding_id, tool_call_id, confidence in (
+            ("f-A-1", "tc-2", "CONFIRMED"),
+            ("f-B-1", "tc-3", "INFERRED"),
+        ):
+            client.call_tool(
+                "audit_append",
+                {
+                    "path": str(audit_path),
+                    "kind": "finding_approved",
+                    "payload": {
+                        "finding_id": finding_id,
+                        "tool_call_id": tool_call_id,
+                        "confidence": confidence,
+                    },
+                },
+            )
+        log("  -> 2 verifier actions, 2 handoffs, 2 approved Findings")
 
         # ---- 4b. audit_verify (post-handoff): chain still verifies ---
         # Proves kind="acp_handoff" doesn't break the prev_hash chain.
@@ -450,9 +560,10 @@ def synthetic_flow(client: StdioClient) -> int:
             "audit_verify (post-handoff): chain still verifies with acp_handoff line..."
         )
         v_post = client.call_tool("audit_verify", {"path": str(audit_path)})
-        if not (v_post["ok"] and v_post["record_count"] == len(records) + 1):
+        expected_post_records = len(records) + 6
+        if not (v_post["ok"] and v_post["record_count"] == expected_post_records):
             fatal(f"audit chain replay failed after acp_handoff: {v_post}")
-        log(f"  -> chain verifies, {v_post['record_count']} records (+1 acp_handoff)")
+        log(f"  -> chain verifies, {v_post['record_count']} records")
 
         # ---- 4c. memory_recall (cold): empty store returns no hits ---
         # Demonstrates the cold-start case Pool A/B sees on the first
@@ -478,6 +589,8 @@ def synthetic_flow(client: StdioClient) -> int:
                 "key": "evil.example.com",
                 "value": "evil.example.com C2 from Pool B exfil finding",
                 "sha256": "sha256:" + "f" * 64,
+                "case_path": str(workdir),
+                "audit_log_path": str(audit_path),
             },
         )
         if mr["case_id"] != case_id or mr["kind"] != "ioc":
@@ -539,9 +652,21 @@ def synthetic_flow(client: StdioClient) -> int:
         )
         if miss["seq"] != 0 or not miss["line_hash"] or miss["github_issue_url"]:
             fatal(f"expert_miss_capture returned unexpected payload: {miss}")
-        miss_verify = client.call_tool("audit_verify", {"path": str(miss_ledger)})
-        if not (miss_verify["ok"] and miss_verify["record_count"] == 1):
-            fatal(f"expert miss ledger failed audit_verify: {miss_verify}")
+        miss_lines = [
+            line
+            for line in miss_ledger.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        persisted_hash = (
+            hashlib.sha256(miss_lines[0].encode("utf-8")).hexdigest()
+            if len(miss_lines) == 1
+            else None
+        )
+        if persisted_hash != miss["line_hash"]:
+            fatal(
+                "expert miss ledger did not persist the returned hash: "
+                f"expected={miss['line_hash']!r}, actual={persisted_hash!r}"
+            )
         log(f"  -> ledger verifies, line_hash={miss['line_hash'][:12]}...")
 
         # ---- 5. detect_contradictions ----------------------------------
@@ -620,6 +745,25 @@ def synthetic_flow(client: StdioClient) -> int:
         downgraded = sum(1 for o in c["outcomes"] if o["action"] == "downgraded")
         log(f"  -> {kept} kept, {downgraded} downgraded by SOUL.md rules")
 
+        # ---- 7a. report QA gate ----------------------------------------
+        report_qa = {"status": "PASS", "checks": []}
+        report_qa_sha256 = hashlib.sha256(
+            json.dumps(report_qa, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        client.call_tool(
+            "audit_append",
+            {
+                "path": str(audit_path),
+                "kind": "report_qa",
+                "payload": {
+                    "status": "PASS",
+                    "report_qa": report_qa,
+                    "report_qa_sha256": report_qa_sha256,
+                },
+            },
+        )
+        log("report_qa: audited PASS document and digest")
+
         # ---- 8. manifest_finalize --------------------------------------
         log("manifest_finalize: build + sign run.manifest.json...")
         mf = client.call_tool(
@@ -654,7 +798,13 @@ def synthetic_flow(client: StdioClient) -> int:
 
         # ---- 9. manifest_verify (offline) ------------------------------
         log("manifest_verify: offline replay...")
-        mv = client.call_tool("manifest_verify", {"manifest_path": str(manifest_path)})
+        mv = client.call_tool(
+            "manifest_verify",
+            {
+                "manifest_path": str(manifest_path),
+                "audit_log_path": str(audit_path),
+            },
+        )
         if not mv["overall"]:
             fatal(f"manifest verification failed: {mv}")
         # No anchor present -> transparency_ok is vacuously True and never gates.
@@ -677,7 +827,13 @@ def synthetic_flow(client: StdioClient) -> int:
         manifest_path.write_text(
             json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        mv2 = client.call_tool("manifest_verify", {"manifest_path": str(manifest_path)})
+        mv2 = client.call_tool(
+            "manifest_verify",
+            {
+                "manifest_path": str(manifest_path),
+                "audit_log_path": str(audit_path),
+            },
+        )
         if mv2["overall"]:
             fatal("tampered manifest must NOT verify, but it did")
         log(f"  -> tampered manifest correctly rejected: {mv2['merkle_root_detail']!r}")
@@ -688,8 +844,8 @@ def synthetic_flow(client: StdioClient) -> int:
         print(f"  case_id        : {case_id}")
         print(f"  run_id         : {run_id}")
         print(
-            f"  audit log      : {audit_path} ({v_post['record_count']} records, "
-            f"includes 1 acp_handoff)"
+            f"  audit log      : {audit_path} ({mf['audit_log_record_count']} records, "
+            f"includes 2 verifier handoffs)"
         )
         print(f"  memory store   : {memory_path} (1 ioc seeded)")
         print(f"  manifest       : {manifest_path}")
@@ -734,8 +890,33 @@ def main() -> int:
         "-m",
         "findevil_agent_mcp.server",
     ]
+    controller_capability = secrets.token_hex(32)
+    started_at = _now_iso()
+    if args.real_evidence is not None:
+        source_case_dir = _resolve_real_case_dir(args.real_evidence)
+        case_dir = REPO / "tmp" / "smoke" / f"real-replay-{uuid.uuid4()}"
+        case_id = _copy_real_case_for_replay(source_case_dir, case_dir)
+        run_id = f"replay-{uuid.uuid4()}"
+        signer = "ed25519"
+    else:
+        case_id = f"smoke-{uuid.uuid4()}"
+        run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        case_dir = REPO / "tmp" / "smoke" / case_id
+        signer = "stub"
+    env_overrides = _prepare_reservation(
+        case_dir,
+        case_id=case_id,
+        run_id=run_id,
+        started_at=started_at,
+        signer=signer,
+        controller_capability=controller_capability,
+    )
     log(f"spawning: {' '.join(cmd)}")
-    client = StdioClient(cmd)
+    client = StdioClient(
+        cmd,
+        env_overrides=env_overrides,
+        controller_capability=controller_capability,
+    )
     try:
         log("initialize handshake...")
         init = client.call(
@@ -779,33 +960,14 @@ def main() -> int:
         log(f"  -> {len(names)} tools registered")
 
         if args.real_evidence is not None:
-            if args.real_evidence == "<latest>":
-                case_dir = latest_auto_run()
-                if case_dir is None:
-                    fatal(
-                        "no auto-run dir found under tmp/auto-runs/ — "
-                        "run scripts/find-evil-auto first"
-                    )
-            else:
-                # `uv run --directory services/agent_mcp` runs the
-                # interpreter with cwd=services/agent_mcp, so a path
-                # like `tmp/auto-runs/auto-<uuid>` is relative to the
-                # repo root the user typed it from, not to the new cwd.
-                # Resolve relative paths against REPO before falling
-                # back to as-given (lets users still pass absolute
-                # paths or paths relative to any cwd that contains the
-                # target).
-                raw = Path(args.real_evidence)
-                case_dir = raw if raw.is_absolute() and raw.is_dir() else (REPO / raw)
-                if not case_dir.is_dir():
-                    case_dir = raw
-                if not case_dir.is_dir():
-                    fatal(
-                        f"--real-evidence path is not a directory: "
-                        f"{args.real_evidence} (also tried {REPO / raw})"
-                    )
             return real_evidence_flow(client, case_dir)
-        return synthetic_flow(client)
+        return synthetic_flow(
+            client,
+            case_id=case_id,
+            run_id=run_id,
+            workdir=case_dir,
+            started_at=started_at,
+        )
     finally:
         client.close()
 

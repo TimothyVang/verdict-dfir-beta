@@ -21,7 +21,10 @@ interface CoverageManifest {
 }
 
 export interface VerdictPayload {
+  case_id?: string;
+  run_id?: string;
   verdict?: string;
+  normalized_timeline?: unknown;
   coverage_manifest?: CoverageManifest;
   rejected_finding_leads?: unknown[];
   analysis_limitations?: unknown[];

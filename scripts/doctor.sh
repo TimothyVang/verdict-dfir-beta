@@ -232,20 +232,20 @@ fi
 GROUP="MCP servers"
 [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}MCP servers${c_off} ${c_dim}(auto-spawned by Claude Code from .mcp.json)${c_off}"; }
 
-# findevil-mcp — Rust, 32 typed DFIR tools. Needs the release binary
+# findevil-mcp — Rust, 43 typed DFIR tools. Needs the release binary
 # (scripts/run-mcp-rust.sh falls back to a slow `cargo run` without it).
 if [ -x "target/release/findevil-mcp" ] || [ -x "target/release/findevil-mcp.exe" ]; then
-  row ok "findevil-mcp" "Rust · 32 DFIR tools · target/release/findevil-mcp"
+  row ok "findevil-mcp" "Rust · 43 DFIR tools · target/release/findevil-mcp"
 else
   row err "findevil-mcp" "not built — run: bash scripts/install.sh"
   REMEDIES+=("findevil-mcp: bash scripts/install.sh   # cargo build --release -p findevil-mcp")
   missing_required=$((missing_required + 1))
 fi
 
-# findevil-agent-mcp — Python, 13 crypto/ACH/memory/ACP tools. Needs the uv
+# findevil-agent-mcp — Python, 14 crypto/ACH/memory/ACP tools. Needs the uv
 # venv synced + the package present (run-mcp-python.sh does `uv run … -m`).
 if [ -d "services/agent_mcp/.venv" ] && [ -d "services/agent_mcp/findevil_agent_mcp" ]; then
-  row ok "findevil-agent-mcp" "Python · 13 tools · services/agent_mcp/.venv"
+  row ok "findevil-agent-mcp" "Python · 14 tools · services/agent_mcp/.venv"
 else
   row err "findevil-agent-mcp" "venv not synced — run: bash scripts/install.sh"
   REMEDIES+=("findevil-agent-mcp: bash scripts/install.sh   # uv sync --directory services/agent_mcp")
@@ -278,19 +278,15 @@ else
   REMEDIES+=("n8n-mcp (opt): install Node 20+ (npx); then python3 scripts/setup-n8n.py")
 fi
 
-# Grounding infra — OPTIONAL post-verdict anti-hallucination sidecar. Needs the
-# self-hosted browserless + SearXNG containers reachable on localhost. Warn-only.
+# Grounding infra — OPTIONAL post-verdict anti-hallucination sidecar. MITRE is
+# fetched directly with strict redirect/size guards; only local SearXNG is needed.
 if curl -fsS --max-time 2 http://127.0.0.1:5678/healthz >/dev/null 2>&1; then
-  bl=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 2 -X POST \
-       http://127.0.0.1:3000/content -H 'Content-Type: application/json' \
-       -d '{"url":"https://attack.mitre.org/"}' 2>/dev/null || echo 000)
-  sx=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 3 \
-       'http://127.0.0.1:8888/search?q=ping&format=json' 2>/dev/null || echo 000)
-  if [ "${bl}" = "200" ] && [ "${sx}" = "200" ]; then
-    row ok "grounding (opt)" "n8n + browserless + searxng up — grounding runs post-verdict"
+  sx=$(docker inspect -f '{{.State.Running}}' searxng 2>/dev/null || echo false)
+  if [ "${sx}" = "true" ]; then
+    row ok "grounding (opt)" "authenticated n8n + private-network searxng up — grounding runs post-verdict"
   else
-    row warn "grounding (opt)" "n8n up; browserless=${bl} searxng=${sx} — deploy: scripts/setup-grounding-workflow.py"
-    REMEDIES+=("grounding (opt): python3 scripts/setup-grounding-workflow.py (starts browserless + searxng)")
+    row warn "grounding (opt)" "n8n up; searxng=${sx} — deploy: scripts/setup-grounding-workflow.py"
+    REMEDIES+=("grounding (opt): python3 scripts/setup-grounding-workflow.py (starts private-network-only searxng)")
   fi
 else
   row warn "grounding (opt)" "optional anti-hallucination sidecar — n8n down; see docs/runbooks/n8n-automation-integration.md"
@@ -305,8 +301,6 @@ dfir "volatility3"  VOLATILITY_BIN  "pipx install volatility3   (or: uv tool ins
      -- vol vol.py volatility3 volatility
 dfir "hayabusa"     HAYABUSA_BIN    "download a release from https://github.com/Yamato-Security/hayabusa/releases onto PATH (or set \$HAYABUSA_BIN)" \
      -- hayabusa
-dfir "velociraptor" VELOCIRAPTOR_BIN "download from https://github.com/Velocidex/velociraptor/releases (or set \$VELOCIRAPTOR_BIN)" \
-     -- velociraptor
 dfir "tshark/zeek"  TSHARK_BIN      "sudo apt-get install -y tshark   (pcap_triage; or set \$TSHARK_BIN/\$ZEEK_BIN)" \
      -- tshark zeek
 dfir "sleuthkit"    SLEUTHKIT_BIN   "sudo apt-get install -y sleuthkit   (disk_extract_artifacts on .e01/.dd; fls/icat/mmls)" \
@@ -345,7 +339,7 @@ fi
 if python3 -c 'import matplotlib' >/dev/null 2>&1; then
   row ok "matplotlib" "$(python3 -c 'import matplotlib as m; print(m.__version__)' 2>/dev/null)"
 else
-  row warn "matplotlib" "absent — report figures skipped (text/HTML/PDF still render)"
+  row warn "matplotlib" "absent — figures skipped; single-host text/HTML/PDF still render, fleet FLEET_REPORT.{html,pdf} do not (fleet_correlation.{json,md} still written)"
   REMEDIES+=("matplotlib: pip3 install --user matplotlib")
 fi
 

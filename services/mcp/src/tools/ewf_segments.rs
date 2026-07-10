@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub(super) enum EwfSegmentError {
+pub enum EwfSegmentError {
     SegmentDirectory {
         directory: PathBuf,
         source: io::Error,
@@ -76,11 +76,11 @@ struct SegmentExtension {
     width: usize,
 }
 
-pub(super) fn is_first_ewf_segment(path: &Path) -> bool {
+pub fn is_first_ewf_segment(path: &Path) -> bool {
     first_segment_extension(path).is_some()
 }
 
-pub(super) fn segment_paths_for_image(image_path: &Path) -> Result<Vec<PathBuf>, EwfSegmentError> {
+pub fn segment_paths_for_image(image_path: &Path) -> Result<Vec<PathBuf>, EwfSegmentError> {
     let Some(first_ext) = first_segment_extension(image_path) else {
         return Ok(vec![image_path.to_path_buf()]);
     };

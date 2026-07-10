@@ -46,7 +46,7 @@ here is asserted without a path you can open or a command you can run.
 
 **Claim:** guardrails are architectural (typed surface, no shell), and bypass was tested.
 
-- **Artifacts:** the 43 typed product tools (no `execute_shell`); read-only `case_open` with SHA-256 image hash; hash-chained `audit.jsonl` (`prev_hash`). **Bypass test:** [`../../services/mcp/tests/bypass_paths.rs`](../../services/mcp/tests/bypass_paths.rs).
+- **Artifacts:** the 57 typed product tools (43 Rust + 14 Python; no `execute_shell`); read-only `case_open` with SHA-256 image hash; hash-chained `audit.jsonl` (`prev_hash`). **Bypass test:** [`../../services/mcp/tests/bypass_paths.rs`](../../services/mcp/tests/bypass_paths.rs).
 - **What the test proves:** `case_open_reads_shell_payload_filename_as_a_literal_file` — a shell-payload filename is invoked through a **fixed argv**, so it resolves to an ordinary file (or not), never an executed command; the opened image still produces a 64-hex SHA-256. (The test also documents, honestly, that there is deliberately no path jail because evidence runs at the analyst's own privilege — the guarantee is "no shell," not "no `..`".)
 - **Verify:** `cargo test -p findevil-mcp --test bypass_paths`.
 
@@ -63,7 +63,7 @@ here is asserted without a path you can open or a command you can run.
 
 **Claim:** a practitioner can deploy and extend it.
 
-- **Deploy:** `scripts/find-evil` (local) / `scripts/verdict <evidence>`; prerequisites in `INSTALL.md` / `QUICKSTART.md`; Apache-2.0.
+- **Deploy:** `scripts/find-evil --acknowledge-evidence-egress` (interactive cloud) / `scripts/verdict <evidence>` (zero-LLM local); prerequisites in `INSTALL.md` / `QUICKSTART.md`; Apache-2.0.
 - **Extend:** [`../extending-the-tool-surface.md`](../extending-the-tool-surface.md) — "add a typed DFIR tool" in five steps, with `services/mcp/src/tools/prefetch_parse.rs` as the reference implementation.
 - **Verify:** `bash scripts/doctor.sh` (preflight) then `scripts/verdict <supported-evidence>`.
 

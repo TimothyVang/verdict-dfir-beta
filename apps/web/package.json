@@ -4,10 +4,10 @@
   "private": true,
   "description": "Find Evil! NES.css local dashboard with SSE audit tail, role-state views, and Codex operator cockpit.",
   "scripts": {
-    "dev": "next dev --turbo",
+    "dev": "next dev --turbo --hostname 127.0.0.1",
     "build": "next build",
     "build:lib": "python3 ../../scripts/build-offline-report.py --out dist/report.html",
-    "start": "next start",
+    "start": "next start --hostname 127.0.0.1",
     "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -17,7 +17,7 @@
   "dependencies": {
     "chokidar": "^4.0.0",
     "nes.css": "^2.3.0",
-    "next": "^15.1.0",
+    "next": "15.5.18",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -32,6 +32,6 @@
     "json-schema-to-typescript": "^14.1.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "3.2.6"
   }
 }

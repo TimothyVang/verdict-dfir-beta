@@ -112,8 +112,8 @@ classes scores higher than 12 shallow EVTX queries.
 > security boundaries are enforced and whether they were tested for
 > bypass.
 
-**Demonstrate via:** the typed product MCP surface: 45 audit-chained
-tools total, including 32 Rust DFIR tools and 13 Python
+**Demonstrate via:** the typed product MCP surface: 57 audit-chained
+product tools total, including 43 Rust DFIR tools and 14 Python
 crypto/ACH/memory/ACP/expert-feedback tools. The Rust surface includes
 `vol_psscan` and `vol_psxview` for DKOM cross-validation plus
 allow-listed long-tail wrappers (`vol_run`, `ez_parse`, `plaso_parse`,
@@ -136,15 +136,18 @@ score lower than typed-surface enforcement.
 
 **Demonstrate via:** Finding → `tool_call_id` → JSONL audit record →
 SHA-256 of the tool's stdout → `manifest_finalize` Merkle root →
-manifest signature metadata. Ed25519 is the offline-verifiable default;
-Sigstore/Rekor is the identity + transparency-log tier when configured.
-The chain is verifiable offline by the `manifest_verify` MCP tool —
+manifest signature metadata. Ed25519 is the default and verifies only against
+the trusted public-key fingerprint supplied outside the case; Sigstore/Rekor
+requires exact trusted identity + issuer policy. The chain is verifiable offline
+by the `manifest_verify` MCP tool under that policy —
 judges run it against the submitted run manifest and reach the
 underlying tool execution with one path. M2 crypto stack is the
-load-bearing answer; FRE 902(14) self-authenticating is the framing.
+load-bearing technical answer; FRE 902(14) is the framing, with qualified-person
+certification and Rule 902(11) notice still outside the software.
 (The OpenTimestamps + Bitcoin anchor that previously closed this
 chain was removed under Amendment A5; see
-`docs/cryptographic-attestation.md` for the trade-off on prong (b).)
+`docs/cryptographic-attestation.md` for the trusted-time limitation, which is
+defense-in-depth rather than a FRE 902(14) legal prong.)
 
 ## 6. Usability and Documentation
 > Can another practitioner deploy and build on this?

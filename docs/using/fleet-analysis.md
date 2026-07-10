@@ -33,7 +33,8 @@ can still run any stage individually:
 
 All three default to the most recent fleet under `tmp/fleet-runs/`, so a clean sequence needs no
 arguments after stage 1. Everything is derivative of the per-host artifacts — the authoritative
-evidence is each host's own `run.manifest.json`, verifiable offline via `manifest_verify` (see
+evidence is each host's own `run.manifest.json`, verifiable offline via `manifest_verify`
+with signer trust supplied outside that host's case (see
 `docs/reference/mcp-and-tools.md`).
 
 ---
@@ -241,14 +242,15 @@ Open `FLEET_REPORT.pdf` (or `.html`) and work top-down:
    patient-zero candidate. Cross-reference the cluster times against EVTX logon events (Type 3
    Network / Type 10 RDP) on the destination hosts.
 6. **Cryptographic attestation** — the fleet report is **derivative**. To actually verify, run
-   `manifest_verify` against each per-host `run.manifest.json` individually — the fleet rollup
+   `manifest_verify` against each per-host `run.manifest.json` individually with the trusted
+   external Ed25519 fingerprint (or exact Sigstore identity + issuer) — the fleet rollup
    summarizes those manifests, it does not replace them.
 
 ---
 
 ## See also
 
-- `docs/reference/mcp-and-tools.md` — the 48 audit-chained product tools (34 Rust + 14 Python) and
+- `docs/reference/mcp-and-tools.md` — the 57 audit-chained product tools (43 Rust + 14 Python) and
   `manifest_verify`. (`.mcp.json` registers 6 servers in total; 4 are non-product.)
 - `docs/reference/dependencies.md` — installing matplotlib and the rest of the toolchain.
 - `docs/reference/environment-variables.md` — `FIND_EVIL_GUEST_IP` / `_GUEST_USER` / `_SSH_KEY`

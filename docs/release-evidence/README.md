@@ -29,12 +29,13 @@ This is intentionally narrow:
 
 Strict check:
 
-Current runs pass this check: NIST recall is **10/14 = 71%**, at its 71% floor
-(measured 2026-07-01, `docs/benchmark/RESULTS.md`; reproduces at 10/14 from
-`evidence/SCHARDT.dd`). The historical `l3-local-sift.json` packet recorded a lower
-7/14 before the disk-artifact emitters and native-fallback triage landed; it is
-retained as a point-in-time receipt, not the current number. The four remaining
-misses (USB history, deleted email, empty-XP-logon, thumbcache) are published in
+The 2026-07-09 live re-carve passes this check: NIST recall is **11/14 = 79%**,
+above its 71% floor (`docs/benchmark/RESULTS.md`; reproduced from
+`evidence/SCHARDT.dd`). The immutable committed sample-run remains historical at
+10/14, while the still older `l3-local-sift.json` packet recorded 7/14 before the
+disk-artifact emitters and native-fallback triage landed. Both are retained as
+point-in-time receipts, not current scores. The three live misses (empty USBSTOR,
+empty/unsatisfiable XP logon `.evt`, and absent `Thumbs.db`) are published in
 `docs/accuracy-report.md`, so the release evidence stays honest about the gap.
 
 ```bash

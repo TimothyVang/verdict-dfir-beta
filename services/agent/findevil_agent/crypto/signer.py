@@ -19,8 +19,10 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import threading
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -35,7 +37,7 @@ class SignedBundle:
     """
 
     payload_sha256: str
-    """SHA-256 hex of the JCS-canonicalized payload bytes."""
+    """SHA-256 hex of the exact VERDICT canonical JSON v1 payload bytes."""
 
     bundle_b64: str
     """Base64-encoded signer bundle JSON, ready for embedding in the
@@ -98,28 +100,29 @@ class SigstoreSigner:
                 return self._signing_ctx
             try:
                 # Lazy import — keeps test env offline-friendly.
+                from sigstore.models import (  # type: ignore[import-not-found]
+                    ClientTrustConfig,
+                )
                 from sigstore.sign import SigningContext  # type: ignore[import-not-found]
             except ImportError as exc:
                 raise RuntimeError(
                     "sigstore-python is not installed. Install with `uv add sigstore` "
                     "or use StubSigner in tests."
                 ) from exc
-            self._signing_ctx = SigningContext.production()
+            trust_config = ClientTrustConfig.production()
+            self._signing_ctx = SigningContext.from_trust_config(trust_config)
             return self._signing_ctx
 
     def sign(self, payload: bytes) -> SignedBundle:
         """Sign ``payload`` (canonical JSON bytes). Returns a SignedBundle."""
-        ctx = self._ensure_ctx()
-        # The exact API differs across sigstore-python versions;
-        # this code path is defensive and pinned to sigstore 3.x
-        # per Spec #2 §16.
-        from sigstore.oidc import IdentityToken  # type: ignore[import-not-found]
-
         if self._identity_token is None:
             raise RuntimeError(
                 "SigstoreSigner requires identity_token in non-interactive mode. "
                 "Acquire one via Sigstore's OIDC flow before instantiation."
             )
+        ctx = self._ensure_ctx()
+        from sigstore.oidc import IdentityToken  # type: ignore[import-not-found]
+
         identity = IdentityToken(self._identity_token)
         with ctx.signer(identity) as signer_session:
             bundle = signer_session.sign_artifact(payload)
@@ -182,21 +185,60 @@ class LocalEd25519Signer:
     stable local path (``~/.findevil/signing.key`` unless overridden via
     ``FINDEVIL_SIGNING_KEY`` or the ``key_path`` argument). The key is
     auto-generated on first use (dir 0o700, file 0o600). The bundle embeds the
-    public key, so ``manifest_verify`` can cryptographically verify the
-    signature OFFLINE — unlike the stub (a placeholder, never proof) and
-    unlike sigstore (which adds identity + a transparency log but needs an
-    OIDC token and network at signing time).
+    public key, while ``manifest_verify`` requires its SHA-256 fingerprint from
+    a trusted source outside that bundle. This provides offline key continuity;
+    an embedded key alone would prove only self-consistency.
 
     This proves *integrity and local key continuity*, not *identity*: the
     customer-release gate still requires sigstore.
     """
 
     def __init__(self, key_path: os.PathLike[str] | str | None = None) -> None:
-        from pathlib import Path
-
-        self._key_path = Path(key_path) if key_path is not None else _default_key_path()
+        selected = Path(key_path) if key_path is not None else _default_key_path()
+        self._key_path = Path(os.path.abspath(selected.expanduser()))
         self._lock = threading.Lock()
         self._private_key: Any = None  # lazy Ed25519PrivateKey
+
+    def _secure_parent(self) -> None:
+        parent = self._key_path.parent
+        current = Path(parent.anchor)
+        for part in parent.parts[1:]:
+            current /= part
+            try:
+                metadata = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, 0o700)
+                metadata = os.lstat(current)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise PermissionError(f"signing-key path contains a symlink: {current}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise PermissionError(f"signing-key parent component is not a directory: {current}")
+        metadata = os.lstat(parent)
+        if os.name == "posix" and metadata.st_uid != os.geteuid():
+            raise PermissionError("signing-key parent is not owned by the current user")
+        os.chmod(parent, 0o700)
+
+    @staticmethod
+    def _validate_key_metadata(metadata: os.stat_result) -> None:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError("signing key is not a regular file")
+        if metadata.st_nlink != 1:
+            raise PermissionError("signing key must not be hard-linked")
+        if os.name == "posix" and metadata.st_uid != os.geteuid():
+            raise PermissionError("signing key is not owned by the current user")
+        if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PermissionError("signing key must have mode 0600")
+
+    def _read_existing_key(self) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(self._key_path, flags)
+        with os.fdopen(descriptor, "rb") as key_file:
+            self._validate_key_metadata(os.fstat(key_file.fileno()))
+            return key_file.read()
 
     def _ensure_key(self) -> Any:
         with self._lock:
@@ -212,17 +254,37 @@ class LocalEd25519Signer:
                 load_pem_private_key,
             )
 
-            if self._key_path.exists():
-                self._private_key = load_pem_private_key(self._key_path.read_bytes(), password=None)
+            self._secure_parent()
+            try:
+                existing = os.lstat(self._key_path)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                self._validate_key_metadata(existing)
+                loaded = load_pem_private_key(self._read_existing_key(), password=None)
+                if not isinstance(loaded, Ed25519PrivateKey):
+                    raise ValueError("signing key is not an Ed25519 private key")
+                self._private_key = loaded
             else:
                 key = Ed25519PrivateKey.generate()
-                self._key_path.parent.mkdir(parents=True, exist_ok=True)
-                os.chmod(self._key_path.parent, 0o700)
                 pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-                # Write owner-only: create with 0o600 before the bytes land.
-                fd = os.open(self._key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as fh:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                try:
+                    descriptor = os.open(self._key_path, flags, 0o600)
+                except FileExistsError as exc:
+                    raise PermissionError("signing key appeared during exclusive creation") from exc
+                with os.fdopen(descriptor, "wb") as fh:
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(fh.fileno(), 0o600)
+                    else:
+                        os.chmod(self._key_path, 0o600)
                     fh.write(pem)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 self._private_key = key
             return self._private_key
 
@@ -253,10 +315,23 @@ class LocalEd25519Signer:
             kind="ed25519",
         )
 
+    def public_fingerprint(self) -> str:
+        """Return the stable public-key SHA-256 pin for trusted verifiers.
+
+        The private key is created on first use using the same owner-only path
+        rules as signing. Only this public fingerprint leaves the custody
+        process.
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            PublicFormat,
+        )
+
+        public_raw = self._ensure_key().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return hashlib.sha256(public_raw).hexdigest()
+
 
 def _default_key_path() -> Any:
-    from pathlib import Path
-
     env = os.environ.get("FINDEVIL_SIGNING_KEY")
     if env:
         return Path(env)
@@ -317,7 +392,8 @@ def make_signer(*, kind: str | None = None, **kwargs: Any) -> Signer:
     """Factory the rest of the agent calls.
 
     ``kind`` defaults to ``$FINDEVIL_SIGNER`` env var, falling back to
-    ``"ed25519"`` — a REAL local signature that verifies offline — so every
+    ``"ed25519"`` — a REAL local signature that verifies offline with a
+    separately trusted public-key fingerprint — so every
     run is cryptographically signed out of the box. ``"stub"`` (a placeholder,
     never proof) is explicit opt-in only. Production deployments set
     ``FINDEVIL_SIGNER=sigstore`` for identity + transparency-log tier.

@@ -32,6 +32,40 @@ unset PROJECT_LOCAL TMPDIR XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME \
 # shellcheck source=lib/project-env.sh
 source "${REPO}/scripts/lib/project-env.sh"
 
+# Migrate custody-bearing state created by older releases under a permissive
+# umask. Never follow symlinks and never chmod another user's files.
+REPO="${REPO}" python3 - <<'PY'
+import os
+import stat
+from pathlib import Path
+
+roots = [
+    Path(os.environ["REPO"]) / "tmp" / "auto-runs",
+    Path(os.environ["FINDEVIL_HOME"]),
+    Path(os.environ["XDG_STATE_HOME"]) / "findevil",
+]
+uid = os.geteuid() if hasattr(os, "geteuid") else None
+signing_key = Path(os.environ["FINDEVIL_SIGNING_KEY"]).resolve(strict=False)
+for root in roots:
+    if not root.exists() or root.is_symlink():
+        continue
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        metadata = os.lstat(current_path)
+        if uid is None or metadata.st_uid == uid:
+            os.chmod(current_path, 0o700)
+        directories[:] = [
+            name for name in directories if not (current_path / name).is_symlink()
+        ]
+        for name in files:
+            path = current_path / name
+            if path.resolve(strict=False) == signing_key:
+                continue
+            metadata = os.lstat(path)
+            if stat.S_ISREG(metadata.st_mode) and (uid is None or metadata.st_uid == uid):
+                os.chmod(path, 0o600)
+PY
+
 SETTINGS="${REPO}/.claude/settings.local.json"
 mkdir -p "${REPO}/.claude"
 

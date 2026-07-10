@@ -13,7 +13,7 @@
 //! * ``merkle`` — append-only SHA-256 Merkle tree with O(log n)
 //!   inclusion proofs. Duplicate-last when a tier
 //!   has odd cardinality. Empty root is 32 zero bytes.
-//! * ``manifest`` — JCS canonicalization helpers for the run
+//! * ``manifest`` — VERDICT canonical JSON v1 helpers for the run
 //!   manifest. (Lands in a follow-up.)
 
 pub mod merkle;

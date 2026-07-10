@@ -17,8 +17,8 @@
 //! forcing a lossy projection. The four bespoke tools stay for the pivots whose
 //! typed output the playbooks depend on.
 //!
-//! Invocation: `<vol> -f <memory> -r json -q <plugin> [--pid <n>]`. Binary
-//! discovery matches `vol_pslist` (`$VOLATILITY_BIN`, then PATH).
+//! Invocation: `<vol> --offline -f <memory> -r json -q <plugin> [--pid <n>]`.
+//! Binary discovery matches `vol_pslist` (`$VOLATILITY_BIN`, then PATH).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tools::proc_runner::{run_with_timeout, timeout_from_env, RunError};
+use crate::tools::proc_runner::{run_with_timeout, timeout_from_env_clamped, RunError};
 
 const DEFAULT_LIMIT: usize = 10_000;
 
@@ -40,6 +40,7 @@ const TIMEOUT_ENV: &str = "FINDEVIL_VOL_TIMEOUT_SECS";
 /// take many minutes on a large image — but bounded so a wedged `vol` can no
 /// longer block the MCP server indefinitely. Override with [`TIMEOUT_ENV`].
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const HARD_TIMEOUT: Duration = Duration::from_secs(7200);
 
 /// Canonical Vol3 plugin names this verb will run. Curated from the
 /// parser-coverage roadmap's memory section — the evil-hunting plugins that run
@@ -177,6 +178,9 @@ pub enum VolRunError {
     )]
     Timeout { seconds: u64 },
 
+    #[error("volatility {stream} exceeded its {limit} byte capture limit and was killed")]
+    OutputLimit { stream: String, limit: usize },
+
     #[error("could not parse volatility JSON output: {0}")]
     OutputParse(String),
 }
@@ -188,10 +192,11 @@ pub fn is_allowed_plugin(plugin: &str) -> bool {
 }
 
 /// Build the fixed argv for a Vol3 run. Pure + unit-tested so the arg contract
-/// (globals before plugin, `--pid` after) can't regress. The plugin is assumed
-/// already allow-list-validated by the caller.
-fn build_vol_args(memory: &Path, plugin: &str, pid: Option<u32>) -> Vec<OsString> {
+/// (`--offline` and globals before plugin, `--pid` after) can't regress. The
+/// plugin is assumed already allow-list-validated by the caller.
+pub(crate) fn build_vol_args(memory: &Path, plugin: &str, pid: Option<u32>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
+        "--offline".into(),
         "-f".into(),
         memory.as_os_str().to_os_string(),
         "-r".into(),
@@ -247,29 +252,46 @@ pub fn vol_run(input: &VolRunInput) -> Result<VolRunOutput, VolRunError> {
 
     // Run in its own process group under a wall-clock budget so a hung plugin is
     // force-killed and reaped instead of blocking the server forever.
-    let proc =
-        run_with_timeout(cmd, timeout_from_env(TIMEOUT_ENV, DEFAULT_TIMEOUT)).map_err(|err| {
-            match err {
-                RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    VolRunError::BinaryNotFound
-                }
-                RunError::Spawn(e) => VolRunError::SubprocessFailed {
-                    exit_code: -1,
-                    stderr: format!("spawn failed: {e}"),
-                },
-                RunError::Io(e) => VolRunError::SubprocessFailed {
-                    exit_code: -1,
-                    stderr: format!("io error: {e}"),
-                },
-                RunError::Timeout(d) => VolRunError::Timeout {
-                    seconds: d.as_secs(),
-                },
-                RunError::ReaderPanicked => VolRunError::SubprocessFailed {
-                    exit_code: -1,
-                    stderr: "volatility output reader thread panicked".to_string(),
-                },
-            }
-        })?;
+    let proc = run_with_timeout(
+        cmd,
+        timeout_from_env_clamped(TIMEOUT_ENV, DEFAULT_TIMEOUT, HARD_TIMEOUT),
+    )
+    .map_err(|err| match err {
+        RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            VolRunError::BinaryNotFound
+        }
+        RunError::Spawn(e) => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("spawn failed: {e}"),
+        },
+        RunError::Io(e) => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("io error: {e}"),
+        },
+        RunError::Timeout(d) => VolRunError::Timeout {
+            seconds: d.as_secs(),
+        },
+        RunError::OutputLimit { stream, limit } => VolRunError::OutputLimit {
+            stream: stream.to_string(),
+            limit,
+        },
+        RunError::OutputQuota(error) => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: error.to_string(),
+        },
+        RunError::PipeStillOpen { streams } => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: format!("inherited subprocess pipes remained open: {streams:?}"),
+        },
+        RunError::ChildTreeStillRunning => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "subprocess descendants remained alive after leader exit".to_string(),
+        },
+        RunError::ReaderPanicked => VolRunError::SubprocessFailed {
+            exit_code: -1,
+            stderr: "volatility output reader thread panicked".to_string(),
+        },
+    })?;
 
     let stderr_tail = truncate_to(String::from_utf8_lossy(&proc.stderr).into_owned(), 4096);
 
@@ -412,7 +434,21 @@ mod tests {
         let s = as_strings(&args);
         assert_eq!(
             s,
-            vec!["-f", "/img.mem", "-r", "json", "-q", "windows.cmdline"]
+            vec![
+                "--offline",
+                "-f",
+                "/img.mem",
+                "-r",
+                "json",
+                "-q",
+                "windows.cmdline"
+            ]
+        );
+        let offline_pos = s.iter().position(|a| a == "--offline").unwrap();
+        let plugin_pos = s.iter().position(|a| a == "windows.cmdline").unwrap();
+        assert!(
+            offline_pos < plugin_pos,
+            "--offline must be a global option before the plugin: {s:?}"
         );
     }
 

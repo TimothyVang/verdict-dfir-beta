@@ -8,7 +8,8 @@
 use std::path::PathBuf;
 
 use findevil_mcp::{
-    browser_history, path_looks_like_browser_history, BrowserHistoryError, BrowserHistoryInput,
+    browser_history, path_looks_like_browser_history, BrowserArtifactKind, BrowserArtifactRow,
+    BrowserHistoryError, BrowserHistoryInput,
 };
 use rusqlite::Connection;
 
@@ -34,7 +35,22 @@ fn browser_history_errors_on_directory_not_file() {
     let dir = tmp.path().join("History");
     std::fs::create_dir_all(&dir).unwrap();
     let err = browser_history(&sample_input(dir)).unwrap_err();
-    assert!(matches!(err, BrowserHistoryError::NotFound(_)));
+    assert!(matches!(err, BrowserHistoryError::NotRegular(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn browser_history_refuses_symlinked_database() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("actual-history");
+    Connection::open(&target).expect("create SQLite target");
+    let link = tmp.path().join("History");
+    symlink(&target, &link).expect("create evidence symlink");
+
+    let error = browser_history(&sample_input(link)).expect_err("reject symlink");
+    assert!(matches!(error, BrowserHistoryError::NotRegular(_)));
 }
 
 #[test]
@@ -112,8 +128,11 @@ fn browser_history_parses_chrome_fixture() {
 
     let out = browser_history(&sample_input(path)).expect("parse chrome history");
     assert_eq!(out.browser_family, "chrome");
+    assert_eq!(out.artifact_kind, BrowserArtifactKind::ChromiumHistory);
     assert_eq!(out.rows.len(), 1);
-    let row = &out.rows[0];
+    let BrowserArtifactRow::Visit(row) = &out.rows[0] else {
+        panic!("expected visit row")
+    };
     assert_eq!(row.url, "http://evil.example/payload.exe");
     assert_eq!(row.visit_count, 3);
     assert_eq!(
@@ -144,9 +163,13 @@ fn browser_history_parses_firefox_fixture() {
 
     let out = browser_history(&sample_input(path)).expect("parse firefox history");
     assert_eq!(out.browser_family, "firefox");
+    assert_eq!(out.artifact_kind, BrowserArtifactKind::FirefoxHistory);
     assert_eq!(out.rows.len(), 1);
+    let BrowserArtifactRow::Visit(row) = &out.rows[0] else {
+        panic!("expected visit row")
+    };
     assert_eq!(
-        out.rows[0].last_visit_time_iso.as_deref(),
+        row.last_visit_time_iso.as_deref(),
         Some("2021-01-01T00:00:00Z")
     );
 }

@@ -12,7 +12,8 @@ Each challenge should produce:
   `failed`, `unsupported`, `not_supplied`, `parse_errors`, `records_seen`, and
   `rows_returned` fields.
 - `analysis_limitations` for unsupported, failed, custody-only, or skipped lanes.
-- `manifest_verify.json` with `overall=true` after the run seals.
+- `manifest_verify.json` with `overall=true` and authenticated
+  `signature_verified=true` after the run seals.
 
 The truth boundary is intentional: if no parser/tool extracts an artifact class,
 VERDICT cannot reason over it. The product wins by making that boundary visible,

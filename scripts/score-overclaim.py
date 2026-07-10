@@ -12,7 +12,9 @@ computes the *mechanically derivable* trust-benchmark metrics:
 
   - citation_coverage  : fraction of findings that cite a ``tool_call_id``        (Provability R1)
   - replay_pass_rate   : fraction whose verifier replay reproduced the output hash (R2)
-  - custody_ok         : manifest_verify ``overall`` (+ chain / merkle / signature) (R7)
+  - custody_ok         : manifest_verify ``overall`` (chain / Merkle / payload envelope);
+                         ``signature_kind`` + ``signature_verified`` separately distinguish
+                         authenticated Ed25519/Sigstore from an advisory stub (R7)
   - confidence_tiers   : CONFIRMED / INFERRED / HYPOTHESIS distribution             (R5)
   - verifier_actions   : approved / rejected / downgraded — the system catching itself
   - overclaim signals  : findings APPROVED despite a failed/absent replay = snuck-through over-claims
@@ -62,7 +64,7 @@ _TOOL_CLASS = {
 }
 
 
-# The 32 audit-chained Rust DFIR product tools (the ``findevil-mcp`` surface, per
+# The audit-chained Rust DFIR product tools (the ``findevil-mcp`` surface, per
 # CLAUDE.md / docs/reference/mcp-and-tools.md). This is the evidence-analysis
 # surface a Case may choose to exercise — it is the denominator for the
 # "allowed-but-not-run" untested-surface table. The 13 Python custody/ACH tools
@@ -101,7 +103,6 @@ _PRODUCT_DFIR_TOOLS = frozenset(
         "nfdump_query",
         "suricata_eve",
         "indx_parse",
-        "vel_collect",
         "browser_history",
     }
 )
