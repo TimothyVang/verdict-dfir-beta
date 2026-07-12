@@ -128,9 +128,17 @@ fi
 git rm -rqf . >/dev/null 2>&1 || true
 cp -a "$TREE/." .
 git add -A
-git -c user.name="Timothy Vang" -c user.email="121889316+TimothyVang@users.noreply.github.com" \
-  commit -q -m "beta: ${TAG:-snapshot of $REF} (clean export)"
-ok "staged clean beta snapshot on '$BRANCH'"
+TREE_UNCHANGED=0
+if git diff --cached --quiet; then
+  # Clean export matches the current beta tip — no tree rewrite needed.
+  # Still allow a new tag/release so develop-pin releases are not blocked.
+  TREE_UNCHANGED=1
+  warn "export tree identical to '$BRANCH' tip — skipping tree commit (tag-only path if --tag set)"
+else
+  git -c user.name="Timothy Vang" -c user.email="121889316+TimothyVang@users.noreply.github.com" \
+    commit -q -m "beta: ${TAG:-snapshot of $REF} (clean export)"
+  ok "staged clean beta snapshot on '$BRANCH'"
+fi
 
 # Staging clone is a clean product export, not a dev pytest workspace. Global ECC
 # pre-push (core.hooksPath ~/.codex/git-hooks) runs bare `pytest -q` and fails with
@@ -140,11 +148,34 @@ ok "staged clean beta snapshot on '$BRANCH'"
 touch .git/ecc-hooks-disable
 
 if [ -n "$TAG" ]; then
-  bash "$REPO/scripts/git-ship" --remote origin --branch "$BRANCH" --tag "$TAG"
+  if [ "$TREE_UNCHANGED" = 1 ]; then
+    # Tag/release on existing tip without inventing an empty tree commit.
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1 \
+      || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+      ok "tag $TAG already exists on remote/local — leaving tree+tag as-is"
+    else
+      git tag -a "$TAG" -m "beta: $TAG (export of $REF; tree already matched tip)"
+      git push origin "refs/heads/$BRANCH" "refs/tags/$TAG"
+      if command -v gh >/dev/null 2>&1; then
+        gh release create "$TAG" -R "$SLUG" --prerelease --title "$TAG" \
+          --notes "Clean export of $REF; beta branch tree already matched export (no rewrite)." \
+          >/dev/null 2>&1 \
+          || gh release edit "$TAG" -R "$SLUG" --prerelease >/dev/null 2>&1 \
+          || warn "could not create/edit GitHub release for $TAG"
+      fi
+      ok "tagged existing tip as $TAG (tag-only ship)"
+    fi
+  else
+    bash "$REPO/scripts/git-ship" --remote origin --branch "$BRANCH" --tag "$TAG"
+  fi
   gh release edit "$TAG" -R "$SLUG" --prerelease >/dev/null 2>&1 \
     && ok "marked $TAG as a pre-release" \
     || warn "could not mark $TAG pre-release (set it in the GitHub release UI)"
 else
-  git push -u origin "$BRANCH"
+  if [ "$TREE_UNCHANGED" = 1 ]; then
+    ok "no tree changes and no --tag — nothing to publish"
+  else
+    git push -u origin "$BRANCH"
+  fi
 fi
 ok "beta published to $SLUG ($BRANCH${TAG:+ @ $TAG})."
