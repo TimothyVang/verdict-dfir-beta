@@ -1954,6 +1954,7 @@ def registry_service_recon_candidates(
 _RECURSIVE_TRIAGE_KEYS = frozenset(
     {
         r"ControlSet001\Services",
+        r"ControlSet001\Services\PortProxy\v4tov4",
         r"ControlSet001\Enum\USBSTOR",
         r"SAM\Domains\Account\Users\Names",
         r"Software\Microsoft\Search Assistant\ACMru",
@@ -1969,6 +1970,40 @@ _USBSTOR_SERIAL_RE = re.compile(
     r"\\enum\\usbstor\\disk&ven_(?P<ven>[^&\\]*)&prod_(?P<prod>[^&\\]*)[^\\]*\\(?P<serial>[^\\]+)$",
     re.IGNORECASE,
 )
+
+
+def registry_portproxy_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify registry_query rows into netsh portproxy (T1090.001) candidates.
+
+    A ``...\\Services\\PortProxy\\v4tov4\\...`` subkey with any value mapping
+    (listen -> connect, e.g. ``0.0.0.0/8443`` -> ``127.0.0.1/3389``) is an
+    internal-proxy configuration -- Volt Typhoon tradecraft (AA24-038A). Pure
+    function (unit-testable without an Investigation).
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key_path") or "")
+        if "\\services\\portproxy\\" not in key.lower():
+            continue
+        for v in row.get("values") or []:
+            if not isinstance(v, dict):
+                continue
+            listen = str(v.get("name") or "").strip()
+            connect = str(v.get("data_str") or "").strip()
+            if not listen or not connect:
+                continue
+            out.append(
+                {
+                    "kind": "portproxy",
+                    "listen": listen,
+                    "connect": connect,
+                    "hive_key": key,
+                    "last_write_time_iso": row.get("last_write_time_iso"),
+                }
+            )
+    return out
 
 
 def registry_usb_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8094,6 +8129,31 @@ def evtx_rows_to_findings(
                     "mitre_technique": "T1021.001",
                 }
             )
+        if (
+            "application" in channel.lower()
+            and event_id in (216, 325, 327)
+            and "ntds" in data_text.lower()
+            and "ntds_esent_dump" not in seen_kinds
+        ):
+            seen_kinds.add("ntds_esent_dump")
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-B-evtx-ntds-esent",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        f"EVTX Application ESENT EID {event_id} references the NTDS "
+                        f"database (ntds.dit) (record {record_id}); consistent with an "
+                        "NTDS.dit dump / IFM creation (ntdsutil) for domain credential "
+                        "extraction. Treat as a lead; corroborate with ntdsutil / "
+                        "vssadmin execution and the dump output path."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1003.003",
+                }
+            )
         if event_id == 1102 and "audit_log_cleared" not in seen_kinds:
             seen_kinds.add("audit_log_cleared")
             findings.append(
@@ -8324,6 +8384,56 @@ def evtx_rows_to_findings(
                 "mitre_technique": "T1110",
             }
         )
+    return findings
+
+
+_ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".cab", ".tar", ".gz", ".tgz", ".ace", ".arj")
+
+
+def usn_rows_to_findings(
+    rows: list[dict[str, Any]], tool_call_id: str, case_id: str, artifact_path: str
+) -> list[dict[str, Any]]:
+    """Detect an archive staged then deleted in the USN journal (T1560.001).
+
+    An archive filename showing both a create (FILE_CREATE / DATA_EXTEND) and a
+    later FILE_DELETE is the collect-then-clean-up pattern: data archived for
+    exfiltration (T1560.001) plus indicator removal via deletion (T1070.004).
+    Emitted once as INFERRED (a two-record correlation over one artifact).
+    """
+    findings: list[dict[str, Any]] = []
+    by_name: dict[str, set[str]] = {}
+    for row in rows:
+        name = str(row.get("filename") or "")
+        if not name.lower().endswith(_ARCHIVE_EXTS):
+            continue
+        flags = by_name.setdefault(name, set())
+        for flag in row.get("reason_flags") or []:
+            flags.add(str(flag).upper())
+    for name, flags in by_name.items():
+        created = bool(flags & {"FILE_CREATE", "DATA_EXTEND"})
+        deleted = "FILE_DELETE" in flags
+        if created and deleted:
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-B-usn-archive-staged-deleted",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        f"USN journal shows archive '{name}' created and then "
+                        "deleted (FILE_CREATE/DATA_EXTEND followed by FILE_DELETE); "
+                        "a collect-then-clean-up staging pattern consistent with "
+                        "data archived for exfiltration (T1560.001) and indicator "
+                        "removal via file deletion (T1070.004). Corroborate with the "
+                        "archiver execution and any exfil channel."
+                    ),
+                    "confidence": "INFERRED",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1560.001",
+                    "derived_from": [tool_call_id],
+                }
+            )
+            break
     return findings
 
 
@@ -10375,6 +10485,7 @@ class Investigation:
         if name == "system":
             return [
                 r"ControlSet001\Services",
+                r"ControlSet001\Services\PortProxy\v4tov4",
                 r"ControlSet001\Enum\USBSTOR",
                 r"MountedDevices",
             ]
@@ -10702,6 +10813,34 @@ class Investigation:
         """
         self._emit_registry_recent_docs_finding(candidates, hive_path, tcid)
         self._emit_registry_service_recon_finding(candidates, hive_path, tcid)
+        for cand in candidates:
+            if cand.get("kind") != "portproxy":
+                continue
+            listen = str(cand.get("listen") or "")
+            connect = str(cand.get("connect") or "")
+            self.findings_pool_b.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        "f-B-registry-portproxy", hive_path, force_suffix=True
+                    ),
+                    "tool_call_id": tcid,
+                    "artifact_path": hive_path,
+                    "description": (
+                        f"SYSTEM registry PortProxy configuration present: netsh "
+                        f"v4tov4 listen {listen} -> connect {connect} "
+                        f"({cand.get('hive_key')}, last_write "
+                        f"{cand.get('last_write_time_iso')}). An internal network "
+                        "proxy (T1090.001) -- Volt Typhoon tradecraft (AA24-038A); "
+                        "corroborate with the netsh execution and relayed sessions."
+                    ),
+                    "confidence": "INFERRED",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1090.001",
+                    "derived_from": [tcid],
+                }
+            )
+            break
         for cand in candidates:
             kind = cand.get("kind")
             if kind in {"search_term", "opened_file"}:
@@ -11592,7 +11731,9 @@ class Investigation:
                 {
                     "case_id": self.handle["id"],
                     "usnjrnl_path": str(e["path"]),
-                    "limit": 5000,
+                    # Scan the full journal: staged-then-deleted archives (T1560.001)
+                    # often sit late in the $J, past a small cap.
+                    "limit": 200000,
                 },
             )
             for e in usn_entries
@@ -11660,6 +11801,12 @@ class Investigation:
                         "reason_flags": row.get("reason_flags", []),
                     },
                 )
+            usn_findings = usn_rows_to_findings(rows, tcid, self.handle["id"], path)
+            for finding in usn_findings:
+                finding["finding_id"] = self._finding_id_for(
+                    finding["finding_id"], path, force_suffix=True
+                )
+                self.findings_pool_b.append(finding)
             print(f"  usnjrnl_query: {path} rows={len(rows)}")
 
         prefetch_entries = by_class["prefetch"][:50]
@@ -12342,7 +12489,8 @@ class Investigation:
                 # Pool B activity emitters: USBSTOR insertion history becomes
                 # a HYPOTHESIS exfil/staging lead citing this registry_query.
                 activity_candidates = (
-                    registry_usb_candidates(rows)
+                    registry_portproxy_candidates(rows)
+                    + registry_usb_candidates(rows)
                     + registry_mounteddevices_candidates(rows)
                     + registry_sam_account_candidates(rows)
                     + registry_mru_candidates(rows)
