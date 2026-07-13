@@ -1954,6 +1954,7 @@ def registry_service_recon_candidates(
 _RECURSIVE_TRIAGE_KEYS = frozenset(
     {
         r"ControlSet001\Services",
+        r"ControlSet001\Services\PortProxy\v4tov4",
         r"ControlSet001\Enum\USBSTOR",
         r"SAM\Domains\Account\Users\Names",
         r"Software\Microsoft\Search Assistant\ACMru",
@@ -1969,6 +1970,40 @@ _USBSTOR_SERIAL_RE = re.compile(
     r"\\enum\\usbstor\\disk&ven_(?P<ven>[^&\\]*)&prod_(?P<prod>[^&\\]*)[^\\]*\\(?P<serial>[^\\]+)$",
     re.IGNORECASE,
 )
+
+
+def registry_portproxy_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify registry_query rows into netsh portproxy (T1090.001) candidates.
+
+    A ``...\\Services\\PortProxy\\v4tov4\\...`` subkey with any value mapping
+    (listen -> connect, e.g. ``0.0.0.0/8443`` -> ``127.0.0.1/3389``) is an
+    internal-proxy configuration -- Volt Typhoon tradecraft (AA24-038A). Pure
+    function (unit-testable without an Investigation).
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("key_path") or "")
+        if "\\services\\portproxy\\" not in key.lower():
+            continue
+        for v in row.get("values") or []:
+            if not isinstance(v, dict):
+                continue
+            listen = str(v.get("name") or "").strip()
+            connect = str(v.get("data_str") or "").strip()
+            if not listen or not connect:
+                continue
+            out.append(
+                {
+                    "kind": "portproxy",
+                    "listen": listen,
+                    "connect": connect,
+                    "hive_key": key,
+                    "last_write_time_iso": row.get("last_write_time_iso"),
+                }
+            )
+    return out
 
 
 def registry_usb_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10450,6 +10485,7 @@ class Investigation:
         if name == "system":
             return [
                 r"ControlSet001\Services",
+                r"ControlSet001\Services\PortProxy\v4tov4",
                 r"ControlSet001\Enum\USBSTOR",
                 r"MountedDevices",
             ]
@@ -10777,6 +10813,34 @@ class Investigation:
         """
         self._emit_registry_recent_docs_finding(candidates, hive_path, tcid)
         self._emit_registry_service_recon_finding(candidates, hive_path, tcid)
+        for cand in candidates:
+            if cand.get("kind") != "portproxy":
+                continue
+            listen = str(cand.get("listen") or "")
+            connect = str(cand.get("connect") or "")
+            self.findings_pool_b.append(
+                {
+                    "case_id": self.handle["id"],
+                    "finding_id": self._finding_id_for(
+                        "f-B-registry-portproxy", hive_path, force_suffix=True
+                    ),
+                    "tool_call_id": tcid,
+                    "artifact_path": hive_path,
+                    "description": (
+                        f"SYSTEM registry PortProxy configuration present: netsh "
+                        f"v4tov4 listen {listen} -> connect {connect} "
+                        f"({cand.get('hive_key')}, last_write "
+                        f"{cand.get('last_write_time_iso')}). An internal network "
+                        "proxy (T1090.001) -- Volt Typhoon tradecraft (AA24-038A); "
+                        "corroborate with the netsh execution and relayed sessions."
+                    ),
+                    "confidence": "INFERRED",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1090.001",
+                    "derived_from": [tcid],
+                }
+            )
+            break
         for cand in candidates:
             kind = cand.get("kind")
             if kind in {"search_term", "opened_file"}:
@@ -12425,7 +12489,8 @@ class Investigation:
                 # Pool B activity emitters: USBSTOR insertion history becomes
                 # a HYPOTHESIS exfil/staging lead citing this registry_query.
                 activity_candidates = (
-                    registry_usb_candidates(rows)
+                    registry_portproxy_candidates(rows)
+                    + registry_usb_candidates(rows)
                     + registry_mounteddevices_candidates(rows)
                     + registry_sam_account_candidates(rows)
                     + registry_mru_candidates(rows)
