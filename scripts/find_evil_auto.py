@@ -8063,6 +8063,37 @@ def evtx_rows_to_findings(
         record_id = row.get("record_id")
         data_text = _json_text(row.get("data", row))
         action_text = data_text.replace("\\\\", "\\")
+        if (
+            "LocalSessionManager" in channel
+            and event_id in (21, 22, 25)
+            and "rdp_lsm_session" not in seen_kinds
+        ):
+            seen_kinds.add("rdp_lsm_session")
+            lent = _extract_evtx_entities(row.get("data") or {}, event_id)
+            who = (
+                _format_account(lent.get("account"), lent.get("domain"))
+                or lent.get("user")
+                or "a session"
+            )
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-B-evtx-rdp-lsm-session",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        "EVTX TerminalServices-LocalSessionManager/Operational EID "
+                        f"{event_id} records a Remote Desktop session for {who} "
+                        f"(record {record_id}); treat as a lateral-movement / "
+                        "remote-access lead. RDP sessions appear here even when no "
+                        "Security 4624 type-10 logon is present; corroborate with the "
+                        "source host and in-session activity."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1021.001",
+                }
+            )
         if event_id == 1102 and "audit_log_cleared" not in seen_kinds:
             seen_kinds.add("audit_log_cleared")
             findings.append(
@@ -10066,7 +10097,22 @@ class Investigation:
         evtx_findings = evtx_rows_to_findings(
             rows, tcid, self.handle["id"], evidence_path
         )
+        self._pool_evtx_findings(evtx_findings, evidence_path)
+
+    def _pool_evtx_findings(
+        self, evtx_findings: list[dict[str, Any]], evidence_path: str
+    ) -> None:
+        """Suffix each evtx finding_id by artifact path, then route to a pool.
+
+        ``evtx_rows_to_findings`` emits hardcoded finding_ids; without a
+        per-artifact suffix the same EID parsed from two EVTX files collides, and
+        ``judge_findings`` rejects the whole batch (0 merged) -> empty verdict.
+        This mirrors the legacy ``.evt`` path's ``force_suffix=True`` fix.
+        """
         for finding in evtx_findings:
+            finding["finding_id"] = self._finding_id_for(
+                finding["finding_id"], evidence_path, force_suffix=True
+            )
             if finding.get("pool_origin") == "B":
                 self.findings_pool_b.append(finding)
             else:
