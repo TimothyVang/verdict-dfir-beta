@@ -8437,6 +8437,40 @@ def usn_rows_to_findings(
     return findings
 
 
+_AI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}")
+
+
+def assess_ai_helper(files: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Assess planted AI-integration artifacts -> ai_assessment (degree AI-present).
+
+    ``files`` is ``[{"path": str, "text": str}]``. Emits an assessment at degree
+    ``AI-present`` when genuine AI-integration indicators appear: an embedded
+    provider API key, a prompt-as-code string, or a local-LLM on-disk trace
+    (~/.ollama history). NEVER emits ``AI-orchestrated`` -- the presence of AI
+    tooling is not evidence the model drove the intrusion, and seeded
+    ai_writing_style / slopsquatted_dep_name decoys must not raise the degree.
+    Returns ``None`` when no genuine indicator is present.
+    """
+    indicators: set[str] = set()
+    for entry in files or []:
+        path = str(entry.get("path") or "").replace("\\", "/").lower()
+        text = str(entry.get("text") or "")
+        low = text.lower()
+        if "/.ollama/" in path or (path.endswith("/history") and ">>>" in text):
+            indicators.add("local_llm_disk_trace")
+        if _AI_KEY_RE.search(text):
+            indicators.add("embedded_api_key")
+        if (
+            "you are a" in low
+            or "promptascode" in low.replace(" ", "").replace("_", "")
+            or (">>>" in text and any(t in low for t in ("summarize", "draft", "prompt")))
+        ):
+            indicators.add("prompts_as_code")
+    if not indicators:
+        return None
+    return {"present": True, "degree": "AI-present", "indicators": sorted(indicators)}
+
+
 def _process_pid(proc: dict[str, Any]) -> int | None:
     pid = proc.get("pid", proc.get("PID"))
     try:
@@ -8748,6 +8782,31 @@ class Investigation:
     def _next_tcid(self) -> str:
         self.tcid_counter += 1
         return f"tc-{self.tcid_counter:03d}"
+
+    def _compute_ai_assessment(self) -> dict[str, Any] | None:
+        """Scan the evidence tree for planted AI-helper artifacts and build an
+        ai_assessment (degree AI-present) if any genuine indicator is found."""
+        root = self.evidence
+        if not root or not os.path.isdir(root):
+            return None
+        files: list[dict[str, Any]] = []
+        for dirpath, _dirs, names in os.walk(root):
+            for name in names:
+                p = os.path.join(dirpath, name)
+                rel = os.path.relpath(p, root)
+                low = rel.replace("\\", "/").lower()
+                if not (
+                    "ollama" in low or low.endswith(".ps1") or low.endswith("history")
+                ):
+                    continue
+                try:
+                    if os.path.getsize(p) > 262144:  # 256 KiB text cap
+                        continue
+                    text = Path(p).read_text(errors="replace")
+                except OSError:
+                    continue
+                files.append({"path": rel, "text": text})
+        return assess_ai_helper(files)
 
     def _finding_id_for(
         self, base: str, artifact_path: str, *, force_suffix: bool = False
@@ -14998,6 +15057,7 @@ class Investigation:
                 "terminated_partial": self._heartbeat_terminated,
             },
             "findings": merged,
+            "ai_assessment": self._compute_ai_assessment(),
             "rejected_finding_leads": self.verifier_rejected_leads,
             "verdict_revisions": self.verdict_revisions,
             "tool_calls": self.tool_calls,
