@@ -8094,6 +8094,31 @@ def evtx_rows_to_findings(
                     "mitre_technique": "T1021.001",
                 }
             )
+        if (
+            "application" in channel.lower()
+            and event_id in (216, 325, 327)
+            and "ntds" in data_text.lower()
+            and "ntds_esent_dump" not in seen_kinds
+        ):
+            seen_kinds.add("ntds_esent_dump")
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "finding_id": "f-B-evtx-ntds-esent",
+                    "tool_call_id": tool_call_id,
+                    "artifact_path": artifact_path,
+                    "description": (
+                        f"EVTX Application ESENT EID {event_id} references the NTDS "
+                        f"database (ntds.dit) (record {record_id}); consistent with an "
+                        "NTDS.dit dump / IFM creation (ntdsutil) for domain credential "
+                        "extraction. Treat as a lead; corroborate with ntdsutil / "
+                        "vssadmin execution and the dump output path."
+                    ),
+                    "confidence": "HYPOTHESIS",
+                    "pool_origin": "B",
+                    "mitre_technique": "T1003.003",
+                }
+            )
         if event_id == 1102 and "audit_log_cleared" not in seen_kinds:
             seen_kinds.add("audit_log_cleared")
             findings.append(
