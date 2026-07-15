@@ -103,10 +103,7 @@ def mem_recall_terms(finding: dict[str, Any]) -> list[str]:
 
 def mem_hits_to_prior_observations(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Project recall hits to NON-evidentiary context (case_id, ts, confidence) only."""
-    return [
-        {"case_id": h["case_id"], "ts": h["ts"], "confidence": h["confidence"]}
-        for h in hits
-    ]
+    return [{"case_id": h["case_id"], "ts": h["ts"], "confidence": h["confidence"]} for h in hits]
 
 
 def mem_attach_prior_observations(
@@ -388,12 +385,7 @@ def _release_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     out: dict[str, Any] = {}
     for key, val in arguments.items():
-        if (
-            isinstance(key, str)
-            and key.endswith("_path")
-            and isinstance(val, str)
-            and val.strip()
-        ):
+        if isinstance(key, str) and key.endswith("_path") and isinstance(val, str) and val.strip():
             out[key] = _relativize_extracted_path(val)
         else:
             out[key] = val
@@ -660,9 +652,7 @@ class SshMcpClient:
         # before blocking on the response so calls actually run in parallel.
         with self._lock:
             if self._closed:
-                raise RuntimeError(
-                    self._spawn_error or f"{self.label}: server closed stdout"
-                )
+                raise RuntimeError(self._spawn_error or f"{self.label}: server closed stdout")
             i = self._next_id
             self._next_id += 1
             msg["id"] = i
@@ -672,15 +662,11 @@ class SshMcpClient:
                 self.proc.stdin.flush()
             except OSError as exc:
                 self._waiters.pop(i, None)
-                raise RuntimeError(
-                    f"{self.label} {method}: server stdin closed"
-                ) from exc
+                raise RuntimeError(f"{self.label} {method}: server stdin closed") from exc
         try:
             env = waiter.get(timeout=timeout)
         except Empty as exc:
-            raise RuntimeError(
-                f"{self.label} {method}: timed out after {timeout:.0f}s"
-            ) from exc
+            raise RuntimeError(f"{self.label} {method}: timed out after {timeout:.0f}s") from exc
         finally:
             with self._lock:
                 self._waiters.pop(i, None)
@@ -692,13 +678,9 @@ class SshMcpClient:
             )
         return env.get("result", {})
 
-    def call_tool(
-        self, name: str, args: dict[str, Any], timeout: float = 600.0
-    ) -> dict[str, Any]:
+    def call_tool(self, name: str, args: dict[str, Any], timeout: float = 600.0) -> dict[str, Any]:
         try:
-            result = self.call(
-                "tools/call", {"name": name, "arguments": args}, timeout=timeout
-            )
+            result = self.call("tools/call", {"name": name, "arguments": args}, timeout=timeout)
         except RuntimeError as e:
             return {"_error": {"message": str(e)}}
         try:
@@ -721,9 +703,7 @@ class SshMcpClient:
                             "kind": err.get("kind"),
                         }
                     }
-                body["_mcp_output_sha256"] = hashlib.sha256(
-                    text.encode("utf-8")
-                ).hexdigest()
+                body["_mcp_output_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
             return body
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             return {"_error": {"message": f"malformed tool response: {e}: {result!r}"}}
@@ -788,9 +768,7 @@ MEMORY_EXTS = (
     else (".mem", ".raw", ".vmem", ".dmp", ".img", ".lime")
 )
 RAW_DISK_EXTS = (
-    _PLAYBOOK_RAW_DISK_EXTS
-    if _PLAYBOOK_AVAILABLE
-    else (".e01", ".dd", ".aff", ".aff4", ".001")
+    _PLAYBOOK_RAW_DISK_EXTS if _PLAYBOOK_AVAILABLE else (".e01", ".dd", ".aff", ".aff4", ".001")
 )
 EXTRACTED_DISK_CLASSES = {
     "mft",
@@ -1349,8 +1327,7 @@ print(json.dumps({
     code, stdout, stderr = ssh_run(cmd, timeout=1800)
     if code != 0:
         raise RuntimeError(
-            "Velociraptor zip extraction failed: "
-            + (stderr.strip() or stdout.strip())[:500]
+            "Velociraptor zip extraction failed: " + (stderr.strip() or stdout.strip())[:500]
         )
     return json.loads(stdout)
 
@@ -1383,23 +1360,14 @@ def is_volatile_run_file(name: str) -> bool:
 
 
 def _inventory_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    class_counts = Counter(
-        str(entry.get("artifact_class") or "unknown") for entry in entries
-    )
-    type_counts = Counter(
-        str(entry.get("evidence_type") or "unknown") for entry in entries
-    )
+    class_counts = Counter(str(entry.get("artifact_class") or "unknown") for entry in entries)
+    type_counts = Counter(str(entry.get("evidence_type") or "unknown") for entry in entries)
     leaf_counts = Counter(
-        PurePosixPath(str(entry.get("path", "")).replace("\\", "/")).name
-        for entry in entries
+        PurePosixPath(str(entry.get("path", "")).replace("\\", "/")).name for entry in entries
     )
-    duplicate_names = sorted(
-        name for name, count in leaf_counts.items() if name and count > 1
-    )
+    duplicate_names = sorted(name for name, count in leaf_counts.items() if name and count > 1)
     rejected = sum(
-        1
-        for entry in entries
-        if str(entry.get("custody_status", "")).startswith("rejected")
+        1 for entry in entries if str(entry.get("custody_status", "")).startswith("rejected")
     )
     unsupported_samples = [
         str(entry.get("path"))
@@ -1416,9 +1384,7 @@ def _inventory_summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "rejected_count": rejected,
         "unsupported_samples": unsupported_samples,
         "raw_disk_count": class_counts.get("raw_disk", 0),
-        "extracted_disk_count": sum(
-            class_counts.get(name, 0) for name in EXTRACTED_DISK_CLASSES
-        ),
+        "extracted_disk_count": sum(class_counts.get(name, 0) for name in EXTRACTED_DISK_CLASSES),
         "yara_target_count": class_counts.get("yara_target", 0),
         "disk_artifact_counts": {
             name: class_counts.get(name, 0)
@@ -1455,9 +1421,7 @@ def finalize_evidence_inventory(
             "child_evidence_id",
             "ev-"
             + hashlib.sha256(
-                json.dumps(
-                    child_preimage, separators=(",", ":"), sort_keys=True
-                ).encode("utf-8")
+                json.dumps(child_preimage, separators=(",", ":"), sort_keys=True).encode("utf-8")
             ).hexdigest()[:16],
         )
     inventory = {
@@ -1478,9 +1442,7 @@ def finalize_evidence_inventory(
     return inventory
 
 
-def build_local_evidence_inventory(
-    root: str | Path, *, limit: int = 500
-) -> dict[str, Any]:
+def build_local_evidence_inventory(root: str | Path, *, limit: int = 500) -> dict[str, Any]:
     """Build a safe local inventory used by policy smokes and offline reports."""
     root_path = Path(root)
     root_real = root_path.resolve(strict=True)
@@ -1517,11 +1479,7 @@ def build_local_evidence_inventory(
         if not path.is_file():
             continue
         real = path.resolve(strict=True)
-        if (
-            real != root_real
-            and root_path.is_dir()
-            and not real.is_relative_to(root_real)
-        ):
+        if real != root_real and root_path.is_dir() and not real.is_relative_to(root_real):
             entries.append(
                 {
                     "path": display_path,
@@ -1629,8 +1587,7 @@ print(json.dumps({
     code, stdout, stderr = ssh_run(cmd, timeout=600)
     if code != 0:
         raise RuntimeError(
-            "remote evidence inventory failed: "
-            + (stderr.strip() or stdout.strip())[:500]
+            "remote evidence inventory failed: " + (stderr.strip() or stdout.strip())[:500]
         )
     data = json.loads(stdout)
     return finalize_evidence_inventory(
@@ -1810,11 +1767,7 @@ def registry_persistence_candidates(
                         or bool(re.match(r"^[a-z]:\\", t_lower))
                         or "\\" in t_lower
                     )
-                    if (
-                        path_like
-                        and not in_system
-                        and base[:14] not in COMMON_WIN_PROCS
-                    ):
+                    if path_like and not in_system and base[:14] not in COMMON_WIN_PROCS:
                         suspicious = True
                 if suspicious:
                     out.append(
@@ -1838,9 +1791,7 @@ def registry_persistence_candidates(
                     out.append(
                         {
                             "kind": "service",
-                            "service_name": row_key.replace("/", "\\").rsplit("\\", 1)[
-                                -1
-                            ],
+                            "service_name": row_key.replace("/", "\\").rsplit("\\", 1)[-1],
                             "image_path": image,
                             "hive_key": row_key,
                             "last_write_time_iso": lw,
@@ -2025,10 +1976,7 @@ def registry_usb_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         friendly = None
         for v in row.get("values") or []:
-            if (
-                isinstance(v, dict)
-                and str(v.get("name") or "").lower() == "friendlyname"
-            ):
+            if isinstance(v, dict) and str(v.get("name") or "").lower() == "friendlyname":
                 friendly = str(v.get("data_str") or "") or None
                 break
         out.append(
@@ -2140,9 +2088,7 @@ _SUSPICIOUS_ACCOUNT_NAME_TOKENS = (
     "hax",
 )
 
-_SAM_NAMES_RE = re.compile(
-    r"\\domains\\account\\users\\names\\(?P<name>[^\\]+)$", re.IGNORECASE
-)
+_SAM_NAMES_RE = re.compile(r"\\domains\\account\\users\\names\\(?P<name>[^\\]+)$", re.IGNORECASE)
 
 
 def registry_sam_account_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2246,9 +2192,7 @@ def _is_suspicious_recent_doc(name: str) -> bool:
     if not low:
         return False
     base = low.replace("/", "\\").rsplit("\\", 1)[-1]
-    if suspicious_prefetch_tool_hint(base) or any(
-        tok in low for tok in _HACKING_TOOL_PATH_TOKENS
-    ):
+    if suspicious_prefetch_tool_hint(base) or any(tok in low for tok in _HACKING_TOOL_PATH_TOKENS):
         return True
     return any(tok in low for tok in _RECENTDOC_TELL_TOKENS)
 
@@ -2285,13 +2229,9 @@ def _is_suspicious_opened_file(path: str) -> bool:
     if low.startswith("\\\\"):
         return True
     base = low.rsplit("\\", 1)[-1]
-    if suspicious_prefetch_tool_hint(base) or any(
-        tok in low for tok in _HACKING_TOOL_PATH_TOKENS
-    ):
+    if suspicious_prefetch_tool_hint(base) or any(tok in low for tok in _HACKING_TOOL_PATH_TOKENS):
         return True
-    if base.endswith(_SUSPICIOUS_OPEN_EXT) and not any(
-        r in low for r in _SYSTEM_PATH_ROOTS
-    ):
+    if base.endswith(_SUSPICIOUS_OPEN_EXT) and not any(r in low for r in _SYSTEM_PATH_ROOTS):
         return True
     return False
 
@@ -2513,8 +2453,7 @@ def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, An
                     {
                         "tool": tok,
                         "path": path,
-                        "created": row.get("fn_created_iso")
-                        or row.get("si_created_iso"),
+                        "created": row.get("fn_created_iso") or row.get("si_created_iso"),
                         "record_number": row.get("record_number"),
                     }
                 )
@@ -2587,9 +2526,7 @@ def lnk_removable_media_candidates(rows: list[dict[str, Any]]) -> list[dict[str,
                 )
             )
         )
-        if not (
-            removable_type or (volume_serial and non_system_target) or path_context
-        ):
+        if not (removable_type or (volume_serial and non_system_target) or path_context):
             continue
         key = (source, target, volume_serial)
         if key in seen:
@@ -2607,9 +2544,7 @@ def lnk_removable_media_candidates(rows: list[dict[str, Any]]) -> list[dict[str,
     return out
 
 
-_USER_PROFILE_PATH_RE = re.compile(
-    r"\\(?:documents and settings|users)\\([^\\]+)\\", re.IGNORECASE
-)
+_USER_PROFILE_PATH_RE = re.compile(r"\\(?:documents and settings|users)\\([^\\]+)\\", re.IGNORECASE)
 # Built-in / system profile names that are NOT a real interactive user. A shortcut
 # under one of these is a stock OS account, not an analyst-relevant per-user lead.
 _DEFAULT_PROFILE_NAMES: frozenset[str] = frozenset(
@@ -2655,9 +2590,7 @@ def _lnk_triage_sort_key(entry: dict[str, Any]) -> tuple[int, str]:
         token in path for token in context_tokens
     ):
         return (0, path)
-    if _is_non_default_user_profile(path) and any(
-        token in path for token in tool_tokens
-    ):
+    if _is_non_default_user_profile(path) and any(token in path for token in tool_tokens):
         return (1, path)
     return (2, path)
 
@@ -2913,11 +2846,7 @@ def ie_history_illicit_candidates(
         if url in seen:
             continue
         seen.add(url)
-        reason = (
-            "illicit/piracy URL token"
-            if has_illicit_token
-            else "executable/archive download"
-        )
+        reason = "illicit/piracy URL token" if has_illicit_token else "executable/archive download"
         out.append(
             {
                 "url": url,
@@ -3042,10 +2971,7 @@ def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     lat2, lon2 = math.radians(b[0]), math.radians(b[1])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    h = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    )
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 2 * _EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(h)))
 
 
@@ -3302,9 +3228,7 @@ def cloud_mfa_fatigue_candidates(
         if burst is None:
             continue
         # The burst ends in an accepted prompt after >=1 denial => caved.
-        accepted_after_denials = burst[-1][2] and any(
-            denied for _, denied, _ in burst[:-1]
-        )
+        accepted_after_denials = burst[-1][2] and any(denied for _, denied, _ in burst[:-1])
         out.append(
             {
                 "kind": "mfa_fatigue",
@@ -3358,9 +3282,7 @@ def _decoded_row_label(row: dict[str, Any]) -> str:
 
 
 CONFIDENCE_RANK = {"HYPOTHESIS": 1, "INFERRED": 2, "CONFIRMED": 3}
-EXPERT_RULES_PATH = (
-    Path(__file__).resolve().parent.parent / "agent-config" / "expert-rules.json"
-)
+EXPERT_RULES_PATH = Path(__file__).resolve().parent.parent / "agent-config" / "expert-rules.json"
 SUSPICIOUS_EVTX_ACTION_TOKENS = (
     "encodedcommand",
     "-encodedcommand",
@@ -4120,9 +4042,7 @@ def build_lane_plan_message(
     if hayabusa_dirs:
         lanes.append(f"{hayabusa_dirs} EVTX dir(s) via hayabusa Sigma sweep")
     if extracted:
-        lanes.append(
-            f"{extracted} extracted disk artifact(s) (prefetch/registry/MFT triage)"
-        )
+        lanes.append(f"{extracted} extracted disk artifact(s) (prefetch/registry/MFT triage)")
     if network:
         lanes.append(f"{network} network capture(s) (pcap/zeek triage)")
     if cloud:
@@ -4163,9 +4083,7 @@ def build_verdict_reasoning_message(
             "findings is NOT scoped-clean"
         )
     if limitations:
-        parts.append(
-            f"{limitations} analysis limitation(s) recorded in the verdict artifact"
-        )
+        parts.append(f"{limitations} analysis limitation(s) recorded in the verdict artifact")
     return "; ".join(parts) + "."
 
 
@@ -4226,9 +4144,7 @@ def build_attack_coverage(
             }
         )
 
-    covered = sum(
-        1 for row in rows if row["status"] in {"finding", "covered_no_finding"}
-    )
+    covered = sum(1 for row in rows if row["status"] in {"finding", "covered_no_finding"})
     observed = sum(1 for row in rows if row["status"] == "finding")
     blind = sum(1 for row in rows if row["status"] == "blind_spot")
     return {
@@ -4316,9 +4232,7 @@ def build_coverage_manifest(
     inventory_class_counts = inventory_summary.get("class_counts", {}) or {}
     unsupported_count = _int_metric(inventory_class_counts.get("unknown"))
     unsupported_samples = [
-        str(sample)
-        for sample in (inventory_summary.get("unsupported_samples") or [])
-        if sample
+        str(sample) for sample in (inventory_summary.get("unsupported_samples") or []) if sample
     ][:20]
     for extraction in velociraptor_zip_extractions or []:
         if not isinstance(extraction, dict):
@@ -4360,15 +4274,10 @@ def build_coverage_manifest(
             status = "not_supplied"
         else:
             status = "available_not_attempted"
-        records_seen = sum(
-            _sum_first_metric(call, _RECORDS_SEEN_FIELDS) for call in calls
-        )
-        rows_returned = sum(
-            _sum_first_metric(call, _ROWS_RETURNED_FIELDS) for call in calls
-        )
+        records_seen = sum(_sum_first_metric(call, _RECORDS_SEEN_FIELDS) for call in calls)
+        rows_returned = sum(_sum_first_metric(call, _ROWS_RETURNED_FIELDS) for call in calls)
         parse_errors = sum(
-            sum(_int_metric(call.get(name)) for name in _PARSE_ERROR_FIELDS)
-            for call in calls
+            sum(_int_metric(call.get(name)) for name in _PARSE_ERROR_FIELDS) for call in calls
         )
         rows.append(
             {
@@ -4382,9 +4291,7 @@ def build_coverage_manifest(
                 "not_supplied": not_supplied,
                 "tools_attempted": [str(call.get("tool")) for call in calls],
                 "tool_call_ids": [
-                    str(call.get("tool_call_id"))
-                    for call in calls
-                    if call.get("tool_call_id")
+                    str(call.get("tool_call_id")) for call in calls if call.get("tool_call_id")
                 ],
                 "tools_failed": [
                     str(call.get("tool")) for call in failed_calls if call.get("tool")
@@ -4496,9 +4403,7 @@ def _citation_ids_for_technique(technique: str | None) -> list[str]:
 
 def _data_sources_for_tools(tools: set[str]) -> list[str]:
     data_sources = {
-        data_source
-        for tool in tools
-        for data_source in DATA_SOURCES_BY_TOOL.get(tool, ())
+        data_source for tool in tools for data_source in DATA_SOURCES_BY_TOOL.get(tool, ())
     }
     return sorted(data_sources)
 
@@ -4517,12 +4422,8 @@ def build_attck_practitioner_coverage(
         if tc.get("tool_call_id") and tc.get("tool")
     }
     checks = {c.get("artifact_class"): c for c in case_completeness.get("checks", [])}
-    touched_classes = {
-        name for name, row in checks.items() if name and row.get("touched")
-    }
-    available_classes = {
-        name for name, row in checks.items() if name and row.get("available")
-    }
+    touched_classes = {name for name, row in checks.items() if name and row.get("touched")}
+    available_classes = {name for name, row in checks.items() if name and row.get("available")}
 
     lane_specs: dict[str, dict[str, Any]] = {
         "endpoint_host": {
@@ -4672,9 +4573,7 @@ def build_attck_practitioner_coverage(
     data_source_rows = []
     for data_source in _data_sources_for_tools(tools_run):
         observed_tools = sorted(
-            tool
-            for tool in tools_run
-            if data_source in DATA_SOURCES_BY_TOOL.get(tool, ())
+            tool for tool in tools_run if data_source in DATA_SOURCES_BY_TOOL.get(tool, ())
         )
         data_source_rows.append(
             {
@@ -4744,9 +4643,7 @@ def build_normalized_timeline(
     corroboration_tcids: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     indexed_findings = [(_finding_id(f, i), f) for i, f in enumerate(findings, 1)]
-    subject_records_by_fid = {
-        fid: _finding_subject_records(f) for fid, f in indexed_findings
-    }
+    subject_records_by_fid = {fid: _finding_subject_records(f) for fid, f in indexed_findings}
     corroboration_tcids = corroboration_tcids or {}
     findings_by_tool: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for fid, finding in indexed_findings:
@@ -4761,9 +4658,7 @@ def build_normalized_timeline(
             findings_by_tool.setdefault(corr, []).append((fid, finding))
 
     events = []
-    for i, event in enumerate(
-        sorted(timeline_events, key=lambda e: e.get("ts") or ""), 1
-    ):
+    for i, event in enumerate(sorted(timeline_events, key=lambda e: e.get("ts") or ""), 1):
         tcid = str(event.get("tool_call_id") or "")
         event_record = str((event.get("details") or {}).get("record_id") or "")
         linked = []
@@ -4806,9 +4701,7 @@ def build_normalized_timeline(
             {
                 "event_id": f"timeline-{i:04d}",
                 "timestamp_utc": event.get("ts"),
-                "timestamp_source": TIMESTAMP_SOURCE_BY_TOOL.get(
-                    source, "source timestamp"
-                ),
+                "timestamp_source": TIMESTAMP_SOURCE_BY_TOOL.get(source, "source timestamp"),
                 "artifact_class": event.get("artifact_class") or "unknown",
                 "tool_call_id": tcid,
                 "source_record_ref": _source_record_ref(event, i),
@@ -4987,9 +4880,7 @@ def build_indicators(
             flags=re.I,
         ):
             relative = _trim_registry_prose(match.group(0))
-            if _ioc_match_is_negated(
-                description, match.start(), match.start() + len(relative)
-            ):
+            if _ioc_match_is_negated(description, match.start(), match.start() + len(relative)):
                 continue
             registry_values.add(f"HKLM\\SYSTEM\\{relative}")
 
@@ -5160,9 +5051,7 @@ def build_report_evidence_cards(
                     "Visual exhibit supports the cited finding but does not replace parsed tool output."
                 ]
                 + (
-                    [
-                        "HYPOTHESIS confidence requires additional artifact corroboration."
-                    ]
+                    ["HYPOTHESIS confidence requires additional artifact corroboration."]
                     if finding.get("confidence") == "HYPOTHESIS"
                     else []
                 ),
@@ -5214,8 +5103,7 @@ def _extract_cve_ids(text: str) -> list[str]:
 
 def _finding_text(finding: dict[str, Any]) -> str:
     return " ".join(
-        str(finding.get(key) or "")
-        for key in ("description", "title", "summary", "reasoning")
+        str(finding.get(key) or "") for key in ("description", "title", "summary", "reasoning")
     ).lower()
 
 
@@ -5292,9 +5180,7 @@ def discipline_agent_findings(
     demoted to a logged audit lead, not a customer-visible finding.
     """
     tool_by_tcid = {
-        str(tc.get("tool_call_id")): tc.get("tool")
-        for tc in tool_calls
-        if tc.get("tool_call_id")
+        str(tc.get("tool_call_id")): tc.get("tool") for tc in tool_calls if tc.get("tool_call_id")
     }
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
@@ -5308,10 +5194,7 @@ def discipline_agent_findings(
                 *(finding.get("derived_from") or []),
             ]:
                 tool = tool_by_tcid.get(str(cid))
-                if (
-                    tool in TOOL_ARTIFACT_CLASSES
-                    and TOOL_ARTIFACT_CLASSES[tool] != "custody"
-                ):
+                if tool in TOOL_ARTIFACT_CLASSES and TOOL_ARTIFACT_CLASSES[tool] != "custody":
                     classes.add(TOOL_ARTIFACT_CLASSES[tool])
             if len(classes) < 2:
                 dropped.append(
@@ -5333,9 +5216,7 @@ def discipline_agent_findings(
 
 # Curated technique_id -> technique_name (gate-safe names, no exoneration/execution
 # tokens) drawn from the coverage table; used to compose agent finding descriptions.
-_ATTACK_NAME_BY_ID = {
-    t["technique_id"]: t["technique_name"] for t in ATTACK_COVERAGE_TARGETS
-}
+_ATTACK_NAME_BY_ID = {t["technique_id"]: t["technique_name"] for t in ATTACK_COVERAGE_TARGETS}
 
 # Defensive last-pass substitutions: the naive report-QA gates match these exact
 # tokens even inside a quoted event name or a denial, so the mechanically-composed
@@ -5358,18 +5239,14 @@ _GATE_SAFE_SUBSTITUTIONS = {
 }
 
 _GATE_SAFE_RE = re.compile(
-    r"(?<![\w-])("
-    + "|".join(re.escape(k) for k in _GATE_SAFE_SUBSTITUTIONS)
-    + r")(?![\w-])",
+    r"(?<![\w-])(" + "|".join(re.escape(k) for k in _GATE_SAFE_SUBSTITUTIONS) + r")(?![\w-])",
     re.IGNORECASE,
 )
 
 
 def _gate_safe_text(text: str) -> str:
     """Neutralize any standalone report-QA trigger token in composed finding text."""
-    return _GATE_SAFE_RE.sub(
-        lambda m: _GATE_SAFE_SUBSTITUTIONS[m.group(0).lower()], text
-    )
+    return _GATE_SAFE_RE.sub(lambda m: _GATE_SAFE_SUBSTITUTIONS[m.group(0).lower()], text)
 
 
 def compose_agent_finding_description(finding: dict[str, Any]) -> str:
@@ -5393,12 +5270,7 @@ def compose_agent_finding_description(finding: dict[str, Any]) -> str:
 
     facts: list[str] = []
     for av in finding.get("asserted_values") or []:
-        field = (
-            str(av.get("path") or "")
-            .replace("[*]", "")
-            .rsplit(".", 1)[-1]
-            .split("[")[0]
-        )
+        field = str(av.get("path") or "").replace("[*]", "").rsplit(".", 1)[-1].split("[")[0]
         value = str(av.get("expected") or "")
         if field and value and len(value) <= 120:
             facts.append(f"{field}={value}")
@@ -5441,9 +5313,7 @@ _ABLATION_TOOL_CLASS = {
 }
 
 
-def ablation_finding_classes(
-    finding: dict[str, Any], tc_index: dict[str, str]
-) -> set[str]:
+def ablation_finding_classes(finding: dict[str, Any], tc_index: dict[str, str]) -> set[str]:
     """Distinct artifact classes a Finding is mechanically tied to.
 
     Mirror of ``_finding_classes`` in scripts/check-corroboration.py: a Finding's
@@ -5582,9 +5452,7 @@ def build_report_qa_signoff(
     for event in timeline_events:
         for finding_id in event.get("linked_finding_ids", []):
             events_by_finding.setdefault(str(finding_id), []).append(event)
-    tool_ids = {
-        str(tc.get("tool_call_id")) for tc in tool_calls if tc.get("tool_call_id")
-    }
+    tool_ids = {str(tc.get("tool_call_id")) for tc in tool_calls if tc.get("tool_call_id")}
     tool_by_tcid = {
         str(tc.get("tool_call_id")): str(tc.get("tool"))
         for tc in tool_calls
@@ -5594,9 +5462,7 @@ def build_report_qa_signoff(
     tool_classes = _tool_classes(tool_calls)
     current_classes = touched_classes | tool_classes
 
-    missing_citations = [
-        fid for fid, f in indexed_findings if not f.get("tool_call_id")
-    ]
+    missing_citations = [fid for fid, f in indexed_findings if not f.get("tool_call_id")]
     unknown_citations = [
         fid
         for fid, f in indexed_findings
@@ -5718,9 +5584,7 @@ def build_report_qa_signoff(
 
     blind_spots = int(attack_coverage.get("blind_spot_count", 0) or 0)
     unexamined_classes = (
-        coverage_unexamined_available_classes(coverage_manifest)
-        if verdict == "NO_EVIL"
-        else []
+        coverage_unexamined_available_classes(coverage_manifest) if verdict == "NO_EVIL" else []
     )
     if verdict == "NO_EVIL" and unexamined_classes:
         # An absence row that names an available artifact class with no
@@ -5832,9 +5696,7 @@ def build_report_qa_signoff(
             "No run-specific analysis limitations were recorded.",
         )
 
-    forbidden_terms = [
-        str(term).lower() for term in rules.get("forbidden_unqualified_terms", [])
-    ]
+    forbidden_terms = [str(term).lower() for term in rules.get("forbidden_unqualified_terms", [])]
     report_text = "\n".join(
         [
             *(_finding_text(f) for _, f in indexed_findings),
@@ -6533,9 +6395,7 @@ _CERTAINTY_BY_CONFIDENCE: dict[str, str] = {
         "Moderate — drawn from two or more corroborating, reproducible facts; an "
         "analyst should confirm."
     ),
-    "HYPOTHESIS": (
-        "Low — a single-source lead; a direction to pursue, not a conclusion."
-    ),
+    "HYPOTHESIS": ("Low — a single-source lead; a direction to pursue, not a conclusion."),
 }
 
 
@@ -6630,9 +6490,7 @@ def _artifact_host_fallback(path: Any) -> str:
     return "" if _is_extracted_artifact_basename(name) else name
 
 
-def tag_finding_hosts(
-    findings: list[dict[str, Any]], normalized_timeline: dict[str, Any]
-) -> None:
+def tag_finding_hosts(findings: list[dict[str, Any]], normalized_timeline: dict[str, Any]) -> None:
     """Denormalize the originating host onto each finding, in place.
 
     Uses the finding's earliest linked event carrying a host/workstation entity
@@ -6642,9 +6500,7 @@ def tag_finding_hosts(
     """
     events_by_finding = _events_by_finding(normalized_timeline)
     for index, finding in enumerate(findings, 1):
-        _actor, host = _lead_entities(
-            events_by_finding.get(_finding_id(finding, index), [])
-        )
+        _actor, host = _lead_entities(events_by_finding.get(_finding_id(finding, index), []))
         finding["host"] = host or _artifact_host_fallback(finding.get("artifact_path"))
 
 
@@ -6709,11 +6565,7 @@ def build_host_groups(
         group["evidence_sources"] = sorted(group["evidence_sources"])
         group["finding_count"] = len(group["finding_ids"])
         group["top_confidence"] = next(
-            (
-                c
-                for c in ("CONFIRMED", "INFERRED", "HYPOTHESIS")
-                if group["by_confidence"].get(c)
-            ),
+            (c for c in ("CONFIRMED", "INFERRED", "HYPOTHESIS") if group["by_confidence"].get(c)),
             "HYPOTHESIS",
         )
         ordered.append(group)
@@ -6746,9 +6598,7 @@ def clean_analysis_limitations(items: list[str]) -> list[str]:
         if not text:
             continue
         if any(marker in text for marker in _RAW_TOOL_ERROR_MARKERS):
-            match = re.match(
-                r"([\w.-]+?)(?:_scan|_query)?(?: failed| could not| exited)", text
-            )
+            match = re.match(r"([\w.-]+?)(?:_scan|_query)?(?: failed| could not| exited)", text)
             tool = match.group(1) if match else "A tool"
             text = (
                 f"{tool} did not complete (tool error); raw output is in the run "
@@ -6799,9 +6649,7 @@ def normalize_hypothesis_prefix(findings: list[dict[str, Any]]) -> list[dict[str
     for f in findings:
         if f.get("confidence") == "HYPOTHESIS":
             desc = f.get("description")
-            if isinstance(desc, str) and not desc.lstrip().lower().startswith(
-                "hypothesis:"
-            ):
+            if isinstance(desc, str) and not desc.lstrip().lower().startswith("hypothesis:"):
                 f = {**f, "description": f"hypothesis: {desc.lstrip()}"}
         out.append(f)
     return out
@@ -6828,19 +6676,11 @@ def build_executive_attack_story(
     for order, (finding_id, finding) in enumerate(indexed_findings, 1):
         events = events_by_finding.get(finding_id, [])
         timestamp = next(
-            (
-                event.get("timestamp_utc")
-                for event in events
-                if event.get("timestamp_utc")
-            ),
+            (event.get("timestamp_utc") for event in events if event.get("timestamp_utc")),
             None,
         )
         artifact_classes = sorted(
-            {
-                str(event.get("artifact_class"))
-                for event in events
-                if event.get("artifact_class")
-            }
+            {str(event.get("artifact_class")) for event in events if event.get("artifact_class")}
         )
         if not artifact_classes:
             artifact_classes = ["see finding artifact"]
@@ -6863,8 +6703,7 @@ def build_executive_attack_story(
                 "summary": str(finding.get("description") or "")[:260],
                 "confidence": confidence,
                 "mitre_technique": finding.get("mitre_technique"),
-                "named_technique": finding.get("named_technique")
-                or beat_profile.get("name", ""),
+                "named_technique": finding.get("named_technique") or beat_profile.get("name", ""),
                 "cves": finding.get("cves") or [],
                 "tool_call_id": finding.get("tool_call_id"),
                 "artifact_classes": artifact_classes,
@@ -6944,9 +6783,7 @@ def build_executive_attack_story(
         # names what actually happened ("cain.exe executed") rather than a
         # placeholder.
         if action.strip().lower() == "suspicious activity":
-            derived = _lead_action_from_description(
-                str((lead or {}).get("description") or "")
-            )
+            derived = _lead_action_from_description(str((lead or {}).get("description") or ""))
             if derived:
                 action = derived
                 category = ""  # the derived phrase already carries the specifics
@@ -6962,9 +6799,7 @@ def build_executive_attack_story(
         # Lead sentence = what happened (with time/host/account). The interpretation
         # (evil + honest caveat) lives only in `assessment` below, so the BLUF does
         # not print the same paragraph twice.
-        customer_summary = (
-            f"The supplied evidence shows {action}{where}{who}{when}."
-        ).strip()
+        customer_summary = (f"The supplied evidence shows {action}{where}{who}{when}.").strip()
         # Prefer the lead finding's named-technique analyst note (the practitioner
         # voice) over the generic technique profile.
         assessment = str(
@@ -7006,9 +6841,7 @@ def build_executive_attack_story(
         "Whether the wider environment is affected — this run examined the supplied evidence only.",
     ]
     for question, reason, recovery in profile.get("cannot", []):
-        cannot_say.append(
-            f"Undetermined: {question}. Reason: {reason}. To resolve: {recovery}."
-        )
+        cannot_say.append(f"Undetermined: {question}. Reason: {reason}. To resolve: {recovery}.")
     checks = {c.get("artifact_class"): c for c in case_completeness.get("checks", [])}
     gaps_added = 0
     for cls in _GAP_PRIORITY:
@@ -7028,8 +6861,7 @@ def build_executive_attack_story(
         (
             b
             for b in beats
-            if b.get("phase") in ("Initial Access", "Lateral Movement")
-            and b.get("named_technique")
+            if b.get("phase") in ("Initial Access", "Lateral Movement") and b.get("named_technique")
         ),
         None,
     )
@@ -7065,9 +6897,7 @@ def build_executive_attack_story(
             action.get("action") for action in next_actions[:3] if action.get("action")
         ],
         "ready_for_expert_signoff": report_qa.get("ready_for_expert_signoff", False),
-        "customer_release_candidate": report_qa.get(
-            "customer_release_candidate", False
-        ),
+        "customer_release_candidate": report_qa.get("customer_release_candidate", False),
         "customer_releasable": report_qa.get("customer_releasable", False),
         "expert_decision": report_qa.get("expert_decision", "pending"),
         "ready_for_customer_pdf": report_qa.get("ready_for_customer_pdf", False),
@@ -7108,24 +6938,18 @@ def customer_visible_report_text(
         )
     for action in next_actions:
         values.extend(
-            str(action.get(key))
-            for key in ("action", "reason", "priority")
-            if action.get(key)
+            str(action.get(key)) for key in ("action", "reason", "priority") if action.get(key)
         )
     for card in evidence_cards:
         values.extend(
-            str(card.get(key))
-            for key in ("title", "why_suspicious", "snippet")
-            if card.get(key)
+            str(card.get(key)) for key in ("title", "why_suspicious", "snippet") if card.get(key)
         )
         values.extend(str(item) for item in card.get("caveats", []) if item)
     values.extend(str(item) for item in analysis_limitations if item)
     return values
 
 
-def build_expert_miss_summary(
-    case_id: str, ledger_path: Path | None = None
-) -> dict[str, Any]:
+def build_expert_miss_summary(case_id: str, ledger_path: Path | None = None) -> dict[str, Any]:
     conversion_targets = {
         "connector": "connector",
         "playbook": "playbook_step",
@@ -7173,16 +6997,12 @@ def build_expert_miss_summary(
                     "expert_name": payload.get("expert_name"),
                     "ledger_seq": record.get("seq"),
                     "ledger_ts": record.get("ts"),
-                    "ledger_line_sha256": hashlib.sha256(
-                        raw.encode("utf-8")
-                    ).hexdigest(),
+                    "ledger_line_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 }
             )
     total = sum(by_type.values())
     if total:
-        by_type_summary = ", ".join(
-            f"{key}={count}" for key, count in sorted(by_type.items())
-        )
+        by_type_summary = ", ".join(f"{key}={count}" for key, count in sorted(by_type.items()))
         summary = f"Expert misses captured this case: {total} ({by_type_summary})"
     else:
         summary = (
@@ -7259,9 +7079,7 @@ _EXPLICIT_IOC_OBSERVATION = re.compile(
 _IOC_CLAUSE_BOUNDARY = re.compile(r"[!?;\r\n]|[.](?=\s|$)")
 
 
-def _ioc_clause_context(
-    text: str, match_start: int, match_end: int
-) -> tuple[str, int, int]:
+def _ioc_clause_context(text: str, match_start: int, match_end: int) -> tuple[str, int, int]:
     prior = list(_IOC_CLAUSE_BOUNDARY.finditer(text, 0, match_start))
     clause_start = prior[-1].end() if prior else 0
     following = _IOC_CLAUSE_BOUNDARY.search(text, match_end)
@@ -7291,9 +7109,7 @@ def _ioc_match_is_negated(text: str, match_start: int, match_end: int) -> bool:
     return bool(cues) and min(cues)[1] == 0
 
 
-def _non_negated_ioc_matches(
-    pattern: str, text: str, *, flags: int = 0
-) -> list[str]:
+def _non_negated_ioc_matches(pattern: str, text: str, *, flags: int = 0) -> list[str]:
     return [
         match.group(0)
         for match in re.finditer(pattern, text, flags=flags)
@@ -7303,9 +7119,7 @@ def _non_negated_ioc_matches(
 
 def _observed_hash_matches(text: str) -> list[str]:
     hashes: list[str] = []
-    for match in re.finditer(
-        r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", text
-    ):
+    for match in re.finditer(r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", text):
         clause, _, _ = _ioc_clause_context(text, match.start(), match.end())
         if _ioc_match_is_negated(text, match.start(), match.end()):
             continue
@@ -7389,13 +7203,9 @@ _NON_DOMAIN_SUFFIXES = frozenset(
 def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
     blob = "\n".join(texts)
     iocs = _empty_iocs()
-    iocs["urls"] = _uniq(
-        _non_negated_ioc_matches(r"https?://[^\s'\"<>]+", blob, flags=re.I)
-    )[:50]
+    iocs["urls"] = _uniq(_non_negated_ioc_matches(r"https?://[^\s'\"<>]+", blob, flags=re.I))[:50]
     iocs["emails"] = _uniq(
-        _non_negated_ioc_matches(
-            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", blob
-        )
+        _non_negated_ioc_matches(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", blob)
     )[:50]
     iocs["ips"] = _uniq(
         _non_negated_ioc_matches(
@@ -7403,9 +7213,7 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
             blob,
         )
     )[:50]
-    domains = _non_negated_ioc_matches(
-        r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", blob
-    )
+    domains = _non_negated_ioc_matches(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", blob)
     # The regex also matches executable/file names like `calc.exe` or `cmd.exe`
     # (the final label looks like a TLD). Those are processes, not domains — drop
     # any candidate whose final label is a known file extension.
@@ -7442,22 +7250,14 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         )
     )
     paths.extend(_non_negated_ioc_matches(r"\b[A-Za-z]:\\[^\s,;\"'<>|]+", blob))
-    paths.extend(
-        _non_negated_ioc_matches(r"\\\\[A-Za-z0-9._$-]+\\[^\s,;\"'<>|]+", blob)
-    )
-    paths.extend(
-        _non_negated_ioc_matches(
-            r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+", blob
-        )
-    )
+    paths.extend(_non_negated_ioc_matches(r"\\\\[A-Za-z0-9._$-]+\\[^\s,;\"'<>|]+", blob))
+    paths.extend(_non_negated_ioc_matches(r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+", blob))
     paths = [path.rstrip(".:)") for path in paths]
     paths = [
         path
         for path in paths
         if not any(
-            other != path
-            and other.lower().startswith((path + " ").lower())
-            for other in paths
+            other != path and other.lower().startswith((path + " ").lower()) for other in paths
         )
     ]
     filenames = _non_negated_ioc_matches(
@@ -7473,13 +7273,9 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
     iocs["paths"] = _uniq(paths)[:50]
     iocs["registry_keys"] = _uniq(_registry_ioc_matches(blob))[:50]
     iocs["hashes"] = _uniq(
-        _non_negated_ioc_matches(
-            r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob
-        )
+        _non_negated_ioc_matches(r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob)
     )[:50]
-    iocs["mutex_like"] = _uniq(
-        re.findall(r"\b(?:Global|Local)\\[A-Za-z0-9_.-]{4,}\b", blob)
-    )[:50]
+    iocs["mutex_like"] = _uniq(re.findall(r"\b(?:Global|Local)\\[A-Za-z0-9_.-]{4,}\b", blob))[:50]
     iocs["user_agents"] = _uniq(
         text
         for text in texts
@@ -7613,9 +7409,7 @@ def build_malware_triage(
     tool_call_ids: dict[str, str],
     artifact_path: str,
 ) -> dict[str, Any]:
-    injections = (
-        malfind_out.get("injections", []) if isinstance(malfind_out, dict) else []
-    )
+    injections = malfind_out.get("injections", []) if isinstance(malfind_out, dict) else []
     if not isinstance(injections, list):
         injections = []
     observables = [
@@ -7660,9 +7454,7 @@ def build_malware_triage(
             "malfind_injection_count": int(
                 malfind_out.get("injections_seen", len(injections)) or 0
             ),
-            "verdict_contribution": "triage_lead"
-            if observables or yara_matches
-            else "none",
+            "verdict_contribution": "triage_lead" if observables or yara_matches else "none",
         },
         "observables": observables,
         "aggregate_iocs": aggregate_iocs,
@@ -7682,9 +7474,9 @@ def build_malware_triage(
 def _top_counter(values: list[Any], limit: int = 10) -> list[dict[str, Any]]:
     return [
         {"value": value, "count": count}
-        for value, count in Counter(
-            str(v) for v in values if v not in (None, "")
-        ).most_common(limit)
+        for value, count in Counter(str(v) for v in values if v not in (None, "")).most_common(
+            limit
+        )
     ]
 
 
@@ -7765,11 +7557,7 @@ def _finalize_disk_artifact_summary(disk_summary: dict[str, Any]) -> dict[str, A
             "P2",
             "Cluster MFT and USN file-system timestamps around EVTX and Prefetch events to build a disk-backed activity window.",
             "File-system timelines are useful for sequence reconstruction but do not prove process execution by themselves.",
-            [
-                tool
-                for tool in ("mft_timeline", "usnjrnl_query")
-                if tool in tool_summaries
-            ],
+            [tool for tool in ("mft_timeline", "usnjrnl_query") if tool in tool_summaries],
         )
     if counts.get("yara_target"):
         add(
@@ -7788,9 +7576,7 @@ def _finalize_disk_artifact_summary(disk_summary: dict[str, Any]) -> dict[str, A
 
     disk_summary["next_actions"] = actions[:5]
     disk_summary["verdict_contribution"] = (
-        "timeline_context"
-        if disk_summary.get("timeline_event_count")
-        else "coverage_only"
+        "timeline_context" if disk_summary.get("timeline_event_count") else "coverage_only"
     )
     return disk_summary
 
@@ -7805,9 +7591,7 @@ def build_next_actions(
     actions: list[dict[str, Any]] = []
     seen: set[str] = set()
     techniques = {
-        f.get("mitre_technique")
-        for f in findings
-        if isinstance(f.get("mitre_technique"), str)
+        f.get("mitre_technique") for f in findings if isinstance(f.get("mitre_technique"), str)
     }
     network_finding_ids = {
         "dns": [
@@ -7831,9 +7615,7 @@ def build_next_actions(
             if "sysmon-network-lead" in str(f.get("finding_id") or "")
         ],
     }
-    checks_by_class = {
-        c.get("artifact_class"): c for c in case_completeness.get("checks", [])
-    }
+    checks_by_class = {c.get("artifact_class"): c for c in case_completeness.get("checks", [])}
 
     def add(
         priority: str,
@@ -8022,8 +7804,7 @@ def _evtx_summary_dict(
         "parse_errors": parse_errors,
         "distinct_event_ids": len(event_ids),
         "top_event_ids": [
-            {"event_id": event_id, "count": count}
-            for event_id, count in event_ids.most_common(10)
+            {"event_id": event_id, "count": count} for event_id, count in event_ids.most_common(10)
         ],
         "channels": channels,
         "suspicious_event_count": suspicious_event_count,
@@ -8171,12 +7952,7 @@ def _sysmon_network_row_is_notable(row: dict[str, Any]) -> tuple[bool, str]:
     image = PurePosixPath(str(row.get("image") or "").replace("\\", "/")).name.lower()
     if _is_external_ip(dst) and port and port not in COMMON_CLIENT_PORTS:
         return True, f"external destination on uncommon port {port}"
-    if (
-        _is_external_ip(dst)
-        and image
-        and image not in COMMON_BROWSER_IMAGES
-        and port in {80, 443}
-    ):
+    if _is_external_ip(dst) and image and image not in COMMON_BROWSER_IMAGES and port in {80, 443}:
         return True, f"non-browser process {image} contacted external web endpoint"
     return False, ""
 
@@ -8358,9 +8134,7 @@ def evtx_rows_to_findings(
                     "asserted_values": [
                         {
                             "path": "rows[*]",
-                            "expected": json.dumps(
-                                {"event_id": "1102", "channel": "Security"}
-                            ),
+                            "expected": json.dumps({"event_id": "1102", "channel": "Security"}),
                             "match": "record",
                         },
                     ],
@@ -8434,10 +8208,7 @@ def evtx_rows_to_findings(
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
             if str(ent.get("logon_type") or "") == "10":
                 seen_kinds.add("rdp_logon")
-                who = (
-                    _format_account(ent.get("account"), ent.get("domain"))
-                    or "an account"
-                )
+                who = _format_account(ent.get("account"), ent.get("domain")) or "an account"
                 src = ent.get("source_ip")
                 findings.append(
                     {
@@ -8510,9 +8281,7 @@ def evtx_rows_to_findings(
             seen_kinds.add("service_install")
             svc = ent.get("service_name") or "a service"
             path = ent.get("service_path")
-            suspicious = any(
-                t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS
-            )
+            suspicious = any(t in str(path or "").lower() for t in _SUSPICIOUS_SVC_PATH_TOKENS)
             findings.append(
                 {
                     "case_id": case_id,
@@ -8534,9 +8303,7 @@ def evtx_rows_to_findings(
             )
     if failed_logons >= 5 and "failed_logon_burst" not in seen_kinds:
         seen_kinds.add("failed_logon_burst")
-        who = _format_account(
-            failed_logon_ctx.get("account"), failed_logon_ctx.get("domain")
-        )
+        who = _format_account(failed_logon_ctx.get("account"), failed_logon_ctx.get("domain"))
         src = failed_logon_ctx.get("source_ip")
         findings.append(
             {
@@ -8751,8 +8518,7 @@ def write_normalized_timeline_csv(events: list[dict[str, Any]], path: Path) -> N
                     "domain": ent.get("domain", ""),
                     "host": ent.get("host", ""),
                     "source_ip": ent.get("source_ip", ""),
-                    "logon_type": ent.get("logon_type_label")
-                    or ent.get("logon_type", ""),
+                    "logon_type": ent.get("logon_type_label") or ent.get("logon_type", ""),
                     "process": ent.get("process", ""),
                     "pid": ent.get("pid", ""),
                     "tool_call_id": event.get("tool_call_id", ""),
@@ -8851,9 +8617,7 @@ class Investigation:
         self.run_id = f"auto-{int(time.time())}"
         self.started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.case_dir = (
-            str(LOCAL_RUNS_DIR / self.case_id)
-            if LOCAL_MODE
-            else f"{GUEST_REPO}/tmp/{self.case_id}"
+            str(LOCAL_RUNS_DIR / self.case_id) if LOCAL_MODE else f"{GUEST_REPO}/tmp/{self.case_id}"
         )
         self.audit_path = f"{self.case_dir}/audit.jsonl"
         self.manifest_path = f"{self.case_dir}/run.manifest.json"
@@ -8967,9 +8731,7 @@ class Investigation:
                 p = os.path.join(dirpath, name)
                 rel = os.path.relpath(p, root)
                 low = rel.replace("\\", "/").lower()
-                if not (
-                    "ollama" in low or low.endswith(".ps1") or low.endswith("history")
-                ):
+                if not ("ollama" in low or low.endswith(".ps1") or low.endswith("history")):
                     continue
                 try:
                     if os.path.getsize(p) > 262144:  # 256 KiB text cap
@@ -8980,9 +8742,7 @@ class Investigation:
                 files.append({"path": rel, "text": text})
         return assess_ai_helper(files)
 
-    def _finding_id_for(
-        self, base: str, artifact_path: str, *, force_suffix: bool = False
-    ) -> str:
+    def _finding_id_for(self, base: str, artifact_path: str, *, force_suffix: bool = False) -> str:
         if not self.evidence_inventory and not force_suffix:
             return base
         suffix = hashlib.sha256(artifact_path.encode("utf-8")).hexdigest()[:8]
@@ -9375,14 +9135,11 @@ class Investigation:
                 "started_at": self.started_at,
                 "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "tool_calls": self.tcid_counter,
-                "findings_so_far": len(self.findings_pool_a)
-                + len(self.findings_pool_b),
+                "findings_so_far": len(self.findings_pool_a) + len(self.findings_pool_b),
                 **extra,
             }
             tmp = case_dir / ".status.json.tmp"
-            tmp.write_text(
-                json.dumps(status, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            tmp.write_text(json.dumps(status, indent=2, sort_keys=True), encoding="utf-8")
             tmp.replace(case_dir / "status.json")
         except Exception:
             # Liveness is advisory; never let it interrupt the case.
@@ -9425,9 +9182,7 @@ class Investigation:
         # verifier/replay path), so relativize it in lockstep to keep the chain and
         # verdict.json /home-free; a mount point outside the case store passes through.
         if isinstance(released_extra.get("fs_root"), str):
-            released_extra["fs_root"] = _relativize_extracted_path(
-                released_extra["fs_root"]
-            )
+            released_extra["fs_root"] = _relativize_extracted_path(released_extra["fs_root"])
         tcid = self._next_tcid()
         self._audit(
             py,
@@ -9455,9 +9210,7 @@ class Investigation:
         self._heartbeat(last_tool=tool)
         return tcid
 
-    def _run_agent_pools(
-        self, rust: SshMcpClient, py: SshMcpClient, evidence_type: str
-    ) -> None:
+    def _run_agent_pools(self, rust: SshMcpClient, py: SshMcpClient, evidence_type: str) -> None:
         """Stage B opt-in: run Pool A and Pool B as an LLM agent loop over the MCP tools.
 
         Each pod drives the same read-only DFIR tool surface the deterministic engine
@@ -9493,20 +9246,14 @@ class Investigation:
         )
         listing = rust.call("tools/list", {})
         mcp_tools = _scope_agent_mcp_tools(
-            [
-                t
-                for t in (listing.get("tools") or [])
-                if t.get("name") not in _AGENT_TOOL_DENYLIST
-            ],
+            [t for t in (listing.get("tools") or []) if t.get("name") not in _AGENT_TOOL_DENYLIST],
             evidence_type,
         )
         product_tools = mcp_tools_to_openai(mcp_tools)
         tools = [*product_tools, RECORD_FINDING_TOOL]
         case_id = self.handle["id"]
 
-        def call_and_record(
-            name: str, args: dict[str, Any]
-        ) -> tuple[str | None, Any, str | None]:
+        def call_and_record(name: str, args: dict[str, Any]) -> tuple[str | None, Any, str | None]:
             original_args = dict(args)
             try:
                 args = _bind_agent_tool_args(
@@ -9517,9 +9264,7 @@ class Investigation:
                 )
             except ValueError as exc:
                 msg = str(exc)
-                self._record_tool(
-                    py, name, "", extra={"error": msg}, arguments=original_args
-                )
+                self._record_tool(py, name, "", extra={"error": msg}, arguments=original_args)
                 return (None, None, msg)
             res = rust.call_tool(name, args)
             if isinstance(res, dict) and "_error" in res:
@@ -9531,11 +9276,7 @@ class Investigation:
                 return (None, None, msg)
             if isinstance(res, dict):
                 sha = str(res.get("_mcp_output_sha256", ""))
-                display = {
-                    k: v
-                    for k, v in res.items()
-                    if k not in ("_mcp_output_sha256", "_meta")
-                }
+                display = {k: v for k, v in res.items() if k not in ("_mcp_output_sha256", "_meta")}
             else:
                 sha = self._hash_obj(res)
                 display = res
@@ -9587,9 +9328,7 @@ class Investigation:
                     },
                 )
                 finding["description"] = compose_agent_finding_description(finding)
-            (
-                self.findings_pool_a if pod.pool_origin == "A" else self.findings_pool_b
-            ).extend(kept)
+            (self.findings_pool_a if pod.pool_origin == "A" else self.findings_pool_b).extend(kept)
 
     def _output_hash(self, obj: dict[str, Any]) -> str:
         value = obj.pop("_mcp_output_sha256", None)
@@ -9630,9 +9369,7 @@ class Investigation:
 
     def _case_completeness(self) -> dict[str, Any]:
         inventory = self.evidence_inventory
-        evidence_type = (
-            "directory" if inventory else detect_evidence_type(self.evidence)
-        )
+        evidence_type = "directory" if inventory else detect_evidence_type(self.evidence)
         inventory_classes = {
             str(entry.get("artifact_class"))
             for entry in inventory_supported_entries(inventory or {})
@@ -9644,26 +9381,20 @@ class Investigation:
         disk_available = evidence_type == "disk" or bool(
             inventory_classes & ({"raw_disk", "yara_target"} | EXTRACTED_DISK_CLASSES)
         )
-        network_available = evidence_type == "network" or bool(
-            inventory_classes & NETWORK_CLASSES
-        )
+        network_available = evidence_type == "network" or bool(inventory_classes & NETWORK_CLASSES)
         velociraptor_available = evidence_type == "velociraptor" or (
             "velociraptor" in inventory_classes
         )
-        velociraptor_touched = "vel_collect" in tools_run or bool(
-            self.velociraptor_zip_extractions
-        )
+        velociraptor_touched = "vel_collect" in tools_run or bool(self.velociraptor_zip_extractions)
         checks = [
             {
                 "artifact_class": "memory",
                 "available": memory_available,
                 "touched": bool(
-                    tools_run
-                    & {"vol_pslist", "vol_psscan", "vol_psxview", "vol_malfind"}
+                    tools_run & {"vol_pslist", "vol_psscan", "vol_psxview", "vol_malfind"}
                 ),
                 "tools": sorted(
-                    tools_run
-                    & {"vol_pslist", "vol_psscan", "vol_psxview", "vol_malfind"}
+                    tools_run & {"vol_pslist", "vol_psscan", "vol_psxview", "vol_malfind"}
                 ),
                 "confidence_impact": "process and injection evidence available"
                 if memory_available
@@ -9765,8 +9496,7 @@ class Investigation:
             inventory = build_remote_evidence_inventory(self.evidence)
         self.evidence_inventory = inventory
         total_bytes = sum(
-            int(entry.get("size_bytes") or 0)
-            for entry in inventory_supported_entries(inventory)
+            int(entry.get("size_bytes") or 0) for entry in inventory_supported_entries(inventory)
         )
         self.handle = {
             "id": inventory["parent_case_id"],
@@ -9800,9 +9530,7 @@ class Investigation:
             self.analysis_limitations.append(
                 f"Evidence inventory recorded {unknown_count} unsupported artifact(s) as custody-only limitations."
             )
-        velociraptor_count = (
-            inventory["summary"].get("class_counts", {}).get("velociraptor", 0)
-        )
+        velociraptor_count = inventory["summary"].get("class_counts", {}).get("velociraptor", 0)
         if velociraptor_count:
             self._audit(
                 py,
@@ -9920,9 +9648,7 @@ class Investigation:
             "memory_path": evidence_path,
             "limit": 200,
         }
-        mal = self._call_resilient(
-            rust, py, "vol_malfind", malfind_args, timeout=1800.0
-        )
+        mal = self._call_resilient(rust, py, "vol_malfind", malfind_args, timeout=1800.0)
         malfind_error = None
         if "_error" in mal:
             malfind_error = str(mal["_error"].get("message", "vol_malfind failed"))
@@ -9965,9 +9691,7 @@ class Investigation:
             if "_error" in yara_out:
                 yara_error = str(yara_out["_error"].get("message", "yara_scan failed"))
                 print(f"  yara_scan error: {yara_error[:80]}")
-                self.analysis_limitations.append(
-                    f"memory yara_scan failed: {yara_error}"
-                )
+                self.analysis_limitations.append(f"memory yara_scan failed: {yara_error}")
                 yara_out = {
                     "_error": {"message": yara_error},
                     "matches": [],
@@ -10056,9 +9780,7 @@ class Investigation:
         # PID set, or process identity.
         tcid_psxview = tcid_psscan
         psxview = []
-        views_diverge, divergence_reason = process_sets_diverge(
-            ps, psscan, ps_seen, psscan_count
-        )
+        views_diverge, divergence_reason = process_sets_diverge(ps, psscan, ps_seen, psscan_count)
         if views_diverge:
             self._narrate(
                 py,
@@ -10074,9 +9796,7 @@ class Investigation:
             psxview_out = rust.call_tool("vol_psxview", psxview_args)
             psxview_error = None
             if "_error" in psxview_out:
-                psxview_error = str(
-                    psxview_out["_error"].get("message", "vol_psxview failed")
-                )
+                psxview_error = str(psxview_out["_error"].get("message", "vol_psxview failed"))
                 print(f"  vol_psxview error: {psxview_error[:80]}")
                 self.analysis_limitations.append(f"vol_psxview failed: {psxview_error}")
                 self._course_correct(
@@ -10091,9 +9811,7 @@ class Investigation:
                     "processes_seen": 0,
                 }
             psxview = psxview_out.get("processes", [])
-            psxview_extra = {
-                "processes_seen": psxview_out.get("processes_seen", len(psxview))
-            }
+            psxview_extra = {"processes_seen": psxview_out.get("processes_seen", len(psxview))}
             if psxview_error:
                 psxview_extra["error"] = psxview_error
             tcid_psxview = self._record_tool(
@@ -10143,9 +9861,7 @@ class Investigation:
             def _ps_pid(p):
                 return p.get("pid", p.get("PID"))
 
-            core_via_psscan = sorted(
-                {_ps_name(p) for p in _ps_list if _ps_name(p) in _core_os}
-            )
+            core_via_psscan = sorted({_ps_name(p) for p in _ps_list if _ps_name(p) in _core_os})
             system_copies = sum(1 for p in _ps_list if str(_ps_pid(p)) == "4")
             smear_tells = []
             if core_via_psscan:
@@ -10153,9 +9869,7 @@ class Investigation:
                     f"core OS singletons recovered only by psscan ({', '.join(core_via_psscan)})"
                 )
             if system_copies > 1:
-                smear_tells.append(
-                    f"{system_copies} duplicate System(PID 4) EPROCESS objects"
-                )
+                smear_tells.append(f"{system_copies} duplicate System(PID 4) EPROCESS objects")
 
             if smear_tells:
                 # Acquisition smear / kernel-global read failure — NOT DKOM.
@@ -10163,9 +9877,7 @@ class Investigation:
                 self.findings_pool_a.append(
                     {
                         "case_id": self.handle["id"],
-                        "finding_id": self._finding_id_for(
-                            "f-A-enum-smear", evidence_path
-                        ),
+                        "finding_id": self._finding_id_for("f-A-enum-smear", evidence_path),
                         "tool_call_id": tcid_psxview,
                         "artifact_path": evidence_path,
                         "description": (
@@ -10214,9 +9926,7 @@ class Investigation:
                 self.findings_pool_b.append(
                     {
                         "case_id": self.handle["id"],
-                        "finding_id": self._finding_id_for(
-                            "f-B-dump-integrity", evidence_path
-                        ),
+                        "finding_id": self._finding_id_for("f-B-dump-integrity", evidence_path),
                         "tool_call_id": tcid_psscan,
                         "artifact_path": evidence_path,
                         "description": (
@@ -10263,15 +9973,12 @@ class Investigation:
                     uncommon.append(p)
         if uncommon:
             sample = ", ".join(
-                (p.get("image_name") or p.get("ImageFileName") or "?")
-                for p in uncommon[:5]
+                (p.get("image_name") or p.get("ImageFileName") or "?") for p in uncommon[:5]
             )
             self.findings_pool_b.append(
                 {
                     "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        "f-B-uncommon-procs", evidence_path
-                    ),
+                    "finding_id": self._finding_id_for("f-B-uncommon-procs", evidence_path),
                     "tool_call_id": tcid_psscan,
                     "artifact_path": evidence_path,
                     "description": (
@@ -10289,19 +9996,11 @@ class Investigation:
             )
 
         # Save psscan for the report
-        self.local_artifacts["psscan_json"] = json.dumps(
-            psscan or [], separators=(",", ":")
-        )
-        self.local_artifacts["psxview_json"] = json.dumps(
-            psxview or [], separators=(",", ":")
-        )
-        self.local_artifacts["malfind_json"] = json.dumps(
-            mal or {}, separators=(",", ":")
-        )
+        self.local_artifacts["psscan_json"] = json.dumps(psscan or [], separators=(",", ":"))
+        self.local_artifacts["psxview_json"] = json.dumps(psxview or [], separators=(",", ":"))
+        self.local_artifacts["malfind_json"] = json.dumps(mal or {}, separators=(",", ":"))
 
-    def investigate_hayabusa_dir(
-        self, rust: SshMcpClient, py: SshMcpClient, evtx_dir: str
-    ) -> None:
+    def investigate_hayabusa_dir(self, rust: SshMcpClient, py: SshMcpClient, evtx_dir: str) -> None:
         print(f"\n=== Hayabusa EVTX directory sweep: {evtx_dir} ===")
         args = {
             "case_id": self.handle["id"],
@@ -10312,9 +10011,7 @@ class Investigation:
         out = rust.call_tool("hayabusa_scan", args, timeout=1800.0)
         error = out.get("_error", {}).get("message") if "_error" in out else None
         if error:
-            self.analysis_limitations.append(
-                f"hayabusa_scan failed for {evtx_dir}: {error}"
-            )
+            self.analysis_limitations.append(f"hayabusa_scan failed for {evtx_dir}: {error}")
             out = {
                 "_error": {"message": error},
                 "alerts": [],
@@ -10375,9 +10072,7 @@ class Investigation:
             # streak), surfaced as a limitation, and the lane yields no events.
             evtx_error = str(out["_error"].get("message", "evtx_query failed"))
             print(f"  evtx_query error: {evtx_error[:80]}")
-            self.analysis_limitations.append(
-                f"evtx_query failed for {evidence_path}: {evtx_error}"
-            )
+            self.analysis_limitations.append(f"evtx_query failed for {evidence_path}: {evtx_error}")
             self._course_correct(
                 py,
                 "evtx_query",
@@ -10408,9 +10103,7 @@ class Investigation:
             event_id = row.get("event_id")
             record_id = row.get("record_id")
             entities = _extract_evtx_entities(row.get("data") or {}, event_id)
-            summary = entities.pop("summary", "") or (
-                f"event id {event_id} record {record_id}"
-            )
+            summary = entities.pop("summary", "") or (f"event id {event_id} record {record_id}")
             details = {"event_id": event_id, "record_id": record_id}
             details.update(entities)
             self._timeline_add(
@@ -10433,9 +10126,7 @@ class Investigation:
         self._evtx_event_id_counts.update(
             str(row.get("event_id")) for row in rows if row.get("event_id")
         )
-        self._evtx_channels.update(
-            row.get("channel") for row in rows if row.get("channel")
-        )
+        self._evtx_channels.update(row.get("channel") for row in rows if row.get("channel"))
         self.evtx_summary = _evtx_summary_dict(
             self._evtx_records_seen_total,
             self._evtx_row_count_total,
@@ -10460,21 +10151,13 @@ class Investigation:
             },
         )
         disk_summary["timeline_event_count"] = len(
-            [
-                event
-                for event in self.timeline_events
-                if event.get("artifact_class") == "evtx"
-            ]
+            [event for event in self.timeline_events if event.get("artifact_class") == "evtx"]
         )
         self.disk_artifact_summary = _finalize_disk_artifact_summary(disk_summary)
-        evtx_findings = evtx_rows_to_findings(
-            rows, tcid, self.handle["id"], evidence_path
-        )
+        evtx_findings = evtx_rows_to_findings(rows, tcid, self.handle["id"], evidence_path)
         self._pool_evtx_findings(evtx_findings, evidence_path)
 
-    def _pool_evtx_findings(
-        self, evtx_findings: list[dict[str, Any]], evidence_path: str
-    ) -> None:
+    def _pool_evtx_findings(self, evtx_findings: list[dict[str, Any]], evidence_path: str) -> None:
         """Suffix each evtx finding_id by artifact path, then route to a pool.
 
         ``evtx_rows_to_findings`` emits hardcoded finding_ids; without a
@@ -10572,9 +10255,7 @@ class Investigation:
             "mode": "auto",
         }
         mounted = rust.call_tool("disk_mount", mount_args, timeout=1800.0)
-        mount_error = (
-            mounted.get("_error", {}).get("message") if "_error" in mounted else None
-        )
+        mount_error = mounted.get("_error", {}).get("message") if "_error" in mounted else None
         mount_extra: dict[str, Any] = {
             "artifact_path": evidence_path,
             "status": mounted.get("status", "error"),
@@ -10618,13 +10299,9 @@ class Investigation:
                 "mount_id": mount_id,
                 "limit": 500,
             }
-            extracted = rust.call_tool(
-                "disk_extract_artifacts", extract_args, timeout=1800.0
-            )
+            extracted = rust.call_tool("disk_extract_artifacts", extract_args, timeout=1800.0)
             extract_error = (
-                extracted.get("_error", {}).get("message")
-                if "_error" in extracted
-                else None
+                extracted.get("_error", {}).get("message") if "_error" in extracted else None
             )
             artifacts = extracted.get("artifacts", []) if not extract_error else []
             self._record_tool(
@@ -10634,9 +10311,7 @@ class Investigation:
                 {
                     "mount_id": mount_id,
                     "artifact_count": len(artifacts),
-                    "artifacts_skipped_oversize": extracted.get(
-                        "artifacts_skipped_oversize", 0
-                    ),
+                    "artifacts_skipped_oversize": extracted.get("artifacts_skipped_oversize", 0),
                     "max_artifact_bytes": extracted.get("max_artifact_bytes"),
                     **({"error": extract_error} if extract_error else {}),
                 },
@@ -10717,9 +10392,7 @@ class Investigation:
             }
             unmounted = rust.call_tool("disk_unmount", unmount_args, timeout=600.0)
             unmount_error = (
-                unmounted.get("_error", {}).get("message")
-                if "_error" in unmounted
-                else None
+                unmounted.get("_error", {}).get("message") if "_error" in unmounted else None
             )
             self._record_tool(
                 py,
@@ -10860,9 +10533,7 @@ class Investigation:
                 target = str(cand.get("target") or "")
                 base = target.lower().replace("/", "\\").rsplit("\\", 1)[-1]
                 safe = (
-                    re.sub(
-                        r"[^a-z0-9]+", "-", str(cand.get("value_name") or "").lower()
-                    ).strip("-")
+                    re.sub(r"[^a-z0-9]+", "-", str(cand.get("value_name") or "").lower()).strip("-")
                     or "value"
                 )
                 derived = [tcid]
@@ -10876,9 +10547,7 @@ class Investigation:
                     )
                 finding = {
                     "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        f"f-A-reg-persist-{safe}", hive_path
-                    ),
+                    "finding_id": self._finding_id_for(f"f-A-reg-persist-{safe}", hive_path),
                     "tool_call_id": tcid,
                     "artifact_path": hive_path,
                     "description": (
@@ -10921,9 +10590,7 @@ class Investigation:
                 safe = re.sub(r"[^a-z0-9]+", "-", svc.lower()).strip("-") or "service"
                 finding = {
                     "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        f"f-A-reg-persist-svc-{safe}", hive_path
-                    ),
+                    "finding_id": self._finding_id_for(f"f-A-reg-persist-svc-{safe}", hive_path),
                     "tool_call_id": tcid,
                     "artifact_path": hive_path,
                     "description": (
@@ -11023,9 +10690,7 @@ class Investigation:
         svcs = [c for c in candidates if c.get("kind") == "service_recon"]
         if not svcs:
             return
-        names = ", ".join(
-            dict.fromkeys(str(c.get("service_name") or "") for c in svcs)
-        )[:200]
+        names = ", ".join(dict.fromkeys(str(c.get("service_name") or "") for c in svcs))[:200]
         first = svcs[0]
         finding = {
             "case_id": self.handle["id"],
@@ -11111,13 +10776,10 @@ class Investigation:
                 # Key the id on the file BASENAME, not the full path — distinct
                 # desktop files must produce distinct ids (the 8-dupes bug).
                 id_seed = value.replace("/", "\\").rsplit("\\", 1)[-1] or value
-                safe = (
-                    re.sub(r"[^a-z0-9]+", "-", id_seed.lower()).strip("-")[:40] or "mru"
-                )
+                safe = re.sub(r"[^a-z0-9]+", "-", id_seed.lower()).strip("-")[:40] or "mru"
                 if kind == "search_term":
                     detail = (
-                        f"User search-assistant history records the recent search term "
-                        f"'{value}'"
+                        f"User search-assistant history records the recent search term '{value}'"
                     )
                 else:
                     detail = f"User recently opened-file MRU records '{value}'"
@@ -11169,25 +10831,17 @@ class Investigation:
                 continue
             if kind == "shellbag":
                 folders = [
-                    str(c.get("folder") or "")
-                    for c in candidates
-                    if c.get("kind") == "shellbag"
+                    str(c.get("folder") or "") for c in candidates if c.get("kind") == "shellbag"
                 ]
                 # Emit once for the whole shellbag set (cand is the first); skip
                 # the rest so we don't duplicate the aggregate finding.
-                if cand is not next(
-                    c for c in candidates if c.get("kind") == "shellbag"
-                ):
+                if cand is not next(c for c in candidates if c.get("kind") == "shellbag"):
                     continue
-                id_seed = (
-                    f"{hive_path}::{cand.get('hive_key') or key_path or 'shellbag'}"
-                )
+                id_seed = f"{hive_path}::{cand.get('hive_key') or key_path or 'shellbag'}"
                 listing = ", ".join(dict.fromkeys(folders))[:300]
                 finding = {
                     "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        "f-B-shellbag", id_seed, force_suffix=True
-                    ),
+                    "finding_id": self._finding_id_for("f-B-shellbag", id_seed, force_suffix=True),
                     "tool_call_id": tcid,
                     "artifact_path": hive_path,
                     "description": (
@@ -11205,18 +10859,14 @@ class Investigation:
                     "derived_from": [tcid],
                 }
                 self.findings_pool_b.append(finding)
-                print(
-                    f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)"
-                )
+                print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
                 continue
             if kind == "mounted_device":
                 mount = str(cand.get("mount_point") or "device")
                 safe = re.sub(r"[^a-z0-9]+", "-", mount.lower()).strip("-") or "device"
                 finding = {
                     "case_id": self.handle["id"],
-                    "finding_id": self._finding_id_for(
-                        f"f-B-mounted-{safe}", hive_path
-                    ),
+                    "finding_id": self._finding_id_for(f"f-B-mounted-{safe}", hive_path),
                     "tool_call_id": tcid,
                     "artifact_path": hive_path,
                     "description": (
@@ -11235,9 +10885,7 @@ class Investigation:
                     "derived_from": [tcid],
                 }
                 self.findings_pool_b.append(finding)
-                print(
-                    f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)"
-                )
+                print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
                 continue
             if cand.get("kind") != "usb_device":
                 continue
@@ -11246,9 +10894,7 @@ class Investigation:
                 or f"{cand.get('vendor') or 'unknown'} {cand.get('product') or 'device'}"
             ).strip()
             safe = (
-                re.sub(
-                    r"[^a-z0-9]+", "-", str(cand.get("serial") or device).lower()
-                ).strip("-")
+                re.sub(r"[^a-z0-9]+", "-", str(cand.get("serial") or device).lower()).strip("-")
                 or "device"
             )
             finding = {
@@ -11317,9 +10963,7 @@ class Investigation:
             "derived_from": [tcid],
         }
         self.findings_pool_a.append(finding)
-        print(
-            f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))"
-        )
+        print(f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))")
 
     def _emit_lnk_removable_media_finding(
         self,
@@ -11333,11 +10977,7 @@ class Investigation:
         examples = "; ".join(
             f"{c.get('source') or lnk_path}"
             + (f" -> {c.get('target')}" if c.get("target") else "")
-            + (
-                f" (volume serial {c.get('volume_serial')})"
-                if c.get("volume_serial")
-                else ""
-            )
+            + (f" (volume serial {c.get('volume_serial')})" if c.get("volume_serial") else "")
             for c in candidates[:5]
         )
         path_only = any(c.get("basis") == "path_name" for c in candidates)
@@ -11383,8 +11023,7 @@ class Investigation:
         if not candidates:
             return
         examples = "; ".join(
-            f"{c.get('path')}"
-            + (f" (deleted {c.get('timestamp')})" if c.get("timestamp") else "")
+            f"{c.get('path')}" + (f" (deleted {c.get('timestamp')})" if c.get("timestamp") else "")
             for c in candidates[:5]
         )
         parsers = sorted({str(c.get("parser") or "recycle_bin") for c in candidates})
@@ -11428,11 +11067,7 @@ class Investigation:
             return
         ids = sorted({int(c.get("event_id")) for c in candidates if c.get("event_id")})
         accounts = sorted(
-            {
-                str(c.get("account") or "").strip()
-                for c in candidates
-                if c.get("account")
-            }
+            {str(c.get("account") or "").strip() for c in candidates if c.get("account")}
         )
         examples = "; ".join(
             f"EID {c.get('event_id')} account={c.get('account') or 'unknown'}"
@@ -11446,9 +11081,7 @@ class Investigation:
             # AppEvent.Evt, SysEvent.Evt). Without a path suffix every file's
             # finding would share id f-B-legacy-evt-logon; the duplicate verifier
             # action then makes judge_findings reject the whole batch (0 merged).
-            "finding_id": self._finding_id_for(
-                "f-B-legacy-evt-logon", evt_path, force_suffix=True
-            ),
+            "finding_id": self._finding_id_for("f-B-legacy-evt-logon", evt_path, force_suffix=True),
             "tool_call_id": tcid,
             "artifact_path": evt_path,
             "description": (
@@ -11518,18 +11151,12 @@ class Investigation:
         if not recon_tools or not service_candidates:
             return
         tools_text = ", ".join(t["exe"] for t in recon_tools[:4])
-        eids = sorted(
-            {int(c["event_id"]) for c in service_candidates if c.get("event_id")}
-        )
-        services = sorted(
-            {str(c["service"]) for c in service_candidates if c.get("service")}
-        )
+        eids = sorted({int(c["event_id"]) for c in service_candidates if c.get("event_id")})
+        services = sorted({str(c["service"]) for c in service_candidates if c.get("service")})
         services_text = ", ".join(services[:5]) if services else "n/a"
         finding = {
             "case_id": self.handle["id"],
-            "finding_id": self._finding_id_for(
-                "f-B-service-recon", evt_path, force_suffix=True
-            ),
+            "finding_id": self._finding_id_for("f-B-service-recon", evt_path, force_suffix=True),
             "tool_call_id": tcid,
             "artifact_path": evt_path,
             "description": (
@@ -11612,9 +11239,7 @@ class Investigation:
             f"(HYPOTHESIS, {len(candidates)} URL(s))"
         )
 
-    def investigate_oe_dbx_stores(
-        self, rust: SshMcpClient, py: SshMcpClient, fs_root: Any
-    ) -> None:
+    def investigate_oe_dbx_stores(self, rust: SshMcpClient, py: SshMcpClient, fs_root: Any) -> None:
         """Parse Outlook Express ``.dbx`` stores on the mounted disk and, if any
         are hacking/cracking newsgroups, emit a newsgroup-affiliation lead.
 
@@ -11696,16 +11321,10 @@ class Investigation:
         primary_path, primary_tcid, _ = max(
             stores, key=lambda s: len(s[2].get("hacking_newsgroups") or [])
         )
-        groups = sorted(
-            {g for _, _, o in stores for g in (o.get("hacking_newsgroups") or [])}
-        )
-        subjects = sorted({s for _, _, o in stores for s in (o.get("subjects") or [])})[
-            :6
-        ]
+        groups = sorted({g for _, _, o in stores for g in (o.get("hacking_newsgroups") or [])})
+        subjects = sorted({s for _, _, o in stores for s in (o.get("subjects") or [])})[:6]
         groups_text = ", ".join(groups[:10])
-        subjects_text = (
-            "; ".join(subjects) if subjects else "headers only (bodies not downloaded)"
-        )
+        subjects_text = "; ".join(subjects) if subjects else "headers only (bodies not downloaded)"
         finding = {
             "case_id": self.handle["id"],
             "finding_id": self._finding_id_for(
@@ -11756,16 +11375,12 @@ class Investigation:
             ua_args = {
                 "case_id": self.handle["id"],
                 "hive_path": path,
-                "key_path": (
-                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
-                ),
+                "key_path": (r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"),
                 "recursive": True,
                 "limit": 500,
             }
             ua_out = rust.call_tool("registry_query", ua_args)
-            ua_err = (
-                ua_out.get("_error", {}).get("message") if "_error" in ua_out else None
-            )
+            ua_err = ua_out.get("_error", {}).get("message") if "_error" in ua_out else None
             if ua_err:
                 ua_out = {"_error": {"message": ua_err}, "entries": []}
             ua_entries = ua_out.get("entries", [])
@@ -11865,9 +11480,7 @@ class Investigation:
         self, rust: SshMcpClient, py: SshMcpClient, entries: list[dict[str, Any]]
     ) -> None:
         print("\n=== extracted disk artifact investigation ===")
-        by_class: dict[str, list[dict[str, Any]]] = {
-            name: [] for name in EXTRACTED_DISK_CLASSES
-        }
+        by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in EXTRACTED_DISK_CLASSES}
         by_class["yara_target"] = []
         for entry in entries:
             artifact_class = str(entry.get("artifact_class") or "")
@@ -11895,8 +11508,7 @@ class Investigation:
                 extracted_tcid,
                 {
                     "artifact_counts": {
-                        name: len(rows_for_class)
-                        for name, rows_for_class in by_class.items()
+                        name: len(rows_for_class) for name, rows_for_class in by_class.items()
                     }
                 },
             )
@@ -11914,15 +11526,11 @@ class Investigation:
             for e in mft_entries
         ]
         mft_outs = self._parallel_tool_calls(rust, mft_specs, timeout=1800.0)
-        for entry, (_name, args), out in zip(
-            mft_entries, mft_specs, mft_outs, strict=True
-        ):
+        for entry, (_name, args), out in zip(mft_entries, mft_specs, mft_outs, strict=True):
             path = str(entry["path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"mft_timeline failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"mft_timeline failed for {path}: {error}")
                 out = {
                     "_error": {"message": error},
                     "entries": [],
@@ -12002,15 +11610,11 @@ class Investigation:
             for e in usn_entries
         ]
         usn_outs = self._parallel_tool_calls(rust, usn_specs, timeout=1800.0)
-        for entry, (_name, args), out in zip(
-            usn_entries, usn_specs, usn_outs, strict=True
-        ):
+        for entry, (_name, args), out in zip(usn_entries, usn_specs, usn_outs, strict=True):
             path = str(entry["path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"usnjrnl_query failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"usnjrnl_query failed for {path}: {error}")
                 out = {
                     "_error": {"message": error},
                     "entries": [],
@@ -12032,9 +11636,7 @@ class Investigation:
                 arguments=args,
             )
             reason_values = [
-                ",".join(row.get("reason_flags", []))
-                for row in rows
-                if isinstance(row, dict)
+                ",".join(row.get("reason_flags", [])) for row in rows if isinstance(row, dict)
             ]
             _merge_disk_tool_summary(
                 disk_summary,
@@ -12087,9 +11689,7 @@ class Investigation:
             path = str(entry["path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"prefetch_parse failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"prefetch_parse failed for {path}: {error}")
                 out = {
                     "_error": {"message": error},
                     "last_run_times_iso": [],
@@ -12167,15 +11767,11 @@ class Investigation:
             for e in lnk_entries
         ]
         lnk_outs = self._parallel_tool_calls(rust, lnk_specs, timeout=600.0)
-        for entry, (_name, args), out in zip(
-            lnk_entries, lnk_specs, lnk_outs, strict=True
-        ):
+        for entry, (_name, args), out in zip(lnk_entries, lnk_specs, lnk_outs, strict=True):
             path = str(entry["path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"ez_parse/lecmd failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"ez_parse/lecmd failed for {path}: {error}")
                 # A deterministic lecmd absence is a recoverable degradation, not
                 # a silent loss: record the pivot to the registry USBSTOR/
                 # MountedDevices coverage as one named course_correction
@@ -12251,13 +11847,9 @@ class Investigation:
                 for e in entries_for_tool
             ]
             outs = self._parallel_tool_calls(rust, specs, timeout=900.0)
-            for entry, (_name, args), out in zip(
-                entries_for_tool, specs, outs, strict=True
-            ):
+            for entry, (_name, args), out in zip(entries_for_tool, specs, outs, strict=True):
                 path = str(entry["path"])
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
                     self.analysis_limitations.append(
                         f"ez_parse/{tool_name} failed for {path}: {error}"
@@ -12292,9 +11884,7 @@ class Investigation:
                         "tool": tool_name,
                         "rows_seen": out.get("rows_seen", len(rows)),
                         "sample_paths": [
-                            _decoded_row_label(row)
-                            for row in rows[:5]
-                            if isinstance(row, dict)
+                            _decoded_row_label(row) for row in rows[:5] if isinstance(row, dict)
                         ],
                         **({"error": error} if error else {}),
                     },
@@ -12328,17 +11918,13 @@ class Investigation:
                     "limit": 500,
                 }
                 out = rust.call_tool("plaso_parse", args, timeout=1200.0)
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
                     self.analysis_limitations.append(
                         f"plaso_parse/recycle_bin_info2 failed for {path}: {error}"
                     )
                     if self._is_deterministic_absence(error):
-                        self._note_tool_absent(
-                            py, "plaso_parse", error, fallback="ez_parse"
-                        )
+                        self._note_tool_absent(py, "plaso_parse", error, fallback="ez_parse")
                     out = {
                         "_error": {"message": error},
                         "parser": "recycle_bin_info2",
@@ -12400,13 +11986,9 @@ class Investigation:
                     "limit": 500,
                 }
                 out = rust.call_tool("ez_parse", args, timeout=600.0)
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
-                    self.analysis_limitations.append(
-                        f"ez_parse/rbcmd failed for {path}: {error}"
-                    )
+                    self.analysis_limitations.append(f"ez_parse/rbcmd failed for {path}: {error}")
                     out = {
                         "_error": {"message": error},
                         "tool": "rbcmd",
@@ -12426,9 +12008,7 @@ class Investigation:
                     },
                     arguments=args,
                 )
-                parser_rows = [
-                    {**row, "parser": "rbcmd"} for row in rows if isinstance(row, dict)
-                ]
+                parser_rows = [{**row, "parser": "rbcmd"} for row in rows if isinstance(row, dict)]
                 _merge_disk_tool_summary(
                     disk_summary,
                     "ez_parse",
@@ -12489,21 +12069,15 @@ class Investigation:
                 for e in entries_for_parser
             ]
             outs = self._parallel_tool_calls(rust, specs, timeout=1200.0)
-            for entry, (_name, args), out in zip(
-                entries_for_parser, specs, outs, strict=True
-            ):
+            for entry, (_name, args), out in zip(entries_for_parser, specs, outs, strict=True):
                 path = str(entry["path"])
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
                     self.analysis_limitations.append(
                         f"plaso_parse/{parser_name} failed for {path}: {error}"
                     )
                     if self._is_deterministic_absence(error):
-                        self._note_tool_absent(
-                            py, "plaso_parse", error, fallback="mft_timeline"
-                        )
+                        self._note_tool_absent(py, "plaso_parse", error, fallback="mft_timeline")
                     out = {
                         "_error": {"message": error},
                         "parser": parser_name,
@@ -12525,9 +12099,7 @@ class Investigation:
                     arguments=args,
                 )
                 parser_events = [
-                    {**event, "parser": parser_name}
-                    for event in events
-                    if isinstance(event, dict)
+                    {**event, "parser": parser_name} for event in events if isinstance(event, dict)
                 ]
                 _merge_disk_tool_summary(
                     disk_summary,
@@ -12538,9 +12110,7 @@ class Investigation:
                         "artifact_class": artifact_class,
                         "parser": parser_name,
                         "events_seen": out.get("events_seen", len(events)),
-                        "sample_labels": [
-                            _decoded_row_label(event) for event in parser_events[:5]
-                        ],
+                        "sample_labels": [_decoded_row_label(event) for event in parser_events[:5]],
                         **({"error": error} if error else {}),
                     },
                 )
@@ -12562,9 +12132,7 @@ class Investigation:
                 if artifact_class == "legacy_evt":
                     logon_candidates = legacy_evt_logon_candidates(parser_events)
                     if logon_candidates:
-                        self._emit_legacy_evt_logon_finding(
-                            logon_candidates, path, tcid
-                        )
+                        self._emit_legacy_evt_logon_finding(logon_candidates, path, tcid)
                     # Service Control Manager events (System log) + executed
                     # network-discovery tooling -> a T1046 reconnaissance lead.
                     service_candidates = legacy_evt_service_candidates(parser_events)
@@ -12578,9 +12146,7 @@ class Investigation:
                 elif artifact_class == "ie_history":
                     illicit_candidates = ie_history_illicit_candidates(parser_events)
                     if illicit_candidates:
-                        self._emit_ie_history_illicit_finding(
-                            illicit_candidates, path, tcid
-                        )
+                        self._emit_ie_history_illicit_finding(illicit_candidates, path, tcid)
                 print(f"  plaso_parse/{parser_name}: {path} events={len(events)}")
 
         browser_entries = (by_class["browser_history"] + by_class["browser_db"])[:20]
@@ -12602,9 +12168,7 @@ class Investigation:
             path = str(entry["path"])
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"browser_history failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"browser_history failed for {path}: {error}")
                 out = {"_error": {"message": error}, "rows": [], "rows_seen": 0}
             rows = out.get("rows", []) or []
             tcid = self._record_tool(
@@ -12672,9 +12236,7 @@ class Investigation:
                     "limit": 500,
                 }
                 out = rust.call_tool("registry_query", args)
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
                     self.analysis_limitations.append(
                         f"registry_query failed for {path} {key_path or '<root>'}: {error}"
@@ -12717,9 +12279,7 @@ class Investigation:
                         "keys_visited": out.get("keys_visited", 0),
                         "parse_errors": out.get("parse_errors", 0),
                         "sample_keys": [
-                            row.get("key_path")
-                            for row in rows[:5]
-                            if isinstance(row, dict)
+                            row.get("key_path") for row in rows[:5] if isinstance(row, dict)
                         ],
                         **({"error": error} if error else {}),
                     },
@@ -12733,9 +12293,7 @@ class Investigation:
                         tcid,
                         {"hive_path": path, "value_count": len(row.get("values", []))},
                     )
-                print(
-                    f"  registry_query: {path} {key_path or '<root>'} entries={len(rows)}"
-                )
+                print(f"  registry_query: {path} {key_path or '<root>'} entries={len(rows)}")
                 # Pool A disk-persistence emitters: Run/RunOnce values and
                 # user-writable service installs become Findings citing this
                 # registry_query tool call (prefetch corroboration when the
@@ -12761,9 +12319,7 @@ class Investigation:
                     + registry_service_recon_candidates(rows)
                 )
                 if activity_candidates:
-                    self._emit_registry_activity_findings(
-                        activity_candidates, path, key_path, tcid
-                    )
+                    self._emit_registry_activity_findings(activity_candidates, path, key_path, tcid)
 
         self._corroborate_execution_with_userassist(rust, py, by_class)
 
@@ -12778,13 +12334,9 @@ class Investigation:
                     "limit": 200,
                 }
                 out = rust.call_tool("yara_scan", args, timeout=1800.0)
-                error = (
-                    out.get("_error", {}).get("message") if "_error" in out else None
-                )
+                error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
-                    self.analysis_limitations.append(
-                        f"disk yara_scan failed for {path}: {error}"
-                    )
+                    self.analysis_limitations.append(f"disk yara_scan failed for {path}: {error}")
                     out = {
                         "_error": {"message": error},
                         "matches": [],
@@ -12949,9 +12501,7 @@ class Investigation:
                 port = row.get("dst_port") or row.get("destination_port")
                 self._network_finding(
                     "A",
-                    self._finding_id_for(
-                        f"f-A-{tool}-external-conversation", artifact_path
-                    ),
+                    self._finding_id_for(f"f-A-{tool}-external-conversation", artifact_path),
                     tcid,
                     artifact_path,
                     (
@@ -13020,11 +12570,7 @@ class Investigation:
                 )
                 emitted += 1
                 continue
-            if (
-                row.get("has_cookie")
-                and _host_is_webmail(host)
-                and (src, host) not in webmail_seen
-            ):
+            if row.get("has_cookie") and _host_is_webmail(host) and (src, host) not in webmail_seen:
                 webmail_seen.add((src, host))
                 self._network_finding(
                     "B",
@@ -13184,9 +12730,7 @@ class Investigation:
         self, rust: SshMcpClient, py: SshMcpClient, entries: list[dict[str, Any]]
     ) -> None:
         print("\n=== network artifact investigation ===")
-        by_class: dict[str, list[dict[str, Any]]] = {
-            name: [] for name in NETWORK_CLASSES
-        }
+        by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in NETWORK_CLASSES}
         for entry in entries:
             artifact_class = str(entry.get("artifact_class") or "")
             if artifact_class in by_class:
@@ -13198,9 +12742,7 @@ class Investigation:
             out = rust.call_tool("sysmon_network_query", args)
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"sysmon_network_query failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"sysmon_network_query failed for {path}: {error}")
                 out = {"_error": {"message": error}, "rows": [], "records_seen": 0}
             rows = out.get("rows", [])
             tcid = self._record_tool(
@@ -13249,17 +12791,13 @@ class Investigation:
                 if entry.get("path")
             }
         )
-        zeek_targets = zeek_dirs[:5] or [
-            str(entry["path"]) for entry in by_class["zeek"][:5]
-        ]
+        zeek_targets = zeek_dirs[:5] or [str(entry["path"]) for entry in by_class["zeek"][:5]]
         for path in zeek_targets:
             args = {"case_id": self.handle["id"], "zeek_path": path, "limit": 100000}
             out = rust.call_tool("zeek_summary", args)
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"zeek_summary failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"zeek_summary failed for {path}: {error}")
                 out = {"_error": {"message": error}, "rows_seen": 0}
             tcid = self._record_tool(
                 py,
@@ -13305,9 +12843,7 @@ class Investigation:
             out = rust.call_tool("pcap_triage", args, timeout=1800.0)
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"pcap_triage failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"pcap_triage failed for {path}: {error}")
                 out = {"_error": {"message": error}, "packets_seen": 0}
             tcid = self._record_tool(
                 py,
@@ -13489,9 +13025,7 @@ class Investigation:
             out = rust.call_tool("cloud_audit", args)
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
-                self.analysis_limitations.append(
-                    f"cloud_audit failed for {path}: {error}"
-                )
+                self.analysis_limitations.append(f"cloud_audit failed for {path}: {error}")
                 out = {"_error": {"message": error}, "events": [], "events_seen": 0}
             events = out.get("events") or []
             tcid = self._record_tool(
@@ -13524,9 +13058,7 @@ class Investigation:
                 limit=500,
             )
         except RuntimeError as exc:
-            limitation = (
-                f"Velociraptor zip extraction failed for {evidence_path}: {exc}"
-            )
+            limitation = f"Velociraptor zip extraction failed for {evidence_path}: {exc}"
             self.analysis_limitations.append(limitation)
             self._audit(
                 py,
@@ -13591,12 +13123,8 @@ class Investigation:
             )
             return
 
-        memory_entries = [
-            entry for entry in entries if entry.get("evidence_type") == "memory"
-        ]
-        evtx_entries = [
-            entry for entry in entries if entry.get("evidence_type") == "evtx"
-        ]
+        memory_entries = [entry for entry in entries if entry.get("evidence_type") == "memory"]
+        evtx_entries = [entry for entry in entries if entry.get("evidence_type") == "evtx"]
         extracted_entries = [
             entry
             for entry in entries
@@ -13605,9 +13133,7 @@ class Investigation:
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES
         ]
-        cloud_entries = [
-            entry for entry in entries if entry.get("artifact_class") in CLOUD_CLASSES
-        ]
+        cloud_entries = [entry for entry in entries if entry.get("artifact_class") in CLOUD_CLASSES]
         evtx_parent_counts = Counter(
             str(PurePosixPath(str(entry["path"]).replace("\\", "/")).parent)
             for entry in evtx_entries
@@ -13636,12 +13162,8 @@ class Investigation:
         if not self.evidence_inventory:
             return
         entries = inventory_supported_entries(self.evidence_inventory)
-        memory_entries = [
-            entry for entry in entries if entry.get("evidence_type") == "memory"
-        ]
-        evtx_entries = [
-            entry for entry in entries if entry.get("evidence_type") == "evtx"
-        ]
+        memory_entries = [entry for entry in entries if entry.get("evidence_type") == "memory"]
+        evtx_entries = [entry for entry in entries if entry.get("evidence_type") == "evtx"]
         evtx_parent_counts = Counter(
             str(PurePosixPath(str(entry["path"]).replace("\\", "/")).parent)
             for entry in evtx_entries
@@ -13652,9 +13174,7 @@ class Investigation:
             for parent, count in evtx_parent_counts.items()
             if parent and parent != "." and count >= 2
         ]
-        raw_disk_entries = [
-            entry for entry in entries if entry.get("artifact_class") == "raw_disk"
-        ]
+        raw_disk_entries = [entry for entry in entries if entry.get("artifact_class") == "raw_disk"]
         extracted_entries = [
             entry
             for entry in entries
@@ -13663,9 +13183,7 @@ class Investigation:
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES
         ]
-        cloud_entries = [
-            entry for entry in entries if entry.get("artifact_class") in CLOUD_CLASSES
-        ]
+        cloud_entries = [entry for entry in entries if entry.get("artifact_class") in CLOUD_CLASSES]
         velociraptor_entries = [
             entry for entry in entries if entry.get("artifact_class") == "velociraptor"
         ]
@@ -13727,13 +13245,9 @@ class Investigation:
             or velociraptor_entries
             or raw_disk_entries
         ):
-            limitation = (
-                "No supported evidence artifacts were discovered in the case inventory."
-            )
+            limitation = "No supported evidence artifacts were discovered in the case inventory."
             self.analysis_limitations.append(limitation)
-            self._audit(
-                py, "agent_message", {"role": "supervisor", "content": limitation}
-            )
+            self._audit(py, "agent_message", {"role": "supervisor", "content": limitation})
 
     def _tool_call_index(self) -> dict[str, dict[str, Any]]:
         return {
@@ -13772,9 +13286,7 @@ class Investigation:
             free.put(client)
         results: list[dict[str, Any]] = [{} for _ in specs]
 
-        def _run(
-            idx: int, name: str, args: dict[str, Any]
-        ) -> tuple[int, dict[str, Any]]:
+        def _run(idx: int, name: str, args: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             client = free.get()
             try:
                 return idx, client.call_tool(name, args, timeout=timeout)
@@ -13784,8 +13296,7 @@ class Investigation:
         try:
             with ThreadPoolExecutor(max_workers=lanes) as pool:
                 futures = [
-                    pool.submit(_run, idx, name, args)
-                    for idx, (name, args) in enumerate(specs)
+                    pool.submit(_run, idx, name, args) for idx, (name, args) in enumerate(specs)
                 ]
                 for future in as_completed(futures):
                     idx, result = future.result()
@@ -13806,9 +13317,7 @@ class Investigation:
         # handoffs stay deterministic regardless of Stage A completion timing).
         # A serial pre-pass consumes FIND_EVIL_FAULT_INJECT (inert by default).
         fault_targets = self._consume_fault_targets(py, findings)
-        results = self._verify_findings_parallel(
-            py, findings, fault_targets=fault_targets
-        )
+        results = self._verify_findings_parallel(py, findings, fault_targets=fault_targets)
         results = self._redispatch_rejections(py, findings, results)
         actions = self._record_verify_actions(py, findings, results)
         # Stage B½: replay each CONFIRMED finding's CORROBORATING tool call so the
@@ -13957,9 +13466,7 @@ class Investigation:
                     # Per-call copy: the corruption hits only this finding's
                     # first attempt; parallel siblings and the re-dispatch
                     # (which builds a fresh index) see the real entries.
-                    index = {
-                        tcid: dict(entry) for tcid, entry in tool_call_index.items()
-                    }
+                    index = {tcid: dict(entry) for tcid, entry in tool_call_index.items()}
                     entry = index.get(str(finding.get("tool_call_id") or ""))
                     if entry is not None:
                         if mode == "verifier_hash_mismatch_once":
@@ -14014,13 +13521,9 @@ class Investigation:
         out = list(results)
         for idx, (finding, result) in enumerate(zip(findings, results, strict=True)):
             if "_error" in result:
-                first_reason = str(
-                    result["_error"].get("message", "verify_finding failed")
-                )
+                first_reason = str(result["_error"].get("message", "verify_finding failed"))
             elif result.get("action") == "rejected":
-                first_reason = str(
-                    result.get("reason", "verify_finding returned no reason")
-                )
+                first_reason = str(result.get("reason", "verify_finding returned no reason"))
             else:
                 continue
             drift = (result.get("replay_artifact") or {}).get("drift_class")
@@ -14030,9 +13533,7 @@ class Investigation:
             # Surface the self-correction in the live terminal, not only the
             # audit chain — every other lane prints its progress, and this is
             # the moment that proves the agent reasons about its own failures.
-            print(
-                f"  verify_finding rejected {finding_id} — re-dispatching once (fresh replay)"
-            )
+            print(f"  verify_finding rejected {finding_id} — re-dispatching once (fresh replay)")
             self._audit(
                 py,
                 "verifier_redispatch",
@@ -14070,9 +13571,7 @@ class Investigation:
                     f"(first attempt: {first_reason[:200]})"
                 )
             else:
-                print(
-                    f"  verify_finding still rejected {finding_id} after re-dispatch — dropping"
-                )
+                print(f"  verify_finding still rejected {finding_id} after re-dispatch — dropping")
                 self._course_correct(
                     py,
                     "verify_finding",
@@ -14127,10 +13626,7 @@ class Investigation:
             action["replay_record_sha256"] = replay_record_sha256
             replay["replay_record_sha256"] = replay_record_sha256
             self.verifier_replays[action_finding_id] = replay
-            if (
-                action.get("action") == "rejected"
-                or replay.get("replay_matched") is False
-            ):
+            if action.get("action") == "rejected" or replay.get("replay_matched") is False:
                 failure = (
                     f"verify_finding rejected or failed for {action_finding_id}: "
                     f"{action.get('reason') or replay.get('replay_error') or 'unknown verifier failure'}"
@@ -14138,9 +13634,7 @@ class Investigation:
                 self.verifier_replay_failures.append(failure)
                 self.analysis_limitations.append(failure)
             if action.get("action") == "rejected":
-                rejected_lead = self._verifier_rejected_lead_snapshot(
-                    finding, action, replay
-                )
+                rejected_lead = self._verifier_rejected_lead_snapshot(finding, action, replay)
                 self.verifier_rejected_leads.append(rejected_lead)
             else:
                 rejected_lead = None
@@ -14157,9 +13651,7 @@ class Investigation:
                     "replay_record_sha256": replay_record_sha256,
                     "force_fresh_replay": self.force_fresh_replay,
                     "replay_artifact": replay.get("replay_artifact"),
-                    "legacy_replay": {
-                        k: v for k, v in replay.items() if k.startswith("replay_")
-                    },
+                    "legacy_replay": {k: v for k, v in replay.items() if k.startswith("replay_")},
                 },
             )
             if rejected_lead:
@@ -14194,9 +13686,7 @@ class Investigation:
     ) -> dict[str, Any]:
         """Preserve a rejected Finding as analyst-reviewable, non-evidentiary context."""
         return {
-            "finding_id": str(
-                action.get("finding_id") or finding.get("finding_id") or ""
-            ),
+            "finding_id": str(action.get("finding_id") or finding.get("finding_id") or ""),
             "tool_call_id": finding.get("tool_call_id"),
             "confidence": finding.get("confidence"),
             "pool_origin": finding.get("pool_origin"),
@@ -14205,9 +13695,7 @@ class Investigation:
             "description": str(finding.get("description") or "")[:500],
             "verifier_action": "rejected",
             "verifier_reason": str(
-                action.get("reason")
-                or replay.get("replay_error")
-                or "unknown verifier failure"
+                action.get("reason") or replay.get("replay_error") or "unknown verifier failure"
             )[:500],
             "replay_matched": replay.get("replay_matched"),
             "replay_error": replay.get("replay_error"),
@@ -14218,9 +13706,7 @@ class Investigation:
             ),
         }
 
-    def _embed_verifier_replays(
-        self, findings: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _embed_verifier_replays(self, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         enriched = []
         for finding in findings:
             finding_id = str(finding.get("finding_id") or "")
@@ -14235,9 +13721,7 @@ class Investigation:
     def _apply_verifier_actions(
         self, findings: list[dict[str, Any]], actions: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        action_by_finding = {
-            str(action.get("finding_id")): action for action in actions
-        }
+        action_by_finding = {str(action.get("finding_id")): action for action in actions}
         verified: list[dict[str, Any]] = []
         for finding in findings:
             finding_id = str(finding.get("finding_id") or "")
@@ -14254,9 +13738,7 @@ class Investigation:
         except Exception:
             return None
 
-    def _memory_recall(
-        self, py: SshMcpClient, store_path: str, query: str
-    ) -> list[dict[str, Any]]:
+    def _memory_recall(self, py: SshMcpClient, store_path: str, query: str) -> list[dict[str, Any]]:
         """Recall prior-case hits for a query. Audit-logged, best-effort (never raises)."""
         out = py.call_tool(
             "memory_recall",
@@ -14297,9 +13779,7 @@ class Investigation:
         if recalls:
             print(f"  memory: attached prior-case context to {recalls} finding(s)")
 
-    def _remember_confirmed(
-        self, py: SshMcpClient, merged: list[dict[str, Any]]
-    ) -> None:
+    def _remember_confirmed(self, py: SshMcpClient, merged: list[dict[str, Any]]) -> None:
         """Seed future cases with this run's CONFIRMED findings (Hermes memory_remember).
 
         Writes one memory_remember row per CONFIRMED finding (G5) and audit-logs the
@@ -14327,9 +13807,7 @@ class Investigation:
             if isinstance(out, dict) and "_error" not in out:
                 remembered += 1
         if remembered:
-            print(
-                f"  memory: remembered {remembered} CONFIRMED finding(s) for future cases"
-            )
+            print(f"  memory: remembered {remembered} CONFIRMED finding(s) for future cases")
 
     def _audit_contradiction_resolutions(
         self, py: SshMcpClient, contras: list[dict[str, Any]]
@@ -14351,9 +13829,7 @@ class Investigation:
                     str(t) for t in contra.get("conflicting_tool_call_ids", [])
                 ],
             )
-            self._audit(
-                py, record["kind"], {k: v for k, v in record.items() if k != "kind"}
-            )
+            self._audit(py, record["kind"], {k: v for k, v in record.items() if k != "kind"})
 
     def _emit_pool_handoff(
         self,
@@ -14478,9 +13954,7 @@ class Investigation:
 
         # Snapshot pre-judge confidence so a verifier-driven downgrade applied at
         # the judge merge is committed as a verdict_revision (self-correction).
-        conf_before_judge = snapshot_finding_confidence(
-            self.findings_pool_a + self.findings_pool_b
-        )
+        conf_before_judge = snapshot_finding_confidence(self.findings_pool_a + self.findings_pool_b)
 
         # judge_findings
         j = py.call_tool(
@@ -14492,16 +13966,12 @@ class Investigation:
                 "pool_b_verifier_actions": pool_b_actions,
             },
         )
-        merged = (
-            [m["finding"] for m in j.get("merged", [])] if "_error" not in j else []
-        )
+        merged = [m["finding"] for m in j.get("merged", [])] if "_error" not in j else []
         print(f"  judge merged: {len(merged)} findings")
         verifier_reasons = {
             a.get("finding_id"): a.get("reason")
             for a in (pool_a_actions + pool_b_actions)
-            if a.get("action") == "downgraded"
-            and a.get("finding_id")
-            and a.get("reason")
+            if a.get("action") == "downgraded" and a.get("finding_id") and a.get("reason")
         }
         self._emit_verdict_revisions(
             py,
@@ -14527,9 +13997,7 @@ class Investigation:
         correlation_reasons = {
             o.get("finding_id"): o.get("reason")
             for o in (self.correlation_outcomes or [])
-            if o.get("action") == "downgraded"
-            and o.get("finding_id")
-            and o.get("reason")
+            if o.get("action") == "downgraded" and o.get("finding_id") and o.get("reason")
         }
         self._emit_verdict_revisions(
             py,
@@ -14582,20 +14050,14 @@ class Investigation:
         print(f"  correlator: {kept} kept, {downgraded} downgraded")
         return merged, kept, downgraded
 
-    def _build_report_metadata(
-        self, merged: list[dict[str, Any]], verdict: str
-    ) -> dict[str, Any]:
+    def _build_report_metadata(self, merged: list[dict[str, Any]], verdict: str) -> dict[str, Any]:
         timeline = sorted(self.timeline_events, key=lambda e: e["ts"])
         case_completeness = self._case_completeness()
-        attack_coverage = build_attack_coverage(
-            self.tool_calls, merged, case_completeness
-        )
+        attack_coverage = build_attack_coverage(self.tool_calls, merged, case_completeness)
         attck_practitioner_coverage = build_attck_practitioner_coverage(
             self.tool_calls, merged, case_completeness, attack_coverage
         )
-        next_actions = build_next_actions(
-            merged, attack_coverage, case_completeness, timeline
-        )
+        next_actions = build_next_actions(merged, attack_coverage, case_completeness, timeline)
         source_bibliography = build_source_bibliography()
         normalized_timeline = build_normalized_timeline(
             timeline, merged, self.execution_corroboration
@@ -14608,9 +14070,7 @@ class Investigation:
         apply_signature_profiles(merged)
         host_groups = build_host_groups(merged, normalized_timeline)
         entity_index = build_entity_index(normalized_timeline["events"], merged)
-        indicators = build_indicators(
-            normalized_timeline["events"], merged, self.malware_triage
-        )
+        indicators = build_indicators(normalized_timeline["events"], merged, self.malware_triage)
         event_narratives = build_event_narratives(normalized_timeline["events"], merged)
         report_evidence_cards = build_report_evidence_cards(
             merged, normalized_timeline["events"], source_bibliography
@@ -14619,9 +14079,7 @@ class Investigation:
         expert_doctrine = build_expert_doctrine(expert_rules)
         # Summarize raw tool-error dumps and drop duplicates before any consumer
         # (QA, narrative, verdict.json) reads the list.
-        self.analysis_limitations = clean_analysis_limitations(
-            self.analysis_limitations
-        )
+        self.analysis_limitations = clean_analysis_limitations(self.analysis_limitations)
         # Build the coverage manifest before report QA so the negative-completeness
         # gate (no_evil_is_scoped) can read the same available/examined record that
         # ships in the report.
@@ -14715,17 +14173,13 @@ class Investigation:
         print("\n=== report QA / expert signoff ===")
         print(f"  status: {report_qa.get('status')}")
         print(f"  packet_state: {report_qa.get('packet_state')}")
-        print(
-            f"  ready_for_expert_signoff: {report_qa.get('ready_for_expert_signoff')}"
-        )
+        print(f"  ready_for_expert_signoff: {report_qa.get('ready_for_expert_signoff')}")
         payload = {
             "status": report_qa.get("status"),
             "packet_state": report_qa.get("packet_state"),
             "ready_for_expert_signoff": report_qa.get("ready_for_expert_signoff"),
             "ready_for_customer_pdf": report_qa.get("ready_for_customer_pdf"),
-            "customer_release_candidate": report_qa.get(
-                "customer_release_candidate", False
-            ),
+            "customer_release_candidate": report_qa.get("customer_release_candidate", False),
             "customer_releasable": report_qa.get("customer_releasable", False),
             "expert_decision": report_qa.get("expert_decision", "pending"),
             "expert_signoff_required": report_qa.get("expert_signoff_required", True),
@@ -14768,9 +14222,7 @@ class Investigation:
         # signature block, and the gate must treat that as NOT customer-
         # releasable — never pass on intent. Falls back to the requested signer
         # only for the preliminary gates that run before the manifest exists.
-        signer_effective = str(
-            (manifest or {}).get("signature", {}).get("kind") or self.signer
-        )
+        signer_effective = str((manifest or {}).get("signature", {}).get("kind") or self.signer)
         signer_customer_ok = signer_effective == "sigstore"
         manifest_verified = bool((manifest_verification or {}).get("overall"))
         manifest_signature_present = bool((manifest or {}).get("signature"))
@@ -14804,9 +14256,7 @@ class Investigation:
             "packet_state": report_qa.get("packet_state"),
             "expert_decision": expert_decision,
             "expert_signoff_required": report_qa.get("expert_signoff_required", True),
-            "customer_release_candidate": report_qa.get(
-                "customer_release_candidate", False
-            ),
+            "customer_release_candidate": report_qa.get("customer_release_candidate", False),
             "customer_releasable": customer_releasable,
             "ready_for_customer_pdf": customer_releasable,
             "report_render_allowed": report_qa.get("ready_for_expert_signoff", False),
@@ -14822,9 +14272,7 @@ class Investigation:
             "release_blockers": sorted(set(release_blockers)),
         }
 
-    def _emit_release_gate(
-        self, py: SshMcpClient, report_qa: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _emit_release_gate(self, py: SshMcpClient, report_qa: dict[str, Any]) -> dict[str, Any]:
         release_gate = self._build_release_gate(report_qa)
         self._audit(
             py,
@@ -14841,17 +14289,14 @@ class Investigation:
         """
         for finding in merged:
             text = " ".join(
-                str(finding.get(k) or "")
-                for k in ("description", "title", "summary", "reasoning")
+                str(finding.get(k) or "") for k in ("description", "title", "summary", "reasoning")
             )
             cves = _extract_cve_ids(text)
             if cves:
                 finding["cves"] = cves
         return merged
 
-    def _emit_final_findings(
-        self, py: SshMcpClient, merged: list[dict[str, Any]]
-    ) -> None:
+    def _emit_final_findings(self, py: SshMcpClient, merged: list[dict[str, Any]]) -> None:
         for index, finding in enumerate(merged, 1):
             finding_id = _finding_id(finding, index)
             self._audit(
@@ -14915,9 +14360,7 @@ class Investigation:
                 _finding_id(finding, index) for index, finding in enumerate(merged, 1)
             ],
             "packet_state": release_gate.get("packet_state"),
-            "customer_release_candidate": release_gate.get(
-                "customer_release_candidate", False
-            ),
+            "customer_release_candidate": release_gate.get("customer_release_candidate", False),
             "customer_releasable": release_gate.get("customer_releasable", False),
         }
 
@@ -14948,18 +14391,14 @@ class Investigation:
             "expert_miss_summary": miss_summary,
             "release_conditions": {
                 "machine_qa_passed": release_gate.get("machine_qa_passed", False),
-                "sigstore_signer": release_gate.get(
-                    "signer_customer_release_ok", False
-                ),
+                "sigstore_signer": release_gate.get("signer_customer_release_ok", False),
                 "expert_approved": release_gate.get("expert_approved", False),
             },
             "referenced_hashes": {
                 "run_manifest_sha256": None,
                 "report_qa_sha256": self._hash_obj(report_qa),
                 "release_gate_sha256": self._hash_obj(release_gate),
-                "verdict_packet_sha256": (packet_attestation or {}).get(
-                    "verdict_packet_sha256"
-                ),
+                "verdict_packet_sha256": (packet_attestation or {}).get("verdict_packet_sha256"),
             },
             "referenced_paths": {
                 "run_manifest": _release_path(self.manifest_path),
@@ -15100,9 +14539,7 @@ class Investigation:
                 inventory = getattr(self, "evidence_inventory", None)
                 if inventory and inventory.get("summary", {}).get("truncated"):
                     return "INDETERMINATE"
-                evidence_type = (
-                    "directory" if inventory else detect_evidence_type(self.evidence)
-                )
+                evidence_type = "directory" if inventory else detect_evidence_type(self.evidence)
                 tools_run = {tc.get("tool") for tc in getattr(self, "tool_calls", [])}
                 if any(tc.get("error") for tc in getattr(self, "tool_calls", [])):
                     return "INDETERMINATE"
@@ -15168,9 +14605,7 @@ class Investigation:
             return "NO_EVIL"
 
         SEVERE_INFERRED_OK = {"T1014", "T1055"}
-        non_hyp = [
-            m for m in merged if m.get("confidence") in ("CONFIRMED", "INFERRED")
-        ]
+        non_hyp = [m for m in merged if m.get("confidence") in ("CONFIRMED", "INFERRED")]
         if any(m.get("confidence") == "CONFIRMED" for m in non_hyp):
             return "SUSPICIOUS"
         if any(m.get("mitre_technique") in SEVERE_INFERRED_OK for m in non_hyp):
@@ -15241,15 +14676,9 @@ class Investigation:
             "findings_summary": {
                 "total_merged": len(merged),
                 "by_confidence": {
-                    "CONFIRMED": sum(
-                        1 for m in merged if m.get("confidence") == "CONFIRMED"
-                    ),
-                    "INFERRED": sum(
-                        1 for m in merged if m.get("confidence") == "INFERRED"
-                    ),
-                    "HYPOTHESIS": sum(
-                        1 for m in merged if m.get("confidence") == "HYPOTHESIS"
-                    ),
+                    "CONFIRMED": sum(1 for m in merged if m.get("confidence") == "CONFIRMED"),
+                    "INFERRED": sum(1 for m in merged if m.get("confidence") == "INFERRED"),
+                    "HYPOTHESIS": sum(1 for m in merged if m.get("confidence") == "HYPOTHESIS"),
                 },
                 "contradictions_surfaced": contras,
                 "soul_md_kept": kept,
@@ -15281,17 +14710,12 @@ class Investigation:
             "report_qa": report_qa,
             "release_gate": release_gate,
             "expert_signoff": {
-                "status": expert_signoff_packet.get("status")
-                or "PENDING_EXPERT_REVIEW",
+                "status": expert_signoff_packet.get("status") or "PENDING_EXPERT_REVIEW",
                 "expert_decision": expert_signoff_packet.get("decision", "pending"),
                 "expert_signoff_required": True,
-                "customer_release_candidate": release_gate.get(
-                    "customer_release_candidate", False
-                ),
+                "customer_release_candidate": release_gate.get("customer_release_candidate", False),
                 "customer_releasable": release_gate.get("customer_releasable", False),
-                "ready_for_customer_pdf": release_gate.get(
-                    "ready_for_customer_pdf", False
-                ),
+                "ready_for_customer_pdf": release_gate.get("ready_for_customer_pdf", False),
                 "signer": self.signer,
                 "signoff_question": "Would I send this report to a company without rewriting it?",
             },
@@ -15358,12 +14782,7 @@ class Investigation:
             local_dir.mkdir(parents=True, exist_ok=True)
             self.local_run_dir = local_dir
         else:
-            local_dir = (
-                Path(__file__).resolve().parent.parent
-                / "tmp"
-                / "auto-runs"
-                / self.case_id
-            )
+            local_dir = Path(__file__).resolve().parent.parent / "tmp" / "auto-runs" / self.case_id
             local_dir.mkdir(parents=True, exist_ok=True)
             self.local_run_dir = local_dir
             for remote, name in [
@@ -15386,9 +14805,7 @@ class Investigation:
                 )
                 if proc.returncode != 0:
                     stderr = proc.stderr.decode("utf-8", errors="replace")
-                    raise RuntimeError(
-                        f"failed to fetch {name} from SIFT VM: {stderr[:300]}"
-                    )
+                    raise RuntimeError(f"failed to fetch {name} from SIFT VM: {stderr[:300]}")
         # Also persist psscan output if we have it (for the report)
         if "psscan_json" in self.local_artifacts:
             (local_dir / "psscan.json").write_text(
@@ -15463,9 +14880,7 @@ class Investigation:
                 encoding="utf-8",
             )
         timeline = sorted(self.timeline_events, key=lambda e: e["ts"])
-        normalized_timeline = self.normalized_timeline or build_normalized_timeline(
-            timeline, []
-        )
+        normalized_timeline = self.normalized_timeline or build_normalized_timeline(timeline, [])
         (local_dir / "timeline.json").write_text(
             json.dumps(normalized_timeline, indent=2, sort_keys=True), encoding="utf-8"
         )
@@ -15486,9 +14901,7 @@ class Investigation:
             return []
         names = ("REPORT.md", "REPORT.html", "REPORT.pdf")
         return [
-            str(self.local_run_dir / name)
-            for name in names
-            if (self.local_run_dir / name).exists()
+            str(self.local_run_dir / name) for name in names if (self.local_run_dir / name).exists()
         ]
 
     def _summary_timeline_paths(self) -> list[str]:
@@ -15520,21 +14933,15 @@ class Investigation:
                 verdict_obj = json.loads(Path(verdict_path).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 verdict_obj = {}
-        report_qa = (
-            verdict_obj.get("report_qa") if isinstance(verdict_obj, dict) else None
-        )
+        report_qa = verdict_obj.get("report_qa") if isinstance(verdict_obj, dict) else None
         release_gate = release_gate or verdict_obj.get("release_gate")
         expert_signoff = verdict_obj.get("expert_signoff")
 
         blockers: list[str] = []
         warnings: list[str] = []
         if release_gate:
-            blockers.extend(
-                str(item) for item in release_gate.get("release_blockers", []) or []
-            )
-            warnings.extend(
-                str(item) for item in release_gate.get("warning_checks", []) or []
-            )
+            blockers.extend(str(item) for item in release_gate.get("release_blockers", []) or [])
+            warnings.extend(str(item) for item in release_gate.get("warning_checks", []) or [])
         if report_qa:
             blockers.extend(
                 str(row.get("check_id"))
@@ -15572,9 +14979,7 @@ class Investigation:
             "run_dir": str(self.local_run_dir) if self.local_run_dir else self.case_dir,
             "audit_path": self._summary_path("audit.jsonl", self.audit_path),
             "verdict_path": verdict_path,
-            "manifest_path": self._summary_path(
-                "run.manifest.json", self.manifest_path
-            ),
+            "manifest_path": self._summary_path("run.manifest.json", self.manifest_path),
             "manifest_verify_path": manifest_verify_path,
             "coverage_manifest_path": self._summary_path("coverage_manifest.json", ""),
             "report_paths": self._summary_report_paths(),
@@ -15601,9 +15006,7 @@ class Investigation:
     # ------------------------------------------------------------------
 
     def run(self) -> dict[str, Any]:
-        print(
-            f"\n{'=' * 70}\nfind-evil-auto: investigating {self.evidence}\n{'=' * 70}"
-        )
+        print(f"\n{'=' * 70}\nfind-evil-auto: investigating {self.evidence}\n{'=' * 70}")
         print(f"  case_id         = {self.case_id}")
         print(f"  run_id          = {self.run_id}")
         print(f"  unattended      = {self.unattended}")
@@ -15777,9 +15180,7 @@ class Investigation:
             verdict_artifact_bytes = verdict_json.encode("utf-8")
             verdict_artifact_sha256 = hashlib.sha256(verdict_artifact_bytes).hexdigest()
             packet_attestation["verdict_artifact_sha256"] = verdict_artifact_sha256
-            packet_attestation["verdict_artifact_path"] = _release_path(
-                self.verdict_path
-            )
+            packet_attestation["verdict_artifact_path"] = _release_path(self.verdict_path)
             packet_attestation["verdict_artifact_bytes"] = len(verdict_artifact_bytes)
             expert_signoff_packet["referenced_hashes"]["verdict_artifact_sha256"] = (
                 verdict_artifact_sha256
@@ -15835,12 +15236,8 @@ class Investigation:
 
             print(f"\n{'=' * 70}\nDONE — verdict: {verdict}\n{'=' * 70}")
             print(f"  packet_state    = {final_release_gate.get('packet_state')}")
-            print(
-                f"  customer_ready  = {final_release_gate.get('customer_releasable', False)}"
-            )
-            if final_release_gate.get("failed_checks") or final_release_gate.get(
-                "warning_checks"
-            ):
+            print(f"  customer_ready  = {final_release_gate.get('customer_releasable', False)}")
+            if final_release_gate.get("failed_checks") or final_release_gate.get("warning_checks"):
                 print(
                     "  qa_checks       = "
                     f"failed={final_release_gate.get('failed_checks', [])} "
@@ -15950,9 +15347,7 @@ def write_run_summary(path: str, summary: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.tmp")
-    tmp.write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    tmp.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(target)
 
 
@@ -16003,9 +15398,7 @@ _AGENT_TOOL_DENYLIST = frozenset({"case_open", "disk_unmount"})
 _AGENT_TOOL_ALLOWLISTS = {"evtx": frozenset({"evtx_query"})}
 
 
-def _scope_agent_mcp_tools(
-    tools: list[dict[str, Any]], evidence_type: str
-) -> list[dict[str, Any]]:
+def _scope_agent_mcp_tools(tools: list[dict[str, Any]], evidence_type: str) -> list[dict[str, Any]]:
     """Keep local-model tool selection tractable for known single-artifact lanes."""
     allowed = _AGENT_TOOL_ALLOWLISTS.get(evidence_type)
     if allowed is None:

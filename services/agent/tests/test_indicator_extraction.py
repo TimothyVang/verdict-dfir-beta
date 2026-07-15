@@ -168,14 +168,7 @@ def test_observed_finding_hash_is_emitted_but_negated_hash_is_not() -> None:
     negated = "b" * 64
     indicators = fea.build_indicators(
         [],
-        [
-            {
-                "description": (
-                    f"Observed SHA-256 {observed}. "
-                    f"Did not observe SHA-256 {negated}."
-                )
-            }
-        ],
+        [{"description": (f"Observed SHA-256 {observed}. Did not observe SHA-256 {negated}.")}],
         None,
     )
 
@@ -206,13 +199,7 @@ def test_postfix_negation_does_not_emit_finding_indicators() -> None:
 def test_mixed_clause_keeps_positive_observable_after_negated_one() -> None:
     indicators = fea.build_indicators(
         [],
-        [
-            {
-                "description": (
-                    "payload.exe was not observed, but observed helper.exe."
-                )
-            }
-        ],
+        [{"description": ("payload.exe was not observed, but observed helper.exe.")}],
         None,
     )
 
@@ -220,12 +207,8 @@ def test_mixed_clause_keeps_positive_observable_after_negated_one() -> None:
 
 
 def test_prefix_and_postfix_ip_negation_keep_only_positive_ip() -> None:
-    prefix = fea._extract_iocs_from_texts(
-        ["Did not observe 10.0.0.1, but observed 10.0.0.2"]
-    )
-    postfix = fea._extract_iocs_from_texts(
-        ["10.0.0.1 was not observed, but 10.0.0.2 was observed"]
-    )
+    prefix = fea._extract_iocs_from_texts(["Did not observe 10.0.0.1, but observed 10.0.0.2"])
+    postfix = fea._extract_iocs_from_texts(["10.0.0.1 was not observed, but 10.0.0.2 was observed"])
 
     assert prefix["ips"] == ["10.0.0.2"]
     assert postfix["ips"] == ["10.0.0.2"]
@@ -254,9 +237,7 @@ def test_and_clause_keeps_positive_file_after_negated_file() -> None:
 
 
 def test_neither_nor_files_are_not_emitted() -> None:
-    extracted = fea._extract_iocs_from_texts(
-        ["Neither first.exe nor second.exe was observed"]
-    )
+    extracted = fea._extract_iocs_from_texts(["Neither first.exe nor second.exe was observed"])
 
     assert extracted["paths"] == []
 
@@ -278,9 +259,7 @@ def test_positive_network_indicator_extraction_is_preserved() -> None:
 
 
 def test_coordinated_subjects_share_postfix_negation() -> None:
-    files = fea._extract_iocs_from_texts(
-        ["payload.exe and helper.exe were not observed"]
-    )
+    files = fea._extract_iocs_from_texts(["payload.exe and helper.exe were not observed"])
     network = fea._extract_iocs_from_texts(
         ["https://bad.example/path and second.example were not observed"]
     )
@@ -291,9 +270,7 @@ def test_coordinated_subjects_share_postfix_negation() -> None:
 
 
 def test_comma_separated_observation_resets_negated_ip_polarity() -> None:
-    extracted = fea._extract_iocs_from_texts(
-        ["Did not observe 10.0.0.1, observed 10.0.0.2"]
-    )
+    extracted = fea._extract_iocs_from_texts(["Did not observe 10.0.0.1, observed 10.0.0.2"])
 
     assert extracted["ips"] == ["10.0.0.2"]
 
