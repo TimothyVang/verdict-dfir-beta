@@ -4986,10 +4986,12 @@ def build_indicators(
             description,
             flags=re.I,
         ):
-            if _ioc_match_is_negated(description, match.start()):
+            relative = _trim_registry_prose(match.group(0))
+            if _ioc_match_is_negated(
+                description, match.start(), match.start() + len(relative)
+            ):
                 continue
-            relative = match.group(0)
-            registry_values.add(f"HKLM\\SYSTEM\\{_trim_registry_prose(relative)}")
+            registry_values.add(f"HKLM\\SYSTEM\\{relative}")
 
     def _cap(values: set[str]) -> list[str]:
         return sorted(v for v in values if v)[:per_list_cap]
@@ -7248,6 +7250,12 @@ _EXPLICIT_IOC_NEGATION = re.compile(
     r"couldn't|wouldn't|shouldn't|can't)\b",
     flags=re.I,
 )
+_EXPLICIT_IOC_POSTFIX_NEGATION = re.compile(
+    r"^\s+(?:(?:was|is|were|are|has|have|had)\s+not|"
+    r"(?:wasn't|isn't|weren't|aren't|hasn't|haven't|hadn't))\s+"
+    r"(?:observed|present|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
+    flags=re.I,
+)
 
 
 def _ioc_clause_prefix(text: str, match_start: int) -> str:
@@ -7260,9 +7268,11 @@ def _ioc_clause_prefix(text: str, match_start: int) -> str:
     return clause
 
 
-def _ioc_match_is_negated(text: str, match_start: int) -> bool:
+def _ioc_match_is_negated(text: str, match_start: int, match_end: int) -> bool:
     """Check explicit negation in the sentence or clause containing an IOC match."""
-    return _EXPLICIT_IOC_NEGATION.search(_ioc_clause_prefix(text, match_start)) is not None
+    if _EXPLICIT_IOC_NEGATION.search(_ioc_clause_prefix(text, match_start)):
+        return True
+    return _EXPLICIT_IOC_POSTFIX_NEGATION.search(text[match_end : match_end + 80]) is not None
 
 
 def _non_negated_ioc_matches(
@@ -7271,7 +7281,7 @@ def _non_negated_ioc_matches(
     return [
         match.group(0)
         for match in re.finditer(pattern, text, flags=flags)
-        if not _ioc_match_is_negated(text, match.start())
+        if not _ioc_match_is_negated(text, match.start(), match.end())
     ]
 
 
@@ -7281,7 +7291,7 @@ def _observed_hash_matches(text: str) -> list[str]:
         r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", text
     ):
         clause = _ioc_clause_prefix(text, match.start())
-        if _EXPLICIT_IOC_NEGATION.search(clause):
+        if _ioc_match_is_negated(text, match.start(), match.end()):
             continue
         if re.search(
             r"\b(?:observed|found|detected|identified|recovered|matched|verified)\b",
@@ -7290,6 +7300,15 @@ def _observed_hash_matches(text: str) -> list[str]:
         ):
             hashes.append(match.group(0))
     return hashes
+
+
+def _registry_ioc_matches(text: str) -> list[str]:
+    registry_keys: list[str] = []
+    for match in re.finditer(r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+", text, flags=re.I):
+        key = _trim_registry_prose(match.group(0))
+        if not _ioc_match_is_negated(text, match.start(), match.start() + len(key)):
+            registry_keys.append(key)
+    return registry_keys
 
 
 def _extract_ascii_strings_from_hex(sample_hex: str, min_len: int = 4) -> list[str]:
@@ -7434,13 +7453,7 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         if not any(path.lower().endswith(f"\\{filename.lower()}") for path in paths)
     )
     iocs["paths"] = _uniq(paths)[:50]
-    registry_keys = _non_negated_ioc_matches(
-        r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+", blob, flags=re.I
-    )
-    iocs["registry_keys"] = _uniq(
-        _trim_registry_prose(key)
-        for key in registry_keys
-    )[:50]
+    iocs["registry_keys"] = _uniq(_registry_ioc_matches(blob))[:50]
     iocs["hashes"] = _uniq(
         _non_negated_ioc_matches(
             r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob

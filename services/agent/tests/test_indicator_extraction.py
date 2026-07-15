@@ -182,6 +182,43 @@ def test_observed_finding_hash_is_emitted_but_negated_hash_is_not() -> None:
     assert indicators["hashes"] == [observed]
 
 
+def test_postfix_negation_does_not_emit_finding_indicators() -> None:
+    digest = "c" * 64
+    indicators = fea.build_indicators(
+        [],
+        [
+            {
+                "description": (
+                    "payload.exe was not observed. "
+                    r"HKLM\SOFTWARE\Bad was not observed. "
+                    f"Observed SHA-256 {digest} was not present."
+                )
+            }
+        ],
+        None,
+    )
+
+    assert indicators["file_paths"] == []
+    assert indicators["registry_values"] == []
+    assert indicators["hashes"] == []
+
+
+def test_mixed_clause_keeps_positive_observable_after_negated_one() -> None:
+    indicators = fea.build_indicators(
+        [],
+        [
+            {
+                "description": (
+                    "payload.exe was not observed, but observed helper.exe."
+                )
+            }
+        ],
+        None,
+    )
+
+    assert indicators["file_paths"] == ["helper.exe"]
+
+
 def test_system_hive_registry_value_stops_before_prose() -> None:
     indicators = fea.build_indicators(
         [],
