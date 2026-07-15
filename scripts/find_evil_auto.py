@@ -7063,6 +7063,7 @@ def _trim_registry_prose(value: str) -> str:
 
 
 _EXPLICIT_IOC_NEGATION = re.compile(
+    r"\bnot\b(?!\s+only\b)|"
     r"\b(?:no|never|without|cannot|neither|nor)\b|"
     r"\b(?:did|do|does|is|are|was|were|has|have|had|could|would|should|can)\s+"
     r"not\b(?!\s+only\b)(?:\s+(?:observ(?:e|ed)|present|found|detected|identified|"
@@ -7130,7 +7131,12 @@ def _observed_hash_matches(text: str) -> list[str]:
 
 def _registry_ioc_matches(text: str) -> list[str]:
     registry_keys: list[str] = []
-    for match in re.finditer(r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+", text, flags=re.I):
+    for match in re.finditer(
+        r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+?"
+        r"(?=\s+and\s+HK(?:LM|CU|CR|U|CC)\\|[,;\r\n]|$)",
+        text,
+        flags=re.I,
+    ):
         key = _trim_registry_prose(match.group(0))
         if not _ioc_match_is_negated(text, match.start(), match.start() + len(key)):
             registry_keys.append(key)

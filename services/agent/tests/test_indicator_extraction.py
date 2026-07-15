@@ -275,6 +275,29 @@ def test_comma_separated_observation_resets_negated_ip_polarity() -> None:
     assert extracted["ips"] == ["10.0.0.2"]
 
 
+def test_contrastive_bare_negation_is_scoped_per_indicator() -> None:
+    files = fea._extract_iocs_from_texts(["Observed payload.exe, but not helper.exe"])
+    ips = fea._extract_iocs_from_texts(["Observed 10.0.0.1, but not 10.0.0.2"])
+    urls = fea._extract_iocs_from_texts(
+        ["Observed https://good.example/path but not https://bad.example/path"]
+    )
+    domains = fea._extract_iocs_from_texts(["Observed first.example, but not second.example"])
+
+    assert files["paths"] == ["payload.exe"]
+    assert ips["ips"] == ["10.0.0.1"]
+    assert urls["urls"] == ["https://good.example/path"]
+    assert domains["domains"] == ["first.example"]
+
+
+def test_adjacent_registry_values_are_extracted_separately() -> None:
+    extracted = fea._extract_iocs_from_texts([r"Observed HKLM\SOFTWARE\One and HKCU\SOFTWARE\Two"])
+
+    assert extracted["registry_keys"] == [
+        r"HKCU\SOFTWARE\Two",
+        r"HKLM\SOFTWARE\One",
+    ]
+
+
 def test_system_hive_registry_value_stops_before_prose() -> None:
     indicators = fea.build_indicators(
         [],
