@@ -7243,16 +7243,25 @@ def _trim_registry_prose(value: str) -> str:
 
 
 _EXPLICIT_IOC_NEGATION = re.compile(
-    r"\b(?:no|never|without|cannot)\b|"
+    r"\b(?:no|never|without|cannot|neither|nor)\b|"
     r"\b(?:did|do|does|is|are|was|were|has|have|had|could|would|should|can)\s+"
     r"not\b(?!\s+only\b)|"
     r"\b(?:didn't|don't|doesn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|"
     r"couldn't|wouldn't|shouldn't|can't)\b",
     flags=re.I,
 )
+_EXPLICIT_IOC_OBSERVATION = re.compile(
+    r"\b(?:observed|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
+    flags=re.I,
+)
 _EXPLICIT_IOC_POSTFIX_NEGATION = re.compile(
     r"^\s+(?:(?:was|is|were|are|has|have|had)\s+not|"
     r"(?:wasn't|isn't|weren't|aren't|hasn't|haven't|hadn't))\s+"
+    r"(?:observed|present|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
+    flags=re.I,
+)
+_EXPLICIT_IOC_POSTFIX_OBSERVATION = re.compile(
+    r"^\s+(?:was|is|were|are|has|have|had)\s+"
     r"(?:observed|present|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
     flags=re.I,
 )
@@ -7270,9 +7279,21 @@ def _ioc_clause_prefix(text: str, match_start: int) -> str:
 
 def _ioc_match_is_negated(text: str, match_start: int, match_end: int) -> bool:
     """Check explicit negation in the sentence or clause containing an IOC match."""
-    if _EXPLICIT_IOC_NEGATION.search(_ioc_clause_prefix(text, match_start)):
+    clause = _ioc_clause_prefix(text, match_start)
+    postfix = text[match_end : match_end + 80]
+    if _EXPLICIT_IOC_POSTFIX_NEGATION.search(postfix):
         return True
-    return _EXPLICIT_IOC_POSTFIX_NEGATION.search(text[match_end : match_end + 80]) is not None
+    if not _EXPLICIT_IOC_NEGATION.search(clause):
+        return False
+    conjunctions = list(re.finditer(r"\band\b", clause, flags=re.I))
+    if conjunctions:
+        local_prefix = clause[conjunctions[-1].end() :]
+        explicitly_observed = _EXPLICIT_IOC_OBSERVATION.search(
+            local_prefix
+        ) or _EXPLICIT_IOC_POSTFIX_OBSERVATION.search(postfix)
+        if explicitly_observed and not _EXPLICIT_IOC_NEGATION.search(local_prefix):
+            return False
+    return True
 
 
 def _non_negated_ioc_matches(
@@ -7293,11 +7314,7 @@ def _observed_hash_matches(text: str) -> list[str]:
         clause = _ioc_clause_prefix(text, match.start())
         if _ioc_match_is_negated(text, match.start(), match.end()):
             continue
-        if re.search(
-            r"\b(?:observed|found|detected|identified|recovered|matched|verified)\b",
-            clause,
-            flags=re.I,
-        ):
+        if _EXPLICIT_IOC_OBSERVATION.search(clause):
             hashes.append(match.group(0))
     return hashes
 
@@ -7377,17 +7394,23 @@ _NON_DOMAIN_SUFFIXES = frozenset(
 def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
     blob = "\n".join(texts)
     iocs = _empty_iocs()
-    iocs["urls"] = _uniq(re.findall(r"https?://[^\s'\"<>]+", blob, flags=re.I))[:50]
+    iocs["urls"] = _uniq(
+        _non_negated_ioc_matches(r"https?://[^\s'\"<>]+", blob, flags=re.I)
+    )[:50]
     iocs["emails"] = _uniq(
-        re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", blob)
+        _non_negated_ioc_matches(
+            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", blob
+        )
     )[:50]
     iocs["ips"] = _uniq(
-        re.findall(
+        _non_negated_ioc_matches(
             r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b",
             blob,
         )
     )[:50]
-    domains = re.findall(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", blob)
+    domains = _non_negated_ioc_matches(
+        r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", blob
+    )
     # The regex also matches executable/file names like `calc.exe` or `cmd.exe`
     # (the final label looks like a TLD). Those are processes, not domains — drop
     # any candidate whose final label is a known file extension.

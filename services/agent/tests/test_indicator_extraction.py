@@ -219,6 +219,64 @@ def test_mixed_clause_keeps_positive_observable_after_negated_one() -> None:
     assert indicators["file_paths"] == ["helper.exe"]
 
 
+def test_prefix_and_postfix_ip_negation_keep_only_positive_ip() -> None:
+    prefix = fea._extract_iocs_from_texts(
+        ["Did not observe 10.0.0.1, but observed 10.0.0.2"]
+    )
+    postfix = fea._extract_iocs_from_texts(
+        ["10.0.0.1 was not observed, but 10.0.0.2 was observed"]
+    )
+
+    assert prefix["ips"] == ["10.0.0.2"]
+    assert postfix["ips"] == ["10.0.0.2"]
+
+
+def test_negation_filters_url_email_and_domain_channels() -> None:
+    extracted = fea._extract_iocs_from_texts(
+        [
+            "Did not observe https://bad.example/path",
+            "analyst@example.org was not observed",
+            "Neither first.example nor second.example was observed",
+        ]
+    )
+
+    assert extracted["urls"] == []
+    assert extracted["emails"] == []
+    assert extracted["domains"] == []
+
+
+def test_and_clause_keeps_positive_file_after_negated_file() -> None:
+    extracted = fea._extract_iocs_from_texts(
+        ["payload.exe was not observed and helper.exe was observed"]
+    )
+
+    assert extracted["paths"] == ["helper.exe"]
+
+
+def test_neither_nor_files_are_not_emitted() -> None:
+    extracted = fea._extract_iocs_from_texts(
+        ["Neither first.exe nor second.exe was observed"]
+    )
+
+    assert extracted["paths"] == []
+
+
+def test_positive_network_indicator_extraction_is_preserved() -> None:
+    extracted = fea._extract_iocs_from_texts(
+        [
+            "Observed https://good.example/path",
+            "Observed analyst@example.org",
+            "Observed 10.0.0.2",
+            "Observed beacon.example.net",
+        ]
+    )
+
+    assert extracted["urls"] == ["https://good.example/path"]
+    assert extracted["emails"] == ["analyst@example.org"]
+    assert extracted["ips"] == ["10.0.0.2"]
+    assert "beacon.example.net" in extracted["domains"]
+
+
 def test_system_hive_registry_value_stops_before_prose() -> None:
     indicators = fea.build_indicators(
         [],
