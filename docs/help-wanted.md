@@ -15,10 +15,11 @@ know DFIR and AI than grind it solo. If that's you: welcome, and thank you.
 
 ## What VERDICT is (the 90-second version)
 
-VERDICT is a **digital-forensics & incident-response (DFIR) agent that runs inside
-[Claude Code](https://claude.com/claude-code)** — there's no separate app server, the Claude Code
-session *is* the engine. You point it at evidence (a memory image, Windows Event Logs, a disk image,
-a packet capture, or a whole multi-host case folder) and it:
+VERDICT is a **digital-forensics & incident-response (DFIR) agent with three runtime paths**: the
+default deterministic `scripts/verdict` quality floor, an allowed beta-native `--agent` loop for
+strict single-file Phase 4 offline acceptance, and
+[Claude Code](https://claude.com/claude-code) as the canonical interactive/cloud runtime. There is
+no separate app server. You point it at supported evidence and it:
 
 1. opens a read-only **Case** and SHA-256s the evidence,
 2. drives a **narrow, typed, read-only** tool surface (45 product tools — 32 Rust DFIR tools + 13
@@ -126,8 +127,16 @@ good it is. Full list in [`CONTRIBUTING.md`](../CONTRIBUTING.md) / `CLAUDE.md`:
 - **No `execute_shell` MCP tool.** The narrow typed surface *is* the product.
 - **Every Finding cites a `tool_call_id`;** evidence is read-only; the audit log is append-only and
   hash-chained.
-- **Claude Code is the orchestrator** — don't reintroduce a standalone agent runtime.
+- **Keep the Amendment A2 boundary.** Claude Code remains canonical for interactive/cloud use. The
+  only allowed beta-native orchestrator is the thin `services/agent/findevil_agent/agentloop/` path
+  reached by `scripts/verdict --agent`; do not restore `graph.py`, `api.py`, `cli.py`,
+  `supervisor.py`, `specialists/`, LangGraph, or FastAPI.
 - **AGPL/GPL DFIR tools stay subprocess-only, never linked** (keeps the tree Apache-2.0).
+
+The current official general judge/demo paths remain default `scripts/verdict <evidence>` and an
+interactive Claude Code session. Strict Phase 4 offline acceptance separately uses `--agent` on one
+evidence file. Directory evidence fails closed in native mode and uses the deterministic path; none
+of these runtime distinctions claim improved local-model detection.
 
 ---
 

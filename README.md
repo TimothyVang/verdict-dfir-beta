@@ -49,13 +49,13 @@ coverage was too limited to scope a clearance, and **`NO_EVIL`** means no report
 artifacts actually examined. `NO_EVIL` is never a whole-environment clean bill of health: coverage is
 bounded, and what was not examined is not the same as absent.
 
-The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT also
-ships its **reference agent**: running `scripts/verdict <evidence>` (or `claude`) in this repo turns
-that [Claude Code](https://claude.com/claude-code) session into the analyst — it opens the Case,
-drives the tools, runs the verifier, and signs the verdict, with no separate application server. It is
-not an autonomous responder: the analyst approves the plan, and before any Finding reaches the report
-the verifier re-runs every cited tool to confirm its output reproduces. Replay reproduces the
-operation; it does not validate the interpretation.
+The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT has
+three supported runtime paths: `scripts/verdict <evidence>` runs the default deterministic quality
+floor; `scripts/verdict --agent <single-file>` runs the optional beta-native provider loop used for
+strict Phase 4 offline acceptance; and [Claude Code](https://claude.com/claude-code) remains the
+canonical interactive/cloud runtime (`claude` / `scripts/find-evil`). All three converge on the same
+verifier, judge, correlator, and signed custody spine. Replay reproduces the operation; it does not
+validate the interpretation or establish detection quality.
 
 > **The tools give any agent a read-only forensic surface; the verdict, custody, and verification
 > guarantees come from VERDICT's orchestration layer** (the verifier, the ≥2-artifact-class gate, the
@@ -84,8 +84,9 @@ curl -fsSL https://raw.githubusercontent.com/TimothyVang/verdict-dfir-beta/main/
 ```
 
 This is a convenience wrapper around the steps below, **not** a standalone binary
-download. VERDICT is a Claude Code agent over a real forensics toolchain, so the
-wrapper still needs `git` and a Claude Code credential present; on a bare machine it
+download. The wrapper needs `git`; Claude credentials are needed only for Claude-backed
+cloud or interactive operation. The beta-native `local` / `dgx` providers use an operator-supplied
+OpenAI-compatible endpoint and do not require a Claude credential. On a bare machine it
 relies on the official Rust/uv/Node installers (driven by setup's `--bootstrap`). It
 will not run a Case by itself — it gets you to a green `scripts/setup`. Prefer to see
 every step? Run them yourself:
@@ -97,9 +98,17 @@ bash scripts/setup            # toolchain + DFIR binaries + both MCP servers + p
 scripts/verdict <path-to-evidence>
 ```
 
-Before your first Case you also need a **Claude Code credential**: a logged-in `claude`,
-`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`. VERDICT drives the tools as a Claude Code agent, so
-`scripts/verdict` needs one to run. `scripts/setup` will go green without it; a Case will not.
+Choose credentials for the runtime you use:
+
+- Claude-backed cloud/interactive: logged-in `claude`, `CLAUDE_CODE_OAUTH_TOKEN`, or
+  `ANTHROPIC_API_KEY`.
+- Beta-native on-prem: `--agent-provider local` or `dgx`, an explicit model, and
+  `FINDEVIL_AGENT_BASE_URL`; no Claude credential or evidence-egress acknowledgement is required.
+- Default deterministic `scripts/verdict`: no LLM credential is required for the investigation
+  engine. Optional Claude-backed post-processing still requires its own credential.
+
+Local/DGX availability changes where inference runs, not the evidence coverage or detection-quality
+claims. See [QUICKSTART.md](QUICKSTART.md) for the strict single-file Phase 4 example.
 
 Point it at supported evidence — a memory image, EVTX log, disk image (`.E01` / `.dd`), packet
 capture, Velociraptor collection, or a whole multi-host case folder. Output lands in
@@ -107,7 +116,9 @@ capture, Velociraptor collection, or a whole multi-host case folder. Output land
 broad clearance claim.
 
 Prefer Claude Code interactively? Run `claude` in the repo and type `/verdict <evidence>` or
-`investigate <evidence>`.
+`investigate <evidence>`. For the optional Phase 4 native loop, pass one evidence file to
+`scripts/verdict --agent`; directory evidence fails closed and must use the default deterministic
+inventory path instead.
 
 ## Get test evidence
 
@@ -287,11 +298,11 @@ claims require at least two artifact classes.
 
 The whole workflow as one picture — every boundary is crossed only through a typed, read-only tool
 whose output is hash-chained into custody: the read-only **evidence vault** → **SIFT tool
-subprocesses** → **two typed MCP servers** → the **Claude Code agent loop** → **cryptographic
+subprocesses** → **two typed MCP servers** → the **supported agent loop** → **cryptographic
 custody** → the **presentation** layer, with trust boundaries marked.
 
 <p align="center">
-  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 13 Python tools), the Claude Code agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
+  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 13 Python tools), the supported agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
 </p>
 
 The same pipeline mapped to the repository — entrypoints (`scripts/`), the agent loop governed by
@@ -501,10 +512,17 @@ network + Velociraptor):
 
 ```bash
 scripts/verdict <path-to-evidence>
+# Optional strict Phase 4 native loop (single evidence file only):
+scripts/verdict --agent --agent-provider local --agent-model <model-id> <path-to-evidence-file>
 #   --sift          run the DFIR tools inside the SANS SIFT VM (default: local host)
 #   --watch         watch evidence/ and investigate on the next drop
 #   --no-dashboard  do not auto-open the browser
 ```
+
+`--agent` currently accepts one evidence file. A directory is rejected before MCP startup rather
+than silently falling back to deterministic analysis; run directory/fleet evidence without
+`--agent`. The Phase 4 gate concerns real MCP custody and control flow, not improved local-model
+detection.
 
 The dashboard at `http://localhost:3000` streams the run live. Evidence files are never committed
 (they are gitignored), so a fresh clone ships with none — stage public datasets with

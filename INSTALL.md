@@ -4,9 +4,10 @@ The single canonical install path: **clone → install → verify → first run*
 pitch see [README.md](README.md); for run modes and every flag see
 [docs/using/running-verdict.md](docs/using/running-verdict.md).
 
-VERDICT runs as a [Claude Code](https://claude.com/claude-code) agent. Installation builds the two
-product MCP servers and the host DFIR toolchain; Claude Code auto-spawns the servers from
-`.mcp.json` on session start. The product surface is 45 tools total: 32 Rust DFIR tools in
+VERDICT supports a default deterministic `scripts/verdict` run, an optional beta-native
+`scripts/verdict --agent` loop, and [Claude Code](https://claude.com/claude-code) for canonical
+interactive/cloud operation. Installation builds the two product MCP servers and the host DFIR
+toolchain; Claude Code auto-spawns the servers from `.mcp.json` on session start. The product surface is 45 tools total: 32 Rust DFIR tools in
 `findevil-mcp` plus 13 Python crypto/ACH/memory/ACP/expert-feedback tools in
 `findevil-agent-mcp`.
 
@@ -14,7 +15,7 @@ product MCP servers and the host DFIR toolchain; Claude Code auto-spawns the ser
 
 ## Prerequisites
 
-Install the required OS tools and configure one Claude credential first. The first-run setup can
+Install the required OS tools, then configure credentials only for the runtime you plan to use. The first-run setup can
 bootstrap the C toolchain (`build-essential` on Debian/Ubuntu), missing cargo/uv via their official
 installers, and Node 20 via `fnm` when needed (best-effort, since Node is optional):
 `bash scripts/setup` calls `scripts/install.sh --bootstrap`. For fail-closed CI/judge checks, run
@@ -29,17 +30,25 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 | unzip | any | extracts Velociraptor `.zip` collections + fixtures | **yes** |
 | Node | 20 | the live dashboard (`apps/web`) | optional |
 | pnpm | latest | dashboard package manager | optional |
-| A Claude credential | one of three (below) | the agent cannot run without it | **yes** |
+| A Claude credential | one of three (below) | Claude-backed cloud/interactive runtime | conditional |
+| OpenAI-compatible endpoint | local or DGX | beta-native on-prem provider | conditional |
 
-**Claude credential — one of three modes** (full detail in [CLAUDE.md §8](CLAUDE.md)):
+**Claude-backed runtime — one of three credential modes** (full detail in [CLAUDE.md](CLAUDE.md)):
 
 1. `CLAUDE_CODE_OAUTH_TOKEN` env var (from `claude setup-token`) — best for CI/automation.
 2. A logged-in Claude Code session (`~/.claude/` present) — the dev default.
 3. `ANTHROPIC_API_KEY` env var — direct metered API.
 
+For beta-native on-prem operation, select `--agent-provider local` or `dgx`, pass
+`--agent-model <id>`, and set `FINDEVIL_AGENT_BASE_URL`. Those providers require no Claude
+credential and no evidence-egress acknowledgement. The default deterministic engine also requires
+no LLM credential.
+
 ### Two hard floors (stated plainly, not bugs)
 
-- **The Claude credential is required** for the investigating agent (one of the three modes above).
+- **A Claude credential is required only for Claude-backed cloud/interactive operation.** Local/DGX
+  beta-native providers and the deterministic engine do not require one. This runtime choice does
+  not improve or prove detection quality.
 - **Disk-image inner-volume extraction needs Sleuth Kit/libewf locally or the SANS SIFT VM** (a
   ~9.3 GB browser-gated download — see [QUICKSTART.md](QUICKSTART.md) "Path A"). Local-host mode
   fully handles memory, EVTX, PCAP, and Velociraptor evidence; raw `.E01`/`.dd` disks are custody-only
@@ -77,8 +86,9 @@ bash scripts/doctor.sh          # human-readable, color table + remedies
 bash scripts/doctor.sh --json   # machine-readable: {"ready":true,...}
 ```
 
-`ready:true` (and no red required rows) means the toolchain, both MCP servers, and a Claude
-credential are present. DFIR-tool and reporting rows are **advisory** — a missing optional binary
+`ready:true` (and no red required rows) means the toolchain, both MCP servers, and the default Claude
+credential check are present. A missing Claude credential is relevant only to Claude-backed runs;
+validate the configured endpoint separately for `local`/`dgx`. DFIR-tool and reporting rows are **advisory** — a missing optional binary
 surfaces at runtime as `BinaryNotFound -32602` and the agent pivots; it does not block a run.
 Failure modes and fixes: [docs/troubleshooting.md](docs/troubleshooting.md).
 
@@ -103,6 +113,10 @@ real Verdict (`SUSPICIOUS` / `INDETERMINATE` / `NO_EVIL`), every Finding cites a
 You can also drive it interactively — open `claude` (or `scripts/find-evil`) in the repo and prompt
 `investigate <path>` — or use the turnkey `/verdict <path>` skill, which also bootstraps n8n and the
 SIFT VM. See [docs/using/running-verdict.md](docs/using/running-verdict.md).
+
+Strict Phase 4 native acceptance is single-file only. Directory evidence passed with `--agent`
+fails closed before MCP startup; use default deterministic `scripts/verdict <directory>` instead.
+See [QUICKSTART.md](QUICKSTART.md) for the command and acceptance checklist.
 
 ---
 
