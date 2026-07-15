@@ -30,19 +30,20 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 | unzip | any | extracts Velociraptor `.zip` collections + fixtures | **yes** |
 | Node | 20 | the live dashboard (`apps/web`) | optional |
 | pnpm | latest | dashboard package manager | optional |
-| A Claude credential | one of three (below) | Claude-backed cloud/interactive runtime | conditional |
-| OpenAI-compatible endpoint | local or DGX | beta-native on-prem provider | conditional |
+| Anthropic/Claude credential | runtime-specific (below) | direct Anthropic or Claude CLI/interactive runtime | conditional |
+| OpenAI-compatible endpoint | local default or explicit DGX URL | beta-native on-prem provider | conditional |
 
-**Claude-backed runtime — one of three credential modes** (full detail in [CLAUDE.md](CLAUDE.md)):
+**Credentials by runtime** (full detail in [CLAUDE.md](CLAUDE.md)):
 
-1. `CLAUDE_CODE_OAUTH_TOKEN` env var (from `claude setup-token`) — best for CI/automation.
-2. A logged-in Claude Code session (`~/.claude/` present) — the dev default.
-3. `ANTHROPIC_API_KEY` env var — direct metered API.
+1. Default native `anthropic`: `ANTHROPIC_API_KEY`, or a supported OAuth token in the logged-in
+   Claude Code credentials file. The adapter does not read `CLAUDE_CODE_OAUTH_TOKEN`.
+2. Claude CLI/interactive: a logged-in Claude Code session or `CLAUDE_CODE_OAUTH_TOKEN` (from
+   `claude setup-token`).
+3. On-prem: `local` defaults to Ollama at `http://localhost:11434/v1`; only `dgx` requires
+   `FINDEVIL_AGENT_BASE_URL`. Both require an explicit model.
 
-For beta-native on-prem operation, select `--agent-provider local` or `dgx`, pass
-`--agent-model <id>`, and set `FINDEVIL_AGENT_BASE_URL`. Those providers require no Claude
-credential and no evidence-egress acknowledgement. The default deterministic engine also requires
-no LLM credential.
+The on-prem providers require no Claude credential or evidence-egress acknowledgement. The default
+deterministic engine also requires no LLM credential.
 
 ### Two hard floors (stated plainly, not bugs)
 
