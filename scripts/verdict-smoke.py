@@ -41,6 +41,74 @@ def test_chains_doctor() -> None:
     ), "verdict does not reference doctor.sh"
 
 
+def test_agent_provider_controls_doctor_credential_mode() -> None:
+    for provider in ("local", "dgx"):
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "README.md",
+                "--agent",
+                "--agent-provider",
+                provider,
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert (
+            f"FINDEVIL_DOCTOR_AGENT_PROVIDER={provider} bash scripts/doctor.sh"
+            in combined
+        ), combined
+
+    for args in ([], ["--agent-provider", "anthropic"]):
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "README.md",
+                "--agent",
+                *args,
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert (
+            "DRY-RUN: env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh"
+            in combined
+        ), combined
+
+
+def test_agent_provider_rejects_unknown_values() -> None:
+    for provider_arg in ("--agent-provider=unknown-provider", "--agent-provider="):
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "README.md",
+                "--agent",
+                provider_arg,
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "unsupported --agent-provider" in combined, combined
+
+
 def test_chains_build() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     assert (
@@ -801,6 +869,11 @@ def main() -> int:
         ("script_exists_and_executable", test_script_exists_and_executable),
         ("bash_syntax_clean", test_bash_syntax_clean),
         ("chains_doctor", test_chains_doctor),
+        (
+            "agent_provider_controls_doctor_credential_mode",
+            test_agent_provider_controls_doctor_credential_mode,
+        ),
+        ("agent_provider_rejects_unknown_values", test_agent_provider_rejects_unknown_values),
         ("chains_build", test_chains_build),
         ("chains_engine", test_chains_engine),
         ("has_sift_and_dashboard_flags", test_has_sift_and_dashboard_flags),

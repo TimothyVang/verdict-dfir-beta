@@ -73,6 +73,8 @@ CASE_ID=""
 CASE_ID_OVERRIDE=""
 PASSTHROUGH=()
 AGENT_MODE=0   # --agent: run the engine under the 3.11 agent venv (host python3 may be 3.10)
+AGENT_PROVIDER=""
+AGENT_PROVIDER_SET=0
 KEEP_SIFT_STAGING=0
 SIFT_STAGING_ROOT=""
 SIFT_STAGING_PARENT=""
@@ -105,8 +107,8 @@ while [[ $# -gt 0 ]]; do
     --workers)       PASSTHROUGH+=("--workers" "$2"); shift 2 ;;   # value-bearing
     --agent)         AGENT_MODE=1; PASSTHROUGH+=("--agent"); shift ;;
     --acknowledge-evidence-egress) PASSTHROUGH+=("--acknowledge-evidence-egress"); shift ;;
-    --agent-provider)   PASSTHROUGH+=("--agent-provider" "$2"); shift 2 ;;   # value-bearing
-    --agent-provider=*) PASSTHROUGH+=("$1"); shift ;;
+    --agent-provider)   if [[ $# -lt 2 ]]; then printf '\033[31m[verdict] FAIL:\033[0m --agent-provider requires a value\n' >&2; exit 1; fi; AGENT_PROVIDER="$2"; AGENT_PROVIDER_SET=1; PASSTHROUGH+=("--agent-provider" "$2"); shift 2 ;;
+    --agent-provider=*) AGENT_PROVIDER="${1#--agent-provider=}"; AGENT_PROVIDER_SET=1; PASSTHROUGH+=("$1"); shift ;;
     --agent-model)      PASSTHROUGH+=("--agent-model" "$2"); shift 2 ;;       # value-bearing
     --agent-model=*)    PASSTHROUGH+=("$1"); shift ;;
     --agent-max-steps)  PASSTHROUGH+=("--agent-max-steps" "$2"); shift 2 ;;   # value-bearing
@@ -1451,6 +1453,12 @@ for passthrough_arg in "${PASSTHROUGH[@]}"; do
     --case-id|--case-id=*) fail "--case-id must be a top-level verdict option, not passed after --" ;;
   esac
 done
+if [[ "${AGENT_PROVIDER_SET}" == "1" ]]; then
+  case "${AGENT_PROVIDER}" in
+    anthropic|claude_cli|openai|openrouter|local|dgx) ;;
+    *) fail "unsupported --agent-provider: ${AGENT_PROVIDER}" ;;
+  esac
+fi
 [[ -n "${CASE_ID_OVERRIDE:-}" ]] && CASE_ID_OVERRIDE="$(safe_case_id "${CASE_ID_OVERRIDE}")"
 [[ -n "${RUN_SUMMARY:-}" ]] && RUN_SUMMARY="$(prepare_requested_run_summary_path "${RUN_SUMMARY}" 0)"
 if [[ "${SIFT}" == "1" ]]; then
@@ -1624,9 +1632,19 @@ run_fleet() {
 # 1. preflight ---------------------------------------------------------------
 log "1/4 preflight"
 if [[ "${DRY}" == "1" ]]; then
-  ok "DRY-RUN: bash scripts/doctor.sh"
+  if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
+    ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=${AGENT_PROVIDER} bash scripts/doctor.sh"
+  else
+    ok "DRY-RUN: env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh"
+  fi
 elif [[ -f scripts/doctor.sh ]]; then
-  bash scripts/doctor.sh || fail "doctor reported missing dependencies — fix them, then re-run"
+  if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
+    FINDEVIL_DOCTOR_AGENT_PROVIDER="${AGENT_PROVIDER}" bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  else
+    env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  fi
 else
   warn "scripts/doctor.sh not found; skipping preflight"
 fi

@@ -130,11 +130,14 @@ if [ -z "${JSON_MODE}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Claude credential mode (mirrors scripts/install.sh §1).
+# Claude credential mode (mirrors scripts/install.sh §1). The canonical launcher
+# sets FINDEVIL_DOCTOR_AGENT_PROVIDER only for explicit on-prem agent providers.
 # ---------------------------------------------------------------------------
 GROUP="Claude credential"
 [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}Claude credential${c_off}"; }
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && command -v claude >/dev/null 2>&1; then
+if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ]; then
+  row ok "credential" "skipped: not required for on-prem provider ${FINDEVIL_DOCTOR_AGENT_PROVIDER}"
+elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && command -v claude >/dev/null 2>&1; then
   row ok "credential" "mode 1: CLAUDE_CODE_OAUTH_TOKEN + claude CLI"
 elif command -v claude >/dev/null 2>&1 && [ -d "${HOME}/.claude" ]; then
   row ok "credential" "mode 2: interactive ~/.claude session"
