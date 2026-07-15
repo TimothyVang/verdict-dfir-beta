@@ -1634,12 +1634,17 @@ log "1/4 preflight"
 if [[ "${DRY}" == "1" ]]; then
   if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
     ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=${AGENT_PROVIDER} bash scripts/doctor.sh"
+  elif [[ "${AGENT_MODE}" == "0" ]]; then
+    ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=deterministic bash scripts/doctor.sh"
   else
     ok "DRY-RUN: env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh"
   fi
 elif [[ -f scripts/doctor.sh ]]; then
   if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
     FINDEVIL_DOCTOR_AGENT_PROVIDER="${AGENT_PROVIDER}" bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  elif [[ "${AGENT_MODE}" == "0" ]]; then
+    FINDEVIL_DOCTOR_AGENT_PROVIDER=deterministic bash scripts/doctor.sh \
       || fail "doctor reported missing dependencies — fix them, then re-run"
   else
     env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh \

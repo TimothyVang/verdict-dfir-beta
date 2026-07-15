@@ -167,14 +167,14 @@ printf '%s\n' '{"verdict":"NO_EVIL"}' >"$(dirname "$(dirname "${summary}")")/ver
         shutil.rmtree(case_dir, ignore_errors=True)
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
-    assert f"not required for on-prem provider {provider}" in combined, combined
+    assert f"not required for {provider} execution" in combined, combined
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         doctor, env = _fixture(Path(tmp))
 
-        for provider in ("local", "dgx"):
+        for provider in ("local", "dgx", "deterministic"):
             report = _run(doctor, env, provider)
             credential = _credential(report)
             claude = _check(report, "claude")

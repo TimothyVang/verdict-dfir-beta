@@ -131,12 +131,12 @@ fi
 
 # ---------------------------------------------------------------------------
 # Claude credential mode (mirrors scripts/install.sh §1). The canonical launcher
-# sets FINDEVIL_DOCTOR_AGENT_PROVIDER only for explicit on-prem agent providers.
+# sets FINDEVIL_DOCTOR_AGENT_PROVIDER for execution paths that do not use Claude.
 # ---------------------------------------------------------------------------
 GROUP="Claude credential"
 [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}Claude credential${c_off}"; }
-if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ]; then
-  row ok "credential" "skipped: not required for on-prem provider ${FINDEVIL_DOCTOR_AGENT_PROVIDER}"
+if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "deterministic" ]; then
+  row ok "credential" "skipped: not required for ${FINDEVIL_DOCTOR_AGENT_PROVIDER} execution"
 elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && command -v claude >/dev/null 2>&1; then
   row ok "credential" "mode 1: CLAUDE_CODE_OAUTH_TOKEN + claude CLI"
 elif command -v claude >/dev/null 2>&1 && [ -d "${HOME}/.claude" ]; then
@@ -160,8 +160,8 @@ require "git"     "install git from https://git-scm.com/downloads" \
         git --version
 require "unzip"   "install unzip: apt install unzip / brew install unzip / choco install unzip" \
         unzip -v
-if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ]; then
-  row ok "claude" "skipped: not required for on-prem provider ${FINDEVIL_DOCTOR_AGENT_PROVIDER}"
+if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "deterministic" ]; then
+  row ok "claude" "skipped: not required for ${FINDEVIL_DOCTOR_AGENT_PROVIDER} execution"
 else
   require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
           claude --version
