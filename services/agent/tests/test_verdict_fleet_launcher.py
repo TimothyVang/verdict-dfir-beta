@@ -8,6 +8,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[3]
 _VERDICT = _REPO / "scripts" / "verdict"
 
@@ -55,3 +57,17 @@ class TestFleetMode:
         assert proc.returncode == 0, out
         assert "run-whole-case-local" not in out
         assert "find_evil_auto" in out  # the normal single-case engine plan
+
+    @pytest.mark.parametrize("extra_args", [[], ["--fleet"]], ids=["auto", "explicit"])
+    def test_agent_mode_rejects_fleet_before_deterministic_run(
+        self, tmp_path: Path, extra_args: list[str]
+    ) -> None:
+        root = _case_root(tmp_path)
+        proc = _run(
+            [str(root), "--agent", *extra_args, "--dry-run", "--no-dashboard"],
+            tmp_path,
+        )
+        out = proc.stdout + proc.stderr
+        assert proc.returncode != 0, out
+        assert "--agent supports single-file evidence only" in out
+        assert "run-whole-case-local" not in out

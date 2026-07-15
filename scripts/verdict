@@ -1550,6 +1550,10 @@ if [[ "${FLEET}" == "0" && -n "${EVIDENCE}" && -d "${EVIDENCE}" ]] \
   ok "multi-host case folder detected (hosts/ or disks/) — fleet mode"
 fi
 
+if [[ "${AGENT_MODE}" == "1" && ( "${FLEET}" == "1" || -d "${EVIDENCE}" ) ]]; then
+  fail "--agent supports single-file evidence only; fleet and directory evidence require the default deterministic mode"
+fi
+
 run_fleet() {
   local case_root="${EVIDENCE}"
   local name fleet_dir
