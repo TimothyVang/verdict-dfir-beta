@@ -102,8 +102,9 @@ Choose credentials for the runtime you use:
 
 - Claude-backed cloud/interactive: logged-in `claude`, `CLAUDE_CODE_OAUTH_TOKEN`, or
   `ANTHROPIC_API_KEY`.
-- Beta-native on-prem: `--agent-provider local` or `dgx`, an explicit model, and
-  `FINDEVIL_AGENT_BASE_URL`; no Claude credential or evidence-egress acknowledgement is required.
+- Beta-native on-prem: `--agent-provider local` defaults to Ollama at
+  `http://localhost:11434/v1`; `--agent-provider dgx` requires `FINDEVIL_AGENT_BASE_URL`. Both need
+  an explicit model, but neither requires a Claude credential or evidence-egress acknowledgement.
 - Default deterministic `scripts/verdict`: no LLM credential is required for the investigation
   engine. Optional Claude-backed post-processing still requires its own credential.
 
@@ -519,10 +520,10 @@ scripts/verdict --agent --agent-provider local --agent-model <model-id> <path-to
 #   --no-dashboard  do not auto-open the browser
 ```
 
-`--agent` currently accepts one evidence file. A directory is rejected before MCP startup rather
-than silently falling back to deterministic analysis; run directory/fleet evidence without
-`--agent`. The Phase 4 gate concerns real MCP custody and control flow, not improved local-model
-detection.
+`--agent` currently accepts one evidence file. Any directory, including a fleet root selected by
+explicit `--fleet` or auto-detection, fails closed in the launcher before MCP startup or deterministic
+fleet execution; run directory/fleet evidence without `--agent`. The Phase 4 gate concerns real MCP
+custody and control flow, not improved local-model detection.
 
 The dashboard at `http://localhost:3000` streams the run live. Evidence files are never committed
 (they are gitignored), so a fresh clone ships with none — stage public datasets with
