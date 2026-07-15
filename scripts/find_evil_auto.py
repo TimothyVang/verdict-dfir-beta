@@ -15021,6 +15021,11 @@ class Investigation:
             etype = "directory"
         print(f"  evidence_type   = {etype}")
         print(f"  signer          = {self.signer}")
+        if self.agent_mode and etype == "directory":
+            raise ValueError(
+                "Phase 4 native agent currently supports single-file evidence only; "
+                "rerun directory evidence without --agent for deterministic inventory investigation"
+            )
         if fault_inject_spec() is not None:
             print(
                 "\n  !! FAULT INJECTION ACTIVE (FIND_EVIL_FAULT_INJECT) — this "

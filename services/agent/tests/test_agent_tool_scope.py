@@ -30,6 +30,28 @@ def test_unknown_agent_evidence_keeps_available_tools() -> None:
     assert fea._scope_agent_mcp_tools(tools, "unknown") == tools
 
 
+def test_agent_directory_is_rejected_before_mcp_startup(monkeypatch, tmp_path: Path) -> None:
+    investigation = object.__new__(fea.Investigation)
+    investigation.evidence = str(tmp_path)
+    investigation.case_id = "case-directory"
+    investigation.run_id = "run-directory"
+    investigation.unattended = True
+    investigation.signer = "stub"
+    investigation.agent_mode = True
+
+    def unexpected_client(*_args, **_kwargs):
+        raise AssertionError("MCP client started before agent directory guard")
+
+    monkeypatch.setattr(fea, "StdioMcpClient", unexpected_client)
+    monkeypatch.setattr(fea, "SshMcpClient", unexpected_client)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Phase 4 native agent currently supports single-file evidence only",
+    ):
+        investigation.run()
+
+
 def test_agent_task_supplies_the_open_case_id() -> None:
     task = fea._agent_pod_task("/evidence/sample.evtx", "case-456", "evtx")
 
