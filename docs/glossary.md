@@ -10,8 +10,8 @@ sources: [CLAUDE.md](../CLAUDE.md), [verdict-semantics.md](verdict-semantics.md)
 |---|---|
 | **VERDICT** | The DFIR agent in this repo. Point it at evidence; it returns a signed Verdict ("is there evil here?") plus a report. |
 | **DFIR** | Digital Forensics & Incident Response — investigating compromised systems to determine what happened. |
-| **MCP** | Model Context Protocol — the typed tool interface Claude Code calls. VERDICT exposes 45 product tools across two MCP servers and adds no `execute_shell`. |
-| **Claude Code is the engine** | Amendment A2: there is no separate app server. When you run `claude`/`scripts/verdict`, that session *is* the forensic analyst. |
+| **MCP** | Model Context Protocol — the typed product tool interface supported agent runtimes call. VERDICT exposes 45 product tools across two MCP servers and adds no `execute_shell`. |
+| **Runtime model** | Amendment A2: Claude Code is the canonical interactive/cloud runtime. The beta-native `scripts/verdict --agent` loop is authoritative for strict Phase 4 offline acceptance; the deterministic engine remains the default quality floor. There is no separate app server. |
 
 ## DFIR vocabulary (used deliberately throughout)
 
@@ -57,6 +57,7 @@ Full semantics in [verdict-semantics.md](verdict-semantics.md). None of them mea
 | **manifest / `manifest_verify`** | The signed seal over the run; `manifest_verify` re-checks the chain + Merkle root **offline**. Post-A5 the chain is audit `prev_hash` → `rs_merkle` → manifest signature, with Ed25519 as the offline-verifiable default and Sigstore as the identity/transparency tier. |
 | **SIFT VM** | The SANS SIFT Workstation VM (a gated ~9.3 GB download) that supplies the full disk-forensics toolchain. Needed only for disk-image inner-volume extraction. |
 | **Live test** | The dev "done" gate: a real investigation producing a real Verdict + `manifest_verify overall:true` — not a smoke run. |
+| **Phase 4 acceptance** | A beta-native `scripts/verdict --agent` run using real MCP calls, with no deterministic fallback, pre-dispatch audit rejection of unadvertised calls, an honestly scoped Verdict, and `manifest_verify overall:true`. Caseforge/OpenCode does not gate it. |
 
 ---
 
@@ -75,7 +76,8 @@ Velociraptor evidence run fully in local-host mode. Disk evidence is custody-onl
 `disk_mount` / `disk_extract_artifacts` cannot produce supported parsed artifacts.
 
 **Is a Claude credential required?**
-Yes for the investigating agent (one of three modes — see [CLAUDE.md "Required Setup"](../CLAUDE.md)).
+Only for Claude-backed runs (one of three modes — see [CLAUDE.md "Required Setup"](../CLAUDE.md)).
+The beta-native loop can use an on-prem `local`/`dgx` OpenAI-compatible endpoint without one.
 
 **Is VERDICT's memory part of the evidence?**
 No. In-flow Hermes recall is an audit-chain aid, not evidence by itself, and optional

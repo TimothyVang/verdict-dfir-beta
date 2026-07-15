@@ -2,7 +2,7 @@
 
 Architecture diagram with trust boundaries, distinguishing prompt-based guardrails from architectural guardrails.
 
-This document is the single-page visual summary operators reach first. It is the public architecture source for VERDICT's seven-layer product shape, credential modes, and Claude Code primary-interface model. Current implementation detail lives in `CLAUDE.md`, `agent-config/`, and `docs/reference/mcp-and-tools.md`; older design specs were removed from the reduced source checkout and remain git-history context only.
+This document is the single-page visual summary operators reach first. It is the public architecture source for VERDICT's seven-layer product shape, credential modes, and runtime model. Claude Code is the canonical interactive/cloud runtime; the beta-native `scripts/verdict --agent` loop is authoritative for Phase 4 offline acceptance. Current implementation detail lives in `CLAUDE.md`, `agent-config/`, and `docs/reference/mcp-and-tools.md`; accepted decisions live in `docs/adr/`. Older design specs were removed from the reduced source checkout and remain git-history context only.
 
 ---
 
@@ -10,14 +10,14 @@ This document is the single-page visual summary operators reach first. It is the
 
 VERDICT combines **two** architectural patterns:
 
-1. **Direct Agent Extension** — Claude Code IS the agent. The operator runs `scripts/verdict <evidence>` for the one-shot path, or `claude` / `scripts/find-evil` at the repo root for interactive exploration; `.mcp.json` auto-spawns both MCP servers; Claude Code drives the investigation as supervisor + Pool A/B subagents (native Task mechanism — not `CLAUDE_CODE_FORK_SUBAGENT`, which is a build-time internal and is not used in this product).
+1. **Direct Agent Extension** — Claude Code is the canonical interactive/cloud agent. The operator runs `claude` / `scripts/find-evil` at the repo root for interactive exploration; `.mcp.json` auto-spawns both MCP servers; Claude Code drives the investigation as supervisor + Pool A/B subagents (native Task mechanism — not `CLAUDE_CODE_FORK_SUBAGENT`, which is a build-time internal and is not used in this product). For offline Phase 4 acceptance, the beta-native loop reached through `scripts/verdict --agent` is authoritative.
 2. **Custom MCP Server** — two purpose-built MCP servers expose the typed tool surface:
    - `findevil-mcp` (Rust) — 32 DFIR primitives (core Windows memory/disk/log/network verbs plus allow-listed long-tail wrappers such as `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, and `cloud_audit`). Read-only on evidence; SHA-256 every output. **NO `execute_shell`.**
    - `findevil-agent-mcp` (Python) — 13 crypto + ACH + memory + ACP + expert-feedback tools (audit_append/verify, manifest_finalize/verify, verify_finding, detect_contradictions, judge_findings, correlate_findings, memory_remember/recall, pool_handoff, expert_miss_capture, accuracy_compare). The pre-A5 `ots_stamp`/`ots_verify` pair was removed.
 
-The combination is the architectural claim: Claude Code's agent loop never touches a raw shell because the only verbs it has are MCP-typed function calls into one of the two servers.
+The combination is the architectural claim: only typed calls through the two product MCP servers enter the evidence audit chain. The beta-native Phase 4 loop dispatches evidence actions only through that surface; operator-side capabilities in an interactive Claude Code session remain outside the product custody boundary.
 
-**Opt-in custom agent loop (A2 update).** Amendment A2 originally forbade any custom orchestrator ("Claude Code is the engine"). That stays the default — the deterministic `scripts/find_evil_auto.py` engine is what `scripts/verdict` runs. VERDICT now *also* ships a strictly **opt-in**, provider-agnostic LLM-driven investigation loop under `services/agent/findevil_agent/agentloop/`, reached only via `scripts/verdict --agent`. It is a thin loop, not a framework resurrection: it must **not** import `langgraph` or `fastapi` (the A2 content rule, still enforced by the L0 `amendment-a2-guard`), and its MCP client runs in-loop over local stdio so the read-only custody boundary the two product servers enforce is unchanged. The removed orchestrator surfaces (`graph.py`, `api.py`, `cli.py`, `supervisor.py`, `specialists/`) stay dropped and are not revived by this path.
+**Beta-native agent loop (A2 update).** The provider-agnostic LLM investigation loop under `services/agent/findevil_agent/agentloop/`, reached only via `scripts/verdict --agent`, is authoritative for strict Phase 4 offline acceptance. The deterministic `scripts/find_evil_auto.py` path remains the default invocation and quality floor, but it is not a fallback for a failed Phase 4 agent run. The native loop uses real MCP calls; lane-unadvertised calls are rejected and audit-recorded before dispatch. Strict acceptance also requires an honestly scoped Verdict and `manifest_verify.overall=true`. It is a thin loop, not a framework resurrection: it must **not** import `langgraph` or `fastapi` (the A2 content rule, still enforced by the L0 `amendment-a2-guard`), and its MCP client runs in-loop over local stdio so the read-only custody boundary the two product servers enforce is unchanged. The removed orchestrator surfaces (`graph.py`, `api.py`, `cli.py`, `supervisor.py`, `specialists/`) stay dropped and are not revived by this path. Claude Code remains canonical for interactive/cloud operation. Caseforge/OpenCode is historical integration evidence and does not gate Phase 4. This decision closes custody/control-flow only; it does not improve or prove detection quality. See `docs/adr/0001-phase-4-native-agent-runtime.md`.
 
 **Maturity note.** The 32 Rust verbs are implemented as a typed, allow-listed surface. The
 long-tail verbs `vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, `cloud_audit`,
@@ -72,8 +72,8 @@ flowchart TB
         DuckDB["DuckDB L1 case store<br/>(path reserved, not yet initialized)"]
     end
 
-    subgraph Trust3["**TRUST BOUNDARY 3** — Claude Code agent loop (A2 — replaces LangGraph)"]
-        Supervisor["Claude Code main agent<br/>= supervisor<br/>reads agent-config/SOUL.md<br/>+ AGENTS.md + MEMORY.md"]
+    subgraph Trust3["**TRUST BOUNDARY 3** — Supported agent loops (A2 — no LangGraph)"]
+        Supervisor["Claude Code interactive/cloud agent<br/>or beta-native --agent loop<br/>reads agent-config/SOUL.md<br/>+ AGENTS.md + MEMORY.md"]
         PoolA["Pool A subagent<br/>(native Task mechanism)<br/>persistence-biased prompt:<br/>Tasks, Services, WMI,<br/>Run, IFEO, LOLBins"]
         PoolB["Pool B subagent<br/>(native Task mechanism)<br/>exfil-biased prompt:<br/>net connections, staging,<br/>certutil/bitsadmin, cloud sync,<br/>USB writes"]
         Contradiction["detect_contradictions<br/>(MCP tool call into agent_mcp)<br/>surfaces disagreements first"]
@@ -146,7 +146,7 @@ flowchart TB
 | 0 | Evidence vault | **Architectural (shipped):** originals opened read-only (libewf for `.e01`); SHA-256 fingerprinted at `case_open` and re-checked at every verifier replay; no write verb exists anywhere in the 45-tool product surface. **Hardened-deployment posture (recommended, not code-enforced):** `mount -o ro` + `chmod 444` on the vault, `inotifywait` write-monitoring | Code-enforced today; filesystem hardening is operator posture |
 | 1 | SIFT tool subprocesses | **Architectural (shipped):** unprivileged user (no root, no CAP_SYS_ADMIN); fixed-argv invocation — `Command::new(bin).args([...])`, never `sh -c`, so a path/arg is never shell-parsed (adversarially pinned by `services/mcp/tests/bypass_paths.rs`). **Optional OS-level hardening (shipped, off by default — defense-in-depth, NOT a replacement):** a binary allow-list `Bash` PreToolUse deny-hook (`scripts/pretooluse-deny-hook.sh` + `scripts/forensic-allowlist.txt`) and a rootless-podman + seccomp + read-only-mount launcher, both documented in `docs/sandbox/optional-os-hardening.md`. **Still roadmap (not yet enforced in code):** per-call wall-clock budget, cpulimit, tmpfs work dir | Process-enforced today; allow-list/rootless sandbox are opt-in OS-level layers; resource caps are roadmap |
 | 2 | Two typed MCP servers | **Architectural:** Rust `findevil-mcp` type system forbids `execute_shell`; Python `findevil-agent-mcp` Pydantic input models use `extra="forbid"`; tool surfaces fixed at compile/build time. Adding a shell passthrough would require a code change + PR + review | Compiler/schema-enforced |
-| 3 | Claude Code agent loop | **Mixed:** agent system prompts (`agent-config/SOUL.md` — epistemic hierarchy, AGENTS.md — roles) are **prompt-based guardrails**; verifier veto (no Finding without `tool_call_id`) is **architectural** (Pydantic schema-level enforced at the `findevil-agent-mcp` boundary). **Real-time recovery is audit-visible and shipped:** the auto-runner (`scripts/find_evil_auto.py`) emits a named `course_correction` record when a tool or verifier path fails, escalates to a run-level `heartbeat_failure` after two consecutive recovery failures, and seals a scoped partial verdict through `heartbeat_terminated`; it also emits a `verdict_revision` record when a Finding's confidence tier flips across the judge/correlate stages (an organic conclusion-flip committed to the prev_hash-linked audit chain, offline-verifiable via `manifest_verify`); demo-only fault injection is explicitly labeled `fault_injection`. These chain-visible records are reconstructed and scored by `scripts/self-score.py` and pinned by tests (`services/agent/tests/test_self_score.py`, `test_verdict_revision.py`, `test_heartbeat_escalation.py`, `test_verifier_redispatch.py`, `test_evtx_resilience.py`). **Roadmap (not yet emitted):** explicit labeled `plan_step` / `hypothesis` / `re_evaluation` records — the recovery arc is currently shown through real failure→adjust→escalate records, not an explicit hypothesis log. | Mixed — prompt guards behavior, Pydantic/schema and audit-chain records guard data and recovery transparency |
+| 3 | Supported agent loops | **Mixed:** agent system prompts (`agent-config/SOUL.md` — epistemic hierarchy, AGENTS.md — roles) are **prompt-based guardrails**; verifier veto (no Finding without `tool_call_id`) is **architectural** (Pydantic schema-level enforced at the `findevil-agent-mcp` boundary). **Real-time recovery is audit-visible and shipped:** the deterministic auto-runner (`scripts/find_evil_auto.py`) emits a named `course_correction` record when a tool or verifier path fails, escalates to a run-level `heartbeat_failure` after two consecutive recovery failures, and seals a scoped partial verdict through `heartbeat_terminated`; it also emits a `verdict_revision` record when a Finding's confidence tier flips across the judge/correlate stages (an organic conclusion-flip committed to the prev_hash-linked audit chain, offline-verifiable via `manifest_verify`); demo-only fault injection is explicitly labeled `fault_injection`. These chain-visible records are reconstructed and scored by `scripts/self-score.py` and pinned by tests (`services/agent/tests/test_self_score.py`, `test_verdict_revision.py`, `test_heartbeat_escalation.py`, `test_verifier_redispatch.py`, `test_evtx_resilience.py`). **Roadmap (not yet emitted):** explicit labeled `plan_step` / `hypothesis` / `re_evaluation` records — the recovery arc is currently shown through real failure→adjust→escalate records, not an explicit hypothesis log. | Mixed — prompt guards behavior, Pydantic/schema and audit-chain records guard data and recovery transparency |
 | 4 | Crypto Custody | **Architectural:** manifest signing and Merkle root computation happen inside `findevil-agent-mcp` before any finding is user-visible. Ed25519 is the offline-verifiable default; Sigstore/Rekor is the identity + transparency-log tier; the pre-A5 OpenTimestamps/Bitcoin tier was removed so `manifest_finalize` is the terminal custody step | Cryptographic |
 | 5 | Presentation | **DEFERRED to bonus (A2 §2.1).** The terminal IS the primary UX. Optional Next.js SSE bus (when shipped) is read-only from the frontend; `--unattended` mode logs `approved_by: "auto"` to the audit chain. | Auth-enforced (when present) |
 
@@ -212,7 +212,7 @@ scanner artifact ships in this tree yet.)
 
 ---
 
-## Credential modes (Amendment A1)
+## Claude credential modes (Amendment A1)
 
 The Product (what operators run) detects three credentials in priority order via `scripts/install.sh` and `services/agent/config.py resolve_credentials()`:
 
@@ -242,15 +242,20 @@ flowchart TD
     style Fail fill:#ffcdd2
 ```
 
-All three modes are **fully supported**. Operators pick whichever they already have — none is required to build or run.
+All three Claude modes are **fully supported**. The beta-native loop can instead use an on-prem
+`local`/`dgx` OpenAI-compatible endpoint without a Claude credential.
 
 ---
 
 ## Data flow — a single investigation from `.e01` to verdict (under A2)
 
-1. Operator runs `scripts/verdict <evidence>` for a one-shot live investigation, or `claude` / `scripts/find-evil` at the repo root for interactive mode. The one-shot launcher performs preflight, starts the optional dashboard unless `--no-dashboard` is set, and delegates to the internal `find-evil-auto` engine. The interactive path uses Claude Code, which reads `.mcp.json`, spawns both MCP servers, and ingests `CLAUDE.md` + `agent-config/*` as system context.
+The three execution surfaces share the custody spine but differ in pool execution: Claude Code is
+canonical for interactive/cloud work, `scripts/verdict --agent` is authoritative for strict Phase 4
+offline acceptance, and the deterministic engine remains the default quality floor.
+
+1. Operator runs `scripts/verdict <evidence>` for the default deterministic one-shot investigation, `scripts/verdict --agent <evidence>` for the Phase 4 beta-native loop, or `claude` / `scripts/find-evil` at the repo root for interactive mode. The launcher performs preflight, starts the optional dashboard unless `--no-dashboard` is set, and delegates to the internal `find-evil-auto` custody spine. The interactive path uses Claude Code, which reads `.mcp.json`, spawns both MCP servers, and ingests `CLAUDE.md` + `agent-config/*` as system context.
 2. In interactive mode, the operator prompts: "investigate fixtures/nist-hacking-case/SCHARDT.001". In one-shot mode, `scripts/verdict` supplies the evidence path to the internal engine. The supervisor calls `case_open` (Rust MCP) — SHA-256 verifies the image, opens via libewf read-only, reserves the `evidence.ddb` path at `~/.findevil/cases/<id>/evidence.ddb` (the DuckDB L1 store is not yet initialized), calls `audit_append` (Python MCP) for the open event.
-3. Claude Code emits a plan as text (no `PlanProposed` event needed — the terminal IS the channel) and forks two subagents via the native Task mechanism: one with the Pool A persistence prompt, one with Pool B exfil.
+3. Claude Code emits a plan as text and forks Pool A/B through its native Task mechanism. The beta-native path instead gives each pool only its lane-advertised MCP tools and rejects plus audit-records any unadvertised call before dispatch. The deterministic default constructs the pool Findings directly. All three paths converge on the same verifier, judge, correlator, and custody stages below.
 4. Each pool subagent invokes Rust MCP DFIR tools (`evtx_query`, `mft_timeline`, `hayabusa_scan`, etc.); each call's SHA-256 output digest is `audit_append`-ed and contributes a Merkle leaf at `manifest_finalize` time.
 5. Both subagents return Findings (each citing a `tool_call_id`). Supervisor calls `detect_contradictions` (Python MCP) which surfaces Pool A vs Pool B disagreements **before** the judge fires.
 6. Analyst resolves contradictions (Trust A / Trust B / Flag) in the terminal, or `--unattended` mode auto-passes them.
@@ -268,7 +273,7 @@ All three modes are **fully supported**. Operators pick whichever they already h
 | Dimension | Valhuntir (reference) | Us |
 |---|---|---|
 | MCP server | Python, 8 servers via sift-gateway, 100+ tools | **Two audit-chained product MCP servers** — Rust `findevil-mcp` (32 DFIR tools, including the deliberately-redundant `vol_pslist` + `vol_psscan` pair plus `vol_psxview` for DKOM cross-validation, disk mount/extract helpers, network/log triage, and allow-listed long-tail wrappers) + Python `findevil-agent-mcp` (13 crypto/ACH/memory/ACP/expert-feedback tools); `.mcp.json` has 6 registered servers total, but the 4 non-product helpers emit no Findings; no execute_shell |
-| Agent runtime | Custom Python harness | **Claude Code** itself ("Direct Agent Extension" pattern) — no custom orchestrator to maintain |
+| Agent runtime | Custom Python harness | **Claude Code** for canonical interactive/cloud operation; beta-native `scripts/verdict --agent` for authoritative Phase 4 offline acceptance; deterministic engine remains the default quality floor |
 | Chain-of-custody | Password-gated HMAC (PBKDF2 2M iter) | Ed25519/Sigstore signer tier + Merkle + audit hash chain (FRE 902(14) self-authenticating, with the A5 timestamp trade-off documented) |
 | Agent pattern | Single agent + human approval | ACH dual-agent (persistence vs exfil) via Claude Code forked subagents + judge + contradiction surface |
 | Benchmarks published | **None** (their README: "no performance metrics disclosed") | DFIR-Metric scoring harness + leaderboard wiring present; no score published yet (roadmap) |
@@ -286,5 +291,6 @@ We match Valhuntir's architectural discipline and exceed it on three dimensions 
 - `CLAUDE.md` — operating contract, run contract, and guardrails
 - `docs/reference/mcp-and-tools.md` — registered MCP servers and product tool inventory
 - `docs/reference/dependencies.md` — runtime dependency matrix
+- `docs/adr/` — accepted architecture decisions
 - `docs/sandbox/optional-os-hardening.md` — optional, opt-in OS-level deny-hook + rootless sandbox (defense-in-depth below the typed-MCP boundary)
 - `agent-config/SOUL.md` + `AGENTS.md` + `TOOLS.md` + `MEMORY.md` + `HEARTBEAT.md` — runtime agent identity

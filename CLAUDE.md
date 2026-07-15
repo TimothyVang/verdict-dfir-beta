@@ -4,9 +4,9 @@ This file is the Claude Code operating contract for **VERDICT DFIR**. It is publ
 
 ## What VERDICT Is
 
-VERDICT is a DFIR agent that runs inside Claude Code. Point it at supported evidence and it opens a **Case**, drives the typed read-only MCP tool surface, verifies every Finding, and writes a signed **Verdict** plus analyst report.
+VERDICT is a DFIR agent with Claude Code as its canonical interactive/cloud runtime and a beta-native offline agent loop for strict Phase 4 acceptance. Point it at supported evidence and it opens a **Case**, drives the typed read-only MCP tool surface, verifies every Finding, and writes a signed **Verdict** plus analyst report.
 
-Canonical one-shot path:
+Default one-shot path:
 
 ```bash
 bash scripts/setup
@@ -40,7 +40,7 @@ That path installs or checks the product prerequisites it can manage, builds the
 
 Minimum required runtime surface:
 
-- Claude Code credential: `CLAUDE_CODE_OAUTH_TOKEN`, logged-in `claude`, or `ANTHROPIC_API_KEY`.
+- Agent backend: a Claude credential (`CLAUDE_CODE_OAUTH_TOKEN`, logged-in `claude`, or `ANTHROPIC_API_KEY`) for Claude-backed runs, or an on-prem `local`/`dgx` OpenAI-compatible endpoint for the beta-native loop.
 - Rust/Cargo pinned by `rust-toolchain.toml`.
 - Python 3.11-3.12 and `uv`.
 - `git` and `unzip`.
@@ -128,7 +128,7 @@ Watch mode:
 scripts/verdict --watch
 ```
 
-Agent mode (opt-in, Stage B): drive Pool A / Pool B as a provider-agnostic LLM agent loop instead of the deterministic engine. `find_evil_auto.py` stays the **default**; `--agent` only changes how the pools reach their Findings — everything downstream (the default-on fact-fidelity gate, `verify_finding`, judge, correlate, signed manifest, `manifest_verify`) is the same custody spine.
+Agent mode: drive Pool A / Pool B through the beta-native, provider-agnostic LLM loop instead of the deterministic engine. This is the authoritative offline runtime for strict Phase 4 acceptance. `find_evil_auto.py` stays the **default quality floor**; `--agent` changes how the pools reach their Findings, while everything downstream (the default-on fact-fidelity gate, `verify_finding`, judge, correlate, signed manifest, `manifest_verify`) uses the same custody spine.
 
 ```bash
 scripts/verdict --agent --acknowledge-evidence-egress <path-to-evidence>
@@ -136,6 +136,7 @@ scripts/verdict --agent --acknowledge-evidence-egress <path-to-evidence>
 
 - Backend defaults to **Claude** via the headless Claude Code CLI (`--agent-provider claude_cli`, the `claude` subscription entitlement — no API key). The loop is provider-agnostic: `--agent-provider {anthropic,openai,openrouter,local,dgx}` + `--agent-model <id>` (plus `FINDEVIL_AGENT_BASE_URL` for `local`/`dgx`) target any OpenAI-compatible endpoint; `local`/`dgx` are on-prem and need no egress ack.
 - `--acknowledge-evidence-egress` is required for cloud backends (evidence text leaves the host). The flag runs the engine under the 3.11 agent venv automatically.
+- Strict Phase 4 acceptance requires real product MCP calls, no deterministic fallback, pre-dispatch rejection plus audit recording for lane-unadvertised calls, an honestly scoped Verdict, and `manifest_verify.json` with `overall: true`. A provider or native-loop failure fails the acceptance run.
 - Status: live-verified on single-artifact evidence (e.g. an EVTX) at report-QA parity with the deterministic engine. The `claude_cli` backend does **not** yet scale to disk-sized investigations (per-turn cost); use the deterministic engine or an efficient OpenAI-compatible endpoint for disk/memory.
 
 Evidence location: `evidence/` at the repo root is the default drop directory (override with `$FINDEVIL_EVIDENCE_ROOT`; see `evidence/README.md`). It is **gitignored and per-checkout**, so a fresh `git worktree` starts with an empty `evidence/` — for a live run from a worktree, pass an explicit path into the checkout that actually holds the images, or set `$FINDEVIL_EVIDENCE_ROOT`. For any live run, demo, or recording, point at real evidence in this directory; never substitute stubbed or mock tool output for a "real" run.
@@ -210,7 +211,7 @@ When modifying VERDICT, keep changes small and evidence-safe.
 - **Path-agnostic always.** Scripts and code must work regardless of the caller's CWD and machine. Derive the repo root at runtime — bash: `REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"`; Python: `Path(__file__).resolve().parent.parent`. Use `$HOME`/`~`, never a hard-coded `/home/<user>`. Make environment-specific paths env-overridable defaults (`${VAR:-default}`, e.g. the SIFT-guest `/home/sansforensics/...` paths). Never hard-code an absolute machine path or assume the CWD is the repo root.
 - Follow existing Rust, Python, and web package boundaries.
 - Do not restore the removed Product orchestrator surfaces — the old `graph.py`, `api.py`, `cli.py`, `supervisor.py`, or `specialists/` runtime code under `services/agent/findevil_agent/`. These remain dropped (the L0 `amendment-a2-guard` job fails CI on their return).
-- The opt-in custom agent orchestrator **is** allowed, scoped to `services/agent/findevil_agent/agentloop/` and exposed via `scripts/verdict --agent`. It does not reverse the boundary above: the deterministic `scripts/find_evil_auto.py` engine stays the **default**, the agent loop is strictly **opt-in**, it must **not** import `langgraph` or `fastapi` (the A2 content rule the L0 guard still enforces), and its MCP client stays in-loop over local stdio so the read-only custody boundary is preserved.
+- The beta-native agent orchestrator **is** allowed, scoped to `services/agent/findevil_agent/agentloop/` and exposed via `scripts/verdict --agent`. It does not reverse the boundary above: the deterministic `scripts/find_evil_auto.py` engine stays the **default quality floor**, the native loop is authoritative only for strict Phase 4 offline acceptance, it must **not** import `langgraph` or `fastapi` (the A2 content rule the L0 guard still enforces), and its MCP client stays in-loop over local stdio so the read-only custody boundary is preserved. Caseforge/OpenCode is historical integration evidence and does not gate Phase 4.
 - Rust MCP tools require typed schemas, unknown-field denial where applicable, safe errors, server registration, and tests.
 - Python MCP tools are protocol shims under `services/agent_mcp/`; domain logic belongs in `services/agent/`.
 - Dashboard audit tail is the SSE API audit route, not WebSocket.
@@ -275,6 +276,7 @@ Public release docs must describe the application and its safety contract. Do no
 - `docs/using/running-verdict.md` - full `scripts/verdict` reference.
 - `docs/reference/mcp-and-tools.md` - MCP and tool inventory.
 - `docs/architecture.md` - system architecture, trust boundaries, prompt-vs-architectural guardrails, and audit-visible self-correction.
+- `docs/adr/` - accepted architecture decisions.
 - `docs/reference/dependencies.md` - dependency matrix.
 - `docs/verdict-semantics.md` - Verdict-word semantics.
 - `docs/false-positives.md` - overclaim prevention.

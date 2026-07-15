@@ -19,8 +19,10 @@ Finding or upgrades a confidence tier.
 
 ## 2 · Invoke — one command in Claude Code
 
-VERDICT *is* a Claude Code agent (Amendment A2). You type one line — `investigate <evidence>`
-— and the agent scopes the case and takes over.
+Claude Code is VERDICT's canonical interactive/cloud runtime (Amendment A2). You type one line —
+`investigate <evidence>` — and the agent scopes the case and takes over. Strict Phase 4 offline
+acceptance uses the beta-native `scripts/verdict --agent` loop; the capture below demonstrates the
+interactive Claude Code path, not that acceptance run.
 
 ![Claude Code investigating evidence](claude-code-live-run.png)
 

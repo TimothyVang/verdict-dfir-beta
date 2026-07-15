@@ -6,7 +6,7 @@ Agent instructions for **VERDICT DFIR**. This file is for Codex, OpenCode, and o
 
 - Work from the repository root.
 - Install or verify prerequisites with `bash scripts/setup`; use `bash scripts/doctor.sh` for a preflight summary.
-- The canonical product run is `scripts/verdict <evidence>`.
+- The default product run is `scripts/verdict <evidence>`; strict Phase 4 offline acceptance uses `scripts/verdict --agent <evidence>`.
 - In Claude Code, the equivalent operator shortcut is `/verdict <evidence>` or `investigate <path>`.
 - Do not create or revive a separate Product CLI. `scripts/verdict`, `scripts/find-evil`, and Claude Code are the supported entry points.
 - Before changing investigation behavior, read `CLAUDE.md` and the runtime files in `agent-config/`.
@@ -70,7 +70,7 @@ scripts/verdict --sift <path-to-evidence>
 scripts/verdict --watch
 ```
 
-Agent mode (opt-in): `scripts/verdict --agent --acknowledge-evidence-egress <evidence>` runs Pool A / Pool B as a provider-agnostic LLM agent loop instead of the deterministic engine (which stays the default). Findings still route through the default-on fact-fidelity gate, `verify_finding`, judge, correlator, and signed manifest. Backend defaults to Claude (`--agent-provider claude_cli`, no API key); `--agent-provider {anthropic,openai,openrouter,local,dgx}` + `--agent-model <id>` (+ `FINDEVIL_AGENT_BASE_URL` for `local`/`dgx`) target any OpenAI-compatible endpoint (`local`/`dgx` on-prem, no egress ack). Live-verified on single-artifact evidence at report-QA parity with the deterministic engine; `claude_cli` does not yet scale to disk.
+Agent mode: `scripts/verdict --agent --acknowledge-evidence-egress <evidence>` runs Pool A / Pool B through the beta-native provider-agnostic LLM loop instead of the deterministic engine. It is the authoritative offline runtime for strict Phase 4 acceptance; Claude Code remains canonical for interactive/cloud operation, and the deterministic engine remains the default quality floor. Findings still route through the default-on fact-fidelity gate, `verify_finding`, judge, correlator, and signed manifest. Backend defaults to Claude (`--agent-provider claude_cli`, no API key); `--agent-provider {anthropic,openai,openrouter,local,dgx}` + `--agent-model <id>` (+ `FINDEVIL_AGENT_BASE_URL` for `local`/`dgx`) target any OpenAI-compatible endpoint (`local`/`dgx` on-prem, no egress ack). Strict acceptance requires real product MCP calls, no deterministic fallback, audit-recorded pre-dispatch rejection of lane-unadvertised calls, an honest Verdict, and `manifest_verify.overall=true`. Caseforge/OpenCode does not gate Phase 4. Live verification is limited to single-artifact evidence at report-QA parity with the deterministic engine; this runtime decision does not establish better detection quality, and `claude_cli` does not yet scale to disk.
 
 Outputs land in `tmp/auto-runs/<case-id>/`. A valid completed run has:
 
@@ -126,7 +126,7 @@ Smokes are CI predictors. They are not a substitute for a real investigation.
 
 **Path-agnostic always.** Scripts and code must run regardless of the caller's CWD or machine. Derive the repo root at runtime — bash: `REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"`; Python: `Path(__file__).resolve().parent.parent`. Use `$HOME`/`~` (never a hard-coded `/home/<user>`), and make environment-specific paths env-overridable defaults (`${VAR:-default}`). Never assume the CWD is the repo root.
 
-Do not restore removed orchestrator code under `services/agent/` such as `graph.py`, `api.py`, `cli.py`, `supervisor.py`, `specialists/`, FastAPI, or LangGraph Product runtime files. Claude Code is the investigation orchestrator.
+Do not restore removed orchestrator code under `services/agent/` such as `graph.py`, `api.py`, `cli.py`, `supervisor.py`, `specialists/`, FastAPI, or LangGraph Product runtime files. Claude Code is the canonical interactive/cloud orchestrator; the only allowed beta-native loop is the thin `services/agent/findevil_agent/agentloop/` path documented above.
 
 ## Release Hygiene
 

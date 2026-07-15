@@ -6,14 +6,15 @@ primitives that ship as the `findevil-agent-mcp` MCP tool surface
 under Amendment A2.
 
 **Authoritative design:** `docs/architecture.md`.
-**Active invariants:** `CLAUDE.md` and `agent-config/` define credential modes and the Claude Code primary-interface model.
+**Active invariants:** `CLAUDE.md` and `agent-config/` define credential modes and runtime boundaries.
 **Invariants:** `CLAUDE.md` §"Non-negotiable invariants".
 
 > **Under Amendment A2 this package is a library, not a service.** The
 > M2/M4 modules below are imported by `services/agent_mcp/` and exposed
 > as MCP tools to Claude Code. The pre-A2 components (`graph.py`,
 > `api.py`, `cli.py`, `supervisor.py`, `specialists/`) are **dropped**
-> — Claude Code is the orchestrator. The L0 `amendment-a2-guard` job
+> — Claude Code remains the canonical interactive/cloud orchestrator. The
+> beta-native Phase 4 loop is limited to `findevil_agent/agentloop/`. The L0 `amendment-a2-guard` job
 > fails CI if any of those files reappear under any filename.
 
 ## Status
@@ -24,6 +25,7 @@ under Amendment A2.
 | `config.resolve_credentials()` (3 modes — Amendment A1) | ✅ |
 | `events.py` AgentEvent union (11 variants) | ✅ |
 | `mcp_client.py` (stdio subprocess manager for the Rust MCP server) | ✅ |
+| `agentloop/` beta-native provider loop (authoritative Phase 4 offline runtime) | ✅ |
 | `crypto/signer.py` Ed25519/Sigstore/stub manifest signer tiers (M2) | ✅ |
 | `crypto/audit_log.py` hash-chained JSONL writer | ✅ |
 | `crypto/merkle.py` rs_merkle Merkle tree builder | ✅ |
@@ -34,7 +36,7 @@ under Amendment A2.
 | `judge.py` credibility-weighted merge | ✅ |
 | `contradiction.py` Pool A vs Pool B disagreement surface | ✅ |
 | `correlator.py` SOUL.md ≥2 artifact-class rule | ✅ |
-| Test suite (`tests/`) | ✅ 156 tests pass |
+| Test suite (`tests/`) | present; run the current suite locally |
 | ~~`graph.py` LangGraph runtime~~ | dropped per A2 |
 | ~~`api.py` FastAPI SSE endpoints~~ | dropped per A2 |
 | ~~`cli.py` CLI entry~~ | dropped per A2 |
@@ -58,7 +60,7 @@ uv run pytest -xvs
 2. `~/.claude/` interactive session (after `claude auth login`).
 3. `ANTHROPIC_API_KEY` env var (direct metered API from console.anthropic.com).
 
-Raises `CredentialsNotAvailableError` with a multi-line message listing all three options if none are found. The CLI catches this and prints the error at startup.
+Raises `CredentialsNotAvailableError` with a multi-line message listing all three options if none are found. The invoking launcher reports the error at startup.
 
 ## AgentEvent union (Spec #2 §5)
 
@@ -81,17 +83,16 @@ Every event is Pydantic-frozen, `extra="forbid"`. `event_id` auto-fills as UUID4
 - New config constant → put it in `findevil_agent/config.py`; export via `__all__`.
 - New crypto primitive (additional Merkle algorithm, alternate signer) → `findevil_agent/crypto/<name>.py` with paired test in `tests/test_crypto_<name>.py`.
 - New ACH-stack primitive → fits in `verifier.py`, `judge.py`, `contradiction.py`, or `correlator.py`. Wrap as an MCP tool in `services/agent_mcp/findevil_agent_mcp/tools/` so Claude Code can reach it.
-- **Do NOT** generate `graph.py`, `api.py`, `cli.py`, `supervisor.py`, or `specialists/` — these are forbidden by the L0 `amendment-a2-guard` job. Under A2, Claude Code IS the orchestrator; the agent runtime is exposed as MCP tools, not as a custom Python service.
+- **Do NOT** generate `graph.py`, `api.py`, `cli.py`, `supervisor.py`, or `specialists/` — these are forbidden by the L0 `amendment-a2-guard` job. Under A2, Claude Code is the canonical interactive/cloud orchestrator; the only allowed beta-native orchestration is the thin `agentloop/` path used by `scripts/verdict --agent`. It must not add LangGraph or FastAPI.
 
 ## Pinned dependencies
 
 See `pyproject.toml`. Do not upgrade without a spec amendment.
 
 Key pins:
-- `langgraph >=1.0,<2.0`
-- `langgraph-checkpoint-sqlite >=2.0,<3.0`  *(Product uses Sqlite)*
 - `anthropic >=0.45,<1.0`
 - `sigstore ==3.*`
-- `fastapi >=0.115,<1.0`
 - `pydantic >=2.7,<3.0`
 - `mitreattack-python >=5.4,<6.0`
+
+LangGraph and FastAPI are intentionally absent under Amendment A2.
