@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCTOR = REPO_ROOT / "scripts" / "doctor.sh"
 VERDICT = REPO_ROOT / "scripts" / "verdict"
-REQUIRED_COMMANDS = ("python3", "git", "unzip", "claude", "cargo", "uv", "npx")
+REQUIRED_COMMANDS = ("python3", "git", "unzip", "cargo", "uv", "npx")
 
 
 def _fixture(root: Path) -> tuple[Path, dict[str, str]]:
@@ -39,7 +39,9 @@ def _fixture(root: Path) -> tuple[Path, dict[str, str]]:
     fake_bin = root / "bin"
     fake_bin.mkdir()
     fake_command = fake_bin / "fake-command"
-    fake_command.write_text("#!/usr/bin/env bash\nprintf 'fixture tool 1.0\\n'\n", encoding="utf-8")
+    fake_command.write_text(
+        "#!/usr/bin/env bash\nprintf 'fixture tool 1.0\\n'\n", encoding="utf-8"
+    )
     fake_command.chmod(0o755)
     for command in REQUIRED_COMMANDS:
         (fake_bin / command).symlink_to(fake_command)
@@ -75,14 +77,18 @@ def _run(doctor: Path, env: dict[str, str], provider: str | None) -> dict[str, o
     return json.loads(result.stdout)
 
 
-def _credential(report: dict[str, object]) -> dict[str, str]:
+def _check(report: dict[str, object], label: str) -> dict[str, str]:
     checks = report["checks"]
     assert isinstance(checks, list)
     return next(
         check
         for check in checks
-        if isinstance(check, dict) and check.get("label") == "credential"
+        if isinstance(check, dict) and check.get("label") == label
     )
+
+
+def _credential(report: dict[str, object]) -> dict[str, str]:
+    return _check(report, "credential")
 
 
 def _run_launcher_without_model(root: Path, provider: str) -> None:
@@ -114,7 +120,9 @@ printf '%s\n' '{"verdict":"NO_EVIL"}' >"$(dirname "$(dirname "${summary}")")/ver
     fake_curl.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
     fake_curl.chmod(0o755)
     fake_cargo = fake_bin / "cargo"
-    fake_cargo.write_text("#!/usr/bin/env bash\nprintf 'cargo fixture 1.0\\n'\n", encoding="utf-8")
+    fake_cargo.write_text(
+        "#!/usr/bin/env bash\nprintf 'cargo fixture 1.0\\n'\n", encoding="utf-8"
+    )
     fake_cargo.chmod(0o755)
 
     evidence = root / f"{provider}.evtx"
@@ -126,12 +134,13 @@ printf '%s\n' '{"verdict":"NO_EVIL"}' >"$(dirname "$(dirname "${summary}")")/ver
     env = {
         **os.environ,
         "HOME": str(home),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
         "REAL_UV": shutil.which("uv") or "uv",
         "FINDEVIL_SKIP_GROUNDING": "1",
     }
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     env.pop("ANTHROPIC_API_KEY", None)
+    assert shutil.which("claude", path=env["PATH"]) is None
 
     try:
         result = subprocess.run(
@@ -168,24 +177,34 @@ def main() -> int:
         for provider in ("local", "dgx"):
             report = _run(doctor, env, provider)
             credential = _credential(report)
+            claude = _check(report, "claude")
             assert report["ready"] is True, report
             assert credential["status"] == "ok", credential
             assert provider in credential["detail"], credential
             assert "not required" in credential["detail"], credential
-            print(f"  [PASS] {provider} needs no Claude credential")
+            assert claude["status"] == "ok", claude
+            assert provider in claude["detail"], claude
+            assert "not required" in claude["detail"], claude
+            print(f"  [PASS] {provider} needs no Claude credential or CLI")
 
         for provider in ("local", "dgx"):
             _run_launcher_without_model(Path(tmp), provider)
-            print(f"  [PASS] canonical {provider} launcher runs without a model or credential")
+            print(
+                f"  [PASS] canonical {provider} launcher runs without a model or credential"
+            )
 
-        for provider in (None, "anthropic"):
+        for provider in (None, "anthropic", "claude_cli"):
             report = _run(doctor, env, provider)
             credential = _credential(report)
+            claude = _check(report, "claude")
             assert report["ready"] is False, report
             assert credential["status"] == "err", credential
-            print(f"  [PASS] {provider or 'default'} still requires a Claude credential")
+            assert claude["status"] == "err", claude
+            print(
+                f"  [PASS] {provider or 'default'} still requires Claude credentials and CLI"
+            )
 
-    print("\ndoctor-agent-provider-smoke: 6 passed, 0 failed")
+    print("\ndoctor-agent-provider-smoke: 7 passed, 0 failed")
     return 0
 
 

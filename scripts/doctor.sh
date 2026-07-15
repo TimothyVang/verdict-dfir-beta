@@ -5,7 +5,7 @@
 # five-second up-front checklist. Reports, for a stock Linux / SIFT Workstation:
 #
 #   REQUIRED   — without these no investigation can run at all
-#                (claude CLI, cargo/rustc, uv).
+#                (claude CLI except for explicit on-prem providers, cargo/rustc, uv).
 #   DFIR tools — the external binaries the Rust MCP server shells out to.
 #                Resolved the SAME way the server resolves them ($VOLATILITY_BIN
 #                then vol/vol.py/volatility3, $HAYABUSA_BIN then hayabusa, etc.).
@@ -160,8 +160,12 @@ require "git"     "install git from https://git-scm.com/downloads" \
         git --version
 require "unzip"   "install unzip: apt install unzip / brew install unzip / choco install unzip" \
         unzip -v
-require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
-        claude --version
+if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ]; then
+  row ok "claude" "skipped: not required for on-prem provider ${FINDEVIL_DOCTOR_AGENT_PROVIDER}"
+else
+  require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
+          claude --version
+fi
 require "cargo"   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" \
         cargo --version
 require "uv"      "curl -LsSf https://astral.sh/uv/install.sh | sh" \
