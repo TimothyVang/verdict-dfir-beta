@@ -15250,7 +15250,19 @@ class Investigation:
                     f"{release_gate.get('packet_state')}"
                 )
 
-            print(f"\n{'=' * 70}\nDONE — verdict: {verdict}\n{'=' * 70}")
+            result = {
+                "case_id": self.case_id,
+                "verdict": verdict,
+                "packet_state": final_release_gate.get("packet_state"),
+                "customer_ready": final_release_gate.get("customer_releasable", False),
+                "manifest_verify_overall": manifest_verification.get("overall"),
+                "heartbeat_terminated": self._heartbeat_terminated,
+                "case_dir_in_vm": self.case_dir,
+                "local_dir": str(local_dir),
+            }
+            run_completed = _print_completion_banner(
+                agent_mode=self.agent_mode, result=result
+            )
             print(f"  packet_state    = {final_release_gate.get('packet_state')}")
             print(f"  customer_ready  = {final_release_gate.get('customer_releasable', False)}")
             if final_release_gate.get("failed_checks") or final_release_gate.get("warning_checks"):
@@ -15267,20 +15279,11 @@ class Investigation:
                 print(f"  Inside VM      : {self.case_dir}/")
             print(f"  On host (local): {local_dir}")
             self._heartbeat(
-                "complete",
+                "complete" if run_completed else "failed",
                 verdict=verdict,
                 manifest_verify_overall=manifest_verification.get("overall"),
             )
-            return {
-                "case_id": self.case_id,
-                "verdict": verdict,
-                "packet_state": final_release_gate.get("packet_state"),
-                "customer_ready": final_release_gate.get("customer_releasable", False),
-                "manifest_verify_overall": manifest_verification.get("overall"),
-                "heartbeat_terminated": self._heartbeat_terminated,
-                "case_dir_in_vm": self.case_dir,
-                "local_dir": str(local_dir),
-            }
+            return result
         finally:
             rust.close()
             py.close()
@@ -15486,6 +15489,24 @@ def _agent_pod_task(evidence_path: str, case_id: str, evidence_type: str) -> str
     return task
 
 
+def _run_completed(*, agent_mode: bool, result: dict[str, Any]) -> bool:
+    if result.get("verdict") == "ERROR":
+        return False
+    return not agent_mode or result.get("manifest_verify_overall") is True
+
+
+def _print_completion_banner(*, agent_mode: bool, result: dict[str, Any]) -> bool:
+    completed = _run_completed(agent_mode=agent_mode, result=result)
+    if agent_mode and result.get("manifest_verify_overall") is not True:
+        print(
+            "\nRUN INCOMPLETE / CUSTODY INVALID — manifest verification failed",
+            file=sys.stderr,
+        )
+    else:
+        print(f"\n{'=' * 70}\nDONE — verdict: {result.get('verdict')}\n{'=' * 70}")
+    return completed
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="find-evil-auto",
@@ -15667,7 +15688,7 @@ def main() -> int:
             args.run_summary,
             inv.build_run_summary(readiness_state=readiness_state, result=result),
         )
-    return 0 if result["verdict"] != "ERROR" else 1
+    return 0 if _run_completed(agent_mode=args.agent, result=result) else 1
 
 
 if __name__ == "__main__":

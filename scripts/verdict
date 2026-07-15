@@ -123,6 +123,19 @@ warn() { printf '   \033[33m!\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[31m[verdict] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 url_up() { [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null)" != "000" ]]; }
 
+agent_manifest_verified() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    summary = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if summary.get("result", {}).get("manifest_verify_overall") is True else 1)
+PY
+}
+
 case_root_abs() {
   if [[ "${CASE_ROOT}" == /* ]]; then
     printf '%s' "${CASE_ROOT}"
@@ -2153,6 +2166,10 @@ if [[ "${SIFT}" == "0" ]]; then
 fi
 
 "${ENGINE[@]}"
+
+if [[ "${AGENT_MODE}" == "1" ]] && ! agent_manifest_verified "${SUMMARY}"; then
+  fail "native agent manifest verification failed; run incomplete / custody invalid"
+fi
 
 if [[ -n "${CASE_DIR:-}" ]]; then
   sync_case_summary "${SUMMARY}"
