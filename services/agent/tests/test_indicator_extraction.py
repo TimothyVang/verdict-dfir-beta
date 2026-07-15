@@ -134,6 +134,54 @@ def test_finding_prose_does_not_blindly_emit_hashes() -> None:
     assert indicators["hashes"] == []
 
 
+def test_non_finding_ioc_extraction_preserves_bare_hashes() -> None:
+    digest = "a" * 64
+
+    assert fea._extract_iocs_from_texts([digest])["hashes"] == [digest]
+
+
+def test_negated_finding_prose_does_not_emit_registry_or_file_indicators() -> None:
+    indicators = fea.build_indicators(
+        [],
+        [
+            {
+                "description": (
+                    r"No registry key HKLM\SOFTWARE\Bad existed. "
+                    "Did not observe payload.exe. "
+                    r"Did not observe C:\staging.dir\nested.exe."
+                )
+            },
+            {
+                "artifact_path": "SYSTEM",
+                "description": r"No registry key ControlSet001\Services\Bad existed.",
+            },
+        ],
+        None,
+    )
+
+    assert indicators["registry_values"] == []
+    assert indicators["file_paths"] == []
+
+
+def test_observed_finding_hash_is_emitted_but_negated_hash_is_not() -> None:
+    observed = "a" * 64
+    negated = "b" * 64
+    indicators = fea.build_indicators(
+        [],
+        [
+            {
+                "description": (
+                    f"Observed SHA-256 {observed}. "
+                    f"Did not observe SHA-256 {negated}."
+                )
+            }
+        ],
+        None,
+    )
+
+    assert indicators["hashes"] == [observed]
+
+
 def test_system_hive_registry_value_stops_before_prose() -> None:
     indicators = fea.build_indicators(
         [],

@@ -4973,15 +4973,22 @@ def build_indicators(
     urls |= set(extra.get("urls", []) or [])
     paths |= set(extra.get("paths", []) or [])
     registry_values |= set(extra.get("registry_keys", []) or [])
+    hashes |= set(extra.get("hashes", []) or []) & set(
+        _observed_hash_matches("\n".join(descriptions))
+    )
     for finding in findings:
         hive = Path(str(finding.get("artifact_path") or "")).name.upper()
         if hive != "SYSTEM":
             continue
-        for relative in re.findall(
+        description = str(finding.get("description") or "")
+        for match in re.finditer(
             r"\b(?:CurrentControlSet|ControlSet\d{3})\\[^,;()\r\n]+",
-            str(finding.get("description") or ""),
+            description,
             flags=re.I,
         ):
+            if _ioc_match_is_negated(description, match.start()):
+                continue
+            relative = match.group(0)
             registry_values.add(f"HKLM\\SYSTEM\\{_trim_registry_prose(relative)}")
 
     def _cap(values: set[str]) -> list[str]:
@@ -7233,6 +7240,58 @@ def _trim_registry_prose(value: str) -> str:
     ).rstrip(".:")
 
 
+_EXPLICIT_IOC_NEGATION = re.compile(
+    r"\b(?:no|never|without|cannot)\b|"
+    r"\b(?:did|do|does|is|are|was|were|has|have|had|could|would|should|can)\s+"
+    r"not\b(?!\s+only\b)|"
+    r"\b(?:didn't|don't|doesn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|"
+    r"couldn't|wouldn't|shouldn't|can't)\b",
+    flags=re.I,
+)
+
+
+def _ioc_clause_prefix(text: str, match_start: int) -> str:
+    prefix = text[:match_start]
+    boundaries = list(re.finditer(r"[!?;\r\n]|[.](?=\s|$)", prefix))
+    clause = prefix[boundaries[-1].end() :] if boundaries else prefix
+    contrasts = list(re.finditer(r"\b(?:but|however)\b", clause, flags=re.I))
+    if contrasts:
+        clause = clause[contrasts[-1].end() :]
+    return clause
+
+
+def _ioc_match_is_negated(text: str, match_start: int) -> bool:
+    """Check explicit negation in the sentence or clause containing an IOC match."""
+    return _EXPLICIT_IOC_NEGATION.search(_ioc_clause_prefix(text, match_start)) is not None
+
+
+def _non_negated_ioc_matches(
+    pattern: str, text: str, *, flags: int = 0
+) -> list[str]:
+    return [
+        match.group(0)
+        for match in re.finditer(pattern, text, flags=flags)
+        if not _ioc_match_is_negated(text, match.start())
+    ]
+
+
+def _observed_hash_matches(text: str) -> list[str]:
+    hashes: list[str] = []
+    for match in re.finditer(
+        r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", text
+    ):
+        clause = _ioc_clause_prefix(text, match.start())
+        if _EXPLICIT_IOC_NEGATION.search(clause):
+            continue
+        if re.search(
+            r"\b(?:observed|found|detected|identified|recovered|matched|verified)\b",
+            clause,
+            flags=re.I,
+        ):
+            hashes.append(match.group(0))
+    return hashes
+
+
 def _extract_ascii_strings_from_hex(sample_hex: str, min_len: int = 4) -> list[str]:
     cleaned = "".join(ch for ch in str(sample_hex) if ch in "0123456789abcdefABCDEF")
     if len(cleaned) < 2:
@@ -7323,14 +7382,14 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         + [domain[4:] for domain in domains if domain.lower().startswith("www.")]
     )[:50]
     file_suffixes = "|".join(sorted(map(re.escape, _NON_DOMAIN_SUFFIXES)))
-    paths = re.findall(
+    paths = _non_negated_ioc_matches(
         rf"\b[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n;,]+\\)*"
         rf"[^\\/:*?\"<>|\r\n;,\s]+\.(?:{file_suffixes})\b",
         blob,
         flags=re.I,
     )
     paths.extend(
-        re.findall(
+        _non_negated_ioc_matches(
             r"\b[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n;,]+\\)+"
             r"[^\\/:*?\"<>|\r\n;,\s]+\.[A-Za-z0-9]{1,16}\b",
             blob,
@@ -7338,17 +7397,21 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         )
     )
     paths.extend(
-        re.findall(
+        _non_negated_ioc_matches(
             r"\\\\[A-Za-z0-9._$-]+\\(?:[^\\/:*?\"<>|\r\n;,]+\\)+"
             r"[^\\/:*?\"<>|\r\n;,\s]+\.[A-Za-z0-9]{1,16}\b",
             blob,
             flags=re.I,
         )
     )
-    paths.extend(re.findall(r"\b[A-Za-z]:\\[^\s,;\"'<>|]+", blob))
-    paths.extend(re.findall(r"\\\\[A-Za-z0-9._$-]+\\[^\s,;\"'<>|]+", blob))
+    paths.extend(_non_negated_ioc_matches(r"\b[A-Za-z]:\\[^\s,;\"'<>|]+", blob))
     paths.extend(
-        re.findall(r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+", blob)
+        _non_negated_ioc_matches(r"\\\\[A-Za-z0-9._$-]+\\[^\s,;\"'<>|]+", blob)
+    )
+    paths.extend(
+        _non_negated_ioc_matches(
+            r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+", blob
+        )
     )
     paths = [path.rstrip(".:)") for path in paths]
     paths = [
@@ -7360,7 +7423,7 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
             for other in paths
         )
     ]
-    filenames = re.findall(
+    filenames = _non_negated_ioc_matches(
         rf"\b[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:{file_suffixes})\b",
         blob,
         flags=re.I,
@@ -7371,7 +7434,7 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         if not any(path.lower().endswith(f"\\{filename.lower()}") for path in paths)
     )
     iocs["paths"] = _uniq(paths)[:50]
-    registry_keys = re.findall(
+    registry_keys = _non_negated_ioc_matches(
         r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+", blob, flags=re.I
     )
     iocs["registry_keys"] = _uniq(
@@ -7379,7 +7442,9 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         for key in registry_keys
     )[:50]
     iocs["hashes"] = _uniq(
-        re.findall(r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob)
+        _non_negated_ioc_matches(
+            r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob
+        )
     )[:50]
     iocs["mutex_like"] = _uniq(
         re.findall(r"\b(?:Global|Local)\\[A-Za-z0-9_.-]{4,}\b", blob)
