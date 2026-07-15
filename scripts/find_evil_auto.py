@@ -7245,55 +7245,50 @@ def _trim_registry_prose(value: str) -> str:
 _EXPLICIT_IOC_NEGATION = re.compile(
     r"\b(?:no|never|without|cannot|neither|nor)\b|"
     r"\b(?:did|do|does|is|are|was|were|has|have|had|could|would|should|can)\s+"
-    r"not\b(?!\s+only\b)|"
+    r"not\b(?!\s+only\b)(?:\s+(?:observ(?:e|ed)|present|found|detected|identified|"
+    r"recovered|matched|verified|seen|confirmed))?|"
     r"\b(?:didn't|don't|doesn't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|"
-    r"couldn't|wouldn't|shouldn't|can't)\b",
+    r"couldn't|wouldn't|shouldn't|can't)\b(?:\s+(?:observ(?:e|ed)|present|found|"
+    r"detected|identified|recovered|matched|verified|seen|confirmed))?",
     flags=re.I,
 )
 _EXPLICIT_IOC_OBSERVATION = re.compile(
     r"\b(?:observed|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
     flags=re.I,
 )
-_EXPLICIT_IOC_POSTFIX_NEGATION = re.compile(
-    r"^\s+(?:(?:was|is|were|are|has|have|had)\s+not|"
-    r"(?:wasn't|isn't|weren't|aren't|hasn't|haven't|hadn't))\s+"
-    r"(?:observed|present|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
-    flags=re.I,
-)
-_EXPLICIT_IOC_POSTFIX_OBSERVATION = re.compile(
-    r"^\s+(?:was|is|were|are|has|have|had)\s+"
-    r"(?:observed|present|found|detected|identified|recovered|matched|verified|seen|confirmed)\b",
-    flags=re.I,
-)
+_IOC_CLAUSE_BOUNDARY = re.compile(r"[!?;\r\n]|[.](?=\s|$)")
 
 
-def _ioc_clause_prefix(text: str, match_start: int) -> str:
-    prefix = text[:match_start]
-    boundaries = list(re.finditer(r"[!?;\r\n]|[.](?=\s|$)", prefix))
-    clause = prefix[boundaries[-1].end() :] if boundaries else prefix
-    contrasts = list(re.finditer(r"\b(?:but|however)\b", clause, flags=re.I))
-    if contrasts:
-        clause = clause[contrasts[-1].end() :]
-    return clause
+def _ioc_clause_context(
+    text: str, match_start: int, match_end: int
+) -> tuple[str, int, int]:
+    prior = list(_IOC_CLAUSE_BOUNDARY.finditer(text, 0, match_start))
+    clause_start = prior[-1].end() if prior else 0
+    following = _IOC_CLAUSE_BOUNDARY.search(text, match_end)
+    clause_end = following.start() if following else len(text)
+    return text[clause_start:clause_end], match_start - clause_start, match_end - clause_start
 
 
 def _ioc_match_is_negated(text: str, match_start: int, match_end: int) -> bool:
-    """Check explicit negation in the sentence or clause containing an IOC match."""
-    clause = _ioc_clause_prefix(text, match_start)
-    postfix = text[match_end : match_end + 80]
-    if _EXPLICIT_IOC_POSTFIX_NEGATION.search(postfix):
-        return True
-    if not _EXPLICIT_IOC_NEGATION.search(clause):
-        return False
-    conjunctions = list(re.finditer(r"\band\b", clause, flags=re.I))
-    if conjunctions:
-        local_prefix = clause[conjunctions[-1].end() :]
-        explicitly_observed = _EXPLICIT_IOC_OBSERVATION.search(
-            local_prefix
-        ) or _EXPLICIT_IOC_POSTFIX_OBSERVATION.search(postfix)
-        if explicitly_observed and not _EXPLICIT_IOC_NEGATION.search(local_prefix):
-            return False
-    return True
+    """Resolve candidate polarity from the nearest cue in its bounded clause."""
+    clause, local_start, local_end = _ioc_clause_context(text, match_start, match_end)
+    negative = list(_EXPLICIT_IOC_NEGATION.finditer(clause))
+    positive = [
+        cue
+        for cue in _EXPLICIT_IOC_OBSERVATION.finditer(clause)
+        if not any(neg.start() <= cue.start() and cue.end() <= neg.end() for neg in negative)
+    ]
+
+    def distance(cue: re.Match[str]) -> int:
+        if cue.end() <= local_start:
+            return local_start - cue.end()
+        if cue.start() >= local_end:
+            return cue.start() - local_end
+        return 0
+
+    cues = [(distance(cue), 0) for cue in negative]
+    cues.extend((distance(cue), 1) for cue in positive)
+    return bool(cues) and min(cues)[1] == 0
 
 
 def _non_negated_ioc_matches(
@@ -7311,7 +7306,7 @@ def _observed_hash_matches(text: str) -> list[str]:
     for match in re.finditer(
         r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", text
     ):
-        clause = _ioc_clause_prefix(text, match.start())
+        clause, _, _ = _ioc_clause_context(text, match.start(), match.end())
         if _ioc_match_is_negated(text, match.start(), match.end()):
             continue
         if _EXPLICIT_IOC_OBSERVATION.search(clause):

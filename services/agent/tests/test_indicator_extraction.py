@@ -277,6 +277,27 @@ def test_positive_network_indicator_extraction_is_preserved() -> None:
     assert "beacon.example.net" in extracted["domains"]
 
 
+def test_coordinated_subjects_share_postfix_negation() -> None:
+    files = fea._extract_iocs_from_texts(
+        ["payload.exe and helper.exe were not observed"]
+    )
+    network = fea._extract_iocs_from_texts(
+        ["https://bad.example/path and second.example were not observed"]
+    )
+
+    assert files["paths"] == []
+    assert network["urls"] == []
+    assert network["domains"] == []
+
+
+def test_comma_separated_observation_resets_negated_ip_polarity() -> None:
+    extracted = fea._extract_iocs_from_texts(
+        ["Did not observe 10.0.0.1, observed 10.0.0.2"]
+    )
+
+    assert extracted["ips"] == ["10.0.0.2"]
+
+
 def test_system_hive_registry_value_stops_before_prose() -> None:
     indicators = fea.build_indicators(
         [],
