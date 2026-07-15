@@ -9308,7 +9308,7 @@ class Investigation:
                 allowed_tool_names={tool["function"]["name"] for tool in product_tools},
                 record_rejection=record_rejection,
             )
-            run_agent_loop(
+            loop_result = run_agent_loop(
                 provider,
                 tools=tools,
                 dispatch=bridge.dispatch,
@@ -9317,6 +9317,11 @@ class Investigation:
                 max_steps=self.agent_max_steps,
                 require_tool_use=True,
             )
+            if not loop_result.has_successful_evidence_invocation():
+                raise RuntimeError(
+                    f"Pool {pod.pool_origin} produced no successful evidence invocation "
+                    f"before agent loop stopped ({loop_result.stop})"
+                )
             # Discipline first (drop execution/exfil over-claims as logged leads), THEN
             # replace each KEPT finding's free-form prose with a gate-safe description
             # composed from its structured facts (the model's prose trips the naive

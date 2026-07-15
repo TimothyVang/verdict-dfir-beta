@@ -55,6 +55,10 @@ class LoopResult:
     messages: list[dict[str, Any]]
     tool_invocations: list[ToolInvocation] = field(default_factory=list)
 
+    def has_successful_evidence_invocation(self) -> bool:
+        """Return whether a non-finding tool completed without an error result."""
+        return _has_successful_evidence_call(self.tool_invocations)
+
 
 def run_agent_loop(
     provider: _SupportsComplete,
