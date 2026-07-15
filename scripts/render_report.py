@@ -1455,6 +1455,7 @@ def build_indicators_section(indicators: dict[str, Any] | None) -> str:
         ("urls", "URLs"),
         ("processes", "Processes"),
         ("services", "Services"),
+        ("registry_values", "Registry values"),
         ("file_paths", "File paths"),
         ("hashes", "Hashes"),
     ]

@@ -74,6 +74,70 @@ def test_loop_dispatches_tool_then_finishes() -> None:
     assert result.tool_invocations[0].result == "5 rows"
 
 
+def test_loop_reprompts_end_turn_until_required_tool_is_used() -> None:
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(text="I would inspect the event log.", stop_reason="end_turn"),
+            ProviderResponse(
+                text="",
+                tool_calls=[ToolCall(id="t1", name="evtx_query", arguments={"evtx_path": "/x"})],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(text="done", stop_reason="end_turn"),
+        ]
+    )
+    seen, dispatch = _dispatch_recorder(result="3 rows")
+
+    result = run_agent_loop(
+        provider,
+        tools=[],
+        dispatch=dispatch,
+        system="s",
+        user_task="go",
+        require_tool_use=True,
+    )
+
+    assert result.stop == "end_turn"
+    assert seen == [("evtx_query", {"evtx_path": "/x"})]
+    assert provider.calls[1][-1]["role"] == "user"
+    assert "call an available tool" in provider.calls[1][-1]["content"].lower()
+
+
+def test_failed_tool_call_does_not_satisfy_required_evidence_use() -> None:
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                text="",
+                tool_calls=[ToolCall(id="bad", name="evtx_query", arguments={})],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(text="done", stop_reason="end_turn"),
+            ProviderResponse(
+                text="",
+                tool_calls=[ToolCall(id="good", name="evtx_query", arguments={})],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(text="done", stop_reason="end_turn"),
+        ]
+    )
+    results = iter(["ERROR calling evtx_query: invalid args", "3 rows"])
+
+    result = run_agent_loop(
+        provider,
+        tools=[],
+        dispatch=lambda _name, _args: next(results),
+        system="s",
+        user_task="go",
+        require_tool_use=True,
+    )
+
+    assert result.stop == "end_turn"
+    assert [call.result for call in result.tool_invocations] == [
+        "ERROR calling evtx_query: invalid args",
+        "3 rows",
+    ]
+
+
 def test_loop_enforces_max_steps_guard() -> None:
     never_stops = [
         ProviderResponse(

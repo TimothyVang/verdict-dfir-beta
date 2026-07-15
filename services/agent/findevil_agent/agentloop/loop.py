@@ -23,6 +23,10 @@ from .types import ProviderResponse
 DispatchFn = Callable[[str, dict[str, Any]], str]
 
 _DEFAULT_MAX_STEPS = 40
+_TOOL_USE_REMINDER = (
+    "You have not inspected the evidence. Call an available tool now; do not describe "
+    "or provide pseudocode for a tool call."
+)
 
 
 class _SupportsComplete(Protocol):
@@ -60,15 +64,27 @@ def run_agent_loop(
     system: str,
     user_task: str,
     max_steps: int = _DEFAULT_MAX_STEPS,
+    require_tool_use: bool = False,
 ) -> LoopResult:
     """Run the provider until ``end_turn`` or ``max_steps`` tool-dispatch rounds."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_task}]
     invocations: list[ToolInvocation] = []
 
     for step in range(1, max_steps + 1):
-        resp = provider.complete(messages, tools, system=system)
+        evidence_used = _has_successful_evidence_call(invocations)
+        resp = provider.complete(
+            messages,
+            tools,
+            system=system,
+            require_tool_use=require_tool_use and not evidence_used,
+        )
 
         if resp.stop_reason != "tool_use" or not resp.tool_calls:
+            if require_tool_use and not evidence_used:
+                if resp.text:
+                    messages.append({"role": "assistant", "content": resp.text})
+                messages.append({"role": "user", "content": _TOOL_USE_REMINDER})
+                continue
             return LoopResult(
                 final_text=resp.text,
                 stop="end_turn",
@@ -91,6 +107,13 @@ def run_agent_loop(
         steps=max_steps,
         messages=messages,
         tool_invocations=invocations,
+    )
+
+
+def _has_successful_evidence_call(invocations: list[ToolInvocation]) -> bool:
+    return any(
+        invocation.name != "record_finding" and not invocation.result.startswith("ERROR")
+        for invocation in invocations
     )
 
 

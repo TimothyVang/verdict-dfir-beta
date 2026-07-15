@@ -4962,6 +4962,7 @@ def build_indicators(
     domains: set[str] = set(aggregate.get("domains", []) or [])
     urls: set[str] = set(aggregate.get("urls", []) or [])
     hashes: set[str] = set(aggregate.get("hashes", []) or [])
+    registry_values: set[str] = set(aggregate.get("registry_keys", []) or [])
     ips |= set(aggregate.get("ips", []) or [])
     paths |= set(aggregate.get("paths", []) or [])
 
@@ -4971,6 +4972,17 @@ def build_indicators(
     domains |= set(extra.get("domains", []) or [])
     urls |= set(extra.get("urls", []) or [])
     paths |= set(extra.get("paths", []) or [])
+    registry_values |= set(extra.get("registry_keys", []) or [])
+    for finding in findings:
+        hive = Path(str(finding.get("artifact_path") or "")).name.upper()
+        if hive != "SYSTEM":
+            continue
+        for relative in re.findall(
+            r"\b(?:CurrentControlSet|ControlSet\d{3})\\[^,;()\r\n]+",
+            str(finding.get("description") or ""),
+            flags=re.I,
+        ):
+            registry_values.add(f"HKLM\\SYSTEM\\{_trim_registry_prose(relative)}")
 
     def _cap(values: set[str]) -> list[str]:
         return sorted(v for v in values if v)[:per_list_cap]
@@ -4985,6 +4997,7 @@ def build_indicators(
         "services": _cap(services),
         "file_paths": _cap(paths),
         "hashes": _cap(hashes),
+        "registry_values": _cap(registry_values),
     }
     return {
         "version": 1,
@@ -7211,6 +7224,15 @@ def _uniq(values: list[str]) -> list[str]:
     return sorted({value for value in values if value})
 
 
+def _trim_registry_prose(value: str) -> str:
+    return re.sub(
+        r"\s+(?:was|is|were|with|observed|last_write|during|after|before)\b.*$",
+        "",
+        value,
+        flags=re.I,
+    ).rstrip(".:")
+
+
 def _extract_ascii_strings_from_hex(sample_hex: str, min_len: int = 4) -> list[str]:
     cleaned = "".join(ch for ch in str(sample_hex) if ch in "0123456789abcdefABCDEF")
     if len(cleaned) < 2:
@@ -7268,6 +7290,8 @@ _NON_DOMAIN_SUFFIXES = frozenset(
         "cfg",
         "sav",
         "txt",
+        "dit",
+        "rar",
     }
 )
 
@@ -7298,13 +7322,65 @@ def _extract_iocs_from_texts(texts: list[str]) -> dict[str, list[str]]:
         [domain for domain in domains if not domain.lower().startswith("www.")]
         + [domain[4:] for domain in domains if domain.lower().startswith("www.")]
     )[:50]
-    iocs["paths"] = _uniq(re.findall(r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\?)+", blob))[
-        :50
+    file_suffixes = "|".join(sorted(map(re.escape, _NON_DOMAIN_SUFFIXES)))
+    paths = re.findall(
+        rf"\b[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n;,]+\\)*"
+        rf"[^\\/:*?\"<>|\r\n;,\s]+\.(?:{file_suffixes})\b",
+        blob,
+        flags=re.I,
+    )
+    paths.extend(
+        re.findall(
+            r"\b[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n;,]+\\)+"
+            r"[^\\/:*?\"<>|\r\n;,\s]+\.[A-Za-z0-9]{1,16}\b",
+            blob,
+            flags=re.I,
+        )
+    )
+    paths.extend(
+        re.findall(
+            r"\\\\[A-Za-z0-9._$-]+\\(?:[^\\/:*?\"<>|\r\n;,]+\\)+"
+            r"[^\\/:*?\"<>|\r\n;,\s]+\.[A-Za-z0-9]{1,16}\b",
+            blob,
+            flags=re.I,
+        )
+    )
+    paths.extend(re.findall(r"\b[A-Za-z]:\\[^\s,;\"'<>|]+", blob))
+    paths.extend(re.findall(r"\\\\[A-Za-z0-9._$-]+\\[^\s,;\"'<>|]+", blob))
+    paths.extend(
+        re.findall(r"(?<![\w:])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+", blob)
+    )
+    paths = [path.rstrip(".:)") for path in paths]
+    paths = [
+        path
+        for path in paths
+        if not any(
+            other != path
+            and other.lower().startswith((path + " ").lower())
+            for other in paths
+        )
     ]
+    filenames = re.findall(
+        rf"\b[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:{file_suffixes})\b",
+        blob,
+        flags=re.I,
+    )
+    paths.extend(
+        filename
+        for filename in filenames
+        if not any(path.lower().endswith(f"\\{filename.lower()}") for path in paths)
+    )
+    iocs["paths"] = _uniq(paths)[:50]
+    registry_keys = re.findall(
+        r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t;,]+", blob, flags=re.I
+    )
     iocs["registry_keys"] = _uniq(
-        re.findall(r"\bHK(?:LM|CU|CR|U|CC)\\[^\r\n\t]+", blob, flags=re.I)
+        _trim_registry_prose(key)
+        for key in registry_keys
     )[:50]
-    iocs["hashes"] = _uniq(re.findall(r"\b[A-Fa-f0-9]{32,64}\b", blob))[:50]
+    iocs["hashes"] = _uniq(
+        re.findall(r"\b(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\b", blob)
+    )[:50]
     iocs["mutex_like"] = _uniq(
         re.findall(r"\b(?:Global|Local)\\[A-Za-z0-9_.-]{4,}\b", blob)
     )[:50]
@@ -9283,7 +9359,9 @@ class Investigation:
         self._heartbeat(last_tool=tool)
         return tcid
 
-    def _run_agent_pools(self, rust: SshMcpClient, py: SshMcpClient) -> None:
+    def _run_agent_pools(
+        self, rust: SshMcpClient, py: SshMcpClient, evidence_type: str
+    ) -> None:
         """Stage B opt-in: run Pool A and Pool B as an LLM agent loop over the MCP tools.
 
         Each pod drives the same read-only DFIR tool surface the deterministic engine
@@ -9318,11 +9396,14 @@ class Investigation:
             acknowledge_evidence_egress=self.agent_acknowledge_evidence_egress,
         )
         listing = rust.call("tools/list", {})
-        mcp_tools = [
-            t
-            for t in (listing.get("tools") or [])
-            if t.get("name") not in _AGENT_TOOL_DENYLIST
-        ]
+        mcp_tools = _scope_agent_mcp_tools(
+            [
+                t
+                for t in (listing.get("tools") or [])
+                if t.get("name") not in _AGENT_TOOL_DENYLIST
+            ],
+            evidence_type,
+        )
         product_tools = mcp_tools_to_openai(mcp_tools)
         tools = [*product_tools, RECORD_FINDING_TOOL]
         case_id = self.handle["id"]
@@ -9330,6 +9411,20 @@ class Investigation:
         def call_and_record(
             name: str, args: dict[str, Any]
         ) -> tuple[str | None, Any, str | None]:
+            original_args = dict(args)
+            try:
+                args = _bind_agent_tool_args(
+                    name,
+                    args,
+                    evidence_path=self.evidence,
+                    case_id=case_id,
+                )
+            except ValueError as exc:
+                msg = str(exc)
+                self._record_tool(
+                    py, name, "", extra={"error": msg}, arguments=original_args
+                )
+                return (None, None, msg)
             res = rust.call_tool(name, args)
             if isinstance(res, dict) and "_error" in res:
                 msg = str(res["_error"].get("message", "tool error"))
@@ -9353,18 +9448,31 @@ class Investigation:
 
         for pod in (POOL_A, POOL_B):
             self._heartbeat(f"agent:{pod.name}")
+
+            def record_rejection(name: str, args: dict[str, Any], reason: str) -> None:
+                self._record_tool(
+                    py,
+                    name,
+                    "",
+                    extra={"error": reason, "rejected": True},
+                    arguments=args,
+                )
+
             bridge = AgentToolBridge(
                 case_id=case_id,
                 pool_origin=pod.pool_origin,
                 call_and_record=call_and_record,
+                allowed_tool_names={tool["function"]["name"] for tool in product_tools},
+                record_rejection=record_rejection,
             )
             run_agent_loop(
                 provider,
                 tools=tools,
                 dispatch=bridge.dispatch,
                 system=pod.system_prompt,
-                user_task=_agent_pod_task(self.evidence),
+                user_task=_agent_pod_task(self.evidence, case_id, evidence_type),
                 max_steps=self.agent_max_steps,
+                require_tool_use=True,
             )
             # Discipline first (drop execution/exfil over-claims as logged leads), THEN
             # replace each KEPT finding's free-form prose with a gate-safe description
@@ -14882,6 +14990,10 @@ class Investigation:
           no evil).
         """
         if not merged:
+            # An LLM ending without recording a finding is not proof of a clean
+            # artifact, even when it executed a substantive parser call.
+            if self is not None and getattr(self, "agent_mode", False):
+                return "INDETERMINATE"
             # A HEARTBEAT-terminated run skipped lanes: empty cannot mean
             # scoped-clean, only "nothing found in the part we examined".
             if self is not None and getattr(self, "_heartbeat_escalated", False):
@@ -15464,7 +15576,7 @@ class Investigation:
                 # Stage B opt-in: an LLM agent drives Pool A/B against the same MCP
                 # tools, recording each call into this Investigation's audit chain.
                 # Findings land in findings_pool_a/b; reason() proceeds unchanged.
-                self._run_agent_pools(rust, py)
+                self._run_agent_pools(rust, py, etype)
             elif etype == "memory":
                 self.investigate_memory(rust, py)
             elif etype == "evtx":
@@ -15792,17 +15904,81 @@ def resolve_evidence_path(
 # teardown mid-run would kill the mount its own later tool calls read from (mount and
 # extract stay available — the agent needs them to investigate a disk).
 _AGENT_TOOL_DENYLIST = frozenset({"case_open", "disk_unmount"})
+_AGENT_TOOL_ALLOWLISTS = {"evtx": frozenset({"evtx_query"})}
 
 
-def _agent_pod_task(evidence_path: str) -> str:
+def _scope_agent_mcp_tools(
+    tools: list[dict[str, Any]], evidence_type: str
+) -> list[dict[str, Any]]:
+    """Keep local-model tool selection tractable for known single-artifact lanes."""
+    allowed = _AGENT_TOOL_ALLOWLISTS.get(evidence_type)
+    if allowed is None:
+        return tools
+    return [tool for tool in tools if tool.get("name") in allowed]
+
+
+def _bind_agent_tool_args(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    evidence_path: str,
+    case_id: str,
+) -> dict[str, Any]:
+    """Bind custody identifiers and normalize narrow local-model schema drift."""
+    if name != "evtx_query":
+        return dict(arguments)
+
+    bound = {
+        key: value
+        for key, value in arguments.items()
+        if key in {"case_id", "evtx_path", "eids", "xpath", "limit"}
+    }
+    if "eids" not in bound and "eid" in arguments:
+        bound["eids"] = arguments["eid"]
+    eids = bound.get("eids")
+    if isinstance(eids, str):
+        try:
+            eids = json.loads(eids)
+        except json.JSONDecodeError:
+            eids = [eids]
+    if isinstance(eids, (int, str)):
+        eids = [eids]
+    if isinstance(eids, list):
+        eids = eids[:64]
+        try:
+            normalized_eids = [int(eid) for eid in eids]
+        except (TypeError, ValueError):
+            raise ValueError("eids must contain only integers") from None
+        if any(eid < 0 or eid > 65535 for eid in normalized_eids):
+            raise ValueError("eids must be between 0 and 65535")
+        bound["eids"] = normalized_eids
+    limit = bound.get("limit")
+    if limit is not None:
+        try:
+            bound["limit"] = min(max(int(limit), 1), 10000)
+        except (TypeError, ValueError):
+            raise ValueError("limit must be an integer") from None
+    bound["case_id"] = case_id
+    bound["evtx_path"] = evidence_path
+    return bound
+
+
+def _agent_pod_task(evidence_path: str, case_id: str, evidence_type: str) -> str:
     """The investigation brief handed to each agent pod (the case is already open)."""
-    return (
-        f"Investigate the digital evidence at {evidence_path}. The case is already open. "
+    task = (
+        f"Investigate the digital evidence at {evidence_path}. The case is already open "
+        f"as case_id {case_id}; use that exact case_id in tool calls. "
         "Use the available read-only tools to examine the artifacts relevant to your "
         "specialty, then record each finding with record_finding, citing the tool_call_id "
         "you observed and declaring the asserted_values you actually read in that output. "
         "Stop when you have no further leads."
     )
+    if evidence_type == "evtx":
+        task += (
+            " For EVTX evidence, first call evtx_query without an eids filter to sample "
+            "the records; only then target event IDs observed in that result."
+        )
+    return task
 
 
 def main() -> int:

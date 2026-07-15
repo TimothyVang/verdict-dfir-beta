@@ -13,6 +13,7 @@ No langgraph/fastapi (Amendment A2 content rule).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 import urllib.parse
@@ -73,9 +74,30 @@ def _parse_openai_response(raw: dict[str, Any]) -> ProviderResponse:
     message = choice.get("message") or {}
     text = message.get("content") or ""
     tool_calls = [ToolCall.from_openai(tc) for tc in message.get("tool_calls") or []]
+    if not tool_calls:
+        content_call = _parse_content_tool_call(text)
+        if content_call is not None:
+            tool_calls = [content_call]
+            text = ""
     finish = choice.get("finish_reason")
     stop_reason = "tool_use" if tool_calls or finish == "tool_calls" else "end_turn"
     return ProviderResponse(text=text, tool_calls=tool_calls, stop_reason=stop_reason)
+
+
+def _parse_content_tool_call(text: str) -> ToolCall | None:
+    """Recover a strict JSON function request emitted in content by some local models."""
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "function":
+        return None
+    name = payload.get("name")
+    arguments = payload.get("arguments", payload.get("parameters"))
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        return None
+    call_id = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return ToolCall(id=f"content_{call_id}", name=name, arguments=arguments)
 
 
 def _default_transport(base_url: str, api_key: str | None, *, max_retries: int = 6) -> Transport:
@@ -132,6 +154,7 @@ class OpenAIProvider:
         tools: list[dict[str, Any]],
         *,
         system: str | None = None,
+        require_tool_use: bool = False,
         **_kwargs: Any,
     ) -> ProviderResponse:
         request: dict[str, Any] = {
@@ -141,7 +164,7 @@ class OpenAIProvider:
         }
         if tools:
             request["tools"] = tools
-            request["tool_choice"] = "auto"
+            request["tool_choice"] = "required" if require_tool_use else "auto"
 
         raw = self._transport(request)
         return _parse_openai_response(raw)
