@@ -8108,7 +8108,11 @@ def evtx_rows_to_findings(
                     "mitre_technique": "T1003.003",
                 }
             )
-        if event_id == 1102 and "audit_log_cleared" not in seen_kinds:
+        if (
+            event_id == 1102
+            and channel.casefold() == "security"
+            and "audit_log_cleared" not in seen_kinds
+        ):
             seen_kinds.add("audit_log_cleared")
             findings.append(
                 {
@@ -8330,6 +8334,59 @@ def evtx_rows_to_findings(
             }
         )
     return findings
+
+
+_AGENT_HIGH_SIGNAL_FINDING_IDS = frozenset({"f-A-evtx-audit-log-cleared"})
+
+
+def _asserts_eid_1102(finding: dict[str, Any]) -> bool:
+    if finding.get("mitre_technique") != "T1070.001":
+        return False
+    for asserted in finding.get("asserted_values") or []:
+        path = str(asserted.get("path", "")).casefold()
+        expected = asserted.get("expected")
+        match = asserted.get("match")
+        if (
+            path.endswith(".event_id")
+            and match in {"exact", "int"}
+            and str(expected) == "1102"
+        ):
+            return True
+        if match != "record" or re.fullmatch(r"rows\[(?:\*|\d+)\]", path) is None:
+            continue
+        try:
+            record = json.loads(expected) if isinstance(expected, str) else expected
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if (
+            str(record.get("event_id")) == "1102"
+            and str(record.get("channel", "")).casefold() == "security"
+        ):
+            return True
+    return False
+
+
+def recover_agent_high_signal_findings(
+    observations: list[tuple[str, dict[str, Any]]],
+    *,
+    existing_findings: list[dict[str, Any]],
+    case_id: str,
+    artifact_path: str,
+) -> list[dict[str, Any]]:
+    """Recover allowlisted findings from successful current-run agent queries."""
+    if any(_asserts_eid_1102(finding) for finding in existing_findings):
+        return []
+
+    for tool_call_id, output in observations:
+        rows = output.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for finding in evtx_rows_to_findings(rows, tool_call_id, case_id, artifact_path):
+            if finding.get("finding_id") in _AGENT_HIGH_SIGNAL_FINDING_IDS:
+                return [finding]
+    return []
 
 
 _ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".cab", ".tar", ".gz", ".tgz", ".ace", ".arj")
@@ -9259,6 +9316,7 @@ class Investigation:
         product_tools = mcp_tools_to_openai(mcp_tools)
         tools = [*product_tools, RECORD_FINDING_TOOL]
         case_id = self.handle["id"]
+        agent_evtx_observations: list[tuple[str, dict[str, Any]]] = []
 
         def call_and_record(name: str, args: dict[str, Any]) -> tuple[str | None, Any, str | None]:
             original_args = dict(args)
@@ -9288,6 +9346,8 @@ class Investigation:
                 sha = self._hash_obj(res)
                 display = res
             tcid = self._record_tool(py, name, sha, arguments=args)
+            if name == "evtx_query" and isinstance(display, dict):
+                agent_evtx_observations.append((tcid, display))
             return (tcid, display, None)
 
         for pod in (POOL_A, POOL_B):
@@ -9341,6 +9401,28 @@ class Investigation:
                 )
                 finding["description"] = compose_agent_finding_description(finding)
             (self.findings_pool_a if pod.pool_origin == "A" else self.findings_pool_b).extend(kept)
+
+        recovered = recover_agent_high_signal_findings(
+            agent_evtx_observations,
+            existing_findings=[*self.findings_pool_a, *self.findings_pool_b],
+            case_id=case_id,
+            artifact_path=self.evidence,
+        )
+        recovered, dropped = discipline_agent_findings(recovered, self.tool_calls)
+        for lead in dropped:
+            self._audit(py, "agent_finding_disciplined", lead)
+        for finding in recovered:
+            self._audit(
+                py,
+                "agent_high_signal_candidate",
+                {
+                    "finding_id": finding["finding_id"],
+                    "tool_call_id": finding["tool_call_id"],
+                    "mitre_technique": finding["mitre_technique"],
+                    "rule_id": "evtx_eid_1102",
+                },
+            )
+        self.findings_pool_a.extend(recovered)
 
     def _output_hash(self, obj: dict[str, Any]) -> str:
         value = obj.pop("_mcp_output_sha256", None)
@@ -15492,7 +15574,8 @@ def _agent_pod_task(evidence_path: str, case_id: str, evidence_type: str) -> str
     if evidence_type == "evtx":
         task += (
             " For EVTX evidence, first call evtx_query without an eids filter to sample "
-            "the records; only then target event IDs observed in that result."
+            "the records; only then target event IDs observed in that result. Record every "
+            "supported high-signal observation before ending the investigation."
         )
     return task
 

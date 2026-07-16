@@ -91,6 +91,7 @@ def test_agent_task_supplies_the_open_case_id() -> None:
     assert "case-456" in task
     assert "already open" in task
     assert "without an eids filter" in task
+    assert "record every supported high-signal observation before ending" in task.lower()
 
 
 def test_evtx_tool_arguments_are_bound_to_the_open_case() -> None:
