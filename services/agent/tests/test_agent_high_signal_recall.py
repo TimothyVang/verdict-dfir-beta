@@ -86,6 +86,37 @@ def test_existing_1102_assertion_suppresses_duplicate() -> None:
     )
 
 
+def test_unrelated_1102_substring_does_not_suppress_recovery() -> None:
+    existing = [
+        {
+            "mitre_technique": "T1070.001",
+            "asserted_values": [
+                {"path": "rows[0].record_id", "expected": "1102", "match": "exact"}
+            ],
+        }
+    ]
+
+    findings = fea.recover_agent_high_signal_findings(
+        [("tc-agent-1", _evtx_output(1102))],
+        existing_findings=existing,
+        case_id="case-agent",
+        artifact_path="/evidence/Security.evtx",
+    )
+
+    assert len(findings) == 1
+
+
+def test_non_security_eid_1102_recovers_nothing() -> None:
+    findings = fea.recover_agent_high_signal_findings(
+        [("tc-agent-1", _evtx_output(1102, channel="Application"))],
+        existing_findings=[],
+        case_id="case-agent",
+        artifact_path="/evidence/Application.evtx",
+    )
+
+    assert findings == []
+
+
 def test_error_shaped_agent_output_recovers_nothing() -> None:
     findings = fea.recover_agent_high_signal_findings(
         [("tc-agent-1", {"_error": {"message": "parse failed"}})],
@@ -142,6 +173,15 @@ def test_agent_pools_recover_1102_when_model_does_not_record(
     investigation._record_tool = record_tool
     audited: list[tuple[str, dict]] = []
     investigation._audit = lambda _py, kind, payload: audited.append((kind, payload))
+    disciplined_nonempty: list[list[dict]] = []
+    real_discipline = fea.discipline_agent_findings
+
+    def track_discipline(findings: list[dict], tool_calls: list[dict]):
+        if findings:
+            disciplined_nonempty.append(findings)
+        return real_discipline(findings, tool_calls)
+
+    monkeypatch.setattr(fea, "discipline_agent_findings", track_discipline)
 
     def run_agent_loop(*_args, **kwargs) -> LoopResult:
         result = kwargs["dispatch"]("evtx_query", {})
@@ -168,3 +208,6 @@ def test_agent_pools_recover_1102_when_model_does_not_record(
     assert [f["mitre_technique"] for f in investigation.findings_pool_a] == ["T1070.001"]
     assert investigation.findings_pool_a[0]["tool_call_id"] in {"tc-agent-1", "tc-agent-2"}
     assert any(kind == "agent_high_signal_candidate" for kind, _payload in audited)
+    assert [[f["mitre_technique"] for f in findings] for findings in disciplined_nonempty] == [
+        ["T1070.001"]
+    ]

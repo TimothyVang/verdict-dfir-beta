@@ -8108,7 +8108,11 @@ def evtx_rows_to_findings(
                     "mitre_technique": "T1003.003",
                 }
             )
-        if event_id == 1102 and "audit_log_cleared" not in seen_kinds:
+        if (
+            event_id == 1102
+            and channel.casefold() == "security"
+            and "audit_log_cleared" not in seen_kinds
+        ):
             seen_kinds.add("audit_log_cleared")
             findings.append(
                 {
@@ -8338,10 +8342,25 @@ _AGENT_HIGH_SIGNAL_FINDING_IDS = frozenset({"f-A-evtx-audit-log-cleared"})
 def _asserts_eid_1102(finding: dict[str, Any]) -> bool:
     if finding.get("mitre_technique") != "T1070.001":
         return False
-    return any(
-        "1102" in str(asserted.get("expected", ""))
-        for asserted in finding.get("asserted_values") or []
-    )
+    for asserted in finding.get("asserted_values") or []:
+        path = str(asserted.get("path", "")).casefold()
+        expected = asserted.get("expected")
+        if path.endswith(".event_id") and str(expected) == "1102":
+            return True
+        if asserted.get("match") != "record":
+            continue
+        try:
+            record = json.loads(expected) if isinstance(expected, str) else expected
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if (
+            str(record.get("event_id")) == "1102"
+            and str(record.get("channel", "")).casefold() == "security"
+        ):
+            return True
+    return False
 
 
 def recover_agent_high_signal_findings(
@@ -9384,6 +9403,9 @@ class Investigation:
             case_id=case_id,
             artifact_path=self.evidence,
         )
+        recovered, dropped = discipline_agent_findings(recovered, self.tool_calls)
+        for lead in dropped:
+            self._audit(py, "agent_finding_disciplined", lead)
         for finding in recovered:
             self._audit(
                 py,
