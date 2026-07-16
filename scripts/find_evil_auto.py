@@ -8332,6 +8332,39 @@ def evtx_rows_to_findings(
     return findings
 
 
+_AGENT_HIGH_SIGNAL_FINDING_IDS = frozenset({"f-A-evtx-audit-log-cleared"})
+
+
+def _asserts_eid_1102(finding: dict[str, Any]) -> bool:
+    if finding.get("mitre_technique") != "T1070.001":
+        return False
+    return any(
+        "1102" in str(asserted.get("expected", ""))
+        for asserted in finding.get("asserted_values") or []
+    )
+
+
+def recover_agent_high_signal_findings(
+    observations: list[tuple[str, dict[str, Any]]],
+    *,
+    existing_findings: list[dict[str, Any]],
+    case_id: str,
+    artifact_path: str,
+) -> list[dict[str, Any]]:
+    """Recover allowlisted findings from successful current-run agent queries."""
+    if any(_asserts_eid_1102(finding) for finding in existing_findings):
+        return []
+
+    for tool_call_id, output in observations:
+        rows = output.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for finding in evtx_rows_to_findings(rows, tool_call_id, case_id, artifact_path):
+            if finding.get("finding_id") in _AGENT_HIGH_SIGNAL_FINDING_IDS:
+                return [finding]
+    return []
+
+
 _ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".cab", ".tar", ".gz", ".tgz", ".ace", ".arj")
 
 
