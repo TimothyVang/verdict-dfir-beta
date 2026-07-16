@@ -2,9 +2,15 @@
 
 Status: ACTIVE
 
-This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official SANS judge/demo path is the one-shot `scripts/verdict <evidence>` launcher or an interactive Claude Code session (`claude` / `scripts/find-evil`) for manual exploration.
+This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official general SANS judge/demo path remains the default deterministic `scripts/verdict <evidence>` launcher or an interactive Claude Code session (`claude` / `scripts/find-evil`) for manual exploration. Strict Phase 4 offline acceptance uses the allowed beta-native `scripts/verdict --agent <single.evtx>` loop; Codex compatibility is not that runtime and does not gate Phase 4.
 
 Codex compatibility means: Codex can read the same repo instructions and, if its MCP client supports stdio servers, launch the same two narrow product MCP servers. It does not mean adding broad external MCPs.
+
+The beta-native loop does not reverse Amendment A2: it is limited to
+`services/agent/findevil_agent/agentloop/`, and the removed pre-A2 modules, LangGraph, and FastAPI
+remain forbidden. Native mode currently accepts one EVTX file; every non-EVTX type and directory
+fails closed before preflight or MCP startup and must use default deterministic analysis. A
+local/DGX provider changes inference location, not detection-quality claims.
 
 ## Canonical MCP Servers
 
@@ -250,7 +256,7 @@ The server route remains constrained:
 - it allowlists MCP tools per investigation mode
 - it accepts paths only under documented evidence/output roots unless `FINDEVIL_CODEX_EXTRA_ROOTS` is set
 
-Use the Codex TUI's built-in dashboard for normal interactive operation. The web cockpit is a prompt and one-shot investigation wrapper, not a replacement for the product's Claude Code judge/demo path.
+Use the Codex TUI's built-in dashboard for normal interactive operation. The web cockpit is a prompt and one-shot investigation wrapper, not a replacement for either the product's general Claude Code/default judge-demo paths or the beta-native Phase 4 acceptance runtime.
 
 ## Investigation Prompt
 
@@ -266,4 +272,4 @@ Do not call limited output clean, cleared, disproven, or proof of absence. Say `
 
 ## Compatibility Boundary
 
-Codex support is best-effort until exercised end-to-end in the target Codex runtime. Treat Claude Code as the reference interface for SANS judging until a Codex-specific investigation smoke test has been run and documented.
+Codex support is best-effort until exercised end-to-end in the target Codex runtime. Treat Claude Code as the reference interactive interface and default `scripts/verdict` as the general one-shot judge/demo path. Codex is not a substitute for strict Phase 4 acceptance through the beta-native `--agent` loop.

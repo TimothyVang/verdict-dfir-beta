@@ -30,6 +30,7 @@ from .pods import RECORD_FINDING_NAME
 CallAndRecord = Callable[
     [str, dict[str, Any]], "tuple[str | None, dict[str, Any] | None, str | None]"
 ]
+RecordRejection = Callable[[str, dict[str, Any], str], None]
 
 _CITE_HEADER = "tool_call_id: "
 
@@ -75,16 +76,27 @@ class AgentToolBridge:
         case_id: str,
         pool_origin: str,
         call_and_record: CallAndRecord,
+        allowed_tool_names: set[str] | None = None,
+        record_rejection: RecordRejection | None = None,
     ) -> None:
         self.case_id = case_id
         self.pool_origin = pool_origin
         self._call_and_record = call_and_record
+        self._allowed_tool_names = (
+            frozenset(allowed_tool_names) if allowed_tool_names is not None else None
+        )
+        self._record_rejection = record_rejection
         self._seen_tcids: set[str] = set()
         self.findings: list[dict[str, Any]] = []
 
     def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
         if name == RECORD_FINDING_NAME:
             return self._record_finding(arguments)
+        if self._allowed_tool_names is not None and name not in self._allowed_tool_names:
+            reason = f"tool {name!r} is not available in this investigation lane"
+            if self._record_rejection is not None:
+                self._record_rejection(name, arguments, reason)
+            return f"ERROR: {reason}"
         tcid, output, error = self._call_and_record(name, arguments)
         if error is not None or tcid is None:
             return f"ERROR calling {name}: {error or 'no tool_call_id returned'}"

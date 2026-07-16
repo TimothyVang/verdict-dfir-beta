@@ -73,6 +73,8 @@ CASE_ID=""
 CASE_ID_OVERRIDE=""
 PASSTHROUGH=()
 AGENT_MODE=0   # --agent: run the engine under the 3.11 agent venv (host python3 may be 3.10)
+AGENT_PROVIDER=""
+AGENT_PROVIDER_SET=0
 KEEP_SIFT_STAGING=0
 SIFT_STAGING_ROOT=""
 SIFT_STAGING_PARENT=""
@@ -105,8 +107,8 @@ while [[ $# -gt 0 ]]; do
     --workers)       PASSTHROUGH+=("--workers" "$2"); shift 2 ;;   # value-bearing
     --agent)         AGENT_MODE=1; PASSTHROUGH+=("--agent"); shift ;;
     --acknowledge-evidence-egress) PASSTHROUGH+=("--acknowledge-evidence-egress"); shift ;;
-    --agent-provider)   PASSTHROUGH+=("--agent-provider" "$2"); shift 2 ;;   # value-bearing
-    --agent-provider=*) PASSTHROUGH+=("$1"); shift ;;
+    --agent-provider)   if [[ $# -lt 2 ]]; then printf '\033[31m[verdict] FAIL:\033[0m --agent-provider requires a value\n' >&2; exit 1; fi; AGENT_PROVIDER="$2"; AGENT_PROVIDER_SET=1; PASSTHROUGH+=("--agent-provider" "$2"); shift 2 ;;
+    --agent-provider=*) AGENT_PROVIDER="${1#--agent-provider=}"; AGENT_PROVIDER_SET=1; PASSTHROUGH+=("$1"); shift ;;
     --agent-model)      PASSTHROUGH+=("--agent-model" "$2"); shift 2 ;;       # value-bearing
     --agent-model=*)    PASSTHROUGH+=("$1"); shift ;;
     --agent-max-steps)  PASSTHROUGH+=("--agent-max-steps" "$2"); shift 2 ;;   # value-bearing
@@ -122,6 +124,19 @@ ok()   { printf '   \033[32m✓\033[0m %s\n' "$*" >&2; }
 warn() { printf '   \033[33m!\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[31m[verdict] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 url_up() { [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null)" != "000" ]]; }
+
+agent_manifest_verified() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    summary = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if summary.get("result", {}).get("manifest_verify_overall") is True else 1)
+PY
+}
 
 case_root_abs() {
   if [[ "${CASE_ROOT}" == /* ]]; then
@@ -1438,6 +1453,23 @@ for passthrough_arg in "${PASSTHROUGH[@]}"; do
     --case-id|--case-id=*) fail "--case-id must be a top-level verdict option, not passed after --" ;;
   esac
 done
+if [[ "${AGENT_PROVIDER_SET}" == "1" ]]; then
+  case "${AGENT_PROVIDER}" in
+    anthropic|claude_cli|openai|openrouter|local|dgx) ;;
+    *) fail "unsupported --agent-provider: ${AGENT_PROVIDER}" ;;
+  esac
+fi
+if [[ "${AGENT_MODE}" == "1" && "${AGENT_PROVIDER_SET}" == "0" ]]; then
+  if [[ -v FINDEVIL_AGENT_PROVIDER ]]; then
+    AGENT_PROVIDER="${FINDEVIL_AGENT_PROVIDER}"
+  else
+    AGENT_PROVIDER="anthropic"
+  fi
+  case "${AGENT_PROVIDER}" in
+    anthropic|claude_cli|openai|openrouter|local|dgx) ;;
+    *) fail "unsupported agent provider: ${AGENT_PROVIDER:-<empty>}" ;;
+  esac
+fi
 [[ -n "${CASE_ID_OVERRIDE:-}" ]] && CASE_ID_OVERRIDE="$(safe_case_id "${CASE_ID_OVERRIDE}")"
 [[ -n "${RUN_SUMMARY:-}" ]] && RUN_SUMMARY="$(prepare_requested_run_summary_path "${RUN_SUMMARY}" 0)"
 if [[ "${SIFT}" == "1" ]]; then
@@ -1540,6 +1572,14 @@ fi
 [[ -n "${EVIDENCE}" || "${DRY}" == "1" ]] || fail "no evidence. Usage: scripts/verdict <evidence> | --watch (drop into evidence/)"
 ORIGINAL_EVIDENCE="${EVIDENCE}"
 
+if [[ "${AGENT_MODE}" == "1" ]]; then
+  agent_evidence_name="${EVIDENCE##*/}"
+  agent_evidence_name="${agent_evidence_name,,}"
+  if [[ "${FLEET}" == "1" || -d "${EVIDENCE}" || "${agent_evidence_name}" != *.evtx ]]; then
+    fail "--agent supports a single EVTX file only; non-EVTX, fleet, and directory evidence require the default deterministic mode"
+  fi
+fi
+
 # 0b. FLEET mode — one command for a whole multi-host case folder ------------
 # Auto-detected (a directory holding hosts/ or disks/ is the whole-case
 # layout) or forced with --fleet. Runs all three fleet stages end to end:
@@ -1607,9 +1647,24 @@ run_fleet() {
 # 1. preflight ---------------------------------------------------------------
 log "1/4 preflight"
 if [[ "${DRY}" == "1" ]]; then
-  ok "DRY-RUN: bash scripts/doctor.sh"
+  if [[ "${AGENT_MODE}" == "1" ]]; then
+    ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=${AGENT_PROVIDER} bash scripts/doctor.sh"
+  elif [[ "${AGENT_MODE}" == "0" ]]; then
+    ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=deterministic bash scripts/doctor.sh"
+  else
+    ok "DRY-RUN: env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh"
+  fi
 elif [[ -f scripts/doctor.sh ]]; then
-  bash scripts/doctor.sh || fail "doctor reported missing dependencies — fix them, then re-run"
+  if [[ "${AGENT_MODE}" == "1" ]]; then
+    FINDEVIL_DOCTOR_AGENT_PROVIDER="${AGENT_PROVIDER}" bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  elif [[ "${AGENT_MODE}" == "0" ]]; then
+    FINDEVIL_DOCTOR_AGENT_PROVIDER=deterministic bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  else
+    env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh \
+      || fail "doctor reported missing dependencies — fix them, then re-run"
+  fi
 else
   warn "scripts/doctor.sh not found; skipping preflight"
 fi
@@ -2149,6 +2204,10 @@ if [[ "${SIFT}" == "0" ]]; then
 fi
 
 "${ENGINE[@]}"
+
+if [[ "${AGENT_MODE}" == "1" ]] && ! agent_manifest_verified "${SUMMARY}"; then
+  fail "native agent manifest verification failed; run incomplete / custody invalid"
+fi
 
 if [[ -n "${CASE_DIR:-}" ]]; then
   sync_case_summary "${SUMMARY}"

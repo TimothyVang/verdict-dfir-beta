@@ -10,11 +10,11 @@ investigation in-process; the external DFIR binaries are needed for memory/disk/
 
 ---
 
-## 1. Host toolchain (REQUIRED — `doctor.sh` blocks without these)
+## 1. Host toolchain (runtime-dependent; `doctor.sh` reports these)
 
 | Tool | Pin | Why | Install |
 |---|---|---|---|
-| `claude` CLI | latest | The agent IS the engine (A2) | `npm i -g @anthropic-ai/claude-code` |
+| `claude` CLI | latest | Canonical interactive runtime and explicit `--agent-provider claude_cli` backend | `npm i -g @anthropic-ai/claude-code` (conditional) |
 | Rust | **1.88** (`rust-toolchain.toml`) | builds `findevil-mcp` | `rustup` |
 | `cargo` | with Rust 1.88 | build/test | rustup |
 | C toolchain (`cc`) | system | links Rust crates (rustup does not install it) | `build-essential` (Debian/Ubuntu) · `xcode-select --install` (macOS) |
@@ -31,11 +31,25 @@ investigation in-process; the external DFIR binaries are needed for memory/disk/
 > obsidian-mind runbook; it is optional operator memory, never evidence, and never audit-chain
 > input.
 
-### Credential modes (Amendment A1 — one of three, detected by `install.sh`)
+The `claude` CLI is not required for the deterministic engine, direct API providers, or
+`local`/`dgx`. It is required for interactive Claude Code and for the explicit `claude_cli` agent
+provider. The default `--agent` provider is direct `anthropic` with model
+`claude-sonnet-4-6`; `claude_cli` defaults to `claude-opus-4-8`. OpenAI-compatible providers have no
+default model and require `--agent-model` or `FINDEVIL_AGENT_MODEL`.
+
+### Claude credential modes (Amendment A1; conditional by runtime)
 
 1. `CLAUDE_CODE_OAUTH_TOKEN` env var (from `claude setup-token`) — non-interactive, preferred.
 2. Interactive Claude Code login (`~/.claude/`) — dev default.
 3. `ANTHROPIC_API_KEY` env var — direct metered API.
+
+The direct `anthropic` adapter accepts mode 3 or the scoped OAuth token in the logged-in Claude Code
+credentials file (mode 2); it does **not** read `CLAUDE_CODE_OAUTH_TOKEN` or require the Claude CLI.
+It requires `--acknowledge-evidence-egress`. Interactive Claude Code and `claude_cli` require the CLI
+plus supported authentication; `claude_cli` also requires egress acknowledgement. The deterministic
+engine needs no LLM credential. `local`/`dgx` and cloud `openai`/`openrouter` do not require Claude
+credentials or the Claude CLI during preflight; their provider factories enforce endpoint and API-key
+requirements. `local`/`dgx` do not require egress acknowledgement; `openai`/`openrouter` do.
 
 ---
 

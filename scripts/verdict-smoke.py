@@ -41,6 +41,141 @@ def test_chains_doctor() -> None:
     ), "verdict does not reference doctor.sh"
 
 
+def test_agent_provider_controls_doctor_credential_mode() -> None:
+    for provider in ("local", "dgx", "openai", "openrouter"):
+        env = {**os.environ, "FINDEVIL_AGENT_PROVIDER": "local"}
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "evidence.evtx",
+                "--agent",
+                "--agent-provider",
+                provider,
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert (
+            f"FINDEVIL_DOCTOR_AGENT_PROVIDER={provider} bash scripts/doctor.sh"
+            in combined
+        ), combined
+
+    env = {**os.environ, "FINDEVIL_AGENT_PROVIDER": "local"}
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "evidence.evtx", "--agent", "--dry-run", "--skip-build"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "FINDEVIL_DOCTOR_AGENT_PROVIDER=local bash scripts/doctor.sh" in combined
+
+    env.pop("FINDEVIL_AGENT_PROVIDER")
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "evidence.evtx", "--agent", "--dry-run", "--skip-build"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "FINDEVIL_DOCTOR_AGENT_PROVIDER=anthropic bash scripts/doctor.sh" in combined
+
+
+def test_agent_provider_rejects_unknown_values() -> None:
+    for provider_arg in ("--agent-provider=unknown-provider", "--agent-provider="):
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "evidence.evtx",
+                "--agent",
+                provider_arg,
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "unsupported --agent-provider" in combined, combined
+
+    for provider in ("unknown-provider", ""):
+        env = {**os.environ, "FINDEVIL_AGENT_PROVIDER": provider}
+        result = subprocess.run(
+            [
+                "bash",
+                str(SCRIPT),
+                "evidence.evtx",
+                "--agent",
+                "--dry-run",
+                "--skip-build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "unsupported agent provider" in combined, combined
+
+
+def test_agent_rejects_non_evtx_before_preflight_but_deterministic_modes_do_not() -> None:
+    for evidence in ("memory.raw", "disk.E01", "traffic.pcap", "collection.zip", "notes.txt"):
+        agent = subprocess.run(
+            ["bash", str(SCRIPT), evidence, "--agent", "--dry-run", "--skip-build"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = agent.stdout + agent.stderr
+        assert agent.returncode != 0, combined
+        assert "single EVTX file only" in combined, combined
+        assert "1/4 preflight" not in combined, combined
+
+        deterministic = subprocess.run(
+            ["bash", str(SCRIPT), evidence, "--dry-run", "--skip-build"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        combined = deterministic.stdout + deterministic.stderr
+        assert deterministic.returncode == 0, combined
+        assert "1/4 preflight" in combined, combined
+
+    forced_fleet = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "evidence.evtx",
+            "--agent",
+            "--fleet",
+            "--dry-run",
+            "--skip-build",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    combined = forced_fleet.stdout + forced_fleet.stderr
+    assert forced_fleet.returncode != 0, combined
+    assert "single EVTX file only" in combined, combined
+    assert "1/4 preflight" not in combined, combined
+
+
 def test_chains_build() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     assert (
@@ -801,6 +936,15 @@ def main() -> int:
         ("script_exists_and_executable", test_script_exists_and_executable),
         ("bash_syntax_clean", test_bash_syntax_clean),
         ("chains_doctor", test_chains_doctor),
+        (
+            "agent_provider_controls_doctor_credential_mode",
+            test_agent_provider_controls_doctor_credential_mode,
+        ),
+        ("agent_provider_rejects_unknown_values", test_agent_provider_rejects_unknown_values),
+        (
+            "agent_rejects_non_evtx_before_preflight_but_deterministic_modes_do_not",
+            test_agent_rejects_non_evtx_before_preflight_but_deterministic_modes_do_not,
+        ),
         ("chains_build", test_chains_build),
         ("chains_engine", test_chains_engine),
         ("has_sift_and_dashboard_flags", test_has_sift_and_dashboard_flags),

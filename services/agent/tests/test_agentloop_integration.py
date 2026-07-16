@@ -46,6 +46,30 @@ def test_product_call_records_and_surfaces_tcid() -> None:
     assert "evil.exe" in out  # raw output surfaced for asserted-value paths
 
 
+def test_unadvertised_tool_is_rejected_before_dispatch() -> None:
+    seen, car = _fake_call_and_record()
+    rejected: list[tuple[str, dict, str]] = []
+    bridge = AgentToolBridge(
+        case_id=_CASE,
+        pool_origin="A",
+        call_and_record=car,
+        allowed_tool_names={"evtx_query"},
+        record_rejection=lambda name, args, reason: rejected.append((name, args, reason)),
+    )
+
+    out = bridge.dispatch("disk_unmount", {"case_id": _CASE})
+
+    assert "not available" in out.lower()
+    assert seen == []
+    assert rejected == [
+        (
+            "disk_unmount",
+            {"case_id": _CASE},
+            "tool 'disk_unmount' is not available in this investigation lane",
+        )
+    ]
+
+
 def test_record_finding_emits_pool_dict() -> None:
     _seen, car = _fake_call_and_record(tcid="tc-007")
     bridge = AgentToolBridge(case_id=_CASE, pool_origin="A", call_and_record=car)

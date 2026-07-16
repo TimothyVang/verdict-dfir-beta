@@ -1,14 +1,15 @@
 # Spec #2 §4.2 + Amendment A1 + Amendment A2. Python agent library —
 # crypto chain-of-custody (M2) + ACH judge/verifier/correlator (M4).
-# Under A2 the agent runtime IS Claude Code; this library is wrapped
-# by `services/agent_mcp/` and exposed as MCP tools. The custom
-# orchestrator (graph.py / api.py / cli.py / supervisor.py /
-# specialists/) is dropped entirely — Claude Code IS the orchestrator.
+# Under A2, Claude Code is the canonical interactive/cloud runtime and this
+# library is wrapped by `services/agent_mcp/` as MCP tools. The beta-native
+# Phase 4 loop is limited to `findevil_agent/agentloop/`. The pre-A2
+# orchestrator (graph.py / api.py / cli.py / supervisor.py / specialists/)
+# remains dropped; LangGraph and FastAPI remain forbidden.
 
 [project]
 name = "findevil-agent"
 version = "0.1.0"
-description = "Find Evil! agent library — M2 crypto chain-of-custody + M4 ACH (no orchestrator under A2)."
+description = "Find Evil! custody and ACH library with the beta-native Phase 4 agent loop."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
@@ -20,12 +21,10 @@ authors = [
 # without a spec amendment is a silent contract break.
 #
 # A2 deltas (removed from this list):
-#   - langgraph, langgraph-checkpoint-sqlite — Claude Code IS the graph
-#   - fastapi, uvicorn[standard], sse-starlette — Claude Code's terminal IS the streaming UX
+#   - langgraph, langgraph-checkpoint-sqlite — the allowed native loop is framework-free
+#   - fastapi, uvicorn[standard], sse-starlette — no Product app server
 dependencies = [
-  # Claude Agent SDK — still here because the `anthropic` types
-  # (Tool, Message, etc.) appear in shared type definitions even
-  # though the orchestrator no longer makes API calls itself.
+  # Anthropic client/types support Claude-backed provider operation.
   "anthropic>=0.45,<1.0",
 
   # Pydantic v2 for the AgentEvent union + all typed models.
@@ -87,9 +86,9 @@ dev = [
   "respx>=0.21",
 ]
 
-# Under A2 there is no `find-evil` console script — Claude Code is
-# the launcher, invoked via scripts/find-evil. The pre-A2 entry point
-# pointed to findevil_agent.cli:main which was never built.
+# Under A2 there is no `find-evil` Python console script. Launch through
+# scripts/find-evil (Claude Code) or scripts/verdict --agent (beta-native).
+# The pre-A2 entry point targeted findevil_agent.cli:main, which remains removed.
 
 [build-system]
 requires = ["hatchling>=1.25"]

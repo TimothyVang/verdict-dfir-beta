@@ -60,6 +60,21 @@ def test_request_carries_model_tools_and_tool_choice() -> None:
     assert req["messages"][1] == {"role": "user", "content": "hi"}
 
 
+def test_request_can_require_a_tool_call() -> None:
+    seen, transport = _recorder(
+        {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+    )
+    provider = OpenAIProvider(model="gpt-x", transport=transport)
+
+    provider.complete(
+        [{"role": "user", "content": "inspect evidence"}],
+        _TOOLS,
+        require_tool_use=True,
+    )
+
+    assert seen[0]["tool_choice"] == "required"
+
+
 def test_tool_call_response_normalizes_to_toolcalls() -> None:
     response = {
         "choices": [
@@ -86,6 +101,31 @@ def test_tool_call_response_normalizes_to_toolcalls() -> None:
     assert resp.tool_calls[0].id == "call_1"
     assert resp.tool_calls[0].name == "evtx_query"
     assert resp.tool_calls[0].arguments == {"path": "/x.evtx"}  # JSON-string args parsed
+
+
+def test_json_content_function_request_normalizes_to_toolcall() -> None:
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '{"type":"function","name":"evtx_query",'
+                        '"parameters":{"evtx_path":"/x.evtx","eids":[1102]}}'
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    _seen, transport = _recorder(response)
+    provider = OpenAIProvider(model="local", transport=transport)
+
+    result = provider.complete([{"role": "user", "content": "inspect"}], _TOOLS)
+
+    assert result.stop_reason == "tool_use"
+    assert [(call.name, call.arguments) for call in result.tool_calls] == [
+        ("evtx_query", {"evtx_path": "/x.evtx", "eids": [1102]})
+    ]
 
 
 def test_text_response_is_end_turn() -> None:

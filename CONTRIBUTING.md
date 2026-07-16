@@ -8,7 +8,9 @@ to the project? Start with [INSTALL.md](INSTALL.md); for the design, read
 map of what VERDICT is, the open problems (including the hard one — keeping the AI honest), and where
 contributors can plug in.
 
-VERDICT is a DFIR agent where **Claude Code is the engine** (Amendment A2). It is three subsystems:
+VERDICT is a DFIR agent where Claude Code is the canonical interactive/cloud runtime and the
+beta-native `scripts/verdict --agent` loop is authoritative for strict Phase 4 offline acceptance
+(Amendment A2). It is three subsystems:
 a Rust MCP server (`services/mcp/`, 32 DFIR tools), a Python MCP server
 (`services/agent_mcp/`, 13 crypto/ACH/memory tools), and a Next.js dashboard (`apps/web/`). The two
 MCP servers are standard MCP, so any MCP-capable agent can drive the tool surface — Claude Code is the
@@ -24,8 +26,10 @@ will be blocked. Full list: [CLAUDE.md §3](CLAUDE.md).
 - **No `execute_shell` MCP tool, ever.** The narrow typed surface *is* the pitch.
 - **Every Finding cites a `tool_call_id`.** The verifier vetoes any that doesn't.
 - **Evidence is read-only;** the audit log is append-only and hash-chained.
-- **Claude Code is the orchestrator** — do not reintroduce `findevil_agent.cli` or `scripts/build-deb.sh`
-  (the L0 `amendment-a2-guard` job and `divergence-smoke.py` will fail CI if you do).
+- **Keep the A2 runtime boundary** — do not reintroduce `findevil_agent.cli`, the removed pre-A2
+  orchestrator modules, LangGraph, FastAPI, or `scripts/build-deb.sh` (the L0
+  `amendment-a2-guard` job and `divergence-smoke.py` will fail CI if you do). The allowed native
+  loop is limited to `services/agent/findevil_agent/agentloop/`.
 - **AGPL/GPL DFIR tools are subprocess-only, never linked** (keeps the tree Apache-2.0).
 - When spec and code disagree, **code + committed pin files win** ([CLAUDE.md §8](CLAUDE.md)).
 
