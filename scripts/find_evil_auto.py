@@ -8345,9 +8345,14 @@ def _asserts_eid_1102(finding: dict[str, Any]) -> bool:
     for asserted in finding.get("asserted_values") or []:
         path = str(asserted.get("path", "")).casefold()
         expected = asserted.get("expected")
-        if path.endswith(".event_id") and str(expected) == "1102":
+        match = asserted.get("match")
+        if (
+            path.endswith(".event_id")
+            and match in {"exact", "int"}
+            and str(expected) == "1102"
+        ):
             return True
-        if asserted.get("match") != "record":
+        if match != "record" or re.fullmatch(r"rows\[(?:\*|\d+)\]", path) is None:
             continue
         try:
             record = json.loads(expected) if isinstance(expected, str) else expected

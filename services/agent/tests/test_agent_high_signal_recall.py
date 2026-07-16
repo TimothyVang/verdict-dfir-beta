@@ -106,6 +106,50 @@ def test_unrelated_1102_substring_does_not_suppress_recovery() -> None:
     assert len(findings) == 1
 
 
+def test_invalid_event_id_matcher_does_not_suppress_recovery() -> None:
+    existing = [
+        {
+            "mitre_technique": "T1070.001",
+            "asserted_values": [
+                {"path": "rows[0].event_id", "expected": "1102", "match": "iso_ts"}
+            ],
+        }
+    ]
+
+    findings = fea.recover_agent_high_signal_findings(
+        [("tc-agent-1", _evtx_output(1102))],
+        existing_findings=existing,
+        case_id="case-agent",
+        artifact_path="/evidence/Security.evtx",
+    )
+
+    assert len(findings) == 1
+
+
+def test_nested_record_assertion_does_not_suppress_recovery() -> None:
+    existing = [
+        {
+            "mitre_technique": "T1070.001",
+            "asserted_values": [
+                {
+                    "path": "rows[*].data",
+                    "expected": '{"event_id": "1102", "channel": "Security"}',
+                    "match": "record",
+                }
+            ],
+        }
+    ]
+
+    findings = fea.recover_agent_high_signal_findings(
+        [("tc-agent-1", _evtx_output(1102))],
+        existing_findings=existing,
+        case_id="case-agent",
+        artifact_path="/evidence/Security.evtx",
+    )
+
+    assert len(findings) == 1
+
+
 def test_non_security_eid_1102_recovers_nothing() -> None:
     findings = fea.recover_agent_high_signal_findings(
         [("tc-agent-1", _evtx_output(1102, channel="Application"))],
