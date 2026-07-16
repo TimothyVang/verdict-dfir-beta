@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from findevil_agent.agentloop.loop import LoopResult, ToolInvocation
 
 _SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
 if str(_SCRIPTS) not in sys.path:
@@ -79,3 +84,87 @@ def test_existing_1102_assertion_suppresses_duplicate() -> None:
         )
         == []
     )
+
+
+def test_error_shaped_agent_output_recovers_nothing() -> None:
+    findings = fea.recover_agent_high_signal_findings(
+        [("tc-agent-1", {"_error": {"message": "parse failed"}})],
+        existing_findings=[],
+        case_id="case-agent",
+        artifact_path="/evidence/Security.evtx",
+    )
+
+    assert findings == []
+
+
+class _Rust:
+    def call(self, method: str, _params: dict) -> dict:
+        assert method == "tools/list"
+        return {"tools": [{"name": "evtx_query"}]}
+
+    def call_tool(self, name: str, _args: dict) -> dict:
+        assert name == "evtx_query"
+        return {**_evtx_output(1102), "_mcp_output_sha256": "a" * 64}
+
+
+def test_agent_pools_recover_1102_when_model_does_not_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import findevil_agent.agentloop.factory as factory
+    import findevil_agent.agentloop.loop as loop
+    import findevil_agent.agentloop.mcp_tools as mcp_tools
+
+    investigation = object.__new__(fea.Investigation)
+    investigation.agent_provider = "stub"
+    investigation.agent_model = "stub"
+    investigation.agent_acknowledge_evidence_egress = False
+    investigation.agent_max_steps = 2
+    investigation.handle = {"id": "case-agent"}
+    investigation.evidence = "/evidence/Security.evtx"
+    investigation.tool_calls = []
+    investigation.findings_pool_a = []
+    investigation.findings_pool_b = []
+    investigation._heartbeat = lambda *_args, **_kwargs: None
+    tcids = iter(("tc-agent-1", "tc-agent-2"))
+
+    def record_tool(_py, name: str, output_hash: str, **kwargs) -> str:
+        tcid = next(tcids)
+        investigation.tool_calls.append(
+            {
+                "tool_call_id": tcid,
+                "tool": name,
+                "output_hash": output_hash,
+                "arguments": kwargs.get("arguments", {}),
+            }
+        )
+        return tcid
+
+    investigation._record_tool = record_tool
+    audited: list[tuple[str, dict]] = []
+    investigation._audit = lambda _py, kind, payload: audited.append((kind, payload))
+
+    def run_agent_loop(*_args, **kwargs) -> LoopResult:
+        result = kwargs["dispatch"]("evtx_query", {})
+        return LoopResult(
+            final_text="done without recording",
+            stop="end_turn",
+            steps=1,
+            messages=[],
+            tool_invocations=[
+                ToolInvocation(id="query", name="evtx_query", arguments={}, result=result)
+            ],
+        )
+
+    monkeypatch.setattr(factory, "build_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(loop, "run_agent_loop", run_agent_loop)
+    monkeypatch.setattr(
+        mcp_tools,
+        "mcp_tools_to_openai",
+        lambda _tools: [{"type": "function", "function": {"name": "evtx_query"}}],
+    )
+
+    investigation._run_agent_pools(_Rust(), SimpleNamespace(), "evtx")
+
+    assert [f["mitre_technique"] for f in investigation.findings_pool_a] == ["T1070.001"]
+    assert investigation.findings_pool_a[0]["tool_call_id"] in {"tc-agent-1", "tc-agent-2"}
+    assert any(kind == "agent_high_signal_candidate" for kind, _payload in audited)

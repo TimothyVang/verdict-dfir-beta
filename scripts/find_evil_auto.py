@@ -9292,6 +9292,7 @@ class Investigation:
         product_tools = mcp_tools_to_openai(mcp_tools)
         tools = [*product_tools, RECORD_FINDING_TOOL]
         case_id = self.handle["id"]
+        agent_evtx_observations: list[tuple[str, dict[str, Any]]] = []
 
         def call_and_record(name: str, args: dict[str, Any]) -> tuple[str | None, Any, str | None]:
             original_args = dict(args)
@@ -9321,6 +9322,8 @@ class Investigation:
                 sha = self._hash_obj(res)
                 display = res
             tcid = self._record_tool(py, name, sha, arguments=args)
+            if name == "evtx_query" and isinstance(display, dict):
+                agent_evtx_observations.append((tcid, display))
             return (tcid, display, None)
 
         for pod in (POOL_A, POOL_B):
@@ -9374,6 +9377,25 @@ class Investigation:
                 )
                 finding["description"] = compose_agent_finding_description(finding)
             (self.findings_pool_a if pod.pool_origin == "A" else self.findings_pool_b).extend(kept)
+
+        recovered = recover_agent_high_signal_findings(
+            agent_evtx_observations,
+            existing_findings=[*self.findings_pool_a, *self.findings_pool_b],
+            case_id=case_id,
+            artifact_path=self.evidence,
+        )
+        for finding in recovered:
+            self._audit(
+                py,
+                "agent_high_signal_candidate",
+                {
+                    "finding_id": finding["finding_id"],
+                    "tool_call_id": finding["tool_call_id"],
+                    "mitre_technique": finding["mitre_technique"],
+                    "rule_id": "evtx_eid_1102",
+                },
+            )
+        self.findings_pool_a.extend(recovered)
 
     def _output_hash(self, obj: dict[str, Any]) -> str:
         value = obj.pop("_mcp_output_sha256", None)
