@@ -15547,7 +15547,8 @@ def _agent_pod_task(evidence_path: str, case_id: str, evidence_type: str) -> str
     if evidence_type == "evtx":
         task += (
             " For EVTX evidence, first call evtx_query without an eids filter to sample "
-            "the records; only then target event IDs observed in that result."
+            "the records; only then target event IDs observed in that result. Record every "
+            "supported high-signal observation before ending the investigation."
         )
     return task
 

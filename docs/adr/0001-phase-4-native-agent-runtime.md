@@ -54,3 +54,7 @@ The native loop must not import or add LangGraph or FastAPI.
 - Claude Code continues to define the primary interactive and cloud operator experience.
 - This decision closes runtime custody and control-flow ambiguity only. It does not claim improved
   detection coverage, recall, precision, or forensic conclusion quality.
+- Native agent mode may recover allowlisted high-signal candidates only from successful,
+  current-run evidence calls made by the agent. This is not deterministic fallback: it issues no
+  second investigation, cannot mask provider or tool failure, remains audit-visible, and every
+  candidate still passes verifier replay and entailment before affecting the verdict.
