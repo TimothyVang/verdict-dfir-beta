@@ -25,6 +25,10 @@ Claude Code remains the canonical interactive and cloud runtime. The determinist
 the default invocation and quality floor; it is not a fallback that may silently replace a failed
 Phase 4 agent run.
 
+Phase 4 native-agent acceptance is currently limited to a single evidence file. Directory and fleet
+inputs fail closed under `--agent`; those inputs continue to use the default deterministic path when
+`--agent` is not requested.
+
 A strict Phase 4 acceptance run must satisfy all of the following:
 
 1. The native agent loop makes real calls through the product MCP servers.
@@ -42,6 +46,8 @@ The native loop must not import or add LangGraph or FastAPI.
 
 - Phase 4 has one beta-owned offline acceptance path and no dependency on a separate repository or
   agent harness.
+- Directory and fleet evidence cannot claim Phase 4 native-agent acceptance until the native loop
+  supports those scopes directly.
 - A failed native agent run fails Phase 4 rather than being masked by deterministic execution.
 - The deterministic engine remains available by default for repeatability, regression comparison,
   and the minimum quality bar.
