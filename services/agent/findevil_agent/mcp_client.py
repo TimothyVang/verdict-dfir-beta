@@ -40,6 +40,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -130,6 +131,8 @@ class StdioMcpClient:
         self._lock = threading.Lock()
         self._next_id = 1
         self._closed = False
+        self._stderr_tail: deque[str] = deque(maxlen=400)
+        self._stderr_thread: threading.Thread | None = None
 
     # --- lifecycle ---
 
@@ -157,6 +160,19 @@ class StdioMcpClient:
             )
         except FileNotFoundError as exc:
             raise McpClientError(f"could not spawn MCP server {self._command!r}: {exc}") from exc
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                self._stderr_tail.append(line.rstrip("\n"))
+        except (ValueError, OSError):
+            # Shutdown may close the pipe while the daemon thread is reading it.
+            return
 
     def close(self) -> None:
         if self._closed:
@@ -176,6 +192,12 @@ class StdioMcpClient:
             proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1)
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(Exception):  # nosec - best effort
+                    pipe.close()
 
     # --- core call ---
 

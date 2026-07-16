@@ -9,6 +9,9 @@ the integration suite covers.
 from __future__ import annotations
 
 import json
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +105,41 @@ class TestStdioMcpClientArgValidation:
         with pytest.raises(McpClientError) as exc:
             c.call_tool("evtx_query", {})
         assert "could not spawn MCP server" in str(exc.value)
+
+    def test_drains_stderr_before_reading_response(self, tmp_path: Path) -> None:
+        server = tmp_path / "stderr_flood_server.py"
+        server.write_text(
+            textwrap.dedent(
+                """
+                import json
+                import sys
+
+                request = json.loads(sys.stdin.readline())
+                for _ in range(300):
+                    sys.stderr.write("x" * 1024 + "\\n")
+                sys.stderr.flush()
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": '{"ok": true}'}]
+                    },
+                }
+                sys.stdout.write(json.dumps(response) + "\\n")
+                sys.stdout.flush()
+                """
+            )
+        )
+
+        client = StdioMcpClient(
+            [sys.executable, str(server)],
+            request_timeout_s=1.0,
+        )
+        try:
+            result = client.call_tool("test", {})
+            assert result.parsed == {"ok": True}
+        finally:
+            client.close()
 
 
 class TestParsing:
