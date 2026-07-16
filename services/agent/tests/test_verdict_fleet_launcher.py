@@ -72,7 +72,7 @@ class TestFleetMode:
         )
         out = proc.stdout + proc.stderr
         assert proc.returncode != 0, out
-        assert "--agent supports single-file evidence only" in out
+        assert "--agent supports a single EVTX file only" in out
         assert "run-whole-case-local" not in out
 
 

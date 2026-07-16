@@ -24,12 +24,6 @@ def test_evtx_agent_receives_only_evtx_tools() -> None:
     assert [tool["name"] for tool in scoped] == ["evtx_query"]
 
 
-def test_unknown_agent_evidence_keeps_available_tools() -> None:
-    tools = [{"name": "evtx_query"}, {"name": "vol_pslist"}]
-
-    assert fea._scope_agent_mcp_tools(tools, "unknown") == tools
-
-
 def test_agent_directory_is_rejected_before_mcp_startup(monkeypatch, tmp_path: Path) -> None:
     investigation = object.__new__(fea.Investigation)
     investigation.evidence = str(tmp_path)
@@ -47,9 +41,48 @@ def test_agent_directory_is_rejected_before_mcp_startup(monkeypatch, tmp_path: P
 
     with pytest.raises(
         ValueError,
-        match=r"Phase 4 native agent currently supports single-file evidence only",
+        match=r"Phase 4 native agent supports a single EVTX file only",
     ):
         investigation.run()
+
+
+@pytest.mark.parametrize(
+    ("filename", "evidence_type"),
+    [
+        ("memory.raw", "memory"),
+        ("disk.E01", "disk"),
+        ("traffic.pcap", "network"),
+        ("collection.zip", "velociraptor"),
+        ("notes.txt", "unknown"),
+    ],
+)
+def test_agent_rejects_every_non_evtx_file_before_agent_or_mcp_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    evidence_type: str,
+) -> None:
+    investigation = object.__new__(fea.Investigation)
+    investigation.evidence = f"/evidence/{filename}"
+    investigation.case_id = "case-non-evtx"
+    investigation.run_id = "run-non-evtx"
+    investigation.unattended = True
+    investigation.signer = "stub"
+    investigation.agent_mode = True
+
+    def unexpected_execution(*_args, **_kwargs):
+        raise AssertionError("agent or MCP execution started before the EVTX-only guard")
+
+    monkeypatch.setattr(fea, "StdioMcpClient", unexpected_execution)
+    monkeypatch.setattr(fea, "SshMcpClient", unexpected_execution)
+    monkeypatch.setattr(fea.Investigation, "_run_agent_pools", unexpected_execution)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Phase 4 native agent supports a single EVTX file only",
+    ):
+        investigation.run()
+
+    assert fea.detect_evidence_type(investigation.evidence) == evidence_type
 
 
 def test_agent_task_supplies_the_open_case_id() -> None:

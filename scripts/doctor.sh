@@ -123,10 +123,47 @@ optional() {
   fi
 }
 
+claude_credentials_support_inference() {
+  python3 - "${HOME}/.claude/.credentials.json" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        oauth = json.load(handle).get("claudeAiOauth", {})
+except (OSError, AttributeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+token = oauth.get("accessToken")
+scopes = oauth.get("scopes", [])
+raise SystemExit(0 if token and "user:inference" in scopes else 1)
+PY
+}
+
+if [[ -v FINDEVIL_DOCTOR_AGENT_PROVIDER ]]; then
+  DOCTOR_AGENT_PROVIDER="${FINDEVIL_DOCTOR_AGENT_PROVIDER}"
+else
+  DOCTOR_AGENT_PROVIDER="claude_cli"
+fi
+PROVIDER_VALID=1
+case "${DOCTOR_AGENT_PROVIDER}" in
+  deterministic|anthropic|claude_cli|openai|openrouter|local|dgx) ;;
+  *) PROVIDER_VALID=0 ;;
+esac
+
 if [ -z "${JSON_MODE}" ]; then
   echo "=========================================="
   echo "Find Evil! — environment doctor"
   echo "=========================================="
+fi
+
+GROUP="Agent provider"
+if [[ "${PROVIDER_VALID}" == "1" ]]; then
+  row ok "agent provider" "${DOCTOR_AGENT_PROVIDER}"
+else
+  row err "agent provider" "unsupported provider: ${DOCTOR_AGENT_PROVIDER:-<empty>}"
+  REMEDIES+=("agent provider: use deterministic, anthropic, claude_cli, openai, openrouter, local, or dgx")
+  missing_required=$((missing_required + 1))
 fi
 
 # ---------------------------------------------------------------------------
@@ -135,19 +172,38 @@ fi
 # ---------------------------------------------------------------------------
 GROUP="Claude credential"
 [ -z "${JSON_MODE}" ] && { echo; echo "${c_blu}Claude credential${c_off}"; }
-if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "deterministic" ]; then
-  row ok "credential" "skipped: not required for ${FINDEVIL_DOCTOR_AGENT_PROVIDER} execution"
-elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && command -v claude >/dev/null 2>&1; then
-  row ok "credential" "mode 1: CLAUDE_CODE_OAUTH_TOKEN + claude CLI"
-elif command -v claude >/dev/null 2>&1 && [ -d "${HOME}/.claude" ]; then
-  row ok "credential" "mode 2: interactive ~/.claude session"
-elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  row ok "credential" "mode 3: ANTHROPIC_API_KEY"
-else
-  row err "credential" "none of the 3 modes detected"
-  REMEDIES+=("credential: run 'claude setup-token', or 'claude auth login', or export ANTHROPIC_API_KEY")
-  missing_required=$((missing_required + 1))
-fi
+case "${DOCTOR_AGENT_PROVIDER}" in
+  deterministic|local|dgx|openai|openrouter)
+    row ok "credential" "skipped: not required for ${DOCTOR_AGENT_PROVIDER} execution"
+    ;;
+  anthropic)
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      row ok "credential" "ANTHROPIC_API_KEY"
+    elif claude_credentials_support_inference; then
+      row ok "credential" "supported ~/.claude/.credentials.json"
+    else
+      row err "credential" "direct anthropic needs ANTHROPIC_API_KEY or supported ~/.claude/.credentials.json"
+      REMEDIES+=("credential: export ANTHROPIC_API_KEY or log in to Claude Code to create a user:inference credential")
+      missing_required=$((missing_required + 1))
+    fi
+    ;;
+  claude_cli)
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      row ok "credential" "CLAUDE_CODE_OAUTH_TOKEN"
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      row ok "credential" "ANTHROPIC_API_KEY"
+    elif claude_credentials_support_inference; then
+      row ok "credential" "supported ~/.claude/.credentials.json"
+    else
+      row err "credential" "claude_cli needs supported Claude authentication"
+      REMEDIES+=("credential: run 'claude setup-token', 'claude auth login', or export ANTHROPIC_API_KEY")
+      missing_required=$((missing_required + 1))
+    fi
+    ;;
+  *)
+    row err "credential" "blocked by unsupported agent provider"
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Required toolchain.
@@ -160,11 +216,13 @@ require "git"     "install git from https://git-scm.com/downloads" \
         git --version
 require "unzip"   "install unzip: apt install unzip / brew install unzip / choco install unzip" \
         unzip -v
-if [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "local" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "dgx" ] || [ "${FINDEVIL_DOCTOR_AGENT_PROVIDER:-}" = "deterministic" ]; then
-  row ok "claude" "skipped: not required for ${FINDEVIL_DOCTOR_AGENT_PROVIDER} execution"
-else
+if [ "${DOCTOR_AGENT_PROVIDER}" = "claude_cli" ]; then
   require "claude"  "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code/install)" \
           claude --version
+elif [ "${PROVIDER_VALID}" = "1" ]; then
+  row ok "claude" "skipped: not required for ${DOCTOR_AGENT_PROVIDER} execution"
+else
+  row err "claude" "blocked by unsupported agent provider"
 fi
 require "cargo"   "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" \
         cargo --version

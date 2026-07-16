@@ -1459,6 +1459,17 @@ if [[ "${AGENT_PROVIDER_SET}" == "1" ]]; then
     *) fail "unsupported --agent-provider: ${AGENT_PROVIDER}" ;;
   esac
 fi
+if [[ "${AGENT_MODE}" == "1" && "${AGENT_PROVIDER_SET}" == "0" ]]; then
+  if [[ -v FINDEVIL_AGENT_PROVIDER ]]; then
+    AGENT_PROVIDER="${FINDEVIL_AGENT_PROVIDER}"
+  else
+    AGENT_PROVIDER="anthropic"
+  fi
+  case "${AGENT_PROVIDER}" in
+    anthropic|claude_cli|openai|openrouter|local|dgx) ;;
+    *) fail "unsupported agent provider: ${AGENT_PROVIDER:-<empty>}" ;;
+  esac
+fi
 [[ -n "${CASE_ID_OVERRIDE:-}" ]] && CASE_ID_OVERRIDE="$(safe_case_id "${CASE_ID_OVERRIDE}")"
 [[ -n "${RUN_SUMMARY:-}" ]] && RUN_SUMMARY="$(prepare_requested_run_summary_path "${RUN_SUMMARY}" 0)"
 if [[ "${SIFT}" == "1" ]]; then
@@ -1561,6 +1572,14 @@ fi
 [[ -n "${EVIDENCE}" || "${DRY}" == "1" ]] || fail "no evidence. Usage: scripts/verdict <evidence> | --watch (drop into evidence/)"
 ORIGINAL_EVIDENCE="${EVIDENCE}"
 
+if [[ "${AGENT_MODE}" == "1" ]]; then
+  agent_evidence_name="${EVIDENCE##*/}"
+  agent_evidence_name="${agent_evidence_name,,}"
+  if [[ "${FLEET}" == "1" || -d "${EVIDENCE}" || "${agent_evidence_name}" != *.evtx ]]; then
+    fail "--agent supports a single EVTX file only; non-EVTX, fleet, and directory evidence require the default deterministic mode"
+  fi
+fi
+
 # 0b. FLEET mode — one command for a whole multi-host case folder ------------
 # Auto-detected (a directory holding hosts/ or disks/ is the whole-case
 # layout) or forced with --fleet. Runs all three fleet stages end to end:
@@ -1569,10 +1588,6 @@ if [[ "${FLEET}" == "0" && -n "${EVIDENCE}" && -d "${EVIDENCE}" ]] \
    && [[ -d "${EVIDENCE}/hosts" || -d "${EVIDENCE}/disks" ]]; then
   FLEET=1
   ok "multi-host case folder detected (hosts/ or disks/) — fleet mode"
-fi
-
-if [[ "${AGENT_MODE}" == "1" && ( "${FLEET}" == "1" || -d "${EVIDENCE}" ) ]]; then
-  fail "--agent supports single-file evidence only; fleet and directory evidence require the default deterministic mode"
 fi
 
 run_fleet() {
@@ -1632,7 +1647,7 @@ run_fleet() {
 # 1. preflight ---------------------------------------------------------------
 log "1/4 preflight"
 if [[ "${DRY}" == "1" ]]; then
-  if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
+  if [[ "${AGENT_MODE}" == "1" ]]; then
     ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=${AGENT_PROVIDER} bash scripts/doctor.sh"
   elif [[ "${AGENT_MODE}" == "0" ]]; then
     ok "DRY-RUN: FINDEVIL_DOCTOR_AGENT_PROVIDER=deterministic bash scripts/doctor.sh"
@@ -1640,7 +1655,7 @@ if [[ "${DRY}" == "1" ]]; then
     ok "DRY-RUN: env -u FINDEVIL_DOCTOR_AGENT_PROVIDER bash scripts/doctor.sh"
   fi
 elif [[ -f scripts/doctor.sh ]]; then
-  if [[ "${AGENT_MODE}" == "1" && ( "${AGENT_PROVIDER}" == "local" || "${AGENT_PROVIDER}" == "dgx" ) ]]; then
+  if [[ "${AGENT_MODE}" == "1" ]]; then
     FINDEVIL_DOCTOR_AGENT_PROVIDER="${AGENT_PROVIDER}" bash scripts/doctor.sh \
       || fail "doctor reported missing dependencies — fix them, then re-run"
   elif [[ "${AGENT_MODE}" == "0" ]]; then

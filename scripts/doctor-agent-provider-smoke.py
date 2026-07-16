@@ -44,6 +44,9 @@ def _fixture(root: Path) -> tuple[Path, dict[str, str]]:
     )
     fake_command.chmod(0o755)
     for command in REQUIRED_COMMANDS:
+        if command == "python3":
+            (fake_bin / command).symlink_to(sys.executable)
+            continue
         (fake_bin / command).symlink_to(fake_command)
     curl = fake_bin / "curl"
     curl.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
@@ -60,6 +63,22 @@ def _fixture(root: Path) -> tuple[Path, dict[str, str]]:
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("FINDEVIL_DOCTOR_AGENT_PROVIDER", None)
     return doctor, env
+
+
+def _write_fixture_credentials(home: Path) -> None:
+    claude_dir = home / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    (claude_dir / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "fixture-token-not-real",
+                    "scopes": ["user:inference"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _run(doctor: Path, env: dict[str, str], provider: str | None) -> dict[str, object]:
@@ -174,7 +193,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         doctor, env = _fixture(Path(tmp))
 
-        for provider in ("local", "dgx", "deterministic"):
+        for provider in ("local", "dgx", "openai", "openrouter", "deterministic"):
             report = _run(doctor, env, provider)
             credential = _credential(report)
             claude = _check(report, "claude")
@@ -193,18 +212,36 @@ def main() -> int:
                 f"  [PASS] canonical {provider} launcher runs without a model or credential"
             )
 
-        for provider in (None, "anthropic", "claude_cli"):
-            report = _run(doctor, env, provider)
-            credential = _credential(report)
-            claude = _check(report, "claude")
-            assert report["ready"] is False, report
-            assert credential["status"] == "err", credential
-            assert claude["status"] == "err", claude
-            print(
-                f"  [PASS] {provider or 'default'} still requires Claude credentials and CLI"
-            )
+        _write_fixture_credentials(Path(env["HOME"]))
+        report = _run(doctor, env, "anthropic")
+        credential = _credential(report)
+        claude = _check(report, "claude")
+        assert report["ready"] is True, report
+        assert credential["status"] == "ok", credential
+        assert "credentials" in credential["detail"], credential
+        assert claude["status"] == "ok", claude
+        assert "not required" in claude["detail"], claude
+        print(
+            "  [PASS] direct anthropic accepts fixture credentials without Claude CLI"
+        )
 
-    print("\ndoctor-agent-provider-smoke: 7 passed, 0 failed")
+        report = _run(doctor, env, "claude_cli")
+        credential = _credential(report)
+        claude = _check(report, "claude")
+        assert report["ready"] is False, report
+        assert credential["status"] == "ok", credential
+        assert claude["status"] == "err", claude
+        print(
+            "  [PASS] claude_cli fails without Claude CLI despite fixture authentication"
+        )
+
+        report = _run(doctor, env, "unknown-provider")
+        assert report["ready"] is False, report
+        provider_check = _check(report, "agent provider")
+        assert provider_check["status"] == "err", provider_check
+        print("  [PASS] unknown provider fails closed")
+
+    print("\ndoctor-agent-provider-smoke: 10 passed, 0 failed")
     return 0
 
 
