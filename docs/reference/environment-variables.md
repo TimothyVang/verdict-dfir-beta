@@ -4,13 +4,15 @@
 > row names the default and which script/component reads it. Defaults are what the code ships;
 > when in doubt, grep the script.
 
-## Credentials (Amendment A1 — one of three, priority order)
+## Provider and credentials
 
 | Var | Default | Read by | Notes |
 |---|---|---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | unset | `install.sh`, `doctor.sh` | Preferred non-interactive mode (`claude setup-token`) |
-| *(interactive `~/.claude/`)* | — | `install.sh` | Dev default if a Claude Code login exists |
-| `ANTHROPIC_API_KEY` | unset | `install.sh` | Fallback mode 3 — direct metered API |
+| `FINDEVIL_AGENT_PROVIDER` | `anthropic` in `scripts/verdict --agent` | `scripts/verdict`, provider factory | Provider selection; an explicit `--agent-provider` wins. Supported: `anthropic`, `claude_cli`, `openai`, `openrouter`, `local`, `dgx`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | unset | `install.sh`, `doctor.sh` | Supported `claude_cli` authentication; not read by direct `anthropic` |
+| *(supported `~/.claude/.credentials.json`)* | — | `doctor.sh`, direct `anthropic`, Claude CLI | Must contain a non-empty OAuth access token with `user:inference` scope for direct `anthropic` preflight |
+| `ANTHROPIC_API_KEY` | unset | `install.sh`, `doctor.sh`, direct `anthropic` | Direct metered Anthropic API; no Claude CLI required |
+| `OPENAI_API_KEY` / `OPENROUTER_API_KEY` | unset | provider factory | Provider-specific cloud keys; doctor does not require Claude credentials or the Claude CLI |
 
 ## Run mode / dashboard
 

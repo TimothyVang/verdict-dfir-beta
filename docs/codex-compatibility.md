@@ -2,14 +2,14 @@
 
 Status: ACTIVE
 
-This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official general SANS judge/demo path remains the default deterministic `scripts/verdict <evidence>` launcher or an interactive Claude Code session (`claude` / `scripts/find-evil`) for manual exploration. Strict Phase 4 offline acceptance uses the allowed beta-native `scripts/verdict --agent <single-file>` loop; Codex compatibility is not that runtime and does not gate Phase 4.
+This document explains how to use Codex as a developer/operator interface for Find Evil without changing the product architecture. The official general SANS judge/demo path remains the default deterministic `scripts/verdict <evidence>` launcher or an interactive Claude Code session (`claude` / `scripts/find-evil`) for manual exploration. Strict Phase 4 offline acceptance uses the allowed beta-native `scripts/verdict --agent <single.evtx>` loop; Codex compatibility is not that runtime and does not gate Phase 4.
 
 Codex compatibility means: Codex can read the same repo instructions and, if its MCP client supports stdio servers, launch the same two narrow product MCP servers. It does not mean adding broad external MCPs.
 
 The beta-native loop does not reverse Amendment A2: it is limited to
 `services/agent/findevil_agent/agentloop/`, and the removed pre-A2 modules, LangGraph, and FastAPI
-remain forbidden. Native mode currently accepts one evidence file; directory evidence fails closed
-before MCP startup (commit `23357548`) and must use default deterministic inventory analysis. A
+remain forbidden. Native mode currently accepts one EVTX file; every non-EVTX type and directory
+fails closed before preflight or MCP startup and must use default deterministic analysis. A
 local/DGX provider changes inference location, not detection-quality claims.
 
 ## Canonical MCP Servers

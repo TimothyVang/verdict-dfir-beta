@@ -19,7 +19,7 @@ and attempts SIFT VM setup when disk evidence needs it.)
 No evidence yet? `bash scripts/fetch-fixtures.sh` stages public datasets (into `fixtures/`).
 Canonical install detail — prerequisites and how to verify — is in [INSTALL.md](INSTALL.md).
 
-### Strict Phase 4 native example (single file)
+### Strict Phase 4 native example (single EVTX file)
 
 Use an operator-supplied local OpenAI-compatible endpoint to keep evidence on premises:
 
@@ -32,11 +32,11 @@ scripts/verdict --agent --agent-provider local --agent-model <model-id> \
 This run qualifies only when it makes real product MCP calls, uses no deterministic fallback,
 rejects and audit-records lane-unadvertised calls before dispatch, emits an honestly scoped Verdict,
 and writes `manifest_verify.json` with `overall: true`. A provider/native-loop failure fails the run.
-`--agent` currently supports one evidence file; directory evidence fails closed before MCP startup
-(commit `23357548`) and must be rerun without `--agent` for deterministic inventory analysis. This
+`--agent` currently supports one EVTX file; every non-EVTX type and directory fails closed before
+preflight or MCP startup and must be rerun without `--agent` for deterministic analysis. This
 acceptance gate proves custody/control flow, not better detection from a local model. The governing
-decision is [ADR 0001](docs/adr/0001-phase-4-native-agent-runtime.md); general launcher flags remain
-in [the running guide](docs/using/running-verdict.md).
+decision is [ADR 0001](docs/adr/0001-phase-4-native-agent-runtime.md); general launcher flags remain in
+[the running guide](docs/using/running-verdict.md).
 
 **Everything below is "going deeper"** — environment choices (SIFT VM vs. local) and the full
 run-mode catalog.
@@ -136,7 +136,7 @@ scripts/verdict <evidence> [--sift] [--no-dashboard] [--unattended]
 signed verdict + report. Add `--sift` to run the DFIR tools inside the SANS SIFT VM.
 
 This is the default deterministic quality floor. Add `--agent` only for the beta-native,
-single-file provider loop described above; it is not a directory/fleet mode.
+single-EVTX provider loop described above; it is not a non-EVTX, directory, or fleet mode.
 
 Examples:
 

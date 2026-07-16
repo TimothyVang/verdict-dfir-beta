@@ -39,8 +39,9 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
    Claude Code credentials file. The adapter does not read `CLAUDE_CODE_OAUTH_TOKEN`.
 2. Claude CLI/interactive: a logged-in Claude Code session or `CLAUDE_CODE_OAUTH_TOKEN` (from
    `claude setup-token`).
-3. On-prem: `local` defaults to Ollama at `http://localhost:11434/v1`; only `dgx` requires
-   `FINDEVIL_AGENT_BASE_URL`. Both require an explicit model.
+3. OpenAI-compatible: `openai` and `openrouter` use their provider-specific API keys; `local`
+   defaults to Ollama at `http://localhost:11434/v1`; only `dgx` requires
+   `FINDEVIL_AGENT_BASE_URL`. All require an explicit model.
 
 The on-prem providers require no Claude credential or evidence-egress acknowledgement. The default
 deterministic engine also requires no LLM credential.
@@ -87,9 +88,11 @@ bash scripts/doctor.sh          # human-readable, color table + remedies
 bash scripts/doctor.sh --json   # machine-readable: {"ready":true,...}
 ```
 
-`ready:true` (and no red required rows) means the toolchain, both MCP servers, and the default Claude
-credential check are present. A missing Claude credential is relevant only to Claude-backed runs;
-validate the configured endpoint separately for `local`/`dgx`. DFIR-tool and reporting rows are **advisory** — a missing optional binary
+`ready:true` (and no red required rows) means the toolchain, both MCP servers, and the selected
+provider's preflight checks are present. Direct `anthropic` accepts `ANTHROPIC_API_KEY` or a supported
+Claude Code credentials file without the Claude CLI; `claude_cli` requires the CLI plus supported
+authentication. OpenAI-compatible providers do not require Claude credentials or the Claude CLI;
+their provider factories enforce their own API keys and endpoints. DFIR-tool and reporting rows are **advisory** — a missing optional binary
 surfaces at runtime as `BinaryNotFound -32602` and the agent pivots; it does not block a run.
 Failure modes and fixes: [docs/troubleshooting.md](docs/troubleshooting.md).
 
@@ -115,8 +118,9 @@ You can also drive it interactively — open `claude` (or `scripts/find-evil`) i
 `investigate <path>` — or use the turnkey `/verdict <path>` skill, which also bootstraps n8n and the
 SIFT VM. See [docs/using/running-verdict.md](docs/using/running-verdict.md).
 
-Strict Phase 4 native acceptance is single-file only. Directory evidence passed with `--agent`
-fails closed before MCP startup; use default deterministic `scripts/verdict <directory>` instead.
+Strict Phase 4 native acceptance is limited to one EVTX file. Every non-EVTX type and directory
+passed with `--agent` fails closed before preflight or MCP startup; use default deterministic
+`scripts/verdict <evidence>` instead.
 See [QUICKSTART.md](QUICKSTART.md) for the command and acceptance checklist.
 
 ---

@@ -44,12 +44,12 @@ default model and require `--agent-model` or `FINDEVIL_AGENT_MODEL`.
 3. `ANTHROPIC_API_KEY` env var — direct metered API.
 
 The direct `anthropic` adapter accepts mode 3 or the scoped OAuth token in the logged-in Claude Code
-credentials file (mode 2); it does **not** read `CLAUDE_CODE_OAUTH_TOKEN`. It requires
-`--acknowledge-evidence-egress`. Interactive Claude Code and `claude_cli` require a logged-in CLI
-environment; `claude_cli` also requires egress acknowledgement. The deterministic engine needs no
-LLM credential. On-prem `local`/`dgx` needs an endpoint and explicit model, not a Claude credential
-or egress acknowledgement. Cloud `openai`/`openrouter` use their provider API keys and require the
-egress flag.
+credentials file (mode 2); it does **not** read `CLAUDE_CODE_OAUTH_TOKEN` or require the Claude CLI.
+It requires `--acknowledge-evidence-egress`. Interactive Claude Code and `claude_cli` require the CLI
+plus supported authentication; `claude_cli` also requires egress acknowledgement. The deterministic
+engine needs no LLM credential. `local`/`dgx` and cloud `openai`/`openrouter` do not require Claude
+credentials or the Claude CLI during preflight; their provider factories enforce endpoint and API-key
+requirements. `local`/`dgx` do not require egress acknowledgement; `openai`/`openrouter` do.
 
 ---
 

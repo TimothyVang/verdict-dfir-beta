@@ -17,7 +17,7 @@ know DFIR and AI than grind it solo. If that's you: welcome, and thank you.
 
 VERDICT is a **digital-forensics & incident-response (DFIR) agent with three runtime paths**: the
 default deterministic `scripts/verdict` quality floor, an allowed beta-native `--agent` loop for
-strict single-file Phase 4 offline acceptance, and
+strict single-EVTX Phase 4 offline acceptance, and
 [Claude Code](https://claude.com/claude-code) as the canonical interactive/cloud runtime. There is
 no separate app server. You point it at supported evidence and it:
 
@@ -135,8 +135,8 @@ good it is. Full list in [`CONTRIBUTING.md`](../CONTRIBUTING.md) / `CLAUDE.md`:
 
 The current official general judge/demo paths remain default `scripts/verdict <evidence>` and an
 interactive Claude Code session. Strict Phase 4 offline acceptance separately uses `--agent` on one
-evidence file. Directory evidence fails closed in native mode and uses the deterministic path; none
-of these runtime distinctions claim improved local-model detection.
+EVTX file. Every non-EVTX type and directory fails closed in native mode and uses the deterministic
+path; none of these runtime distinctions claim improved local-model detection.
 
 ---
 

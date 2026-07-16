@@ -5,7 +5,7 @@
 VERDICT has **one launcher**: `scripts/verdict <evidence>`. Without `--agent`, it runs the default
 deterministic quality floor and accepts a single Observable or a mixed case directory. With
 `--agent`, it runs the beta-native provider loop used for strict Phase 4 acceptance and currently
-accepts one evidence file only.
+accepts one EVTX file only.
 
 ```
 preflight (doctor) → build the Rust MCP server if needed → investigate via the typed
@@ -70,7 +70,7 @@ Every flag the launcher actually parses:
 | `--parallel` / `--no-parallel` | Run independent tool calls (verify re-runs + disk-artifact parses) concurrently. **On by default**; `--no-parallel` (alias `--sequential`) forces serial. Audit appends stay serialized, so the Verdict + hash-chained log are identical to serial. |
 | `--workers N` | Max concurrent lanes for `--parallel` (default 2). Each lane is its own findevil-mcp process, so a higher count can over-subscribe a RAM-constrained host (e.g. the SIFT VM) and corrupt registry hive loads; raise only after a parallel-vs-serial parity check. |
 | `--run-summary <path>` | Also write a machine-readable JSON pointer/QA file to `<path>` (see §6). |
-| `--agent` | Replace deterministic Pool A/B synthesis with the beta-native LLM tool loop. Current strict Phase 4 scope is one evidence file; directories fail closed before MCP startup. |
+| `--agent` | Replace deterministic Pool A/B synthesis with the beta-native LLM tool loop. Current strict Phase 4 scope is one EVTX file; every non-EVTX type and directory fails closed before preflight or MCP startup. |
 | `--agent-provider NAME` | Agent provider: `anthropic`, `claude_cli`, `openai`, `openrouter`, `local`, or `dgx`. Selection precedence is this flag, then `FINDEVIL_AGENT_PROVIDER`, then `anthropic`. |
 | `--agent-model ID` | Model ID. Selection precedence is this flag, then `FINDEVIL_AGENT_MODEL`, then the provider default. Defaults exist only for `anthropic` (`claude-sonnet-4-6`) and `claude_cli` (`claude-opus-4-8`); every OpenAI-compatible provider requires an explicit model. |
 | `--agent-max-steps N` | Maximum provider-to-tool rounds per Pool A/B pod (default: 40). |
@@ -117,8 +117,9 @@ scripts/verdict --agent --agent-provider anthropic \
 ```
 
 The Anthropic provider resolves `ANTHROPIC_API_KEY` first, then a usable OAuth token from the local
-Claude Code credentials file. It does not read `CLAUDE_CODE_OAUTH_TOKEN`. The separate `claude_cli`
-provider shells out to logged-in `claude -p`, defaults to
+Claude Code credentials file. It does not read `CLAUDE_CODE_OAUTH_TOKEN` and does not require the
+Claude CLI. The separate `claude_cli` provider requires the CLI plus supported authentication,
+shells out to `claude -p`, defaults to
 `claude-opus-4-8`, still sends evidence to Anthropic, and therefore also requires the egress flag.
 
 OpenAI-compatible providers require an explicit model. `openai` uses `OPENAI_API_KEY`;
@@ -132,14 +133,18 @@ scripts/verdict --agent --agent-provider local --agent-model <model-id> evidence
 ```
 
 Provider and model can also come from `FINDEVIL_AGENT_PROVIDER` and `FINDEVIL_AGENT_MODEL`; explicit
-flags win. `FINDEVIL_AGENT_BASE_URL` overrides the OpenAI-compatible endpoint.
+flags win. Provider preflight uses that same effective selection. `openai`, `openrouter`, `local`,
+and `dgx` do not require Claude credentials or the Claude CLI; each provider factory still enforces
+its own API-key or endpoint requirements. `FINDEVIL_AGENT_BASE_URL` overrides the OpenAI-compatible
+endpoint.
 
 A strict Phase 4 run passes only when it makes real product MCP calls, uses no deterministic
 fallback, rejects and audit-records lane-unadvertised calls before dispatch, emits an honestly
 scoped Verdict, and writes `manifest_verify.json` with `overall: true`. Provider/native-loop failure
-fails the run. Directory evidence fails closed before MCP startup; rerun it without `--agent` for
-deterministic inventory analysis. These controls establish custody and control flow, not detection
-quality. See [`../adr/0001-phase-4-native-agent-runtime.md`](../adr/0001-phase-4-native-agent-runtime.md).
+fails the run. Every non-EVTX type and directory fails closed before preflight or MCP startup; rerun
+it without `--agent` for deterministic analysis. These controls establish custody and control flow,
+not detection quality. See
+[`../adr/0001-phase-4-native-agent-runtime.md`](../adr/0001-phase-4-native-agent-runtime.md).
 
 ---
 

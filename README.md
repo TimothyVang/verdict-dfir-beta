@@ -51,7 +51,7 @@ bounded, and what was not examined is not the same as absent.
 
 The two tool servers are **standard MCP** — any MCP-capable agent can connect to them. VERDICT has
 three supported runtime paths: `scripts/verdict <evidence>` runs the default deterministic quality
-floor; `scripts/verdict --agent <single-file>` runs the optional beta-native provider loop used for
+floor; `scripts/verdict --agent <single.evtx>` runs the optional beta-native provider loop used for
 strict Phase 4 offline acceptance; and [Claude Code](https://claude.com/claude-code) remains the
 canonical interactive/cloud runtime (`claude` / `scripts/find-evil`). All three converge on the same
 verifier, judge, correlator, and signed custody spine. Replay reproduces the operation; it does not
@@ -109,7 +109,7 @@ Choose credentials for the runtime you use:
   engine. Optional Claude-backed post-processing still requires its own credential.
 
 Local/DGX availability changes where inference runs, not the evidence coverage or detection-quality
-claims. See [QUICKSTART.md](QUICKSTART.md) for the strict single-file Phase 4 example.
+claims. See [QUICKSTART.md](QUICKSTART.md) for the strict single-EVTX Phase 4 example.
 
 Point it at supported evidence — a memory image, EVTX log, disk image (`.E01` / `.dd`), packet
 capture, Velociraptor collection, or a whole multi-host case folder. Output lands in
@@ -117,9 +117,9 @@ capture, Velociraptor collection, or a whole multi-host case folder. Output land
 broad clearance claim.
 
 Prefer Claude Code interactively? Run `claude` in the repo and type `/verdict <evidence>` or
-`investigate <evidence>`. For the optional Phase 4 native loop, pass one evidence file to
-`scripts/verdict --agent`; directory evidence fails closed and must use the default deterministic
-inventory path instead.
+`investigate <evidence>`. For the optional Phase 4 native loop, pass one EVTX file to
+`scripts/verdict --agent`; every non-EVTX type and directory fails closed and must use the default
+deterministic path instead.
 
 ## Get test evidence
 
@@ -513,17 +513,17 @@ network + Velociraptor):
 
 ```bash
 scripts/verdict <path-to-evidence>
-# Optional strict Phase 4 native loop (single evidence file only):
-scripts/verdict --agent --agent-provider local --agent-model <model-id> <path-to-evidence-file>
+# Optional strict Phase 4 native loop (single EVTX file only):
+scripts/verdict --agent --agent-provider local --agent-model <model-id> <path-to-evidence.evtx>
 #   --sift          run the DFIR tools inside the SANS SIFT VM (default: local host)
 #   --watch         watch evidence/ and investigate on the next drop
 #   --no-dashboard  do not auto-open the browser
 ```
 
-`--agent` currently accepts one evidence file. Any directory, including a fleet root selected by
-explicit `--fleet` or auto-detection, fails closed in the launcher before MCP startup or deterministic
-fleet execution; run directory/fleet evidence without `--agent`. The Phase 4 gate concerns real MCP
-custody and control flow, not improved local-model detection.
+`--agent` currently accepts one EVTX file. Every non-EVTX type and any directory, including a fleet
+root selected by explicit `--fleet` or auto-detection, fails closed in the launcher before preflight
+or MCP startup; run all other evidence without `--agent`. The Phase 4 gate concerns real MCP custody
+and control flow, not improved local-model detection.
 
 The dashboard at `http://localhost:3000` streams the run live. Evidence files are never committed
 (they are gitignored), so a fresh clone ships with none — stage public datasets with
