@@ -8341,44 +8341,45 @@ def usn_rows_to_findings(
     """Detect an archive staged then deleted in the USN journal (T1560.001).
 
     An archive filename showing both a create (FILE_CREATE / DATA_EXTEND) and a
-    later FILE_DELETE is the collect-then-clean-up pattern: data archived for
-    exfiltration (T1560.001) plus indicator removal via deletion (T1070.004).
+    later FILE_DELETE is an archive-staging and cleanup pattern (T1560.001 plus
+    T1070.004). The USN records do not establish archive contents or movement.
     Emitted once as INFERRED (a two-record correlation over one artifact).
     """
     findings: list[dict[str, Any]] = []
-    by_name: dict[str, set[str]] = {}
+    created_names: set[str] = set()
+    staged_deleted_name: str | None = None
     for row in rows:
         name = str(row.get("filename") or "")
         if not name.lower().endswith(_ARCHIVE_EXTS):
             continue
-        flags = by_name.setdefault(name, set())
-        for flag in row.get("reason_flags") or []:
-            flags.add(str(flag).upper())
-    for name, flags in by_name.items():
-        created = bool(flags & {"FILE_CREATE", "DATA_EXTEND"})
-        deleted = "FILE_DELETE" in flags
-        if created and deleted:
-            findings.append(
-                {
-                    "case_id": case_id,
-                    "finding_id": "f-B-usn-archive-staged-deleted",
-                    "tool_call_id": tool_call_id,
-                    "artifact_path": artifact_path,
-                    "description": (
-                        f"USN journal shows archive '{name}' created and then "
-                        "deleted (FILE_CREATE/DATA_EXTEND followed by FILE_DELETE); "
-                        "a collect-then-clean-up staging pattern consistent with "
-                        "data archived for exfiltration (T1560.001) and indicator "
-                        "removal via file deletion (T1070.004). Corroborate with the "
-                        "archiver execution and any exfil channel."
-                    ),
-                    "confidence": "INFERRED",
-                    "pool_origin": "B",
-                    "mitre_technique": "T1560.001",
-                    "derived_from": [tool_call_id],
-                }
-            )
+        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
+        if "FILE_DELETE" in flags and name in created_names:
+            staged_deleted_name = name
             break
+        if flags & {"FILE_CREATE", "DATA_EXTEND"}:
+            created_names.add(name)
+    if staged_deleted_name:
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": "f-B-usn-archive-staged-deleted",
+                "tool_call_id": tool_call_id,
+                "artifact_path": artifact_path,
+                "description": (
+                    f"USN journal shows archive '{staged_deleted_name}' created and then "
+                    "deleted (FILE_CREATE/DATA_EXTEND followed by FILE_DELETE); "
+                    "a collect-then-clean-up archive staging pattern (T1560.001) "
+                    "with indicator removal via file deletion (T1070.004). These "
+                    "records do not establish archive contents or data movement. "
+                    "Corroborate with archiver execution and an independently "
+                    "observed transfer channel."
+                ),
+                "confidence": "INFERRED",
+                "pool_origin": "B",
+                "mitre_technique": "T1560.001",
+                "derived_from": [tool_call_id],
+            }
+        )
     return findings
 
 
