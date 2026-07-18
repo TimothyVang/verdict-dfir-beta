@@ -73,3 +73,58 @@ class TestPrioritizeRegistryHives:
 
     def test_empty_input_yields_empty(self) -> None:
         assert fea._prioritize_registry_hives([]) == []
+
+
+class TestMachineHivePriorityNotStarved:
+    """The SYSTEM hive (USB / MountedDevices carrier) must never be starved.
+
+    On a multi-user disk the per-user NTUSER.DAT / UsrClass.dat hives repeat once
+    per profile and can consume the per-run registry_query budget (and the [:20]
+    hive cap) before the single SYSTEM hive is reached — silently losing the USB
+    device-insertion history (``Enum\\USBSTOR``) and ``MountedDevices`` lane. The
+    machine hives (SYSTEM / SOFTWARE / SAM) are ranked ahead of the per-user hives
+    so that lane stays covered on any image regardless of profile count.
+    """
+
+    def test_system_hive_pulled_ahead_of_many_user_hives(self) -> None:
+        # Seven per-user NTUSER hives listed BEFORE the SYSTEM hive would, at 9
+        # keys each, exhaust the 60-call budget before SYSTEM is ever queried.
+        user_hives = [_entry(f"registry/Users/user{i}/NTUSER.DAT") for i in range(7)]
+        system = _entry("registry/Windows/System32/config/SYSTEM")
+        ordered = fea._prioritize_registry_hives([*user_hives, system])
+        # SYSTEM is now first, so its USBSTOR / MountedDevices keys are queried
+        # well within budget.
+        assert ordered[0]["path"] == "registry/Windows/System32/config/SYSTEM"
+
+    def test_machine_hives_lead_user_hives(self) -> None:
+        ntuser = _entry("registry/Users/bob/NTUSER.DAT")
+        usrclass = _entry("registry/Users/bob/AppData/Local/Microsoft/Windows/UsrClass.dat")
+        system = _entry("registry/Windows/System32/config/SYSTEM")
+        software = _entry("registry/Windows/System32/config/SOFTWARE")
+        sam = _entry("registry/Windows/System32/config/SAM")
+        ordered = fea._prioritize_registry_hives([ntuser, usrclass, software, sam, system])
+        names = [Path(e["path"]).name.lower() for e in ordered]
+        # Machine hives (system/software/sam) precede per-user hives.
+        assert names.index("system") < names.index("ntuser.dat")
+        assert names.index("software") < names.index("ntuser.dat")
+        assert names.index("sam") < names.index("usrclass.dat")
+        # SYSTEM (the USB/MountedDevices carrier) is first among machine hives.
+        assert names[0] == "system"
+
+    def test_live_system_still_beats_backup_system_with_user_hives_present(self) -> None:
+        backup_system = _entry("registry/Windows/System32/config/RegBack/SYSTEM")
+        ntuser = _entry("registry/Users/bob/NTUSER.DAT")
+        live_system = _entry("registry/Windows/System32/config/SYSTEM")
+        ordered = fea._prioritize_registry_hives([backup_system, ntuser, live_system])
+        paths = [e["path"] for e in ordered]
+        # Live SYSTEM leads; the backup copy is de-prioritized to the tail.
+        assert paths[0] == "registry/Windows/System32/config/SYSTEM"
+        assert paths[-1] == "registry/Windows/System32/config/RegBack/SYSTEM"
+
+    def test_machine_priority_within_class_is_stable(self) -> None:
+        # Two live SYSTEM hives (unusual, but must not be reordered relative to
+        # each other) keep input order — the sort is stable within a rank.
+        a = _entry("registry/Windows/System32/config/SYSTEM")
+        b = _entry("registry/mnt/other/SYSTEM")
+        ordered = fea._prioritize_registry_hives([a, b])
+        assert [e["path"] for e in ordered] == [a["path"], b["path"]]

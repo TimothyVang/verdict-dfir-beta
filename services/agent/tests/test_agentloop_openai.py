@@ -22,6 +22,7 @@ def test_rejects_non_http_base_url() -> None:
     with pytest.raises(ValueError, match="http"):
         OpenAIProvider(model="m", base_url="file:///etc/passwd")
 
+
 _TOOLS = [
     {
         "type": "function",

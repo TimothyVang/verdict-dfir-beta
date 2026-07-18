@@ -336,6 +336,38 @@ def _pick_chosen(a: Finding | None, b: Finding | None) -> tuple[Finding | None, 
     return None, "?"
 
 
+def compute_coverage_discounted_score(
+    confidence_tiers: Iterable[str],
+    applicable_classes: int,
+    consulted_classes: int,
+) -> float:
+    """Case-level confidence in [0, 1] that a thin investigation cannot inflate.
+
+    ``score = mean(CONFIDENCE_VALUE[tier]) * (consulted / applicable)``
+
+    The per-finding confidence mean is discounted by the fraction of *applicable*
+    artifact classes that were actually *consulted*, so a single CONFIRMED finding
+    drawn from one of five available classes scores 0.2, not 1.0 — breadth of
+    investigation, not just the strength of one claim, bounds the headline number.
+
+    ``applicable_classes`` must be the classes available for *this* evidence type
+    (available and not unsupported), supplied by the caller — never a fixed count
+    of all classes, which would permanently cap a complete single-artifact run.
+    Empty findings or zero applicable classes score 0.0. Pure: reads only the
+    confidence tiers, mutates nothing.
+
+    A bare-host mirror of this formula lives in ``scripts/find_evil_auto.py``
+    (``_coverage_discounted_confidence``) because that 3.10 engine cannot import
+    this 3.11 package; keep the two in sync.
+    """
+    tiers = list(confidence_tiers)
+    if applicable_classes <= 0 or not tiers:
+        return 0.0
+    coverage_ratio = min(1.0, consulted_classes / applicable_classes)
+    finding_score = sum(CONFIDENCE_VALUE.get(t, 0.0) for t in tiers) / len(tiers)
+    return round(finding_score * coverage_ratio, 4)
+
+
 __all__ = [
     "CONFIDENCE_VALUE",
     "CORROBORATION_BONUS",
@@ -345,5 +377,6 @@ __all__ = [
     "JudgeBudgetExceeded",
     "MergedFinding",
     "PoolStats",
+    "compute_coverage_discounted_score",
     "judge_findings",
 ]

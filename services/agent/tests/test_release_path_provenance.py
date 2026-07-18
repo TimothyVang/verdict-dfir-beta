@@ -128,3 +128,45 @@ def test_verdict_artifact_record_has_no_home_leak() -> None:
     assert verdict_artifact_record["path"] == "verdict.json"
     assert packet_attestation["verdict_artifact_path"] == "verdict.json"
     assert cryptographic_attestation["manifest_path"] == "run.manifest.json"
+
+
+def test_relativize_repo_paths_strips_repo_prefix_recursively() -> None:
+    # Arrange: the evidence-provenance block as the engine assembles it for
+    # verdict.json, with the absolute repo-root prefix the older _release_path
+    # path never covered (evidence_inventory / coverage_manifest / evidence_path).
+    base = "/home/analyst/Desktop/proj/dev-verdict-github"
+    verdict_obj = {
+        "evidence_path": f"{base}/fixtures/synthetic-benign",
+        "evidence_inventory": {
+            "root_path": f"{base}/fixtures/synthetic-benign",
+            "entries": [{"path": f"{base}/fixtures/synthetic-benign/README.md"}],
+        },
+        "note": "a description with no path",
+        "count": 3,
+    }
+
+    # Act
+    out = fea._relativize_repo_paths(verdict_obj, base)
+
+    # Assert: every under-base path is now repo-relative; no /home leak remains.
+    assert not _contains_home_or_absolute(out)
+    assert out["evidence_path"] == "fixtures/synthetic-benign"
+    assert out["evidence_inventory"]["root_path"] == "fixtures/synthetic-benign"
+    assert out["evidence_inventory"]["entries"][0]["path"] == "fixtures/synthetic-benign/README.md"
+    # Non-path strings and scalars are untouched.
+    assert out["note"] == "a description with no path"
+    assert out["count"] == 3
+
+
+def test_relativize_repo_paths_leaves_outside_paths_and_is_pure() -> None:
+    base = "/home/analyst/Desktop/proj/dev-verdict-github"
+    obj = {"outside": "/var/lib/other/x", "rel": "already/relative", "n": None}
+
+    out = fea._relativize_repo_paths(obj, base)
+
+    # Paths not under base are preserved verbatim (only the machine repo prefix goes).
+    assert out["outside"] == "/var/lib/other/x"
+    assert out["rel"] == "already/relative"
+    assert out["n"] is None
+    # Pure: the input is not mutated.
+    assert obj["outside"] == "/var/lib/other/x"

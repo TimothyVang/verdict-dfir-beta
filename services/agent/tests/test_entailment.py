@@ -6,6 +6,10 @@ re-run tool output, confirm each asserted value is actually present. This is
 what catches a "misread of real data laundered through a valid citation."
 """
 
+import hashlib
+import importlib.util
+from pathlib import Path
+
 from findevil_agent.entailment import (
     EntailmentResult,
     MatchedValue,
@@ -14,6 +18,22 @@ from findevil_agent.entailment import (
     recheck_entailment_slice,
 )
 from findevil_agent.events import AssertedValue
+
+# services/agent/tests/ -> repo root is parents[3].
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_HELD_OUT = _REPO_ROOT / "goldens" / "fact-fidelity" / "held-out-findings.json"
+
+
+def _load_rate_harness():
+    """Import the standalone calibration harness by path (it is a CLI script,
+    not an installed module — same loader pattern the smoke scripts use)."""
+    spec = importlib.util.spec_from_file_location(
+        "fact_fidelity_rate", _REPO_ROOT / "scripts" / "fact-fidelity-rate.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestOfflineSlice:
@@ -225,6 +245,87 @@ class TestContainsMatch:
         assert check_entailment(asserted, output).passed is True
 
 
+class TestContainsTokenBoundary:
+    """Regression for incidental-substring laundering. A ``contains`` anchor must
+    align to TOKEN boundaries: an incidental fragment of a larger word must NOT
+    match, while a real whole-token hit MUST still match. The transform stays
+    deterministic so the sealed-slice recheck reproduces the same decision."""
+
+    def test_incidental_substring_does_not_match(self) -> None:
+        # The canonical hole: "cain" laundered through "mccain".
+        asserted = [AssertedValue(path="user", expected="cain", match="contains")]
+        assert check_entailment(asserted, {"user": "mccain"}).passed is False
+
+    def test_whole_token_still_matches(self) -> None:
+        # The same anchor against a standalone token must still entail.
+        asserted = [AssertedValue(path="user", expected="cain", match="contains")]
+        assert check_entailment(asserted, {"user": "John Cain logged in"}).passed is True
+
+    def test_token_glued_on_the_right_edge_does_not_match(self) -> None:
+        # "evil" must not launder through "evilcorp.exe".
+        asserted = [AssertedValue(path="image", expected="evil", match="contains")]
+        assert check_entailment(asserted, {"image": "C:\\evilcorp.exe"}).passed is False
+
+    def test_token_bounded_by_path_separator_matches(self) -> None:
+        asserted = [AssertedValue(path="image", expected="evil.exe", match="contains")]
+        assert check_entailment(asserted, {"image": "C:\\Users\\bob\\evil.exe"}).passed is True
+
+    def test_multi_token_phrase_with_internal_separators_matches(self) -> None:
+        asserted = [AssertedValue(path="cmd", expected="certutil.exe -urlcache", match="contains")]
+        out = {"cmd": "C:\\Windows\\certutil.exe -urlcache -split"}
+        assert check_entailment(asserted, out).passed is True
+
+    def test_phrase_not_assembled_across_a_newline(self) -> None:
+        # Per-line matching: "alpha beta" must not match when the two tokens sit
+        # on different lines of the archived raw output.
+        asserted = [AssertedValue(path="blob", expected="alpha beta", match="contains")]
+        assert check_entailment(asserted, {"blob": "...alpha\nbeta..."}).passed is False
+
+    def test_phrase_matches_within_a_single_line_of_a_multiline_blob(self) -> None:
+        asserted = [AssertedValue(path="blob", expected="alpha beta", match="contains")]
+        out = {"blob": "first line\nx alpha beta y\nlast line"}
+        assert check_entailment(asserted, out).passed is True
+
+    def test_empty_needle_keeps_field_present_semantics(self) -> None:
+        asserted = [AssertedValue(path="note", expected="", match="contains")]
+        assert check_entailment(asserted, {"note": "anything"}).passed is True
+
+    def test_short_needle_below_min_token_len_keeps_plain_containment(self) -> None:
+        # A single-character fragment carries no laundering-prone token, so the
+        # legacy plain-containment behavior is preserved (no false rejection).
+        asserted = [AssertedValue(path="flag", expected="x", match="contains")]
+        assert check_entailment(asserted, {"flag": "axb"}).passed is True
+
+    def test_sealed_token_bounded_slice_rechecks_true(self) -> None:
+        # Determinism: a confirmed token-bounded contains seal still rechecks.
+        asserted = [AssertedValue(path="image", expected="evil.exe", match="contains")]
+        sl = entailment_slice(check_entailment(asserted, {"image": "C:\\x\\evil.exe"}))
+        assert sl["passed"] is True
+        assert recheck_entailment_slice(sl) is True
+
+
+class TestRecordTokenBoundary:
+    """The co-location matcher shares the token-boundary rule: a per-field
+    constraint must hit a whole token, not an incidental fragment."""
+
+    def test_incidental_substring_in_a_field_does_not_satisfy_record(self) -> None:
+        av = AssertedValue(
+            path="entries[*]",
+            expected='{"user": "cain"}',
+            match="record",
+        )
+        assert check_entailment([av], {"entries": [{"user": "mccain"}]}).passed is False
+
+    def test_whole_token_field_satisfies_record(self) -> None:
+        av = AssertedValue(
+            path="entries[*]",
+            expected='{"name": "Updater", "data_str": "evil.exe"}',
+            match="record",
+        )
+        out = {"entries": [{"name": "Updater", "data_str": "C:\\x\\evil.exe"}]}
+        assert check_entailment([av], out).passed is True
+
+
 class TestIntMatch:
     def test_decimal_int_matches(self) -> None:
         asserted = [AssertedValue(path="run_count", expected="8", match="int")]
@@ -279,3 +380,67 @@ class TestMultipleAssertions:
     def test_empty_assertions_passes_vacuously(self) -> None:
         # No structured assertions -> nothing to check (backward compatible).
         assert check_entailment([], {"anything": 1}).passed is True
+
+
+class TestAbsentIocNegativeControl:
+    """Negative control: a synthetic indicator (cryptographic hash / IP address)
+    that appears in NO cited span CANNOT reach GROUNDED. An identity anchor has
+    no legitimate near-miss reading, so its absence must reject outright — this
+    is the floor the adversarial held-out validation rests on."""
+
+    def test_absent_hash_cannot_ground(self) -> None:
+        asserted = [AssertedValue(path="rows[*].sha256", expected="d" * 64)]
+        output = {"rows": [{"sha256": "a" * 64}, {"sha256": "b" * 64}]}
+        result = check_entailment(asserted, output)
+        assert result.passed is False
+        assert "rows[*].sha256" in result.identity_failures
+
+    def test_absent_ip_cannot_ground(self) -> None:
+        # 203.0.113.0/24 (TEST-NET-3) absent from a 198.51.100.0/24 output.
+        asserted = [AssertedValue(path="conns[*].dst", expected="203.0.113.77")]
+        output = {"conns": [{"dst": "198.51.100.10"}]}
+        result = check_entailment(asserted, output)
+        assert result.passed is False
+        assert "conns[*].dst" in result.identity_failures
+
+
+class TestHeldOutAdversarialValidation:
+    """Blind red-team validation of the entailment detector against a committed,
+    frozen held-out fixture set scored by ``scripts/fact-fidelity-rate.py``. The
+    fixtures are committed (not generated at run time) so the result is
+    deterministic; the harness records the detector source hash so a silent edit
+    to the detector forces the validation to be re-run."""
+
+    def test_held_out_fixtures_are_committed(self) -> None:
+        assert _HELD_OUT.is_file(), "held-out adversarial fixtures must be committed"
+
+    def test_recorded_detector_sha256_matches_module(self) -> None:
+        mod = _load_rate_harness()
+        from findevil_agent import entailment
+
+        expected = hashlib.sha256(Path(entailment.__file__).read_bytes()).hexdigest()
+        assert mod.detector_sha256() == expected
+
+    def test_harness_emits_two_distinct_arm_scores(self) -> None:
+        mod = _load_rate_harness()
+        report = mod.score(mod.load_fixtures(_HELD_OUT))
+        assert {"calibration", "held_out"} <= set(report["arms"])
+        for arm in ("calibration", "held_out"):
+            metrics = report["arms"][arm]
+            assert "precision" in metrics and "recall" in metrics
+            assert metrics["total"] > 0
+
+    def test_no_held_out_hallucination_reaches_grounded(self) -> None:
+        mod = _load_rate_harness()
+        report = mod.score(mod.load_fixtures(_HELD_OUT))
+        held = report["arms"]["held_out"]
+        # Every in-scope hallucinated finding in the blind set is caught.
+        assert held["false_negatives"] == 0
+        assert held["recall"] == 1.0
+
+    def test_no_genuine_finding_is_falsely_rejected(self) -> None:
+        mod = _load_rate_harness()
+        report = mod.score(mod.load_fixtures(_HELD_OUT))
+        held = report["arms"]["held_out"]
+        assert held["false_positives"] == 0
+        assert held["precision"] == 1.0

@@ -37,6 +37,24 @@ def _case_home(env: os._Environ[str] | dict[str, str] | None) -> Path:
     return resolve_case_home(env=env)
 
 
+def _repo_root(env: os._Environ[str] | dict[str, str] | None) -> Path | None:
+    """The repo root, mirroring the engine's repo-root relativization base.
+
+    Prefers ``$PROJECT_ROOT`` (exported by ``scripts/lib/project-env.sh`` for every
+    run) and falls back to deriving it from this file's location
+    (``services/agent/findevil_agent/case_paths.py`` -> repo root). Returns None if
+    neither resolves.
+    """
+    source = env if env is not None else os.environ
+    project_root = (source.get("PROJECT_ROOT") or "").strip()
+    if project_root:
+        return Path(project_root)
+    try:
+        return Path(__file__).resolve().parents[3]
+    except IndexError:
+        return None
+
+
 def relativize_extracted_path(
     path: str, *, env: os._Environ[str] | dict[str, str] | None = None
 ) -> str:
@@ -78,13 +96,24 @@ def resolve_extracted_path(
         return path
     if os.path.isabs(path):
         return path
-    if not path.startswith(_CASE_PREFIX):
-        return path
-    try:
-        base = _case_home(env)
-    except RuntimeError:
-        return path
-    return str(base / path)
+    if path.startswith(_CASE_PREFIX):
+        try:
+            base = _case_home(env)
+        except RuntimeError:
+            return path
+        return str(base / path)
+    # Repo-relative evidence path (e.g. ``evidence/<image>.dd``) recorded by the
+    # engine's repo-root relativizer. Re-absolutize under the repo root so replay
+    # finds the evidence — the inverse of that record-side transform, keeping
+    # output_sha256 parity for cases whose findings cite the evidence file itself
+    # (memory/EVTX/PCAP). Existence-guarded so an arbitrary relative string (or a
+    # fresh clone without the evidence) is left verbatim rather than mangled.
+    root = _repo_root(env)
+    if root is not None:
+        candidate = root / path
+        if candidate.exists():
+            return str(candidate)
+    return path
 
 
 def rewrite_arguments_for_replay(

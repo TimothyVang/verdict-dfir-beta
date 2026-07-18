@@ -139,3 +139,45 @@ class TestReplayResolvesRelativePath:
         # And the tool was actually handed the resolved ABSOLUTE path.
         _called_tool, called_args, _ = client.calls[-1]
         assert called_args["mft_path"] == absolute
+
+
+class TestResolveRepoRelativeEvidencePath:
+    """resolve_extracted_path re-absolutizes a repo-relative evidence path under the
+    repo root (the inverse of the engine's repo-root relativizer), so replay of a
+    finding that cites the evidence file (memory/EVTX/PCAP) still finds it — while
+    arbitrary relative strings and fresh-clone-missing evidence are left verbatim."""
+
+    def test_repo_relative_evidence_resolves_when_present(self, tmp_path) -> None:
+        from findevil_agent import case_paths
+
+        (tmp_path / "evidence").mkdir()
+        img = tmp_path / "evidence" / "sample.mem"
+        img.write_bytes(b"x")
+        env = {"PROJECT_ROOT": str(tmp_path)}
+        out = case_paths.resolve_extracted_path("evidence/sample.mem", env=env)
+        assert out == str(img)
+
+    def test_absent_repo_relative_left_verbatim(self, tmp_path) -> None:
+        from findevil_agent import case_paths
+
+        env = {"PROJECT_ROOT": str(tmp_path)}
+        # Not on disk -> portable value survives (fresh clone / non-replay host).
+        assert (
+            case_paths.resolve_extracted_path("evidence/missing.dd", env=env)
+            == "evidence/missing.dd"
+        )
+
+    def test_case_relative_still_resolves(self, tmp_path) -> None:
+        from findevil_agent import case_paths
+
+        env = {"FINDEVIL_HOME": str(tmp_path), "PROJECT_ROOT": str(tmp_path)}
+        out = case_paths.resolve_extracted_path("cases/abc/extracted/x", env=env)
+        assert out == str(tmp_path / "cases/abc/extracted/x")
+
+    def test_absolute_unchanged(self, tmp_path) -> None:
+        from findevil_agent import case_paths
+
+        env = {"PROJECT_ROOT": str(tmp_path)}
+        assert (
+            case_paths.resolve_extracted_path("/abs/evidence/x.dd", env=env) == "/abs/evidence/x.dd"
+        )

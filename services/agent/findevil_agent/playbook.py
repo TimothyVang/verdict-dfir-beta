@@ -79,6 +79,12 @@ TOOL_SEQUENCES: dict[str, list[PlaybookStep]] = {
         PlaybookStep("disk_mount", "Mount the disk image via libewf", pool="both"),
         PlaybookStep("disk_extract_artifacts", "Extract filesystem artifacts", pool="both"),
         PlaybookStep(
+            "bulk_extract",
+            "Free-space feature recovery (deleted email / unallocated carve)",
+            pool="both",
+            optional=True,
+        ),
+        PlaybookStep(
             "mft_timeline", "MFT timeline with timestomp detection ($SI vs $FN)", pool="both"
         ),
         PlaybookStep("usnjrnl_query", "UsnJrnl change log — file create/delete/rename", pool="A"),
@@ -303,11 +309,15 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "evidence_type": "extracted_disk",
             "parser_tool": "plaso_parse",
         }
-    if name == "thumbs.db" or name.endswith(".thumbcache"):
+    if (
+        name == "thumbs.db"
+        or name.endswith(".thumbcache")
+        or (name.startswith(("thumbcache_", "iconcache_")) and name.endswith(".db"))
+    ):
         return {
             "artifact_class": "thumbnail",
             "evidence_type": "extracted_disk",
-            "parser_tool": None,
+            "parser_tool": "thumbcache_parse",
         }
     if name in {
         "history",

@@ -127,3 +127,70 @@ def test_gate_safe_text_neutralizes_quoted_event_name() -> None:
     low = out.lower()
     assert "cleared" not in low
     assert "execution" not in low
+
+
+# --- categorical-impossibility gate (platform-consistency + temporal-physics) ----
+# Wired into discipline_agent_findings: an agent finding that is physically/logically
+# impossible given the case context is demoted to a logged lead, like the exec/exfil
+# over-claim above. The gate is a no-op when no context (capture_time/platform) is given.
+
+_WIN_CLAIM = "Persistence via HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run autorun key"
+
+
+def _cat_finding(desc: str) -> dict:
+    return {
+        "case_id": "t",
+        "finding_id": "cat-1",
+        "tool_call_id": "tc-reg",
+        "artifact_path": "registry",
+        "confidence": "CONFIRMED",
+        "mitre_technique": "T1070.001",  # log-clear: NOT an exec/exfil over-claim prefix
+        "description": desc,
+    }
+
+
+def test_categorical_gate_drops_windows_claim_on_linux_image() -> None:
+    kept, dropped = fea.discipline_agent_findings(
+        [_cat_finding(_WIN_CLAIM)], _TOOL_CALLS, platform="linux"
+    )
+    assert kept == []
+    assert dropped[0]["finding_id"] == "cat-1"
+    assert "categorical impossibility" in dropped[0]["reason"]
+    assert dropped[0]["categorical_refutations"][0]["reason"] == "platform_consistency"
+
+
+def test_categorical_gate_keeps_windows_claim_on_windows_image() -> None:
+    kept, dropped = fea.discipline_agent_findings(
+        [_cat_finding(_WIN_CLAIM)], _TOOL_CALLS, platform="windows"
+    )
+    assert [f["finding_id"] for f in kept] == ["cat-1"]
+    assert dropped == []
+
+
+def test_categorical_gate_is_noop_without_context() -> None:
+    kept, _ = fea.discipline_agent_findings([_cat_finding(_WIN_CLAIM)], _TOOL_CALLS)
+    assert [f["finding_id"] for f in kept] == ["cat-1"]
+
+
+def test_categorical_gate_drops_future_dated_finding() -> None:
+    f = _cat_finding("Event recorded 2099-01-01T00:00:00Z, long after acquisition")
+    kept, dropped = fea.discipline_agent_findings(
+        [f], _TOOL_CALLS, capture_time="2020-01-01T00:00:00Z"
+    )
+    assert kept == []
+    assert dropped[0]["categorical_refutations"][0]["reason"] == "temporal_physics"
+
+
+def test_platform_from_tool_calls() -> None:
+    assert (
+        fea._platform_from_tool_calls([{"tool": "evtx_query"}, {"tool": "registry_query"}])
+        == "windows"
+    )
+    assert fea._platform_from_tool_calls([{"tool": "journalctl_query"}]) == "linux"
+    # cross-platform mix -> None (never refute against an unestablished platform)
+    assert (
+        fea._platform_from_tool_calls([{"tool": "evtx_query"}, {"tool": "journalctl_query"}])
+        is None
+    )
+    # OS-ambiguous tools only -> None
+    assert fea._platform_from_tool_calls([{"tool": "pcap_triage"}]) is None

@@ -23,7 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from findevil_agent.accuracy import resolve_golden, score
+from findevil_agent.accuracy import cache_key, resolve_golden, score
 from findevil_agent.crypto.audit_log import AuditLog
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -92,6 +92,32 @@ class AccuracyCompareOutput(BaseModel):
     f1: float
     hallucination_rate: float
     negative_coverage: dict[str, Any]
+    validation_class: str = Field(
+        ...,
+        description=(
+            "Epistemic class of the golden's corpus: 'synthetic', "
+            "'public-documented', or 'held-out'. Drives contamination_caveat."
+        ),
+    )
+    corpus_identity: str = Field(
+        ...,
+        description="Short corpus label for the report ('synthetic' | 'public' | 'held-out').",
+    )
+    contamination_caveat: str = Field(
+        ...,
+        description=(
+            "Non-empty ONLY for a public-documented corpus: the case is a published "
+            "walkthrough whose answer may be in model training data, so recall here "
+            "can reflect memorization, not from-scratch detection. Empty otherwise."
+        ),
+    )
+    does_not_measure: list[str] = Field(
+        ...,
+        description=(
+            "Scope caveats: what this accuracy score does NOT measure (custody "
+            "integrity, generalization, absent artifact classes, train-set recall)."
+        ),
+    )
     run_verdict: str | None
     golden_verdict: str | None
     verdict_match: bool
@@ -107,6 +133,15 @@ class AccuracyCompareOutput(BaseModel):
         description=(
             "Kind of the audit record appended ('accuracy_diagnostic'), or null "
             "when no audit_log_path was given. Never 'finding_approved'."
+        ),
+    )
+    cache_key: str = Field(
+        ...,
+        description=(
+            "Content-addressed sha256 of the exact inputs that determine this score "
+            "(the run's verdict.json + the golden). Identical inputs replay this key "
+            "bit-identically; any drift in verdict.json or the golden flips it, so a "
+            "'live' number can only be replayed when it ties to the same artifacts."
         ),
     )
 
@@ -153,6 +188,10 @@ async def _handle(inp: BaseModel) -> AccuracyCompareOutput:
         )
 
     result = score(case_dir, golden_path)
+    # Content-addressed key over the exact scored inputs. The scoring math is
+    # unchanged — this only ties the returned number to specific artifacts so a
+    # hand-edited verdict.json or swapped golden produces a different key.
+    score_cache_key = cache_key(case_dir, golden_path)
 
     audit_record_kind: str | None = None
     if inp.audit_log_path:
@@ -195,6 +234,10 @@ async def _handle(inp: BaseModel) -> AccuracyCompareOutput:
         f1=result["f1"],
         hallucination_rate=result["hallucination_rate"],
         negative_coverage=result["negative_coverage"],
+        validation_class=result["validation_class"],
+        corpus_identity=result["corpus_identity"],
+        contamination_caveat=result["contamination_caveat"],
+        does_not_measure=result["does_not_measure"],
         run_verdict=result["run_verdict"],
         golden_verdict=result["golden_verdict"],
         verdict_match=result["verdict_match"],
@@ -205,6 +248,7 @@ async def _handle(inp: BaseModel) -> AccuracyCompareOutput:
         false_positives=result["false_positives"],
         planted_bait=result["planted_bait"],
         audit_record_kind=audit_record_kind,
+        cache_key=score_cache_key,
     )
 
 

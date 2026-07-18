@@ -23,6 +23,7 @@ if str(_SCRIPTS) not in sys.path:
 
 import find_evil_auto as fea  # noqa: E402
 import pytest  # noqa: E402
+import render_report as rr  # noqa: E402
 
 
 def test_build_verdict_revision_record_ok() -> None:
@@ -170,3 +171,115 @@ def test_course_correct_enriches_payload_when_mechanism_given() -> None:
     assert cc["mechanism"] == "tool_failure_resequence"
     assert cc["finding_refs"] == ["f-9"]
     assert cc["action"] == "reject_after_redispatch"
+
+
+# ---------------------------------------------------------------------------
+# Rendered Self-Correction narrative block (render_report.py).
+#
+# The committed verdict_revision records live in audit.jsonl; the report reads
+# them back read-only (custody is untouched) and renders the organic arc as a
+# prose Self-Correction section: INITIAL claim -> EVIDENCE (trigger
+# tool_call_id) -> CORRECTION (mechanism) -> FINAL verdict.
+# ---------------------------------------------------------------------------
+
+
+def _audit_revision(payload: dict, *, seq: int) -> dict:
+    """Wrap a verdict_revision payload as it appears in audit.jsonl."""
+    return {"kind": "verdict_revision", "payload": payload, "seq": seq, "prev_hash": ""}
+
+
+def _payload(**override) -> dict:
+    base = fea.build_verdict_revision_record(
+        finding_id="f-1",
+        from_verdict="CONFIRMED",
+        to_verdict="INFERRED",
+        mechanism="verify_hash_drift",
+        trigger_tool_call_id="tc-9",
+        reason="output_sha256 drift on re-run",
+    )
+    # audit.jsonl payloads carry no top-level "kind" (it is the record key).
+    base.pop("kind", None)
+    base.update(override)
+    return base
+
+
+def test_verdict_revisions_from_audit_extracts_payloads() -> None:
+    audit = [
+        {"kind": "agent_message", "payload": {"content": "x"}, "seq": 0},
+        _audit_revision(_payload(finding_id="f-1", trigger_tool_call_id="tc-1"), seq=1),
+        _audit_revision(
+            _payload(
+                finding_id="f-2",
+                from_verdict="CONFIRMED",
+                to_verdict="HYPOTHESIS",
+                trigger_tool_call_id="tc-2",
+                mechanism="correlation_downgrade",
+            ),
+            seq=2,
+        ),
+    ]
+    revs = rr.verdict_revisions_from_audit(audit)
+    assert [r["finding_id"] for r in revs] == ["f-1", "f-2"]
+    assert revs[0]["trigger_tool_call_id"] == "tc-1"
+    assert revs[1]["to_verdict"] == "HYPOTHESIS"
+
+
+def test_verdict_revisions_from_audit_ignores_other_kinds_and_bad_rows() -> None:
+    audit = [
+        {"kind": "course_correction", "payload": {"finding_id": "f-9"}},
+        {"kind": "verdict_revision"},  # no payload dict
+        {"kind": "verdict_revision", "payload": "not-a-dict"},
+    ]
+    assert rr.verdict_revisions_from_audit(audit) == []
+
+
+def test_self_correction_enabled_defaults_on(monkeypatch) -> None:
+    monkeypatch.delenv("FINDEVIL_REPORT_SELF_CORRECTION", raising=False)
+    assert rr.self_correction_enabled() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "FALSE", " Off "])
+def test_self_correction_disabled_by_env(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("FINDEVIL_REPORT_SELF_CORRECTION", value)
+    assert rr.self_correction_enabled() is False
+
+
+def test_render_self_correction_section_from_two_audit_records() -> None:
+    audit = [
+        _audit_revision(
+            _payload(
+                finding_id="f-aaa",
+                from_verdict="CONFIRMED",
+                to_verdict="INFERRED",
+                trigger_tool_call_id="tc-111",
+                mechanism="verify_hash_drift",
+            ),
+            seq=1,
+        ),
+        _audit_revision(
+            _payload(
+                finding_id="f-bbb",
+                from_verdict="INFERRED",
+                to_verdict="HYPOTHESIS",
+                trigger_tool_call_id="tc-222",
+                mechanism="correlation_downgrade",
+            ),
+            seq=2,
+        ),
+    ]
+    section = rr.render_self_correction_section(rr.verdict_revisions_from_audit(audit))
+    assert "## Self-Correction" in section
+    # both finding_ids present
+    assert "f-aaa" in section
+    assert "f-bbb" in section
+    # both from->to transitions present
+    assert "`CONFIRMED` -> `INFERRED`" in section
+    assert "`INFERRED` -> `HYPOTHESIS`" in section
+    # both trigger tool_call_ids cited as the EVIDENCE step
+    assert "tc-111" in section
+    assert "tc-222" in section
+
+
+def test_render_self_correction_section_empty_when_no_records() -> None:
+    assert rr.render_self_correction_section([]) == ""
+    assert rr.render_self_correction_section(rr.verdict_revisions_from_audit([])) == ""

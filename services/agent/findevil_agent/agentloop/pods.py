@@ -69,7 +69,12 @@ _RECORD_FINDING_DESCRIPTION = (
     "Record a forensic finding citing exactly one tool_call_id from a prior tool "
     "result. CONFIRMED/INFERRED findings must declare asserted_values (or, for "
     "INFERRED, derived_from). Values are re-extracted from the cited output by a "
-    "non-LLM verifier; assert only what is actually present."
+    "non-LLM verifier; assert only what is actually present. For a CONFIRMED "
+    "execution/intent claim (process execution, persistence, lateral movement, "
+    "malicious intent), also set counter_hypothesis: name the most plausible "
+    "benign explanation you considered (vendor updater, admin task, known-FP) and "
+    "why the evidence overrules it — a confident claim that ruled out no benign "
+    "alternative is rejected."
 )
 
 RECORD_FINDING_TOOL: dict[str, Any] = {
@@ -117,6 +122,16 @@ RECORD_FINDING_TOOL: dict[str, Any] = {
                     "type": "array",
                     "description": "tool_call_ids/finding_ids an INFERRED finding rests on.",
                     "items": {"type": "string"},
+                },
+                "counter_hypothesis": {
+                    "type": "string",
+                    "description": (
+                        "The benign/alternative explanation you considered and ruled "
+                        "out, and why the evidence overrules it. Required for a "
+                        "CONFIRMED execution/intent claim under the benign-explanation "
+                        "gate; a confident claim that considered no alternative is the "
+                        "'too clean' tell."
+                    ),
                 },
             },
             "required": ["tool_call_id", "confidence", "artifact_path", "description"],

@@ -36,4 +36,6 @@ def test_no_execution_artifact_tagged_obtain_capabilities() -> None:
     # nothing the engine detects on a host image should be ASSIGNED it. Comments that
     # name the wrong code to document the fix are fine, so match the quoted value only.
     src = (Path(_SCRIPTS) / "find_evil_auto.py").read_text()
-    assert '"T1588.002"' not in src, "T1588.002 (off-host acquisition) must not tag on-host artifacts"
+    assert (
+        '"T1588.002"' not in src
+    ), "T1588.002 (off-host acquisition) must not tag on-host artifacts"
