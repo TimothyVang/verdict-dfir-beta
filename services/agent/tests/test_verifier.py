@@ -45,10 +45,22 @@ def _make_index(
 
 class TestRequiredCitation:
     def test_missing_tool_call_id_rejects(self) -> None:
-        # Build a Finding with empty tool_call_id by directly creating
-        # one (bypassing Pydantic's "required" since the runtime path
-        # has agents that may emit empty strings).
-        f = _make_finding(tool_call_id="")
+        # Two-layer defense for the evidence anchor:
+        #   (1) the schema firewall (events.py _require_tool_call_id_for_anchored)
+        #       now rejects a blank-cited CONFIRMED/INFERRED finding at construction,
+        #   (2) the verifier preflight below stays as defense-in-depth for findings
+        #       that bypass the constructor.
+        # This test exercises layer (2), so it builds the finding via
+        # model_construct (which skips validators) to reach the verifier with a
+        # blank anchor — exactly the model_construct/MCP-wire path layer (2) guards.
+        f = Finding.model_construct(
+            case_id="c-1",
+            finding_id="f-1",
+            tool_call_id="",
+            artifact_path="Security.evtx",
+            confidence="CONFIRMED",
+            description="logon from 192.168.1.5",
+        )
         action, replay = reverify_finding(f, mcp=MockMcpClient(), tool_call_index={})
         assert action.action == "rejected"
         assert "tool_call_id" in action.reason

@@ -69,9 +69,7 @@ def _fake_orchestrator() -> types.SimpleNamespace:
     fake._verify_execution_corroborations = types.MethodType(
         fea.Investigation._verify_execution_corroborations, fake
     )
-    fake._embed_verifier_replays = types.MethodType(
-        fea.Investigation._embed_verifier_replays, fake
-    )
+    fake._embed_verifier_replays = types.MethodType(fea.Investigation._embed_verifier_replays, fake)
     fake.verifier_replays = {}
     return fake
 

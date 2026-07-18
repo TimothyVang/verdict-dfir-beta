@@ -90,15 +90,34 @@ def test_extracted_lnk_recyclebin_indexdat_collapse_to_one_host() -> None:
     # artifacts, not hosts — keyed off the /extracted/ path, not a basename list.
     base = "cases/x/extracted/disk/dx"
     findings = [
-        {"finding_id": "f-lnk", "confidence": "HYPOTHESIS", "tool_call_id": "tc-1",
-         "artifact_path": f"{base}/lnk/Documents and Settings/u/Recent/GhostWare.lnk",
-         "description": "LNK target lead."},
-        {"finding_id": "f-info2", "confidence": "HYPOTHESIS", "tool_call_id": "tc-2",
-         "artifact_path": f"{base}/recyclebin/RECYCLER/S-1-5/INFO2", "description": "Recycle Bin."},
-        {"finding_id": "f-iehist", "confidence": "HYPOTHESIS", "tool_call_id": "tc-3",
-         "artifact_path": f"{base}/iehistory/index.dat", "description": "IE history."},
-        {"finding_id": "f-evt", "confidence": "HYPOTHESIS", "tool_call_id": "tc-4",
-         "artifact_path": f"{base}/evt/SysEvent.Evt", "description": "Event log."},
+        {
+            "finding_id": "f-lnk",
+            "confidence": "HYPOTHESIS",
+            "tool_call_id": "tc-1",
+            "artifact_path": f"{base}/lnk/Documents and Settings/u/Recent/GhostWare.lnk",
+            "description": "LNK target lead.",
+        },
+        {
+            "finding_id": "f-info2",
+            "confidence": "HYPOTHESIS",
+            "tool_call_id": "tc-2",
+            "artifact_path": f"{base}/recyclebin/RECYCLER/S-1-5/INFO2",
+            "description": "Recycle Bin.",
+        },
+        {
+            "finding_id": "f-iehist",
+            "confidence": "HYPOTHESIS",
+            "tool_call_id": "tc-3",
+            "artifact_path": f"{base}/iehistory/index.dat",
+            "description": "IE history.",
+        },
+        {
+            "finding_id": "f-evt",
+            "confidence": "HYPOTHESIS",
+            "tool_call_id": "tc-4",
+            "artifact_path": f"{base}/evt/SysEvent.Evt",
+            "description": "Event log.",
+        },
     ]
     timeline = _timeline_without_host(findings)
     fea.tag_finding_hosts(findings, timeline)

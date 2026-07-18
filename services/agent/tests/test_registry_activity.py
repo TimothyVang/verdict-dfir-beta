@@ -69,6 +69,44 @@ class TestUsbCandidates:
     def test_empty_rows_yield_nothing(self) -> None:
         assert fea.registry_usb_candidates([]) == []
 
+    def test_generic_system_hive_usbstor_row_yields_removable_lead(self) -> None:
+        # Evidence-agnostic: keyed on the GENERAL Enum\\USBSTOR\\Disk&Ven_X&Prod_Y
+        # key shape, not any real vendor/product/serial. This is the outcome the
+        # hive-priority fix guarantees reaches the classifier: once the SYSTEM
+        # hive is queried within budget, a serial-level USBSTOR row surfaces as a
+        # single removable-device lead, while the benign machine-hive rows
+        # queried alongside it (Services, root/device-class USBSTOR) stay quiet.
+        system_rows = [
+            _row("ROOT\\ControlSet001\\Services\\Spooler", [_val("ImagePath", "spoolsv.exe")]),
+            _row("ROOT\\ControlSet001\\Enum\\USBSTOR"),
+            _row("ROOT\\ControlSet001\\Enum\\USBSTOR\\Disk&Ven_X&Prod_Y&Rev_1.00"),
+            _row(
+                "ROOT\\ControlSet001\\Enum\\USBSTOR\\Disk&Ven_X&Prod_Y&Rev_1.00\\SERIAL123&0",
+                [_val("FriendlyName", "X Y USB Device")],
+            ),
+        ]
+        cands = fea.registry_usb_candidates(system_rows)
+        assert len(cands) == 1
+        c = cands[0]
+        assert c["kind"] == "usb_device"
+        assert c["vendor"] == "X"
+        assert c["product"] == "Y"
+        assert c["serial"] == "SERIAL123&0"
+
+    def test_benign_system_hive_rows_yield_no_removable_lead(self) -> None:
+        # A SYSTEM hive with no serial-level USBSTOR row (only stock Services and
+        # the empty USBSTOR root) produces no USB lead — FP safety on a machine
+        # that has never had a removable device.
+        benign_rows = [
+            _row("ROOT\\ControlSet001\\Services\\Tcpip", [_val("ImagePath", "tcpip.sys")]),
+            _row("ROOT\\ControlSet001\\Enum\\USBSTOR"),
+            _row(
+                "ROOT\\MountedDevices",
+                [_val("\\DosDevices\\C:", "f8a1b2c30000000000007e0000000000")],
+            ),
+        ]
+        assert fea.registry_usb_candidates(benign_rows) == []
+
 
 class TestPoolBUsbEmitter:
     def _inv(self):

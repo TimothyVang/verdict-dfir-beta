@@ -141,7 +141,7 @@ def test_local_mode_home_evidence_path_basenamed(monkeypatch, tmp_path: Path) ->
     # replay path is unaffected (verifier replays by tool_call_id; the rebind gate
     # matches by basename), so a basename is a correct /home-free display value.
     monkeypatch.setenv("FINDEVIL_HOME", str(tmp_path / ".findevil"))
-    leaky = "/home/assessor/Desktop/PUG-Projects/dev-verdict-github/evidence/nitroba.pcap"
+    leaky = "/home/user/cases/verdict/evidence/nitroba.pcap"
 
     finding = {
         "case_id": "case-paths",

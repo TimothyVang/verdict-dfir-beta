@@ -95,6 +95,14 @@ class RunManifest:
     """SignedBundle of the canonicalized manifest body (without the
     ``signature`` field). Filled by ``finalize`` after signing."""
 
+    transparency_log: dict[str, Any] = field(default_factory=dict)
+    """Optional Sigstore Rekor (or RFC-3161) anchor of ``merkle_root_hex``.
+    Empty by default — a run that did not opt into transparency anchoring is
+    byte-identical to one built before this field existed. Attached AFTER
+    signing and EXCLUDED from the signed body (see ``_to_json_safe`` /
+    ``_verify_ed25519_signature``), so it can never invalidate the signature.
+    A non-gating side-signal only: see ``ManifestVerification.transparency_ok``."""
+
     extra: dict[str, Any] = field(default_factory=dict)
     """Free-form metadata: image_path, image_hash, model name,
     agent version, etc. Captured but not part of Merkle leaves —
@@ -298,6 +306,13 @@ class ManifestVerification:
     ``signature_verified`` it is a separate honest signal and does NOT gate
     ``overall``; byte-tampering of a slice is already caught by the Merkle
     root, so this reports the semantic check."""
+    transparency_ok: bool | str = True
+    """Offline verification of the optional Sigstore Rekor / RFC-3161 anchor of
+    the Merkle root (``transparency_log``). ``True`` when the anchor's subject
+    digest matches the root and its inclusion proof / timestamp verifies, and
+    vacuously ``True`` when a run carries NO anchor (the absent-by-default case).
+    Like ``signature_verified`` and ``entailment_ok`` it is a separate honest
+    side-signal and does NOT gate ``overall``."""
     overall: bool = False
 
 
@@ -347,7 +362,10 @@ def verify_manifest(
       * ``signature_present``: True if ``signature`` is non-empty.
       * ``signature_verified``: True only for a cryptographically verified
         Ed25519 manifest; Sigstore and stub return explicit reason strings.
-      * ``overall``: AND of the above.
+      * ``overall``: chain + Merkle root + leaf count verify and a signature
+        bundle is present, and no present signature failed verification
+        (``stub`` / recorded ``sigstore`` are advisory). ``signature_verified``
+        and ``entailment_ok`` are reported as separate side-signals.
     """
     obj = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -436,11 +454,33 @@ def verify_manifest(
         except AuditLogError as exc:
             entailment_status = f"entailment re-check could not read the audit log: {exc}"
 
-    # `overall` stays presence-based (chain + merkle + count + a bundle exists)
-    # so dev/offline stub runs — every committed sample run — still verify
-    # end-to-end. `signature_verified` is the separate, honest crypto signal.
+    # 6. Optional transparency anchor (separate honest signal, like
+    # signature_verified/entailment_ok — does NOT gate overall). Absent by
+    # default: a run that did not opt into anchoring carries no block, so this
+    # is vacuously True and the manifest verifies exactly as before.
+    transparency_status: bool | str = True
+    anchor = obj.get("transparency_log") or {}
+    if anchor:
+        from findevil_agent.crypto.anchor import verify_anchor
+
+        transparency_status = verify_anchor(anchor, declared_root)
+
+    # `overall` requires the chain, Merkle root, and leaf count to verify and a
+    # signature bundle to be present. A `stub` (dev/offline placeholder) or a
+    # recorded `sigstore` bundle is advisory — it does not gate `overall`, so
+    # dev/offline stub runs still verify end-to-end. But a signature that is
+    # present and was cryptographically checked yet did NOT verify (a forged or
+    # corrupted `ed25519` bundle, or an unknown signer kind) is a hard failure:
+    # `overall` must not stay true for a signature that fails verification.
+    # `signature_verified` remains the separate, field-level crypto signal.
+    advisory_sig_kinds = ("stub", "sigstore")
+    sig_failed = sig_present and sig_kind not in advisory_sig_kinds and sig_verified is not True
     overall = (
-        audit_status is True and rebuild_status is True and count_status is True and sig_present
+        audit_status is True
+        and rebuild_status is True
+        and count_status is True
+        and sig_present
+        and not sig_failed
     )
     return ManifestVerification(
         audit_chain_ok=audit_status,
@@ -450,6 +490,7 @@ def verify_manifest(
         signature_kind=sig_kind,
         signature_verified=sig_verified,
         entailment_ok=entailment_status,
+        transparency_ok=transparency_status,
         overall=overall,
     )
 
@@ -502,7 +543,10 @@ def _verify_ed25519_signature(sig: dict[str, Any], manifest_obj: dict[str, Any])
         signature_b64 = bundle["signature_b64"]
     except (KeyError, ValueError, TypeError) as exc:
         return f"ed25519 bundle malformed: {exc}"
-    body = {k: v for k, v in manifest_obj.items() if k != "signature"}
+    # Mirror the sign path: the signed body excludes BOTH ``signature`` and the
+    # after-signing ``transparency_log`` anchor, so exclude both when rebuilding
+    # the bytes to verify. (See ``_to_json_safe(exclude_signature=True)``.)
+    body = {k: v for k, v in manifest_obj.items() if k not in ("signature", "transparency_log")}
     body_bytes = canonicalize_json(body)
     try:
         from cryptography.exceptions import InvalidSignature
@@ -547,6 +591,12 @@ def _to_json_safe(manifest: RunManifest, *, exclude_signature: bool = False) -> 
     out: dict[str, Any] = asdict(manifest)
     if exclude_signature:
         out.pop("signature", None)
+        # The transparency anchor is attached AFTER signing, so it must never be
+        # part of the signed bytes — strip it on the sign/verify path exactly
+        # like ``signature``. The on-disk write (exclude_signature=False) keeps
+        # both, so a re-write that adds the anchor does not invalidate the
+        # already-computed signature.
+        out.pop("transparency_log", None)
     return out
 
 

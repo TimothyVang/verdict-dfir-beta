@@ -13,6 +13,7 @@ from findevil_agent.judge import (
     THRESHOLD_INFERRED,
     JudgeBudgetExceeded,
     PoolStats,
+    compute_coverage_discounted_score,
     judge_findings,
 )
 
@@ -336,3 +337,67 @@ class TestPoolOriginPreservation:
         )
         merged = judge_findings(a, b)
         assert merged[0].finding.pool_origin == "merged"
+
+
+class TestCoverageDiscountedScore:
+    """P0-6: a case-level confidence a thin investigation cannot inflate.
+
+    score = mean(CONFIDENCE_VALUE[tier]) * (consulted_classes / applicable_classes),
+    so a CONFIRMED finding from a 1-of-5-classes run scores 0.2, not 1.0. Pure and
+    side-effect-free; ``applicable`` must mean classes available for *this* evidence
+    type, not all classes unconditionally (the caller supplies the count).
+    """
+
+    def test_full_coverage_single_confirmed_scores_one(self) -> None:
+        score = compute_coverage_discounted_score(
+            ["CONFIRMED"], applicable_classes=3, consulted_classes=3
+        )
+        assert score == pytest.approx(1.0)
+
+    def test_thin_investigation_cannot_score_high(self) -> None:
+        # CONFIRMED finding but only 1 of 5 applicable classes consulted.
+        score = compute_coverage_discounted_score(
+            ["CONFIRMED"], applicable_classes=5, consulted_classes=1
+        )
+        assert score == pytest.approx(0.2)
+
+    def test_empty_findings_score_zero(self) -> None:
+        assert (
+            compute_coverage_discounted_score([], applicable_classes=3, consulted_classes=3) == 0.0
+        )
+
+    def test_zero_applicable_classes_guards_div_by_zero(self) -> None:
+        assert (
+            compute_coverage_discounted_score(
+                ["CONFIRMED"], applicable_classes=0, consulted_classes=0
+            )
+            == 0.0
+        )
+
+    def test_mixed_tiers_average_then_discount(self) -> None:
+        # mean(1.0, 0.6) = 0.8 ; 2 of 4 consulted -> 0.5 ; 0.8 * 0.5 = 0.4
+        score = compute_coverage_discounted_score(
+            ["CONFIRMED", "INFERRED"], applicable_classes=4, consulted_classes=2
+        )
+        assert score == pytest.approx(0.4)
+
+    def test_hypothesis_only_caps_low_even_at_full_coverage(self) -> None:
+        # HYPOTHESIS is a lead (0.3); a full-coverage hypotheses-only run is still 0.3.
+        score = compute_coverage_discounted_score(
+            ["HYPOTHESIS"], applicable_classes=2, consulted_classes=2
+        )
+        assert score == pytest.approx(0.3)
+
+    def test_consulted_capped_at_applicable(self) -> None:
+        # Defensive: consulted should never exceed applicable, but if it does the
+        # ratio is capped at 1.0 rather than inflating the score above the tier mean.
+        score = compute_coverage_discounted_score(
+            ["CONFIRMED"], applicable_classes=2, consulted_classes=5
+        )
+        assert score == pytest.approx(1.0)
+
+    def test_result_in_unit_interval(self) -> None:
+        score = compute_coverage_discounted_score(
+            ["CONFIRMED", "HYPOTHESIS", "INFERRED"], applicable_classes=5, consulted_classes=3
+        )
+        assert 0.0 <= score <= 1.0
