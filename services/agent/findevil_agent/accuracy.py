@@ -232,8 +232,11 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
     heartbeat = verdict_doc.get("heartbeat") or {}
     if heartbeat.get("terminated_partial"):
         reasons.append("heartbeat terminated the case partway (terminated_partial)")
-    # Recovery is per-tool: a tool that failed and later succeeded was retried and
-    # got through. A DIFFERENT tool succeeding says nothing about the failed one.
+    # Recovery is per-tool and deliberately order-insensitive: if a tool succeeded
+    # at any point in the run, that tool got through at least once, so a failure on
+    # it is not evidence the run could not reach that evidence. A DIFFERENT tool
+    # succeeding says nothing about the failed one. See
+    # test_a_tool_that_succeeded_then_failed_reads_as_recovered_by_decision.
     failed: set[str] = set()
     succeeded: set[str] = set()
     for tc in verdict_doc.get("tool_calls") or []:
@@ -244,7 +247,7 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
             failed.add(name)
     unrecovered = sorted(failed - succeeded)
     if unrecovered:
-        reasons.append("tool call(s) failed with no later success: " + ", ".join(unrecovered))
+        reasons.append("tool call(s) failed and never succeeded: " + ", ".join(unrecovered))
     return not reasons, reasons
 
 

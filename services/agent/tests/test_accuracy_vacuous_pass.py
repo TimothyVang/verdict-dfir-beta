@@ -343,3 +343,50 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
         result = accuracy.score(case, _BENIGN_GOLDEN)
         assert result["run_completed"] is False
         assert result["pass"] is False
+
+    def test_a_tool_that_succeeded_then_failed_reads_as_recovered_by_decision(
+        self, tmp_path: Path
+    ) -> None:
+        """Order-insensitivity in ``failed - succeeded`` is a DECISION, not an oversight.
+
+        A tool that succeeded and then failed reads as recovered, because the set
+        difference does not care which came first. Foreman's call (2026-07-28), and the
+        reasoning is on the record: this gate has already been wrong twice by
+        over-correcting in opposite directions, and both corrections were driven by a
+        REPRODUCED case. Succeeded-then-failed is reasoned, not reproduced -- tightening
+        on it would risk the failure mode that costs more, a false FAIL on the two
+        true-negative controls that exist to catch over-claiming.
+
+        The property being defended is unchanged: a run that did not see the evidence
+        must not pass on an empty expectation. This run did see it, at least once.
+
+        KNOWN LIMITS, spelled out so a real case can move this. Neither is reproduced
+        in the recorded data today; a reproduced run is what moves it, not another
+        round of reasoning.
+
+        1. A PARTIAL read -- the tool succeeds on the first slice of evidence and then
+           fails partway through the rest -- slips through and scores as complete. The
+           fix for that shape is order-aware: a failure is recovered only by a LATER
+           success of the same tool.
+        2. Warden's sharper case (2026-07-28): a tool that succeeds on one TARGET and
+           fails on another -- ``disk_extract_artifacts`` reading partition 1 and
+           failing partition 2 -- reads as complete with half the evidence unread. His
+           conclusion, and it is the one to follow: the fix for that is per-TARGET, not
+           per-order. Ordering would not catch it at all.
+
+        If either shape is reproduced reaching a correct verdict with nothing found,
+        tighten along the axis named for that shape and delete this test.
+        """
+        first_ok = {"tool_call_id": "tc-2", "tool": "disk_extract_artifacts"}
+        later_failure = dict(_FAILED_TOOL, tool_call_id="tc-3")
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, first_ok, later_failure],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is True
+        assert result["run_incomplete_reasons"] == []
+        assert result["pass"] is True
