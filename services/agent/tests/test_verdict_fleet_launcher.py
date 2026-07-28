@@ -139,5 +139,14 @@ printf '%s\n' 'DONE — verdict: NO_EVIL'
         shutil.rmtree(case_dir, ignore_errors=True)
 
     out = proc.stdout + proc.stderr
+    # Assert the reason before the exit code. `returncode != 0` on its own is
+    # satisfied by any abort: on a worktree with no target/release/findevil-mcp
+    # built, scripts/verdict bails at the doctor preflight and this test used to
+    # pass for a reason unrelated to what it is named after.
+    assert "manifest verification failed" in out.lower(), (
+        f"launcher exited {proc.returncode}, but not for the manifest:\n{out}"
+    )
+    assert "doctor reported missing dependencies" not in out.lower(), (
+        f"aborted at the doctor preflight and never reached the manifest check:\n{out}"
+    )
     assert proc.returncode != 0, out
-    assert "manifest verification failed" in out.lower()
