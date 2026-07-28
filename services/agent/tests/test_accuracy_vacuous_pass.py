@@ -308,3 +308,38 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
         result = accuracy.score(case, _BENIGN_GOLDEN)
         assert result["run_completed"] is False
         assert "None" not in "; ".join(result["run_incomplete_reasons"])
+
+    def test_an_unrelated_later_success_does_not_count_as_recovery(self, tmp_path: Path) -> None:
+        # The engine's streak answers "should I abort this case?"; the scorer is asking
+        # "did this run actually see the evidence?". A successful case_close answers the
+        # first and says nothing about the second. Recovered means the tool that FAILED
+        # later succeeded — a retry — not that something else succeeded afterwards.
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, _FAILED_TOOL, {"tool_call_id": "tc-4", "tool": "case_close"}],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is False
+        assert "disk_extract_artifacts" in "; ".join(result["run_incomplete_reasons"])
+        assert result["pass"] is False
+
+    def test_repeated_evidence_failures_are_not_cleared_by_one_other_success(
+        self, tmp_path: Path
+    ) -> None:
+        # Could not read the disk three times, then made one unrelated successful call.
+        # Under a trailing-streak rule this scores recall=100 PASS on a true-negative
+        # key with nothing found — the exact vacuous pass this branch exists to close.
+        failures = [dict(_FAILED_TOOL, tool_call_id=f"tc-{i}") for i in range(2, 5)]
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, *failures, {"tool_call_id": "tc-9", "tool": "case_close"}],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is False
+        assert result["pass"] is False

@@ -212,11 +212,15 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
         (find_evil_auto.py:9361) — the bridge refusing an out-of-scope tool request.
         That is the guardrail WORKING, not the run breaking, so ``rejected`` calls
         are excluded.
-      * ``_record_tool`` (find_evil_auto.py:9234) resets the consecutive-failure
-        streak on ANY successful call: "a single transient error never trips the
-        HEARTBEAT escalation". So a failure with a later success after it is one the
-        engine recovered from; only a TRAILING unrecovered failure means the run
-        stopped on it. We mirror that streak here rather than re-deriving it.
+      * A failure the engine RETRIED and got through is not a failure to see the
+        evidence. Recovery is per-tool: the tool that failed later succeeded. We do
+        NOT mirror the engine's consecutive-failure streak
+        (``_record_tool``, find_evil_auto.py:9234), because that streak answers a
+        different question — "should I abort this case?" — and a later successful
+        ``case_close`` answers it while saying nothing about whether the disk was
+        ever read. Under the streak rule, a run that failed to read the evidence
+        three times and then closed cleanly scores 100% recall on a true-negative
+        key with nothing found.
 
     This gates ONLY the zero-expected recall shortcut in :func:`score`. A
     true-negative golden must be scored on the run having actually established the
@@ -228,18 +232,19 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
     heartbeat = verdict_doc.get("heartbeat") or {}
     if heartbeat.get("terminated_partial"):
         reasons.append("heartbeat terminated the case partway (terminated_partial)")
-    # Walk the calls the way the engine walks its own streak: any success clears
-    # what came before it, so what survives to the end is the unrecovered tail.
-    unrecovered: list[str] = []
+    # Recovery is per-tool: a tool that failed and later succeeded was retried and
+    # got through. A DIFFERENT tool succeeding says nothing about the failed one.
+    failed: set[str] = set()
+    succeeded: set[str] = set()
     for tc in verdict_doc.get("tool_calls") or []:
+        name = str(tc.get("tool") or "unnamed tool")
         if not tc.get("error"):
-            unrecovered.clear()
+            succeeded.add(name)
         elif not tc.get("rejected"):
-            unrecovered.append(str(tc.get("tool") or "unnamed tool"))
+            failed.add(name)
+    unrecovered = sorted(failed - succeeded)
     if unrecovered:
-        reasons.append(
-            "tool call(s) failed with no later success: " + ", ".join(sorted(set(unrecovered)))
-        )
+        reasons.append("tool call(s) failed with no later success: " + ", ".join(unrecovered))
     return not reasons, reasons
 
 
