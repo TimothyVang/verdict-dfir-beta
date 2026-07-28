@@ -202,24 +202,44 @@ def _verdict_consistent(run_verdict: str | None, golden_verdict: str | None) -> 
 def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
     """Did the run finish its work, or fall over on the way?
 
-    Two signals, both recorded by the engine itself: a tool call that failed
-    (every failure site tags ``extra["error"]`` before ``_record_tool``, so the
-    error survives into ``verdict.json .tool_calls[]``) and the HEARTBEAT
-    terminator giving up mid-case (``heartbeat.terminated_partial``).
+    Deliberately mirrors the ENGINE's own model of failure rather than inventing a
+    stricter one, because "any tool call that errored" is not what the engine means
+    by a failed run:
+
+      * ``heartbeat.terminated_partial`` is the HEARTBEAT terminator saying it gave
+        up mid-case. That is the engine's own "I stopped".
+      * A guardrail rejection is recorded as ``{"error": ..., "rejected": True}``
+        (find_evil_auto.py:9361) — the bridge refusing an out-of-scope tool request.
+        That is the guardrail WORKING, not the run breaking, so ``rejected`` calls
+        are excluded.
+      * ``_record_tool`` (find_evil_auto.py:9234) resets the consecutive-failure
+        streak on ANY successful call: "a single transient error never trips the
+        HEARTBEAT escalation". So a failure with a later success after it is one the
+        engine recovered from; only a TRAILING unrecovered failure means the run
+        stopped on it. We mirror that streak here rather than re-deriving it.
 
     This gates ONLY the zero-expected recall shortcut in :func:`score`. A
-    true-negative golden must be scored on the run having actually established
-    the negative, not on it having crashed before it could assert anything.
+    true-negative golden must be scored on the run having actually established the
+    negative, not on it having crashed before it could assert anything — but those
+    same two controls are what catch over-claiming, so a false FAIL here makes them
+    unusable rather than merely wrong.
     """
     reasons: list[str] = []
     heartbeat = verdict_doc.get("heartbeat") or {}
     if heartbeat.get("terminated_partial"):
         reasons.append("heartbeat terminated the case partway (terminated_partial)")
-    failed = sorted(
-        {str(tc.get("tool")) for tc in (verdict_doc.get("tool_calls") or []) if tc.get("error")}
-    )
-    if failed:
-        reasons.append("tool call(s) failed: " + ", ".join(failed))
+    # Walk the calls the way the engine walks its own streak: any success clears
+    # what came before it, so what survives to the end is the unrecovered tail.
+    unrecovered: list[str] = []
+    for tc in verdict_doc.get("tool_calls") or []:
+        if not tc.get("error"):
+            unrecovered.clear()
+        elif not tc.get("rejected"):
+            unrecovered.append(str(tc.get("tool") or "unnamed tool"))
+    if unrecovered:
+        reasons.append(
+            "tool call(s) failed with no later success: " + ", ".join(sorted(set(unrecovered)))
+        )
     return not reasons, reasons
 
 
@@ -456,7 +476,10 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     precision_denom = recalled_n + fp_n
     precision_frac = recalled_n / precision_denom if precision_denom else None
     precision_percent = None if precision_frac is None else round(precision_frac * 100)
-    recall_frac = 1.0 if expected_n == 0 else recalled_n / expected_n
+    # Derived from recall_percent so this function carries ONE definition of
+    # recall: on a zero-expected golden that is the completed-and-verdict-matched
+    # decision above, not an unconditional 1.0 contradicting it.
+    recall_frac = recall_percent / 100 if expected_n == 0 else recalled_n / expected_n
     if precision_frac is None:
         f1 = None
     else:

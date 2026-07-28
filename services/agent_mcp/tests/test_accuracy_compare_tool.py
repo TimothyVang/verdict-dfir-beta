@@ -163,3 +163,72 @@ class TestGoldenResolution:
         )
         with pytest.raises(FileNotFoundError):
             await SPEC.handler(AccuracyCompareInput(case_dir=str(d)))
+
+
+class TestZeroFindingRunStillReturns:
+    """A scored run with no findings must still produce output, not a ValidationError.
+
+    ``accuracy.score`` reports ``precision_percent`` / ``f1`` / ``hallucination_rate``
+    as None when the denominator is zero — nothing matched and nothing was provably
+    wrong. The tests above never drive a *scored* zero-finding case to output
+    construction (the one ``findings: []`` case takes the no-golden-found path and
+    never reaches ``score()``), so the shim's non-Optional output fields went
+    unexercised on exactly the run this scorer change exists to reward: a complete,
+    correct, zero-finding true-negative.
+    """
+
+    _BENIGN_GOLDEN = _REPO_ROOT / "goldens" / "synthetic-benign" / "expected-findings.json"
+
+    def _benign_case(self, tmp_path: Path) -> Path:
+        d = tmp_path / "benign"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "verdict.json").write_text(
+            json.dumps(
+                {
+                    "case_id": "synthetic-benign",
+                    "verdict": "NO_EVIL",
+                    "findings": [],
+                    "tool_calls": [{"tool_call_id": "tc-1", "tool": "case_open"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return d
+
+    async def test_clean_true_negative_run_returns_unmeasured_metrics(self, tmp_path: Path) -> None:
+        out = await SPEC.handler(
+            AccuracyCompareInput(
+                case_dir=str(self._benign_case(tmp_path)),
+                golden_path=str(self._BENIGN_GOLDEN),
+            )
+        )
+        assert isinstance(out, AccuracyCompareOutput)
+        # The run is a genuine PASS ...
+        assert out.pass_ is True
+        assert out.run_completed is True
+        assert out.run_incomplete_reasons == []
+        # ... and the unmeasurable metrics travel as null, not as a perfect score.
+        assert out.precision_percent is None
+        assert out.f1 is None
+        assert out.hallucination_rate is None
+
+    async def test_incomplete_zero_finding_run_reports_its_reasons(self, tmp_path: Path) -> None:
+        d = tmp_path / "broken"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "verdict.json").write_text(
+            json.dumps(
+                {
+                    "case_id": "synthetic-benign",
+                    "verdict": "NO_EVIL",
+                    "findings": [],
+                    "heartbeat": {"terminated_partial": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = await SPEC.handler(
+            AccuracyCompareInput(case_dir=str(d), golden_path=str(self._BENIGN_GOLDEN))
+        )
+        assert out.pass_ is False
+        assert out.run_completed is False
+        assert out.run_incomplete_reasons != []

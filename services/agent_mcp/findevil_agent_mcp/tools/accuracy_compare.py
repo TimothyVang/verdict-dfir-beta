@@ -86,15 +86,23 @@ class AccuracyCompareOutput(BaseModel):
     extra_n: int
     false_positives_n: int
     fp_planted: int
-    precision_percent: int
+    # None when the metric could not be measured: precision/F1 on a zero
+    # denominator (nothing matched, nothing provably wrong) and hallucination rate
+    # on a run with no findings at all. A zero-finding run is UNMEASURED, not
+    # perfectly precise, so these travel as null rather than 100 / 0.0.
+    precision_percent: int | None
     precision_scored: bool
     exhaustive: bool
-    f1: float
-    hallucination_rate: float
+    f1: float | None
+    hallucination_rate: float | None
     negative_coverage: dict[str, Any]
     run_verdict: str | None
     golden_verdict: str | None
     verdict_match: bool
+    # Did the run finish its work? A true-negative golden is only fully recalled
+    # when the run actually established the negative rather than falling over.
+    run_completed: bool
+    run_incomplete_reasons: list[str]
     # ``pass`` is a Python keyword, so the wire field is ``pass`` via alias.
     pass_: bool = Field(..., alias="pass")
     matched: list[dict[str, Any]]
@@ -172,6 +180,7 @@ async def _handle(inp: BaseModel) -> AccuracyCompareOutput:
             "fp_planted": result["fp_planted"],
             "negative_coverage": result["negative_coverage"],
             "verdict_match": result["verdict_match"],
+            "run_completed": result["run_completed"],
             "pass": result["pass"],
         }
         AuditLog(Path(inp.audit_log_path)).append(DIAGNOSTIC_KIND, payload)
@@ -198,6 +207,8 @@ async def _handle(inp: BaseModel) -> AccuracyCompareOutput:
         run_verdict=result["run_verdict"],
         golden_verdict=result["golden_verdict"],
         verdict_match=result["verdict_match"],
+        run_completed=result["run_completed"],
+        run_incomplete_reasons=result["run_incomplete_reasons"],
         **{"pass": result["pass"]},
         matched=result["matched"],
         unmatched=result["unmatched"],

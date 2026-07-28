@@ -202,9 +202,109 @@ class TestUnscoredPrecisionIsNotReportedAsPerfect:
 
 
 class TestNullMinRecallFailsLoudly:
-    """``sans-starter`` carries ``min_recall_percent: null`` — a stub, not a threshold."""
+    """A golden with ``min_recall_percent: null`` is a stub, not a threshold."""
 
     def test_null_min_recall_raises_an_error_naming_the_golden(self, tmp_path: Path) -> None:
+        # Stub golden built here, so this pins the BRANCH independently of whichever
+        # committed goldens happen to be unpopulated today.
+        golden = tmp_path / "stub" / "expected-findings.json"
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(
+            json.dumps(
+                {
+                    "case_id": "stub-pending-walkthrough",
+                    "status": "pending_manual_walkthrough",
+                    "verdict": "UNKNOWN",
+                    "min_recall_percent": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        case = _write_case(tmp_path / "stub-case", "stub-pending-walkthrough", "UNKNOWN", [])
+        with pytest.raises(ValueError, match="stub-pending-walkthrough"):
+            accuracy.score(case, golden)
+
+    def test_the_live_sans_starter_golden_is_still_an_unscoreable_stub(
+        self, tmp_path: Path
+    ) -> None:
+        # Tripwire on the real committed key, which is what made this a live failure
+        # rather than an expression-level one. Populating sans-starter's
+        # min_recall_percent SHOULD break this test — when it does, delete this test;
+        # the branch itself stays covered by the stub case above.
         case = _write_case(tmp_path / "sans", "sans-starter", "UNKNOWN", [])
         with pytest.raises(ValueError, match="sans-starter"):
             accuracy.score(case, _SANS_GOLDEN)
+
+
+class TestRunCompletionMatchesTheEnginesOwnFailureModel:
+    """ "Any tool call with an error" is stricter than the engine's own definition.
+
+    Both cases below are a CORRECT run on the true-negative control: complete, right
+    verdict, correctly found nothing. Failing them makes the two goldens that exist
+    to catch over-claiming unusable rather than merely wrong. Neither can produce a
+    false PASS — this gate only reaches ``expected_n == 0`` goldens.
+    """
+
+    def test_guardrail_rejection_is_not_an_incomplete_run(self, tmp_path: Path) -> None:
+        # find_evil_auto.py:9361 records a refused out-of-scope tool request as
+        # {"error": reason, "rejected": True}. That is the guardrail WORKING.
+        rejected = {
+            "tool_call_id": "tc-2",
+            "tool": "vol_pslist",
+            "error": "tool not permitted for this evidence type",
+            "rejected": True,
+        }
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, rejected],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is True
+        assert result["recall_percent"] == 100
+        assert result["pass"] is True
+
+    def test_transient_failure_the_engine_recovered_from_is_not_incomplete(
+        self, tmp_path: Path
+    ) -> None:
+        # find_evil_auto.py:9234 resets the engine's consecutive-failure streak on
+        # ANY successful call — "a single transient error never trips the HEARTBEAT
+        # escalation". A later success is the engine saying it recovered.
+        retry = {"tool_call_id": "tc-3", "tool": "disk_extract_artifacts"}
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, _FAILED_TOOL, retry],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is True
+        assert result["pass"] is True
+
+    def test_unrecovered_trailing_failure_is_still_incomplete(self, tmp_path: Path) -> None:
+        # Nothing succeeded after the failure: the run stopped on it.
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[_OK_TOOL, _FAILED_TOOL],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is False
+        assert result["pass"] is False
+
+    def test_nameless_failed_tool_does_not_render_as_the_string_None(self, tmp_path: Path) -> None:
+        case = _write_case(
+            tmp_path / "benign",
+            "synthetic-benign",
+            "NO_EVIL",
+            [],
+            tool_calls=[{"tool_call_id": "tc-9", "error": "boom"}],
+        )
+        result = accuracy.score(case, _BENIGN_GOLDEN)
+        assert result["run_completed"] is False
+        assert "None" not in "; ".join(result["run_incomplete_reasons"])
