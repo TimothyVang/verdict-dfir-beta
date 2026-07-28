@@ -93,3 +93,21 @@ def test_comment_key_is_ignored() -> None:
     # "_comment" is a doc convention, not a typo — it must not raise.
     bounds = {"_comment": "the floor rationale", "min_recall_percent": 36}
     assert srb.check_bounds(_METRICS, bounds) == []
+
+
+def test_unmeasured_floor_metric_is_a_violation() -> None:
+    # accuracy.score reports precision as None when nothing was scoreable. A floor
+    # claims the run ACHIEVED at least X — an unmeasured metric cannot support that.
+    metrics = {**_METRICS, "precision_percent": None}
+    violations = srb.check_bounds(metrics, {"min_precision_percent": 90})
+    assert len(violations) == 1
+    assert "not measured" in violations[0]
+
+
+def test_unmeasured_ceiling_metric_is_satisfied() -> None:
+    # A run with zero findings has no hallucination rate to report, but it also
+    # asserted nothing — there is no over-claim for the ceiling to catch. The
+    # "produced nothing" case is failed upstream by recall / verdict / completeness,
+    # not by pretending this ceiling was breached.
+    metrics = {**_METRICS, "hallucination_rate": None}
+    assert srb.check_bounds(metrics, {"max_hallucination_rate": 0.0}) == []
