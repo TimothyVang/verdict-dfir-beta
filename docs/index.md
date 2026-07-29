@@ -18,6 +18,7 @@ what an agent did.
 | Install from a cold clone | [Install Guide](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/INSTALL.md) |
 | Run in three commands | [Quickstart](https://github.com/TimothyVang/verdict-dfir-beta/blob/main/QUICKSTART.md) |
 | Run every mode and flag | [Running VERDICT](using/running-verdict.md) |
+| Download one shared lab case | [Evidence from Drive](using/evidence-from-drive.md) |
 | Understand trust boundaries | [Architecture](architecture.md) |
 | Verify custody claims | [Cryptographic Attestation](cryptographic-attestation.md) |
 | See why a finding can't lie about a value | [Fact-Fidelity (entailment check)](fact-fidelity.md) |

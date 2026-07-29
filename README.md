@@ -74,6 +74,7 @@ validate the interpretation or establish detection quality.
 |---|---|
 | Cold-clone install | [`INSTALL.md`](INSTALL.md) |
 | Three-command quickstart | [`QUICKSTART.md`](QUICKSTART.md) |
+| Download one shared lab case | [`docs/using/evidence-from-drive.md`](docs/using/evidence-from-drive.md) |
 | Every run mode, flag, and output file | [`docs/using/running-verdict.md`](docs/using/running-verdict.md) |
 | Failure-mode fixes | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
 
@@ -123,14 +124,38 @@ deterministic path instead.
 
 ## Get test evidence
 
-The repo's `evidence/` directory ships empty — real forensic images are far too large to host on GitHub. Drop your own evidence into `evidence/` (or point `$FINDEVIL_EVIDENCE_ROOT` at wherever you keep it) and run `scripts/verdict <image>`.
+The repo's `evidence/` directory ships empty — multi-GB forensic images do not belong on GitHub.
+Drop your own evidence into `evidence/`, point `$FINDEVIL_EVIDENCE_ROOT` at another location, or
+pull one named lab case from the shared Google Drive library.
+
+### Shared lab library
+
+Viewer or Commenter access is sufficient to download when the owner allows downloads; Editor
+access is neither required nor recommended. Configure a read-only rclone remote once, then:
+
+```bash
+bash scripts/evidence-from-drive/pull-evidence.sh --list
+CASE_DIR="$(bash scripts/evidence-from-drive/pull-evidence.sh win-lateral-movement)"
+scripts/verdict "$CASE_DIR"
+
+# Optional: delete only this local cached case, never the Drive copy.
+bash scripts/evidence-from-drive/pull-evidence.sh --evict win-lateral-movement
+```
+
+Downloads default to `${XDG_CACHE_HOME:-$HOME/.cache}/verdict-evidence/<case-id>/`; override the
+root with `EVIDENCE_CACHE`. Start with `win-lateral-movement`, then check the size hints before
+pulling disk or memory images. See the
+[Drive evidence guide](docs/using/evidence-from-drive.md) for setup, the full case catalog, and
+troubleshooting.
+
+### Other public datasets
 
 Public datasets you can download to try VERDICT, mapped to the path each exercises:
 
 | Dataset | Type → VERDICT path | Free source |
 |---|---|---|
-| **NIST Hacking Case** (Schardt, `SCHARDT.dd`) | disk → registry / prefetch / MFT / EVTX | [cfreds.nist.gov · Hacking Case](https://cfreds.nist.gov/all/NIST/HackingCase) |
-| **Nitroba University** (`nitroba.pcap`) | pcap → network triage | [digitalcorpora.org · Nitroba](https://digitalcorpora.org/corpora/scenarios/nitroba-university-harassment-scenario/) |
+| **NIST Hacking Case** (Schardt, `SCHARDT.dd`) | disk → registry / prefetch / MFT / EVTX | [cfreds.nist.gov · Hacking Case](https://cfreds.nist.gov/all/NIST/HackingCase) (Drive case: `nist-schardt`) |
+| **Nitroba University** (`nitroba.pcap`) | pcap → network triage | [digitalcorpora.org · Nitroba](https://digitalcorpora.org/corpora/scenarios/nitroba-university-harassment-scenario/) (Drive case: `network-nitroba`) |
 | **NIST CFReDS** (disk, memory, mobile, more) | mixed | [cfreds.nist.gov](https://cfreds.nist.gov/) |
 | **Digital Corpora** (M57-Patents, scenarios) | disk / pcap | [digitalcorpora.org](https://digitalcorpora.org/) |
 | **Digital Corpora scenario backlog** (2012-ngdc, 2019-narcos, 2019-owl, 2019-tuck) | disk / mobile / mixed | [digitalcorpora.org · scenarios](https://digitalcorpora.org/corpora/scenarios/) |

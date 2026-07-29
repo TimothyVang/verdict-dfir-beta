@@ -8,6 +8,13 @@ VERDICT investigates whatever you point it at. The fastest path is to drop a fil
 mixed case folder) into `evidence/` and run `scripts/verdict`. This doc covers the
 conventions that keep that intake clean, reproducible, and forensically sound.
 
+Large lab corpora live outside git. To pull one named public case into a local cache, see
+[Evidence from Drive](evidence-from-drive.md) or list the catalog from any clone:
+
+```bash
+bash scripts/evidence-from-drive/pull-evidence.sh --list
+```
+
 ---
 
 ## 1. The `evidence/` directory

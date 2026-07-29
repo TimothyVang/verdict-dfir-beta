@@ -155,6 +155,8 @@ coverage/
 /evidence/*
 !/evidence/README.md
 !/evidence/.gitkeep
+# Optional repo-local cache shown in the Drive evidence guide.
+/.evidence-cache/
 
 # Smoke test working dir (Amendment A2) — produces audit logs +
 # manifests under tmp/smoke/ that should never be committed.

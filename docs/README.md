@@ -10,6 +10,7 @@ fresh clone of `TimothyVang/verdict-dfir`.
 |---|---|
 | Install from a cold clone | [`../INSTALL.md`](../INSTALL.md) |
 | Pick a run mode | [`../QUICKSTART.md`](../QUICKSTART.md) |
+| Download one shared lab case | [`using/evidence-from-drive.md`](using/evidence-from-drive.md) |
 | Run every `scripts/verdict` mode and flag | [`using/running-verdict.md`](using/running-verdict.md) |
 | Understand trust boundaries | [`architecture.md`](architecture.md) |
 | Verify signed outputs | [`cryptographic-attestation.md`](cryptographic-attestation.md) |
@@ -39,6 +40,7 @@ fresh clone of `TimothyVang/verdict-dfir`.
 |---|---|
 | `using/running-verdict.md` | Canonical command reference for `scripts/verdict`. |
 | `using/evidence-intake.md` | Evidence staging and evidence-type routing. |
+| `using/evidence-from-drive.md` | Read-only Google Drive setup, case catalog, pull, and local eviction. |
 | `using/fleet-analysis.md` | Multi-host fleet workflow. |
 | `using/reports.md` | Report rendering and re-rendering. |
 | `reference/dependencies.md` | Dependency and tool version matrix. |

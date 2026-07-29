@@ -16,7 +16,17 @@ scripts/verdict <path-to-evidence>    # investigate -> live dashboard -> signed 
 type **`investigate evidence/`**. (Or hands-free in a session: `/verdict <path>` runs the pipeline
 and attempts SIFT VM setup when disk evidence needs it.)
 
-No evidence yet? `bash scripts/fetch-fixtures.sh` stages public datasets (into `fixtures/`).
+No evidence yet? Pull one named case from the shared Google Drive library:
+
+```bash
+bash scripts/evidence-from-drive/pull-evidence.sh --list
+CASE_DIR="$(bash scripts/evidence-from-drive/pull-evidence.sh win-lateral-movement)"
+scripts/verdict "$CASE_DIR"
+```
+
+The one-time read-only rclone setup and cache controls are in the
+[Drive evidence guide](docs/using/evidence-from-drive.md). Alternatively,
+`bash scripts/fetch-fixtures.sh` stages other public datasets into `fixtures/`.
 Canonical install detail — prerequisites and how to verify — is in [INSTALL.md](INSTALL.md).
 
 ### Strict Phase 4 native example (single EVTX file)
