@@ -1111,9 +1111,11 @@ fn build_registry() -> Vec<ToolEntry> {
                  browser_history Finding is a legitimate CONFIRMED browser fact and never \
                  trips the ≥2-artifact-class execution rule; intent is a separate \
                  'hypothesis:' layer. \
-                 ERRORS: NotFound (verify path), Unreadable (not openable), ParseFailed \
-                 (corrupt DB / unexpected column shape), UnknownSchema (a valid SQLite file \
-                 that is neither a Chrome nor a Firefox history DB).",
+                 ERRORS: NotFound (verify path), NotSqlite (readable file with the wrong \
+                 16-byte SQLite header), Truncated (file ends before the full SQLite header), \
+                 HeaderUnreadable (header cannot be read), Unreadable (SQLite cannot open it), \
+                 ParseFailed (corrupt DB / unexpected column shape), UnknownSchema (a valid \
+                 SQLite file that is neither a Chrome nor a Firefox history DB).",
             annotations: ToolAnnotations {
                 title: "Read Browser History",
                 read_only: true,
