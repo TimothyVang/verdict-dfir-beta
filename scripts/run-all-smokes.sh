@@ -178,6 +178,10 @@ run_smoke \
     "python3 scripts/starter-data-smoke.py"
 
 run_smoke \
+    "evidence-from-drive-smoke (offline pull/list/evict safety contract)" \
+    "python3 scripts/evidence-from-drive-smoke.py"
+
+run_smoke \
     "golden-answer-key-smoke (all committed expected-findings schemas valid)" \
     "python3 scripts/golden-answer-key-smoke.py"
 
