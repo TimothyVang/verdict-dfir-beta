@@ -35,6 +35,13 @@ const WEBKIT_UNIX_OFFSET_SECS: i64 = 11_644_473_600;
 const DEFAULT_LIMIT: usize = 10_000;
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqliteHeader {
+    Valid,
+    WrongMagic,
+    Truncated { bytes_read: usize },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserHistoryInput {
@@ -89,8 +96,13 @@ pub enum BrowserHistoryError {
         source: rusqlite::Error,
     },
 
-    #[error("browser history candidate is not SQLite (missing SQLite format 3 header): {0}")]
+    #[error("browser history candidate is not SQLite (wrong SQLite format 3 header): {0}")]
     NotSqlite(PathBuf),
+
+    #[error(
+        "browser history SQLite candidate is truncated: read {bytes_read} of 16 header bytes from {path}"
+    )]
+    Truncated { path: PathBuf, bytes_read: usize },
 
     #[error("browser history header unreadable {path}: {source}")]
     HeaderUnreadable {
@@ -137,13 +149,21 @@ pub fn path_looks_like_browser_history(path: &Path) -> bool {
 
 /// Validate the fixed 16-byte `SQLite` format header without parsing or reading
 /// the rest of the evidence file.
-pub(crate) fn has_sqlite_header(path: &Path) -> Result<bool, io::Error> {
+pub(crate) fn inspect_sqlite_header(path: &Path) -> Result<SqliteHeader, io::Error> {
     let mut file = File::open(path)?;
     let mut header = [0_u8; SQLITE_HEADER.len()];
-    match file.read_exact(&mut header) {
-        Ok(()) => Ok(&header == SQLITE_HEADER),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error),
+    let mut bytes_read = 0;
+    while bytes_read < header.len() {
+        let count = file.read(&mut header[bytes_read..])?;
+        if count == 0 {
+            return Ok(SqliteHeader::Truncated { bytes_read });
+        }
+        bytes_read += count;
+    }
+    if &header == SQLITE_HEADER {
+        Ok(SqliteHeader::Valid)
+    } else {
+        Ok(SqliteHeader::WrongMagic)
     }
 }
 
@@ -151,7 +171,8 @@ pub(crate) fn has_sqlite_header(path: &Path) -> Result<bool, io::Error> {
 ///
 /// # Errors
 /// * [`BrowserHistoryError::NotFound`] — the file does not exist.
-/// * [`BrowserHistoryError::NotSqlite`] — the file lacks the `SQLite` format header.
+/// * [`BrowserHistoryError::NotSqlite`] — the file has the wrong `SQLite` format header.
+/// * [`BrowserHistoryError::Truncated`] — fewer than 16 header bytes are readable.
 /// * [`BrowserHistoryError::HeaderUnreadable`] — the header could not be read.
 /// * [`BrowserHistoryError::Unreadable`] — exists but cannot be opened.
 /// * [`BrowserHistoryError::ParseFailed`] — opened but a query failed
@@ -165,9 +186,17 @@ pub fn browser_history(
     if !path.is_file() {
         return Err(BrowserHistoryError::NotFound(path.clone()));
     }
-    match has_sqlite_header(path) {
-        Ok(true) => {}
-        Ok(false) => return Err(BrowserHistoryError::NotSqlite(path.clone())),
+    match inspect_sqlite_header(path) {
+        Ok(SqliteHeader::Valid) => {}
+        Ok(SqliteHeader::WrongMagic) => {
+            return Err(BrowserHistoryError::NotSqlite(path.clone()));
+        }
+        Ok(SqliteHeader::Truncated { bytes_read }) => {
+            return Err(BrowserHistoryError::Truncated {
+                path: path.clone(),
+                bytes_read,
+            });
+        }
         Err(source) => {
             return Err(BrowserHistoryError::HeaderUnreadable {
                 path: path.clone(),

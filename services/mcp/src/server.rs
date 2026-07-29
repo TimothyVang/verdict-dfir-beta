@@ -1760,8 +1760,8 @@ fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
     let input: BrowserHistoryInput = parse_args(args)?;
     // NotFound / NotSqlite / UnknownSchema are user-input territory (wrong
     // path, wrong file type, or a non-browser SQLite DB); surface as -32602.
-    // HeaderUnreadable / Unreadable / ParseFailed are corrupt-or-permission
-    // system issues → -32603.
+    // Truncated / HeaderUnreadable / Unreadable / ParseFailed are
+    // corrupt-or-permission system issues → -32603.
     match browser_history(&input) {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))

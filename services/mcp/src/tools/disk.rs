@@ -313,11 +313,14 @@ pub fn disk_extract_artifacts(
                 .then_some((class, inode, path))
         })
         .collect();
-    let selected = select_artifacts(candidates, input.limit);
+    let ordered_candidates = order_artifacts(candidates);
 
     let mut artifacts = Vec::new();
     let mut artifacts_skipped_oversize = 0;
-    for (class, inode, path) in selected {
+    for (class, inode, path) in ordered_candidates {
+        if artifacts.len() >= input.limit {
+            break;
+        }
         match (via_walk, &mock_root) {
             (true, Some(root)) => mock_extract(
                 root,
@@ -1055,6 +1058,15 @@ fn select_artifacts(
     selected
 }
 
+/// Fairly order every candidate so extraction can backfill rejected entries
+/// until the accepted-artifact limit is reached.
+fn order_artifacts(
+    candidates: Vec<(&'static str, String, String)>,
+) -> Vec<(&'static str, String, String)> {
+    let candidate_count = candidates.len();
+    select_artifacts(candidates, candidate_count)
+}
+
 /// `icat` one inode out of the image into `output_dir/<class>/<rel_path>`,
 /// streaming to disk (no in-memory buffering) and enforcing the size cap.
 /// A failed `icat` (unreadable inode) is skipped, not fatal.
@@ -1126,10 +1138,12 @@ fn extracted_artifact_type_matches(class: &str, path: &Path) -> Result<bool, Dis
     if class != "browser_db" {
         return Ok(true);
     }
-    super::browser_history::has_sqlite_header(path).map_err(|source| DiskError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    super::browser_history::inspect_sqlite_header(path)
+        .map(|header| matches!(header, super::browser_history::SqliteHeader::Valid))
+        .map_err(|source| DiskError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// Join an image-internal path under `base`, keeping only normal components so a

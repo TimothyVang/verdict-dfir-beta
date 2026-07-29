@@ -53,6 +53,22 @@ fn browser_history_errors_on_garbage_bytes() {
 }
 
 #[test]
+fn browser_history_reports_truncated_sqlite_candidate() {
+    // A short file can be a truncated/corrupt SQLite artifact, which is a
+    // materially different direct-call failure from a readable wrong-magic
+    // file. Auto-discovery may skip it, but an explicit request must surface
+    // the coverage limitation.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("History");
+    std::fs::write(&path, b"SQLite").unwrap();
+    let err = browser_history(&sample_input(path)).unwrap_err();
+    assert!(
+        matches!(err, BrowserHistoryError::Truncated { bytes_read: 6, .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn browser_history_errors_on_unknown_schema() {
     // A valid SQLite DB that is neither Chrome nor Firefox.
     let tmp = tempfile::tempdir().expect("tempdir");

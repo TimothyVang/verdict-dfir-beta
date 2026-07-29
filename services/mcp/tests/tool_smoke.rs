@@ -467,12 +467,14 @@ fn disk_extract_artifacts_skips_non_sqlite_history_name_collision() {
     drop(conn);
     let sqlite_bytes = fs::read(sqlite_path).expect("read sqlite fixture");
 
-    let shell_history = PathBuf::from("home/analyst/.mc/history");
-    let browser_history = PathBuf::from("home/analyst/.config/google-chrome/Default/History");
+    let shell_history = PathBuf::from("aaa/home/analyst/.mc/history");
+    let truncated_history = PathBuf::from("aab/browser/History");
+    let browser_history = PathBuf::from("zzz/home/analyst/.config/google-chrome/Default/History");
     let _tsk = FakeTsk::install(
         tmp.path(),
         &[
             ("300", shell_history.to_str().unwrap(), b"cd /tmp\nls -la\n"),
+            ("302", truncated_history.to_str().unwrap(), b"SQLite"),
             (
                 "301",
                 browser_history.to_str().unwrap(),
@@ -493,7 +495,9 @@ fn disk_extract_artifacts_skips_non_sqlite_history_name_collision() {
         case_id: handle.id,
         mount_id: mounted.mount_id,
         artifact_kinds: vec![],
-        limit: 20,
+        // Both false candidates sort before the genuine DB. They must not
+        // consume this single accepted-artifact slot.
+        limit: 1,
         max_artifact_bytes: 1024 * 1024,
     })
     .expect("extract artifacts");
@@ -504,6 +508,13 @@ fn disk_extract_artifacts_skips_non_sqlite_history_name_collision() {
             .iter()
             .all(|artifact| artifact.source_path != shell_history),
         "plain-text .mc/history is a name collision, not a browser database"
+    );
+    assert!(
+        extracted
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.source_path != truncated_history),
+        "a truncated SQLite-looking History candidate must be skipped during auto-discovery"
     );
     assert!(
         extracted
