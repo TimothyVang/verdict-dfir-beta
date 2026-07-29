@@ -64,12 +64,51 @@ def test_l3_fallback_fails_when_recall_percent_does_not_match_counts() -> None:
     assert "recall.recall_percent must match recalled_n / expected_n" in errors
 
 
-def test_l3_fallback_fails_when_product_commit_is_not_expected_commit() -> None:
+def test_l3_fallback_still_requires_a_real_product_commit() -> None:
     evidence = _l3_fallback_evidence()
+    evidence["product_commit"] = "not-a-sha"
 
-    errors = validate_l3_evidence.validate_evidence(evidence, expected_commit="a" * 40)
+    errors = validate_l3_evidence.validate_evidence(evidence)
 
-    assert "product_commit must match expected commit" in errors
+    assert "product_commit must be a 40-character lowercase hex SHA" in errors
+
+
+def test_l3_fallback_fails_when_the_record_is_stale() -> None:
+    """Staleness is the honest question; matching today's HEAD is not.
+
+    The old check compared product_commit to $GITHUB_SHA, so it failed on every commit that was
+    not the one the record happened to be generated on -- permanently, on every push, regardless
+    of product quality. It fired for 14 consecutive nights while saying nothing about the
+    product. Age is what distinguishes a usable record from an abandoned one.
+    """
+    evidence = _l3_fallback_evidence()
+    evidence["generated_at_utc"] = "2020-01-01T00:00:00Z"
+
+    errors = validate_l3_evidence.validate_evidence(evidence, max_age_days=30)
+
+    assert any("evidence is stale" in error for error in errors)
+
+
+def test_l3_fallback_accepts_a_recent_record_on_a_different_commit() -> None:
+    evidence = _l3_fallback_evidence()
+    evidence["generated_at_utc"] = "2999-01-01T00:00:00Z"
+
+    errors = validate_l3_evidence.validate_evidence(evidence, max_age_days=30)
+
+    assert not any("stale" in error for error in errors)
+    assert not any("product_commit must match" in error for error in errors)
+
+
+def test_recall_failure_stays_a_hard_error_named_as_product_signal() -> None:
+    """A failing recall must remain a hard error and be classified as product signal.
+
+    Downgrading it to a warning would turn L3 green while nist-hacking-case scores 50% against a
+    71% bar -- the exact failure mode this gate exists to prevent.
+    """
+    errors = validate_l3_evidence.validate_evidence(_l3_fallback_evidence())
+
+    assert "recall.pass must be true" in errors
+    assert "recall.pass must be true" in validate_l3_evidence.PRODUCT_GATE_ERRORS
 
 
 def test_l3_fallback_fails_without_itemized_recall_ids() -> None:
