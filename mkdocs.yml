@@ -77,6 +77,7 @@ nav:
   - Operators:
       - Fleet Analysis: using/fleet-analysis.md
       - Evidence Intake: using/evidence-intake.md
+      - Evidence from Drive: using/evidence-from-drive.md
       - Reports: using/reports.md
       - Troubleshooting: troubleshooting.md
   - Contributing:
