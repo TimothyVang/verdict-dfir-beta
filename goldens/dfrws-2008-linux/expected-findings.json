@@ -2,7 +2,7 @@
   "_comment": [
     "Ground truth for the DFRWS 2008 Forensic Challenge (Linux intrusion).",
     "Source: https://github.com/dfrws/dfrws2008-challenge",
-    "Tier: YELLOW (build/test, score with care). Memory + disk + network, all in-repo.",
+    "Tier: YELLOW (build/test, score with care). Score only the canonical challenge archive's response_data entrypoint; never the repository or competitor results tree.",
     "Anna built a VIGIA/ground-truth file for this case; this golden mirrors its core",
     "claims. Scenario: compromised Linux host abused for admin-share theft and used as",
     "a proxy to relay exfiltration traffic."
@@ -10,6 +10,33 @@
   "case_id": "dfrws-2008-linux",
   "source_url": "https://github.com/dfrws/dfrws2008-challenge",
   "license": "DFRWS Forensic Challenge — public for research/education",
+  "fixture_contract": {
+    "staging_root": "canonical/response_data",
+    "analysis_entrypoint": ".",
+    "source_artifact": {
+      "path": "details/dfrws2008-challenge.zip",
+      "size_bytes": 94421088,
+      "sha1": "52014e22c843ece2736bce59f652f43e96035825",
+      "archive_type": "zip",
+      "member_root": "response_data",
+      "strict_members": true
+    },
+    "required_artifacts": [
+      {
+        "path": "challenge.mem",
+        "size_bytes": 297795584
+      },
+      {
+        "path": "suspect.pcap",
+        "size_bytes": 5110493
+      },
+      {
+        "path": "user_files",
+        "type": "directory",
+        "min_files": 1
+      }
+    ]
+  },
   "verdict": "CONFIRMED_EVIL",
   "min_recall_percent": 50,
   "findings": [

@@ -29,7 +29,8 @@ SSH_PORT="${SSH_PORT:-2222}"
 SSH_USER="${SSH_USER:-sansforensics}"
 SSH_PASS="${SSH_PASS:-forensics}"
 
-# Ordered list of fixtures to run. Skipped silently if absent.
+# Ordered list of fixtures to run. Missing and explicitly NOT_READY fixtures
+# are skipped with a reason before anything is copied into the VM.
 FIXTURES=(
   "nist-hacking-case"
   "sans-starter"
@@ -159,11 +160,38 @@ for fixture in "${FIXTURES[@]}"; do
     log "SKIP ${fixture}: missing ${golden_dir} or ${fixture_dir}"
     continue
   fi
+  expected="${golden_dir}/expected-findings.json"
+  if [[ ! -f "${expected}" ]]; then
+    log "SKIP ${fixture}: missing ${expected}"
+    continue
+  fi
+  if ! readiness_json="$(
+    python3 scripts/fixture-readiness.py --json "${expected}" "${fixture_dir}"
+  )"; then
+    readiness_reason="$(
+      jq -r '.reason // "fixture readiness check failed"' <<<"${readiness_json}" \
+        2>/dev/null || printf '%s' "${readiness_json}"
+    )"
+    log "SKIP ${fixture}: NOT_READY ${readiness_reason}"
+    continue
+  fi
+  staging_root="$(jq -er '.staging_root' <<<"${readiness_json}")"
+  analysis_entrypoint="$(
+    jq -er '.analysis_entrypoint_relative' <<<"${readiness_json}"
+  )"
+  log "READY ${fixture}: $(jq -r '.reason' <<<"${readiness_json}")"
 
-  # Push fixture into VM (may already be there from a prior run).
-  scp_to "${fixture_dir}"
+  # Copy only the contract-selected canonical staging root. In particular, this
+  # keeps DFRWS competitor submissions and repository metadata out of the case.
+  scp_to "${staging_root}"
   log "running Product against ${fixture}..."
-  case_path="~/${fixture}"
+  # scp_to copies into the remote user's HOME, which is ssh_exec's working dir.
+  remote_staging_root="${staging_root##*/}"
+  case_path="${remote_staging_root}/${analysis_entrypoint}"
+  if [[ "${analysis_entrypoint}" == "." ]]; then
+    case_path="${remote_staging_root}"
+  fi
+  printf -v case_path_q '%q' "${case_path}"
   run_log="${LOG_DIR}/${fixture}-run.log"
 
   # `scripts/find-evil-auto` is the internal headless engine that the
@@ -172,7 +200,7 @@ for fixture in "${FIXTURES[@]}"; do
   # along with findevil_agent/cli.py.) Guarded by `|| true` so the L3
   # workflow stays exercised even when the SIFT VM doesn't have the
   # orchestrator deployed yet.
-  ssh_exec "bash scripts/find-evil-auto ${case_path} --unattended 2>/dev/null" \
+  ssh_exec "bash scripts/find-evil-auto ${case_path_q} --unattended 2>/dev/null" \
     > "${run_log}" \
     || {
       log "WARN: find-evil-auto not callable on VM yet (expected pre-Week-2)"
@@ -188,18 +216,15 @@ for fixture in "${FIXTURES[@]}"; do
   # (MITRE + description token overlap) and honest verdict consistency
   # instead of an exact diff. score-recall.py reads <case_dir>/verdict.json,
   # so stage the captured verdict under a per-fixture case dir.
-  expected="${golden_dir}/expected-findings.json"
-  if [[ -f "${expected}" ]]; then
-    run_case_dir="${LOG_DIR}/${fixture}-case"
-    mkdir -p "${run_case_dir}"
-    cp "${verdict_json}" "${run_case_dir}/verdict.json"
-    log "scoring recall vs ${expected}"
-    if python3 scripts/score-recall.py "${run_case_dir}" --golden "${golden_dir}"; then
-      log "PASS ${fixture}: recall >= target and verdict consistent"
-    else
-      log "FAIL ${fixture}: recall below target or verdict mismatch (see ${run_case_dir}/recall-score.json)"
-      OVERALL_EXIT=1
-    fi
+  run_case_dir="${LOG_DIR}/${fixture}-case"
+  mkdir -p "${run_case_dir}"
+  cp "${verdict_json}" "${run_case_dir}/verdict.json"
+  log "scoring recall vs ${expected}"
+  if python3 scripts/score-recall.py "${run_case_dir}" --golden "${golden_dir}"; then
+    log "PASS ${fixture}: recall >= target and verdict consistent"
+  else
+    log "FAIL ${fixture}: recall below target or verdict mismatch (see ${run_case_dir}/recall-score.json)"
+    OVERALL_EXIT=1
   fi
 done
 

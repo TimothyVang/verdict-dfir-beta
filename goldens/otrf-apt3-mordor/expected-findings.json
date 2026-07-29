@@ -8,6 +8,8 @@
   "case_id": "otrf-apt3-mordor",
   "source_url": "https://github.com/OTRF/Security-Datasets/tree/master/datasets/compound/windows/apt3",
   "license": "MIT License (OTRF Security-Datasets)",
+  "scoring_status": "not_ready",
+  "not_ready_reason": "The pinned sparse checkout stages APT3 telemetry only inside upstream archives; no integrity-verified, engine-supported EVTX is currently extracted for this answer key.",
   "verdict": "SUSPICIOUS",
   "min_recall_percent": 60,
   "findings": [

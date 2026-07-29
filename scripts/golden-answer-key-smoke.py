@@ -10,7 +10,7 @@ under source control.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
@@ -27,6 +27,7 @@ VALID_VERDICTS = {
     "INDETERMINATE",
 }
 VALID_CONFIDENCE = {"CONFIRMED", "INFERRED", "HYPOTHESIS"}
+VALID_SCORING_STATUSES = {"ready", "not_ready"}
 
 REQUIRED_TOP_LEVEL = {"case_id", "source_url", "license", "verdict", "findings"}
 REQUIRED_FINDING = {
@@ -36,10 +37,94 @@ REQUIRED_FINDING = {
     "artifact_class",
     "artifact_hint",
 }
+HASH_LENGTHS = {"md5": 32, "sha1": 40, "sha256": 64}
 
 
 def _nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _safe_relative_path(value: Any) -> bool:
+    if not _nonempty_string(value) or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    return not path.is_absolute() and ".." not in path.parts
+
+
+def _valid_digests(spec: dict, label: str, errors: list[str]) -> int:
+    found = 0
+    for algorithm, length in HASH_LENGTHS.items():
+        value = spec.get(algorithm)
+        if value is None:
+            continue
+        found += 1
+        if (
+            not isinstance(value, str)
+            or len(value) != length
+            or any(character not in "0123456789abcdefABCDEF" for character in value)
+        ):
+            errors.append(f"{label}.{algorithm} must be {length} hexadecimal characters")
+    return found
+
+
+def _validate_fixture_contract(data: dict) -> list[str]:
+    contract = data.get("fixture_contract")
+    if contract is None:
+        return []
+    if not isinstance(contract, dict):
+        return ["fixture_contract must be an object"]
+
+    errors: list[str] = []
+    for key in ("staging_root", "analysis_entrypoint"):
+        if not _safe_relative_path(contract.get(key)):
+            errors.append(f"fixture_contract.{key} must be a safe relative POSIX path")
+
+    source = contract.get("source_artifact")
+    source_verified = source is not None
+    if source is not None:
+        label = "fixture_contract.source_artifact"
+        if not isinstance(source, dict):
+            errors.append(f"{label} must be an object")
+        else:
+            if not _safe_relative_path(source.get("path")):
+                errors.append(f"{label}.path must be a safe relative POSIX path")
+            if not isinstance(source.get("size_bytes"), int) or source["size_bytes"] <= 0:
+                errors.append(f"{label}.size_bytes must be a positive integer")
+            if _valid_digests(source, label, errors) == 0:
+                errors.append(f"{label} requires md5, sha1, or sha256")
+            archive_type = source.get("archive_type")
+            if archive_type is not None:
+                if archive_type != "zip":
+                    errors.append(f"{label}.archive_type must be 'zip'")
+                if not _safe_relative_path(source.get("member_root")):
+                    errors.append(f"{label}.member_root must be a safe relative POSIX path")
+                if not isinstance(source.get("strict_members"), bool):
+                    errors.append(f"{label}.strict_members must be boolean")
+
+    required = contract.get("required_artifacts")
+    if not isinstance(required, list) or not required:
+        errors.append("fixture_contract.required_artifacts must be a non-empty list")
+        return errors
+    for index, artifact in enumerate(required):
+        label = f"fixture_contract.required_artifacts[{index}]"
+        if not isinstance(artifact, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        if not _safe_relative_path(artifact.get("path")):
+            errors.append(f"{label}.path must be a safe relative POSIX path")
+        artifact_type = artifact.get("type", "file")
+        if artifact_type == "directory":
+            if not isinstance(artifact.get("min_files"), int) or artifact["min_files"] <= 0:
+                errors.append(f"{label}.min_files must be a positive integer")
+            continue
+        if artifact_type != "file":
+            errors.append(f"{label}.type must be 'file' or 'directory'")
+            continue
+        if not isinstance(artifact.get("size_bytes"), int) or artifact["size_bytes"] <= 0:
+            errors.append(f"{label}.size_bytes must be a positive integer")
+        if _valid_digests(artifact, label, errors) == 0 and not source_verified:
+            errors.append(f"{label} requires a digest when no source_artifact is verified")
+    return errors
 
 
 def _validate(path: Path) -> list[str]:
@@ -63,13 +148,20 @@ def _validate(path: Path) -> list[str]:
     if verdict not in VALID_VERDICTS:
         errors.append(f"verdict {verdict!r} is not a recognized scorer verdict")
 
+    scoring_status = data.get("scoring_status", "ready")
+    if scoring_status not in VALID_SCORING_STATUSES:
+        errors.append(
+            f"scoring_status {scoring_status!r} must be one of {sorted(VALID_SCORING_STATUSES)}"
+        )
+    if scoring_status == "not_ready" and not _nonempty_string(data.get("not_ready_reason")):
+        errors.append("scoring_status=not_ready requires not_ready_reason")
+    errors.extend(_validate_fixture_contract(data))
+
     pending = data.get("status") == "pending_manual_walkthrough"
     min_recall = data.get("min_recall_percent")
     if pending:
         if min_recall is not None:
-            errors.append(
-                "pending_manual_walkthrough stubs must omit min_recall_percent"
-            )
+            errors.append("pending_manual_walkthrough stubs must omit min_recall_percent")
     elif not isinstance(min_recall, int) or not 0 <= min_recall <= 100:
         errors.append("min_recall_percent must be an integer from 0 to 100")
 
