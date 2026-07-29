@@ -58,15 +58,30 @@ def check_bounds(metrics: dict[str, Any], bounds: dict[str, Any]) -> list[str]:
             f"(allowed: {sorted(_ALL_BOUND_KEYS)})"
         )
     violations: list[str] = []
+    # The scorer reports None for a metric it could not measure: precision/F1 on a
+    # zero denominator (nothing matched, nothing provably wrong) and hallucination
+    # rate on a run with no findings at all. Floors and ceilings treat that
+    # differently, and the asymmetry is the point:
+    #   * a FLOOR claims "the run achieved at least X" — an unmeasured metric
+    #     cannot support that claim, so it is a violation; and
+    #   * a CEILING claims "the run did not exceed X" — a run that asserted
+    #     nothing genuinely did not exceed a hallucination ceiling, so there is no
+    #     over-claim to catch and the bound is satisfied.
+    # A run that produced nothing is caught upstream in accuracy.score (recall,
+    # verdict consistency and run completion), not by pretending a ceiling failed.
     for key, metric in _FLOOR_KEYS.items():
         if key in bounds:
             got = metrics.get(metric, 0)
-            if got < bounds[key]:
+            if got is None:
+                violations.append(
+                    f"{metric} not measured — cannot satisfy floor {bounds[key]} ({key})"
+                )
+            elif got < bounds[key]:
                 violations.append(f"{metric} {got} < floor {bounds[key]} ({key})")
     for key, metric in _CEIL_KEYS.items():
         if key in bounds:
             got = metrics.get(metric, 0)
-            if got > bounds[key]:
+            if got is not None and got > bounds[key]:
                 violations.append(f"{metric} {got} > ceiling {bounds[key]} ({key})")
     for key, metric in _FLAG_KEYS.items():
         if bounds.get(key) and not metrics.get(metric):

@@ -30,9 +30,10 @@ scorer reports ``precision_percent`` / ``f1`` / ``hallucination_rate`` and a
 PASS rule (exit 0) requires ALL of:
   - ``recall_percent >= min_recall_percent`` from the golden,
   - ``verdict_match`` — the run's verdict word is consistent with the golden's.
-    Consistency is honest, not literal: ``INDETERMINATE`` is always accepted (a
-    scoped-partial run is never a recall failure, per the live-test gate), and the
-    evil/no-evil polarity must agree otherwise, and
+    Consistency is honest, not literal: a NEUTRAL run (``INDETERMINATE``/``UNKNOWN``)
+    matches only a NEUTRAL golden — it is also what a tool failure emits, so it
+    cannot stand in for a definite answer — and the evil/no-evil polarity must
+    agree otherwise, and
   - no ``anti_fact`` / ``known_negative`` violation — asserting a known-wrong claim
     fails the run even on an open-world key. Generic extra findings are reported
     but do not fail, so surfacing a real claim the key omitted is not punished.
@@ -81,12 +82,19 @@ def _print_report(result: dict[str, Any]) -> None:
         f"= {result['recall_percent']}%  (min {result['min_recall_percent']}%)"
     )
     scored = "scored" if result["precision_scored"] else "open-world (not scored)"
+    # precision/F1 are None when nothing was scoreable (nothing matched, nothing
+    # provably wrong). Print that as n/a — a zero-denominator run is unmeasured,
+    # not perfect.
+    prec = result["precision_percent"]
+    prec_txt = "n/a (nothing scored)" if prec is None else f"{prec}%"
+    f1_txt = "n/a" if result["f1"] is None else result["f1"]
     print(
-        f"  precision: {result['precision_percent']}%  "
-        f"(F1 {result['f1']}; {result['false_positives_n']} FP / "
+        f"  precision: {prec_txt}  "
+        f"(F1 {f1_txt}; {result['false_positives_n']} FP / "
         f"{result['extra_n']} extra of {result['run_finding_n']} findings; {scored})"
     )
-    print(f"  halluc.  : {result['hallucination_rate']}")
+    halluc = result["hallucination_rate"]
+    print(f"  halluc.  : {'n/a (no findings)' if halluc is None else halluc}")
     print(
         f"  fp_planted: {result['fp_planted']} (planted bait the run must not assert)"
     )
@@ -94,6 +102,10 @@ def _print_report(result: dict[str, Any]) -> None:
         f"  verdict  : run={result['run_verdict']} golden={result['golden_verdict']} "
         f"match={'yes' if result['verdict_match'] else 'NO'}"
     )
+    if not result["run_completed"]:
+        print(
+            "  run      : INCOMPLETE — " + "; ".join(result["run_incomplete_reasons"])
+        )
     if result["planted_bait"]:
         print("  PLANTED BAIT ASSERTED (fails the run):")
         for b in result["planted_bait"]:
@@ -146,7 +158,13 @@ def main(argv: list[str]) -> int:
         print("  pass one explicitly with --golden goldens/<case-id>", file=sys.stderr)
         return 2
 
-    result = score(case_dir, golden_path)
+    try:
+        result = score(case_dir, golden_path)
+    except ValueError as exc:
+        # e.g. an unpopulated stub golden (min_recall_percent: null). Report the
+        # golden by name rather than dying in a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not quiet:
         _print_report(result)
     out = case_dir / "recall-score.json"

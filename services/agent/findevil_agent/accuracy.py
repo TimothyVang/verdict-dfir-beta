@@ -99,8 +99,9 @@ _STOPWORDS = frozenset(
     ]
 )
 
-# Verdict words the product emits, grouped by polarity. INDETERMINATE is handled
-# separately (always accepted). Goldens use the same vocabulary as verdict.json.
+# Verdict words the product emits, grouped by polarity. NEUTRAL is handled
+# separately: a neutral run matches only a neutral golden (see
+# _verdict_consistent). Goldens use the same vocabulary as verdict.json.
 _EVIL_WORDS = frozenset({"CONFIRMED_EVIL", "SUSPICIOUS", "SUSPICION", "EVIL"})
 _BENIGN_WORDS = frozenset({"NO_EVIL", "BENIGN"})
 _NEUTRAL_WORDS = frozenset({"UNKNOWN", "INDETERMINATE"})
@@ -171,9 +172,13 @@ def _verdict_consistent(run_verdict: str | None, golden_verdict: str | None) -> 
     (CONFIRMED_EVIL/SUSPICIOUS), BENIGN (NO_EVIL), NEUTRAL (INDETERMINATE/UNKNOWN).
 
     Rules, in order:
-      1. A NEUTRAL *run* verdict is always accepted. We never punish honest
-         uncertainty — a scoped-partial or "saw leads, couldn't corroborate" run
-         is the correct posture, not a failure (matches the live-test gate).
+      1. A NEUTRAL *run* verdict matches only a NEUTRAL *golden*. INDETERMINATE
+         used to be accepted against any key, on the grounds that we never punish
+         honest uncertainty — but INDETERMINATE is also exactly what a tool
+         failure emits, which made this check a near no-op: in the 2026-07-28
+         aggregate three of the four "passing" goldens ended INDETERMINATE,
+         nitroba included, against a CONFIRMED_EVIL key. A key that asserts a
+         definite answer is not satisfied by a run that never reached one.
       2. Once the run makes a *definite* call (EVIL or BENIGN), a NEUTRAL *golden*
          means the case was authored to expect uncertainty — so the definite call
          is over/under-confident and FAILS. This is what makes a false-positive
@@ -184,7 +189,7 @@ def _verdict_consistent(run_verdict: str | None, golden_verdict: str | None) -> 
     rv = (run_verdict or "").upper()
     gv = (golden_verdict or "").upper()
     if rv in _NEUTRAL_WORDS:
-        return True
+        return gv in _NEUTRAL_WORDS
     if gv in _NEUTRAL_WORDS:
         return False
     if rv in _EVIL_WORDS and gv in _EVIL_WORDS:
@@ -192,6 +197,58 @@ def _verdict_consistent(run_verdict: str | None, golden_verdict: str | None) -> 
     if rv in _BENIGN_WORDS and gv in _BENIGN_WORDS:
         return True
     return rv == gv
+
+
+def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Did the run finish its work, or fall over on the way?
+
+    Deliberately mirrors the ENGINE's own model of failure rather than inventing a
+    stricter one, because "any tool call that errored" is not what the engine means
+    by a failed run:
+
+      * ``heartbeat.terminated_partial`` is the HEARTBEAT terminator saying it gave
+        up mid-case. That is the engine's own "I stopped".
+      * A guardrail rejection is recorded as ``{"error": ..., "rejected": True}``
+        (find_evil_auto.py:9361) — the bridge refusing an out-of-scope tool request.
+        That is the guardrail WORKING, not the run breaking, so ``rejected`` calls
+        are excluded.
+      * A failure the engine RETRIED and got through is not a failure to see the
+        evidence. Recovery is per-tool: the tool that failed later succeeded. We do
+        NOT mirror the engine's consecutive-failure streak
+        (``_record_tool``, find_evil_auto.py:9234), because that streak answers a
+        different question — "should I abort this case?" — and a later successful
+        ``case_close`` answers it while saying nothing about whether the disk was
+        ever read. Under the streak rule, a run that failed to read the evidence
+        three times and then closed cleanly scores 100% recall on a true-negative
+        key with nothing found.
+
+    This gates ONLY the zero-expected recall shortcut in :func:`score`. A
+    true-negative golden must be scored on the run having actually established the
+    negative, not on it having crashed before it could assert anything — but those
+    same two controls are what catch over-claiming, so a false FAIL here makes them
+    unusable rather than merely wrong.
+    """
+    reasons: list[str] = []
+    heartbeat = verdict_doc.get("heartbeat") or {}
+    if heartbeat.get("terminated_partial"):
+        reasons.append("heartbeat terminated the case partway (terminated_partial)")
+    # Recovery is per-tool and deliberately order-insensitive: if a tool succeeded
+    # at any point in the run, that tool got through at least once, so a failure on
+    # it is not evidence the run could not reach that evidence. A DIFFERENT tool
+    # succeeding says nothing about the failed one. See
+    # test_a_tool_that_succeeded_then_failed_reads_as_recovered_by_decision.
+    failed: set[str] = set()
+    succeeded: set[str] = set()
+    for tc in verdict_doc.get("tool_calls") or []:
+        name = str(tc.get("tool") or "unnamed tool")
+        if not tc.get("error"):
+            succeeded.add(name)
+        elif not tc.get("rejected"):
+            failed.add(name)
+    unrecovered = sorted(failed - succeeded)
+    if unrecovered:
+        reasons.append("tool call(s) failed and never succeeded: " + ", ".join(unrecovered))
+    return not reasons, reasons
 
 
 def _is_eligible(expected: dict[str, Any], rf: dict[str, Any]) -> bool:
@@ -321,14 +378,39 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
 
     expected_n = len(expected)
     recalled_n = len(matched)
-    # An empty golden (e.g. synthetic-benign) is 100% recalled by definition: a
-    # clean case has nothing to find, so a run with no findings is a perfect score.
-    recall_percent = 100 if expected_n == 0 else round(recalled_n * 100 / expected_n)
-    min_recall = int(golden.get("min_recall_percent", 0))
 
     run_verdict = verdict_doc.get("verdict")
     golden_verdict = golden.get("verdict")
     verdict_match = _verdict_consistent(run_verdict, golden_verdict)
+    run_completed, run_incomplete_reasons = _run_completed(verdict_doc)
+
+    # An empty golden (synthetic-benign / -decoy) says "there is nothing to find
+    # here" — it does NOT say "nothing went wrong". Scoring recall 100 on
+    # expected_n == 0 unconditionally is what let a run that produced nothing at
+    # all pass two goldens in the 2026-07-28 aggregate: it errored out, emitted
+    # zero findings and INDETERMINATE, and scored a perfect recall for it. So the
+    # shortcut now requires the run to have actually established the negative —
+    # finished without a tool failure AND reached the verdict the key asked for.
+    # Zero-expected is still not an automatic fail: a clean, complete,
+    # correctly-verdicted run on a true-negative case scores 100, as it should.
+    if expected_n:
+        recall_percent = round(recalled_n * 100 / expected_n)
+    else:
+        recall_percent = 100 if (run_completed and verdict_match) else 0
+
+    # A stub golden (e.g. sans-starter, status pending_manual_walkthrough) carries
+    # `min_recall_percent: null`. int(None) is a TypeError with no case name in it;
+    # say which key is unscoreable instead. No default threshold is invented — a
+    # stub is not a bar the run can clear.
+    raw_min_recall = golden.get("min_recall_percent", 0)
+    if raw_min_recall is None:
+        raise ValueError(
+            f"golden '{golden.get('case_id') or golden_path.parent.name}' has "
+            f"min_recall_percent: null ({golden_path}) — it is an unpopulated stub, "
+            "not a scoreable answer key. Populate min_recall_percent (and findings) "
+            "before scoring a run against it."
+        )
+    min_recall = int(raw_min_recall)
 
     # --- False-positive / precision side -------------------------------------
     # Recall asks "did the run surface the ground truth?"; precision asks "did it
@@ -393,13 +475,25 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     false_positives = extra if exhaustive else violations
     fp_n = len(false_positives)
 
+    # Zero denominator means UNMEASURED, not perfect. A run that matched no claim
+    # and asserted nothing provably wrong has no precision to report, and a run
+    # with no findings at all has no hallucination rate — reporting 1.0 / 0.0 there
+    # is what made every failing zero-finding row print `prec=100 halluc=0.0`.
+    # None is deliberate: it forces every reader to render "n/a" rather than a
+    # number that looks like a perfect score.
     precision_denom = recalled_n + fp_n
-    precision_frac = recalled_n / precision_denom if precision_denom else 1.0
-    precision_percent = round(precision_frac * 100)
-    recall_frac = 1.0 if expected_n == 0 else recalled_n / expected_n
-    pr_sum = precision_frac + recall_frac
-    f1 = round(2 * precision_frac * recall_frac / pr_sum, 4) if pr_sum else 0.0
-    hallucination_rate = round(fp_n / total_run, 4) if total_run else 0.0
+    precision_frac = recalled_n / precision_denom if precision_denom else None
+    precision_percent = None if precision_frac is None else round(precision_frac * 100)
+    # Derived from recall_percent so this function carries ONE definition of
+    # recall: on a zero-expected golden that is the completed-and-verdict-matched
+    # decision above, not an unconditional 1.0 contradicting it.
+    recall_frac = recall_percent / 100 if expected_n == 0 else recalled_n / expected_n
+    if precision_frac is None:
+        f1 = None
+    else:
+        pr_sum = precision_frac + recall_frac
+        f1 = round(2 * precision_frac * recall_frac / pr_sum, 4) if pr_sum else 0.0
+    hallucination_rate = round(fp_n / total_run, 4) if total_run else None
 
     negative_coverage = _negative_coverage(
         violations, denylist_hits, anti_facts, known_negatives, named_denylist
@@ -432,6 +526,8 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
         "run_verdict": run_verdict,
         "golden_verdict": golden_verdict,
         "verdict_match": verdict_match,
+        "run_completed": run_completed,
+        "run_incomplete_reasons": run_incomplete_reasons,
         "pass": passed,
         "matched": matched,
         "unmatched": unmatched,

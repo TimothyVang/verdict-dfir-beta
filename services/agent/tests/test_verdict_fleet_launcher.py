@@ -41,16 +41,16 @@ class TestFleetMode:
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
         # All three stages are named in the plan.
-        assert "run-whole-case-local" in out
-        assert "fleet_correlate" in out
-        assert "render_fleet_report" in out
+        assert "run-whole-case-local" in out, out
+        assert "fleet_correlate" in out, out
+        assert "render_fleet_report" in out, out
 
     def test_explicit_fleet_flag(self, tmp_path: Path) -> None:
         root = _case_root(tmp_path)
         proc = _run([str(root), "--fleet", "--dry-run", "--no-dashboard"], tmp_path)
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
-        assert "run-whole-case-local" in out
+        assert "run-whole-case-local" in out, out
 
     def test_single_file_evidence_does_not_enter_fleet_mode(self, tmp_path: Path) -> None:
         evidence = tmp_path / "memory.img"
@@ -58,8 +58,8 @@ class TestFleetMode:
         proc = _run([str(evidence), "--dry-run", "--no-dashboard", "--skip-build"], tmp_path)
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
-        assert "run-whole-case-local" not in out
-        assert "find_evil_auto" in out  # the normal single-case engine plan
+        assert "run-whole-case-local" not in out, out
+        assert "find_evil_auto" in out, out  # the normal single-case engine plan
 
     @pytest.mark.parametrize("extra_args", [[], ["--fleet"]], ids=["auto", "explicit"])
     def test_agent_mode_rejects_fleet_before_deterministic_run(
@@ -72,8 +72,8 @@ class TestFleetMode:
         )
         out = proc.stdout + proc.stderr
         assert proc.returncode != 0, out
-        assert "--agent supports a single EVTX file only" in out
-        assert "run-whole-case-local" not in out
+        assert "--agent supports a single EVTX file only" in out, out
+        assert "run-whole-case-local" not in out, out
 
 
 def test_agent_launcher_rejects_successful_engine_with_failed_manifest(
@@ -139,5 +139,11 @@ printf '%s\n' 'DONE — verdict: NO_EVIL'
         shutil.rmtree(case_dir, ignore_errors=True)
 
     out = proc.stdout + proc.stderr
+    # Assert the reason before the exit code. `returncode != 0` on its own is
+    # satisfied by any abort: on a worktree with no target/release/findevil-mcp
+    # built, scripts/verdict bails at the doctor preflight and this test used to
+    # pass for a reason unrelated to what it is named after.
+    assert "manifest verification failed" in out.lower(), (
+        f"launcher exited {proc.returncode}, but not for the manifest:\n{out}"
+    )
     assert proc.returncode != 0, out
-    assert "manifest verification failed" in out.lower()
