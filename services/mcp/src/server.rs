@@ -1758,15 +1758,17 @@ fn dispatch_vel_collect(args: Value) -> Result<Value, ToolError> {
 
 fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
     let input: BrowserHistoryInput = parse_args(args)?;
-    // NotFound / UnknownSchema are user-input territory (wrong path, or a file
-    // that isn't a browser history DB); surface as -32602. Unreadable/ParseFailed
-    // are corrupt-or-permission system issues → -32603.
+    // NotFound / NotSqlite / UnknownSchema are user-input territory (wrong
+    // path, wrong file type, or a non-browser SQLite DB); surface as -32602.
+    // HeaderUnreadable / Unreadable / ParseFailed are corrupt-or-permission
+    // system issues → -32603.
     match browser_history(&input) {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
         }
         Err(
             e @ (crate::tools::BrowserHistoryError::NotFound(_)
+            | crate::tools::BrowserHistoryError::NotSqlite(_)
             | crate::tools::BrowserHistoryError::UnknownSchema(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("browser_history: {e}"))),

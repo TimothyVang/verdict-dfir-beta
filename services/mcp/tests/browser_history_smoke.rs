@@ -39,16 +39,15 @@ fn browser_history_errors_on_directory_not_file() {
 
 #[test]
 fn browser_history_errors_on_garbage_bytes() {
-    // A non-SQLite file must surface a typed error, not panic.
+    // A directly configured non-SQLite artifact must still surface a typed
+    // failure. Auto-discovered name collisions are filtered before dispatch,
+    // but an explicit parser request must never be silently treated as empty.
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("History");
     std::fs::write(&path, b"this is definitely not a sqlite database header").unwrap();
     let err = browser_history(&sample_input(path)).unwrap_err();
     assert!(
-        matches!(
-            err,
-            BrowserHistoryError::ParseFailed { .. } | BrowserHistoryError::Unreadable { .. }
-        ),
+        matches!(err, BrowserHistoryError::NotSqlite(_)),
         "got {err:?}"
     );
 }

@@ -442,3 +442,74 @@ fn disk_extract_artifacts_skips_oversized_yara_targets() {
         "oversized YARA target should not be copied"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_artifacts_skips_non_sqlite_history_name_collision() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("disk-browser-history-type-check".to_string()),
+    })
+    .expect("case_open ok");
+
+    let sqlite_path = tmp.path().join("valid-history.sqlite");
+    let conn = rusqlite::Connection::open(&sqlite_path).expect("create sqlite fixture");
+    conn.execute_batch(
+        "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, \
+             visit_count INTEGER, last_visit_time INTEGER);
+         CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);",
+    )
+    .expect("create chrome-shaped schema");
+    drop(conn);
+    let sqlite_bytes = fs::read(sqlite_path).expect("read sqlite fixture");
+
+    let shell_history = PathBuf::from("home/analyst/.mc/history");
+    let browser_history = PathBuf::from("home/analyst/.config/google-chrome/Default/History");
+    let _tsk = FakeTsk::install(
+        tmp.path(),
+        &[
+            ("300", shell_history.to_str().unwrap(), b"cd /tmp\nls -la\n"),
+            (
+                "301",
+                browser_history.to_str().unwrap(),
+                sqlite_bytes.as_slice(),
+            ),
+        ],
+    );
+
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+
+    let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 1024 * 1024,
+    })
+    .expect("extract artifacts");
+
+    assert!(
+        extracted
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.source_path != shell_history),
+        "plain-text .mc/history is a name collision, not a browser database"
+    );
+    assert!(
+        extracted
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.source_path == browser_history),
+        "a genuine SQLite History database must remain available for parsing"
+    );
+}

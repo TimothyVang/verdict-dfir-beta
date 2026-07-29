@@ -899,6 +899,10 @@ fn mock_extract(
         path: dest.clone(),
         source,
     })?;
+    if !extracted_artifact_type_matches(class, &dest)? {
+        fs::remove_file(&dest).map_err(|source| DiskError::Io { path: dest, source })?;
+        return Ok(());
+    }
     out.push(ExtractedDiskArtifact {
         artifact_class: class.to_string(),
         source_path: PathBuf::from(rel_path),
@@ -1102,6 +1106,10 @@ fn tsk_extract(
         *skipped_oversize += 1;
         return Ok(());
     }
+    if !extracted_artifact_type_matches(class, &dest)? {
+        fs::remove_file(&dest).map_err(|source| DiskError::Io { path: dest, source })?;
+        return Ok(());
+    }
     out.push(ExtractedDiskArtifact {
         artifact_class: class.to_string(),
         source_path: PathBuf::from(rel_path),
@@ -1109,6 +1117,19 @@ fn tsk_extract(
         size_bytes: size,
     });
     Ok(())
+}
+
+/// Confirm filename-classified artifacts have the minimum format signature
+/// required by their downstream parser. Browser databases are the only
+/// filename-collision-prone class today (`History` is also used by shells).
+fn extracted_artifact_type_matches(class: &str, path: &Path) -> Result<bool, DiskError> {
+    if class != "browser_db" {
+        return Ok(true);
+    }
+    super::browser_history::has_sqlite_header(path).map_err(|source| DiskError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Join an image-internal path under `base`, keeping only normal components so a
