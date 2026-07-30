@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from findevil_agent import accuracy
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +26,17 @@ def _write_verdict(case_dir: Path, verdict: str, findings: list[dict[str, object
     doc = {"case_id": "nist-hacking-case", "verdict": verdict, "findings": findings}
     (case_dir / "verdict.json").write_text(json.dumps(doc), encoding="utf-8")
     return case_dir
+
+
+def _ready_golden_copy(tmp_path: Path, source: Path) -> Path:
+    """Make an explicitly scoreable copy for tests of scoring math."""
+
+    data = json.loads(source.read_text(encoding="utf-8"))
+    data["scoring_status"] = "ready"
+    data.pop("not_ready_reason", None)
+    destination = tmp_path / f"{source.parent.name}-ready.json"
+    destination.write_text(json.dumps(data), encoding="utf-8")
+    return destination
 
 
 # Seven of the 14 SCHARDT ground-truth claims, worded with the distinctive tokens
@@ -85,12 +98,25 @@ class TestScoreCore:
         ):
             assert key in result, f"missing {key}"
 
+    def test_not_ready_golden_cannot_produce_a_score(self, tmp_path: Path) -> None:
+        golden = _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json"
+        case_dir = _write_verdict(tmp_path / "decoy", "NO_EVIL", [])
+
+        with pytest.raises(
+            ValueError,
+            match=r"scoring_status=not_ready.*not scoreable",
+        ):
+            accuracy.score(case_dir, golden)
+
 
 class TestNegativeCoverage:
     def test_clean_decoy_run_has_full_negative_coverage(self, tmp_path: Path) -> None:
         # A run that surfaces ZERO findings against the planted-DECOY golden
         # correctly avoids every known_negative / denylisted name.
-        golden = _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json"
+        golden = _ready_golden_copy(
+            tmp_path,
+            _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json",
+        )
         case_dir = _write_verdict(tmp_path / "decoy", "NO_EVIL", [])
         result = accuracy.score(case_dir, golden)
         neg = result["negative_coverage"]
@@ -102,7 +128,10 @@ class TestNegativeCoverage:
         assert neg["coverage_percent"] == 100
 
     def test_asserting_denylisted_name_drops_negative_coverage(self, tmp_path: Path) -> None:
-        golden = _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json"
+        golden = _ready_golden_copy(
+            tmp_path,
+            _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json",
+        )
         # A hallucinated finding that asserts a denylisted malware name on the
         # benign decoy: planted-bait false positive.
         findings = [

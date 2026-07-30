@@ -159,6 +159,15 @@ def _load_decoy_golden() -> dict:
     return json.loads(_DECOY_GOLDEN.read_text(encoding="utf-8"))
 
 
+def _ready_decoy_golden(tmp_path: Path) -> Path:
+    golden = _load_decoy_golden()
+    golden["scoring_status"] = "ready"
+    golden.pop("not_ready_reason", None)
+    path = tmp_path / "synthetic-decoy-ready.json"
+    path.write_text(json.dumps(golden), encoding="utf-8")
+    return path
+
+
 def test_synthetic_decoy_golden_parses_with_planted_bait_schema() -> None:
     golden = _load_decoy_golden()
     assert golden["case_id"] == "synthetic-decoy"
@@ -181,7 +190,7 @@ def test_synthetic_decoy_clean_run_scores_fp_planted_zero_pass(tmp_path: Path) -
     # A correct run reports the benign decoys without escalating: no findings,
     # verdict NO_EVIL -> fp_planted 0 and PASS against the committed golden.
     case = _case(tmp_path, [], verdict="NO_EVIL")
-    r = score_recall.score(case, _DECOY_GOLDEN)
+    r = score_recall.score(case, _ready_decoy_golden(tmp_path))
 
     assert r["fp_planted"] == 0
     assert r["pass"] is True
@@ -195,7 +204,7 @@ def test_synthetic_decoy_escalating_run_fails_on_planted_bait(tmp_path: Path) ->
         [_finding("r1", "host executed Mimikatz to dump LSASS credentials")],
         verdict="SUSPICIOUS",
     )
-    r = score_recall.score(case, _DECOY_GOLDEN)
+    r = score_recall.score(case, _ready_decoy_golden(tmp_path))
 
     assert r["fp_planted"] >= 1
     assert any(b["violation"] == "named_claim_denylist" for b in r["planted_bait"])

@@ -241,17 +241,44 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# 2. NIST CFReDS Hacking Case (~4.5 GB E01). Public domain.
-#    The canonical distribution URL is long-lived.
+# 2. NIST CFReDS Hacking Case (~4.5 GB split DD). Public domain.
+#    NIST documents SCHARDT.001 through SCHARDT.008 as one image. Fetch every
+#    segment, then enforce the official per-segment sizes and MD5 values from
+#    SCHARDT.LOG through the answer key's fixture contract.
 # ---------------------------------------------------------------------
-fetch_fixture \
-  "https://cfreds-archive.nist.gov/images/hacking-dd/SCHARDT.001" \
-  "nist-hacking-case/SCHARDT.001" \
-  ""  # sha recorded on first pull
+mapfile -t NIST_SCHARDT_SEGMENTS < <(
+  python3 - "${REPO_ROOT}/goldens/nist-hacking-case/expected-findings.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+golden = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for artifact in golden["fixture_contract"]["required_artifacts"]:
+    print(artifact["path"])
+PY
+)
+for segment in "${NIST_SCHARDT_SEGMENTS[@]}"; do
+  fetch_fixture \
+    "https://cfreds-archive.nist.gov/images/hacking-dd/${segment}" \
+    "nist-hacking-case/${segment}" \
+    ""  # SHA-256 recorded locally; official MD5 is enforced below
+done
+if ! readiness="$(
+  python3 scripts/fixture-readiness.py \
+    goldens/nist-hacking-case/expected-findings.json \
+    "${FIXTURES}/nist-hacking-case"
+)"; then
+  log "ERROR: ${readiness}"
+  exit 1
+fi
+log "${readiness}"
 
 # ---------------------------------------------------------------------
-# 3. OTRF Security-Datasets — small EVTX/JSON samples. MIT.
-#    Clone sparse Windows atomic telemetry plus the compound APT3 bundle.
+# 3. OTRF Security-Datasets — compressed JSON samples. MIT.
+#    Clone sparse Windows atomic telemetry plus the compound APT3 bundle as
+#    source material only. The pinned APT3 archives are not integrity-verified,
+#    extracted EVTX, so this checkout is explicitly NOT_READY for accuracy
+#    scoring (see the answer key's scoring_status).
 # ---------------------------------------------------------------------
 OTRF_SECURITY_DATASETS_REF="${OTRF_SECURITY_DATASETS_REF:-d9d40ef123d2c87d5d3df28c96bcab4f0faccc87}"
 if [[ ! "${OTRF_SECURITY_DATASETS_REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -278,6 +305,7 @@ fi
   git fetch --depth 1 origin "${OTRF_SECURITY_DATASETS_REF}" && \
   git checkout --detach FETCH_HEAD && \
   git sparse-checkout set "${OTRF_PATHS[@]}")
+log "NOT_READY otrf-apt3-mordor: sparse source checkout has no integrity-verified, extracted EVTX"
 
 # ---------------------------------------------------------------------
 # 4. Volatility Foundation memory samples — pick the smallest one.
@@ -293,9 +321,9 @@ if ! (
 fi
 
 # ---------------------------------------------------------------------
-# 5. Synthetic benign baseline — generated in-repo on first run.
-#    Zero bytes of real data; lives to verify the agent distinguishes
-#    clean systems from compromised ones. See DATASET.md §Synthetic.
+# 5. Synthetic benign placeholder — generated in-repo on first run.
+#    This is documentation, not a clean Windows evidence capture. It remains
+#    useful as policy-test metadata but is NOT_READY for product accuracy.
 # ---------------------------------------------------------------------
 if [[ ! -f "${FIXTURES}/synthetic-benign/.generated" ]]; then
   mkdir -p "${FIXTURES}/synthetic-benign"
@@ -307,8 +335,8 @@ Contents intentionally minimal. The agent's acceptance criterion for
 this fixture is that it produces **zero findings** and verdict
 `NO_EVIL`. A nonzero result proves hallucination.
 EOF
-  log "ok: synthetic-benign placeholder written"
 fi
+log "NOT_READY synthetic-benign: README placeholder is not a clean Windows evidence capture"
 
 # ---------------------------------------------------------------------
 # 5b. Synthetic DECOY case — generated in-repo on first run. Companion to
@@ -322,8 +350,9 @@ fi
 #     lookup C2, calling the archive exfil) is planted-bait false positive and
 #     fails the run via goldens/synthetic-decoy/expected-findings.json
 #     (known_negatives + named_claim_denylist, scored by scripts/score-recall.py
-#     as fp_planted). Content is fixed so the per-file SHA-256 is deterministic
-#     and pinnable in fixtures/sha256sums.txt like every other fixture.
+#     as fp_planted). This is a policy regression fixture, not supported forensic
+#     telemetry, and remains NOT_READY for end-to-end product accuracy. Content
+#     is fixed so the per-file SHA-256 is deterministic and pinnable.
 # ---------------------------------------------------------------------
 if [[ ! -f "${FIXTURES}/synthetic-decoy/.generated" ]]; then
   mkdir -p "${FIXTURES}/synthetic-decoy/Users/decoy/Desktop"
@@ -380,8 +409,8 @@ these lookalikes is planted-bait false-positive hallucination and FAILS the run
 `fp_planted`).
 EOF
   : > "${FIXTURES}/synthetic-decoy/.generated"
-  log "ok: synthetic-decoy planted-bait fixture written"
 fi
+log "NOT_READY synthetic-decoy: text lookalikes are policy-test inputs, not forensic telemetry"
 
 # ---------------------------------------------------------------------
 # 6. Public DFIR benchmark datasets (Anna Tchijova's verified/ranked list).
@@ -443,6 +472,57 @@ if [[ -d "${FIXTURES}/dfrws-2008-linux/.git" ]]; then
   (cd "${FIXTURES}/dfrws-2008-linux" && \
     git fetch --depth 1 origin "${DFRWS2008_REF}" && \
     git checkout --detach FETCH_HEAD)
+  DFRWS2008_ARCHIVE="${FIXTURES}/dfrws-2008-linux/details/dfrws2008-challenge.zip"
+  DFRWS2008_ARCHIVE_SIZE=94421088
+  DFRWS2008_ARCHIVE_SHA1=52014e22c843ece2736bce59f652f43e96035825
+  if ! python3 - \
+    "${DFRWS2008_ARCHIVE}" \
+    "${DFRWS2008_ARCHIVE_SIZE}" \
+    "${DFRWS2008_ARCHIVE_SHA1}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_size = int(sys.argv[2])
+expected_sha1 = sys.argv[3]
+if not path.is_file():
+    raise SystemExit(f"missing canonical DFRWS archive: {path}")
+if path.stat().st_size != expected_size:
+    raise SystemExit(
+        f"DFRWS archive size mismatch: expected={expected_size} actual={path.stat().st_size}"
+    )
+digest = hashlib.sha1()
+with path.open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+actual_sha1 = digest.hexdigest()
+if actual_sha1 != expected_sha1:
+    raise SystemExit(
+        f"DFRWS archive SHA-1 mismatch: expected={expected_sha1} actual={actual_sha1}"
+    )
+PY
+  then
+    log "ERROR: canonical DFRWS archive failed integrity validation"
+    exit 1
+  fi
+
+  if ! python3 scripts/fixture-readiness.py \
+    goldens/dfrws-2008-linux/expected-findings.json \
+    "${FIXTURES}/dfrws-2008-linux" >/dev/null; then
+    extract_zip_fixture \
+      "${DFRWS2008_ARCHIVE}" \
+      "${FIXTURES}/dfrws-2008-linux/canonical"
+  fi
+  if ! readiness="$(
+    python3 scripts/fixture-readiness.py \
+      goldens/dfrws-2008-linux/expected-findings.json \
+      "${FIXTURES}/dfrws-2008-linux"
+  )"; then
+    log "ERROR: ${readiness}"
+    exit 1
+  fi
+  log "${readiness}"
 fi
 
 # 6e-g. Ali Hadi challenges — gated (archive.org item filenames vary per case).

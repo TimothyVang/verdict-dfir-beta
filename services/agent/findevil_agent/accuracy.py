@@ -105,6 +105,7 @@ _STOPWORDS = frozenset(
 _EVIL_WORDS = frozenset({"CONFIRMED_EVIL", "SUSPICIOUS", "SUSPICION", "EVIL"})
 _BENIGN_WORDS = frozenset({"NO_EVIL", "BENIGN"})
 _NEUTRAL_WORDS = frozenset({"UNKNOWN", "INDETERMINATE"})
+_VALID_SCORING_STATUSES = frozenset({"ready", "not_ready"})
 
 
 def _tokens(*parts: str | None) -> set[str]:
@@ -347,6 +348,25 @@ def _negative_coverage(
     }
 
 
+def _require_scoreable_golden(golden: dict[str, Any], golden_path: Path) -> None:
+    """Reject incomplete or malformed answer keys before computing metrics."""
+
+    scoring_status = golden.get("scoring_status", "ready")
+    if scoring_status not in _VALID_SCORING_STATUSES:
+        raise ValueError(
+            f"golden '{golden.get('case_id') or golden_path.parent.name}' has unsupported "
+            f"scoring_status {scoring_status!r}; expected one of "
+            f"{sorted(_VALID_SCORING_STATUSES)}"
+        )
+    if scoring_status == "not_ready":
+        reason = golden.get("not_ready_reason")
+        reason_suffix = f": {reason.strip()}" if isinstance(reason, str) and reason.strip() else ""
+        raise ValueError(
+            f"golden '{golden.get('case_id') or golden_path.parent.name}' has "
+            f"scoring_status=not_ready and is not scoreable{reason_suffix}"
+        )
+
+
 def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     """Grade a finished Case directory against a ground-truth golden.
 
@@ -357,6 +377,7 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     """
     verdict_doc = json.loads((case_dir / "verdict.json").read_text(encoding="utf-8"))
     golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    _require_scoreable_golden(golden, golden_path)
 
     run_findings: list[dict[str, Any]] = verdict_doc.get("findings") or []
     expected: list[dict[str, Any]] = golden.get("findings") or []
