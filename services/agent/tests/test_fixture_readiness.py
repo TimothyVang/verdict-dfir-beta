@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -52,6 +54,57 @@ def test_explicit_not_ready_fixture_is_not_scorable(tmp_path: Path) -> None:
 
     assert result.ready is False
     assert result.reason == "placeholder is not forensic evidence"
+
+
+def test_cli_distinguishes_not_ready_from_checker_error(tmp_path: Path) -> None:
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    golden = _golden(
+        tmp_path,
+        scoring_status="not_ready",
+        not_ready_reason="fixture acquisition is incomplete",
+    )
+
+    not_ready = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPTS / "fixture-readiness.py"),
+            "--json",
+            str(golden),
+            str(fixture),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert not_ready.returncode == 3
+    assert json.loads(not_ready.stdout)["status"] == "NOT_READY"
+
+    golden.write_text(
+        json.dumps(
+            {
+                "case_id": "case",
+                "scoring_status": "invalid",
+                "min_recall_percent": 0,
+                "findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    checker_error = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPTS / "fixture-readiness.py"),
+            "--json",
+            str(golden),
+            str(fixture),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert checker_error.returncode == 2
+    assert json.loads(checker_error.stdout)["status"] == "ERROR"
 
 
 def test_documentation_and_archives_alone_are_not_scorable(tmp_path: Path) -> None:
@@ -317,6 +370,16 @@ def test_l3_runner_checks_readiness_before_copy_or_score() -> None:
     score = text.index("score-recall.py", copy)
 
     assert readiness < copy < score
+
+
+def test_l3_runner_fails_on_readiness_errors_but_skips_not_ready() -> None:
+    text = (_SCRIPTS / "l3-run-goldens.sh").read_text(encoding="utf-8")
+
+    assert "readiness_exit=$?" in text
+    assert 'if [[ "${readiness_exit}" -eq 3 ]]' in text
+    assert 'log "SKIP ${fixture}: NOT_READY ${readiness_reason}"' in text
+    assert 'log "FAIL ${fixture}: fixture readiness ERROR ${readiness_reason}"' in text
+    assert "OVERALL_EXIT=1" in text
 
 
 def test_l3_runner_copies_only_staging_root_and_uses_analysis_entrypoint() -> None:

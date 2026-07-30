@@ -83,6 +83,17 @@ def _echo_golden_findings(golden_path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _score_with_ready_copy(case_dir: Path, source: Path, tmp_path: Path) -> dict[str, Any]:
+    """Exercise scoring math without weakening committed fixture readiness."""
+
+    golden = json.loads(source.read_text(encoding="utf-8"))
+    golden["scoring_status"] = "ready"
+    golden.pop("not_ready_reason", None)
+    destination = tmp_path / f"{source.parent.name}-ready.json"
+    destination.write_text(json.dumps(golden), encoding="utf-8")
+    return accuracy.score(case_dir, destination)
+
+
 class TestEmptyGoldenIsNotAFreePass:
     """``expected_n == 0`` means "nothing to find", not "nothing went wrong"."""
 
@@ -90,7 +101,7 @@ class TestEmptyGoldenIsNotAFreePass:
         # The exact shape of the 2026-07-28 synthetic-benign "pass": zero findings,
         # verdict INDETERMINATE. The golden wants NO_EVIL.
         case = _write_case(tmp_path / "benign", "synthetic-benign", "INDETERMINATE", [])
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_finding_n"] == 0
         assert result["recall_percent"] != 100
         assert result["pass"] is False
@@ -105,7 +116,7 @@ class TestEmptyGoldenIsNotAFreePass:
             [],
             tool_calls=[_OK_TOOL, _FAILED_TOOL],
         )
-        result = accuracy.score(case, _DECOY_GOLDEN)
+        result = _score_with_ready_copy(case, _DECOY_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert result["recall_percent"] != 100
         assert result["pass"] is False
@@ -118,7 +129,7 @@ class TestEmptyGoldenIsNotAFreePass:
             [],
             heartbeat={"terminated_partial": True},
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert result["pass"] is False
 
@@ -127,7 +138,7 @@ class TestEmptyGoldenIsNotAFreePass:
         # the case NO_EVIL and correctly found nothing is a real PASS. Zero-expected
         # must not become an automatic fail.
         case = _write_case(tmp_path / "benign", "synthetic-benign", "NO_EVIL", [])
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is True
         assert result["recall_percent"] == 100
         assert result["pass"] is True
@@ -261,7 +272,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, rejected],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is True
         assert result["recall_percent"] == 100
         assert result["pass"] is True
@@ -280,7 +291,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, _FAILED_TOOL, retry],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is True
         assert result["pass"] is True
 
@@ -293,7 +304,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, _FAILED_TOOL],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert result["pass"] is False
 
@@ -305,7 +316,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[{"tool_call_id": "tc-9", "error": "boom"}],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert "None" not in "; ".join(result["run_incomplete_reasons"])
 
@@ -321,7 +332,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, _FAILED_TOOL, {"tool_call_id": "tc-4", "tool": "case_close"}],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert "disk_extract_artifacts" in "; ".join(result["run_incomplete_reasons"])
         assert result["pass"] is False
@@ -340,7 +351,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, *failures, {"tool_call_id": "tc-9", "tool": "case_close"}],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is False
         assert result["pass"] is False
 
@@ -386,7 +397,7 @@ class TestRunCompletionMatchesTheEnginesOwnFailureModel:
             [],
             tool_calls=[_OK_TOOL, first_ok, later_failure],
         )
-        result = accuracy.score(case, _BENIGN_GOLDEN)
+        result = _score_with_ready_copy(case, _BENIGN_GOLDEN, tmp_path)
         assert result["run_completed"] is True
         assert result["run_incomplete_reasons"] == []
         assert result["pass"] is True

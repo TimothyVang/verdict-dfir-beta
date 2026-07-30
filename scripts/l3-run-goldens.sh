@@ -165,14 +165,25 @@ for fixture in "${FIXTURES[@]}"; do
     log "SKIP ${fixture}: missing ${expected}"
     continue
   fi
-  if ! readiness_json="$(
+  if readiness_json="$(
     python3 scripts/fixture-readiness.py --json "${expected}" "${fixture_dir}"
   )"; then
+    readiness_status="READY"
+  else
+    readiness_exit=$?
+    readiness_status="$(
+      jq -r '.status // empty' <<<"${readiness_json}" 2>/dev/null || true
+    )"
     readiness_reason="$(
       jq -r '.reason // "fixture readiness check failed"' <<<"${readiness_json}" \
         2>/dev/null || printf '%s' "${readiness_json}"
     )"
-    log "SKIP ${fixture}: NOT_READY ${readiness_reason}"
+    if [[ "${readiness_exit}" -eq 3 ]] && [[ "${readiness_status}" == "NOT_READY" ]]; then
+      log "SKIP ${fixture}: NOT_READY ${readiness_reason}"
+      continue
+    fi
+    log "FAIL ${fixture}: fixture readiness ERROR ${readiness_reason}"
+    OVERALL_EXIT=1
     continue
   fi
   staging_root="$(jq -er '.staging_root' <<<"${readiness_json}")"

@@ -179,6 +179,14 @@ class TestZeroFindingRunStillReturns:
 
     _BENIGN_GOLDEN = _REPO_ROOT / "goldens" / "synthetic-benign" / "expected-findings.json"
 
+    def _ready_benign_golden(self, tmp_path: Path) -> Path:
+        data = json.loads(self._BENIGN_GOLDEN.read_text(encoding="utf-8"))
+        data["scoring_status"] = "ready"
+        data.pop("not_ready_reason", None)
+        path = tmp_path / "synthetic-benign-ready.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
     def _benign_case(self, tmp_path: Path) -> Path:
         d = tmp_path / "benign"
         d.mkdir(parents=True, exist_ok=True)
@@ -199,7 +207,7 @@ class TestZeroFindingRunStillReturns:
         out = await SPEC.handler(
             AccuracyCompareInput(
                 case_dir=str(self._benign_case(tmp_path)),
-                golden_path=str(self._BENIGN_GOLDEN),
+                golden_path=str(self._ready_benign_golden(tmp_path)),
             )
         )
         assert isinstance(out, AccuracyCompareOutput)
@@ -227,8 +235,30 @@ class TestZeroFindingRunStillReturns:
             encoding="utf-8",
         )
         out = await SPEC.handler(
-            AccuracyCompareInput(case_dir=str(d), golden_path=str(self._BENIGN_GOLDEN))
+            AccuracyCompareInput(
+                case_dir=str(d),
+                golden_path=str(self._ready_benign_golden(tmp_path)),
+            )
         )
         assert out.pass_ is False
         assert out.run_completed is False
         assert out.run_incomplete_reasons != []
+
+    async def test_not_ready_golden_is_rejected_without_an_audit_record(
+        self, tmp_path: Path
+    ) -> None:
+        audit_path = tmp_path / "audit.jsonl"
+
+        with pytest.raises(
+            ValueError,
+            match=r"scoring_status=not_ready.*not scoreable",
+        ):
+            await SPEC.handler(
+                AccuracyCompareInput(
+                    case_dir=str(self._benign_case(tmp_path)),
+                    golden_path=str(self._BENIGN_GOLDEN),
+                    audit_log_path=str(audit_path),
+                )
+            )
+
+        assert not audit_path.exists()
