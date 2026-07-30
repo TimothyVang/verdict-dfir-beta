@@ -19,7 +19,11 @@
 //! trips the >=2-artifact-class execution rule. Intent ("this is a malware
 //! stager") is a separate `hypothesis:`-prefixed layer.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{Connection, OpenFlags};
 use schemars::JsonSchema;
@@ -29,6 +33,14 @@ use thiserror::Error;
 /// `WebKit`/Chrome epoch (1601-01-01) to Unix epoch (1970-01-01), in seconds.
 const WEBKIT_UNIX_OFFSET_SECS: i64 = 11_644_473_600;
 const DEFAULT_LIMIT: usize = 10_000;
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqliteHeader {
+    Valid,
+    WrongMagic,
+    Truncated { bytes_read: usize },
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +96,21 @@ pub enum BrowserHistoryError {
         source: rusqlite::Error,
     },
 
+    #[error("browser history candidate is not SQLite (wrong SQLite format 3 header): {0}")]
+    NotSqlite(PathBuf),
+
+    #[error(
+        "browser history SQLite candidate is truncated: read {bytes_read} of 16 header bytes from {path}"
+    )]
+    Truncated { path: PathBuf, bytes_read: usize },
+
+    #[error("browser history header unreadable {path}: {source}")]
+    HeaderUnreadable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("browser history parse failed for {path}: {source}")]
     ParseFailed {
         path: PathBuf,
@@ -120,10 +147,33 @@ pub fn path_looks_like_browser_history(path: &Path) -> bool {
     )
 }
 
+/// Validate the fixed 16-byte `SQLite` format header without parsing or reading
+/// the rest of the evidence file.
+pub(crate) fn inspect_sqlite_header(path: &Path) -> Result<SqliteHeader, io::Error> {
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; SQLITE_HEADER.len()];
+    let mut bytes_read = 0;
+    while bytes_read < header.len() {
+        let count = file.read(&mut header[bytes_read..])?;
+        if count == 0 {
+            return Ok(SqliteHeader::Truncated { bytes_read });
+        }
+        bytes_read += count;
+    }
+    if &header == SQLITE_HEADER {
+        Ok(SqliteHeader::Valid)
+    } else {
+        Ok(SqliteHeader::WrongMagic)
+    }
+}
+
 /// Read visited URLs from an offline browser history database.
 ///
 /// # Errors
 /// * [`BrowserHistoryError::NotFound`] — the file does not exist.
+/// * [`BrowserHistoryError::NotSqlite`] — the file has the wrong `SQLite` format header.
+/// * [`BrowserHistoryError::Truncated`] — fewer than 16 header bytes are readable.
+/// * [`BrowserHistoryError::HeaderUnreadable`] — the header could not be read.
 /// * [`BrowserHistoryError::Unreadable`] — exists but cannot be opened.
 /// * [`BrowserHistoryError::ParseFailed`] — opened but a query failed
 ///   (corrupt DB / unexpected column shape).
@@ -135,6 +185,24 @@ pub fn browser_history(
     let path = &input.history_path;
     if !path.is_file() {
         return Err(BrowserHistoryError::NotFound(path.clone()));
+    }
+    match inspect_sqlite_header(path) {
+        Ok(SqliteHeader::Valid) => {}
+        Ok(SqliteHeader::WrongMagic) => {
+            return Err(BrowserHistoryError::NotSqlite(path.clone()));
+        }
+        Ok(SqliteHeader::Truncated { bytes_read }) => {
+            return Err(BrowserHistoryError::Truncated {
+                path: path.clone(),
+                bytes_read,
+            });
+        }
+        Err(source) => {
+            return Err(BrowserHistoryError::HeaderUnreadable {
+                path: path.clone(),
+                source,
+            });
+        }
     }
     // Read-only + immutable so we never write a -wal/-journal next to the
     // evidence file, and a stale WAL header can't block the open.

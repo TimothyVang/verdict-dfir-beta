@@ -1111,9 +1111,11 @@ fn build_registry() -> Vec<ToolEntry> {
                  browser_history Finding is a legitimate CONFIRMED browser fact and never \
                  trips the ≥2-artifact-class execution rule; intent is a separate \
                  'hypothesis:' layer. \
-                 ERRORS: NotFound (verify path), Unreadable (not openable), ParseFailed \
-                 (corrupt DB / unexpected column shape), UnknownSchema (a valid SQLite file \
-                 that is neither a Chrome nor a Firefox history DB).",
+                 ERRORS: NotFound (verify path), NotSqlite (readable file with the wrong \
+                 16-byte SQLite header), Truncated (file ends before the full SQLite header), \
+                 HeaderUnreadable (header cannot be read), Unreadable (SQLite cannot open it), \
+                 ParseFailed (corrupt DB / unexpected column shape), UnknownSchema (a valid \
+                 SQLite file that is neither a Chrome nor a Firefox history DB).",
             annotations: ToolAnnotations {
                 title: "Read Browser History",
                 read_only: true,
@@ -1758,15 +1760,17 @@ fn dispatch_vel_collect(args: Value) -> Result<Value, ToolError> {
 
 fn dispatch_browser_history(args: Value) -> Result<Value, ToolError> {
     let input: BrowserHistoryInput = parse_args(args)?;
-    // NotFound / UnknownSchema are user-input territory (wrong path, or a file
-    // that isn't a browser history DB); surface as -32602. Unreadable/ParseFailed
-    // are corrupt-or-permission system issues → -32603.
+    // NotFound / NotSqlite / UnknownSchema are user-input territory (wrong
+    // path, wrong file type, or a non-browser SQLite DB); surface as -32602.
+    // Truncated / HeaderUnreadable / Unreadable / ParseFailed are
+    // corrupt-or-permission system issues → -32603.
     match browser_history(&input) {
         Ok(output) => {
             serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
         }
         Err(
             e @ (crate::tools::BrowserHistoryError::NotFound(_)
+            | crate::tools::BrowserHistoryError::NotSqlite(_)
             | crate::tools::BrowserHistoryError::UnknownSchema(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
         Err(e) => Err(ToolError::Internal(format!("browser_history: {e}"))),
