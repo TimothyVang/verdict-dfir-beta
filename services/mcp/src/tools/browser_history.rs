@@ -312,12 +312,70 @@ fn read_firefox(
         path: path.to_path_buf(),
         source,
     };
+    // Firefox < 3.5 has no `moz_places.last_visit_date`; the per-visit dates
+    // live only in `moz_historyvisits.visit_date` (same Unix-microsecond
+    // epoch). Branch on the column, not on a query-error string, so a corrupt
+    // modern DB still surfaces as ParseFailed instead of silently downgrading.
+    if !firefox_has_last_visit_date(conn).map_err(map_err)? {
+        return read_firefox_legacy(conn, path, limit);
+    }
     let mut stmt = conn
         .prepare(
             "SELECT url, title, visit_count, last_visit_date \
              FROM moz_places ORDER BY last_visit_date DESC LIMIT ?1",
         )
         .map_err(map_err)?;
+    let rows = stmt
+        .query_map([limit_as_i64(limit)], |row| {
+            let unix_micros: Option<i64> = row.get(3)?;
+            Ok(BrowserHistoryRow {
+                url: row.get(0)?,
+                title: row.get::<_, Option<String>>(1)?,
+                visit_count: row.get(2)?,
+                last_visit_time_iso: unix_micros.and_then(unix_micros_to_iso),
+            })
+        })
+        .map_err(map_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    Ok(rows)
+}
+
+fn firefox_has_last_visit_date(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(moz_places)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case("last_visit_date") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Firefox 2.x/3.0-era `places.sqlite` (e.g. 2008 evidence): derive the last
+/// visit per place from `moz_historyvisits`. Without that table the rows still
+/// carry url/title/visit_count - a dateless visited-URL fact beats a hard
+/// error on real evidence.
+fn read_firefox_legacy(
+    conn: &Connection,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<BrowserHistoryRow>, BrowserHistoryError> {
+    let map_err = |source| BrowserHistoryError::ParseFailed {
+        path: path.to_path_buf(),
+        source,
+    };
+    let sql = if has_table(conn, "moz_historyvisits").map_err(map_err)? {
+        "SELECT p.url, p.title, p.visit_count, MAX(v.visit_date) \
+         FROM moz_places p LEFT JOIN moz_historyvisits v ON v.place_id = p.id \
+         GROUP BY p.id, p.url, p.title, p.visit_count \
+         ORDER BY MAX(v.visit_date) DESC LIMIT ?1"
+    } else {
+        "SELECT url, title, visit_count, NULL \
+         FROM moz_places ORDER BY visit_count DESC LIMIT ?1"
+    };
+    let mut stmt = conn.prepare(sql).map_err(map_err)?;
     let rows = stmt
         .query_map([limit_as_i64(limit)], |row| {
             let unix_micros: Option<i64> = row.get(3)?;
@@ -382,6 +440,78 @@ mod tests {
     fn zero_timestamps_are_none() {
         assert_eq!(webkit_micros_to_iso(0), None);
         assert_eq!(unix_micros_to_iso(0), None);
+    }
+
+
+    fn mem_conn() -> Connection {
+        Connection::open_in_memory().expect("in-memory sqlite")
+    }
+
+    fn legacy_firefox_db(with_visits: bool) -> Connection {
+        // Firefox 3.0-era shape (2008 evidence): moz_places has NO
+        // last_visit_date column; dates live in moz_historyvisits.
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (
+                 id INTEGER PRIMARY KEY, url TEXT, title TEXT, rev_host TEXT,
+                 visit_count INTEGER DEFAULT 0, hidden INTEGER, typed INTEGER,
+                 favicon_id INTEGER, frecency INTEGER);
+             INSERT INTO moz_places (id, url, title, visit_count)
+             VALUES (1, 'http://legacy.example/', 'Legacy', 3);",
+        )
+        .expect("legacy schema");
+        if with_visits {
+            conn.execute_batch(
+                "CREATE TABLE moz_historyvisits (
+                     id INTEGER PRIMARY KEY, from_visit INTEGER,
+                     place_id INTEGER, visit_date INTEGER, visit_type INTEGER,
+                     session INTEGER);
+                 INSERT INTO moz_historyvisits (place_id, visit_date)
+                 VALUES (1, 1609459200000000);",
+            )
+            .expect("visits");
+        }
+        conn
+    }
+
+    #[test]
+    fn legacy_firefox_schema_reads_via_historyvisits() {
+        let conn = legacy_firefox_db(true);
+        let rows = read_firefox(&conn, Path::new("places.sqlite"), 10).expect("legacy read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url, "http://legacy.example/");
+        assert_eq!(rows[0].visit_count, 3);
+        assert_eq!(
+            rows[0].last_visit_time_iso.as_deref(),
+            Some("2021-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn legacy_firefox_without_visits_table_is_dateless_not_an_error() {
+        let conn = legacy_firefox_db(false);
+        let rows = read_firefox(&conn, Path::new("places.sqlite"), 10).expect("dateless read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_visit_time_iso, None);
+    }
+
+    #[test]
+    fn modern_firefox_schema_still_uses_last_visit_date() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (
+                 id INTEGER PRIMARY KEY, url TEXT, title TEXT,
+                 visit_count INTEGER, last_visit_date INTEGER);
+             INSERT INTO moz_places (id, url, title, visit_count, last_visit_date)
+             VALUES (1, 'http://modern.example/', 'Modern', 2, 1609459200000000);",
+        )
+        .expect("modern schema");
+        let rows = read_firefox(&conn, Path::new("places.sqlite"), 10).expect("modern read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].last_visit_time_iso.as_deref(),
+            Some("2021-01-01T00:00:00Z")
+        );
     }
 
     #[test]
