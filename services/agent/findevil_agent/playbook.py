@@ -167,6 +167,27 @@ EVIDENCE_TYPE_RULES: list[tuple[str, str]] = [
 ]
 
 
+# Chromium is the only browser whose history DB is the bare name "history"; it
+# always lives under a browser-profile path. Midnight Commander's .mc/history
+# and shell history files collide on the name but never on that path, so gate
+# the bare-name browser_db route on this context.
+_BROWSER_PROFILE_MARKERS: tuple[str, ...] = (
+    "chrome",
+    "chromium",
+    "brave",
+    "user data",
+    "opera software",
+    "vivaldi",
+    "microsoft/edge",
+    "mozilla",
+    "firefox",
+)
+
+
+def _history_name_is_browser(lower_path: str) -> bool:
+    return any(marker in lower_path for marker in _BROWSER_PROFILE_MARKERS)
+
+
 def detect_evidence_type(path: str) -> str:
     """Return one of: directory, memory, evtx, disk, network, velociraptor, unknown.
 
@@ -310,12 +331,13 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "parser_tool": None,
         }
     if name in {
-        "history",
         "places.sqlite",
         "web data",
         "cookies",
         "login data",
-    } or name.endswith(".sqlite"):
+    } or name.endswith(".sqlite") or (
+        name == "history" and _history_name_is_browser(lower_path)
+    ):
         return {
             "artifact_class": "browser_db",
             "evidence_type": "extracted_disk",

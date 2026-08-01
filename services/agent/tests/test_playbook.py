@@ -102,7 +102,7 @@ class TestClassifyArtifactPath:
             ("Documents and Settings/Mr. Evil/My Documents/Thumbs.db", "thumbnail", None),
             ("malware.exe", "yara_target", "yara_scan"),
             ("collection.zip", "velociraptor", "vel_collect"),
-            ("History", "browser_db", "browser_history"),
+            ("Users/e/AppData/Local/Google/Chrome/User Data/Default/History", "browser_db", "browser_history"),
             ("places.sqlite", "browser_db", "browser_history"),
             ("Archived History.sqlite", "browser_db", "browser_history"),
             ("readme.txt", "unknown", None),
