@@ -945,6 +945,26 @@ def _userassist_exe(encoded_name: str) -> str | None:
     return base if base.endswith(".exe") else None
 
 
+# Chromium is the only browser whose history DB is the bare name "history"; it
+# always lives under a browser-profile path. MC/shell "history" files collide on
+# the name but never on the path, so gate the bare-name route on this context.
+_BROWSER_PROFILE_MARKERS = (
+    "chrome",
+    "chromium",
+    "brave",
+    "user data",
+    "opera software",
+    "vivaldi",
+    "microsoft/edge",
+    "mozilla",
+    "firefox",
+)
+
+
+def _history_name_is_browser(lower_path: str) -> bool:
+    return any(marker in lower_path for marker in _BROWSER_PROFILE_MARKERS)
+
+
 def classify_artifact_path(path: str) -> dict[str, str | None]:
     """Classify a file path into a supported evidence/artifact lane."""
     # Cloud/identity logs route to the cloud_audit lane. Checked before delegating
@@ -1084,12 +1104,13 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "parser_tool": None,
         }
     if lower_name in {
-        "history",
         "places.sqlite",
         "web data",
         "cookies",
         "login data",
-    } or lower_name.endswith(".sqlite"):
+    } or lower_name.endswith(".sqlite") or (
+        lower_name == "history" and _history_name_is_browser(lower_path)
+    ):
         return {
             "artifact_class": "browser_db",
             "evidence_type": "extracted_disk",
@@ -1238,7 +1259,7 @@ def classify_artifact_path(path):
         return {"artifact_class": "ie_history", "evidence_type": "extracted_disk", "parser_tool": "plaso_parse"}
     if lower_name == "thumbs.db" or lower_name.endswith(".thumbcache"):
         return {"artifact_class": "thumbnail", "evidence_type": "extracted_disk", "parser_tool": None}
-    if lower_name in {"history", "places.sqlite", "web data", "cookies", "login data"} or lower_name.endswith(".sqlite"):
+    if lower_name in {"places.sqlite", "web data", "cookies", "login data"} or lower_name.endswith(".sqlite") or (lower_name == "history" and _history_name_is_browser(lower_path)):
         return {"artifact_class": "browser_db", "evidence_type": "extracted_disk", "parser_tool": "browser_history"}
     if lower_name.endswith(YARA_TARGET_EXTS):
         return {"artifact_class": "yara_target", "evidence_type": "extracted_disk", "parser_tool": "yara_scan"}
