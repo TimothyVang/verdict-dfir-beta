@@ -139,6 +139,15 @@ printf '%s\n' 'DONE — verdict: NO_EVIL'
         shutil.rmtree(case_dir, ignore_errors=True)
 
     out = proc.stdout + proc.stderr
+    # The launcher runs a doctor preflight before it ever reaches the manifest
+    # check, so on a machine without the DFIR toolchain provisioned it aborts
+    # early and this assertion can never be exercised. That is a missing local
+    # dependency, not a product failure - skip rather than report red.
+    if "doctor reported missing dependencies" in out.lower():
+        pytest.skip(
+            "launcher aborted at the doctor preflight; this test needs a "
+            "provisioned DFIR toolchain to reach the manifest check"
+        )
     # Assert the reason before the exit code. `returncode != 0` on its own is
     # satisfied by any abort: on a worktree with no target/release/findevil-mcp
     # built, scripts/verdict bails at the doctor preflight and this test used to
