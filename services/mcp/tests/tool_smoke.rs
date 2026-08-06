@@ -524,3 +524,217 @@ fn disk_extract_artifacts_skips_non_sqlite_history_name_collision() {
         "a genuine SQLite History database must remain available for parsing"
     );
 }
+
+/// Offset-aware fake TSK toolchain for **multi-partition** images. A fake
+/// `mmls` prints a canned partition table, and fake `fls`/`icat` dispatch on
+/// the `-o <sector>` argument — mirroring how real TSK addresses exactly one
+/// partition per invocation. Any offset without a canned partition (including
+/// a missing `-o` on a full-disk image) fails the way real TSK does, so the
+/// engine only sees files on partitions it explicitly asked for.
+///
+/// Same env-lock discipline as [`FakeTsk`]: install while a [`HomeGuard`] is
+/// held, drop before it.
+#[cfg(unix)]
+struct FakeMultiPartitionTsk {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+/// One fake partition: its `-o` sector offset plus `(inode, path, bytes)`
+/// rows.
+#[cfg(unix)]
+type FakePartition<'a> = (u64, &'a [(&'a str, &'a str, &'a [u8])]);
+
+#[cfg(unix)]
+impl FakeMultiPartitionTsk {
+    fn install(dir: &std::path::Path, mmls_output: &str, partitions: &[FakePartition<'_>]) -> Self {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mmls_txt = dir.join("mmls.txt");
+        fs::write(&mmls_txt, mmls_output).unwrap();
+        let mmls = dir.join("fake_mmls.sh");
+        fs::write(&mmls, format!("#!/bin/sh\ncat '{}'\n", mmls_txt.display())).unwrap();
+
+        let mut fls_cases = String::new();
+        for (offset, files) in partitions {
+            let blobs = dir.join(format!("blobs_{offset}"));
+            fs::create_dir_all(&blobs).unwrap();
+            let mut listing = String::new();
+            for (inode, path, bytes) in *files {
+                writeln!(listing, "r/r {inode}:\t{path}").unwrap();
+                fs::write(blobs.join(format!("{inode}.bin")), bytes).unwrap();
+            }
+            let listing_txt = dir.join(format!("fls_{offset}.txt"));
+            fs::write(&listing_txt, listing).unwrap();
+            writeln!(fls_cases, "  {offset}) cat '{}' ;;", listing_txt.display()).unwrap();
+        }
+
+        // Both scripts recover the `-o <sector>` value the engine passed; fls
+        // prints that partition's listing, icat streams blob `<offset>/<inode>`.
+        let arg_scan = "off=\"\"\nprev=\"\"\nlast=\"\"\n\
+                        for a in \"$@\"; do\n\
+                        \t[ \"$prev\" = \"-o\" ] && off=\"$a\"\n\
+                        \tprev=\"$a\"\n\
+                        \tlast=\"$a\"\n\
+                        done\n";
+        let fls = dir.join("fake_fls.sh");
+        fs::write(
+            &fls,
+            format!(
+                "#!/bin/sh\n{arg_scan}case \"$off\" in\n{fls_cases}  *) echo \
+                 'Cannot determine file system type' >&2; exit 1 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        let icat = dir.join("fake_icat.sh");
+        fs::write(
+            &icat,
+            format!(
+                "#!/bin/sh\n{arg_scan}[ -n \"$off\" ] || {{ echo 'Cannot determine file \
+                 system type' >&2; exit 1; }}\ncat '{}'/blobs_\"$off\"/\"$last\".bin\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+
+        for script in [&mmls, &fls, &icat] {
+            let mut perm = fs::metadata(script).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(script, perm).unwrap();
+        }
+
+        let mut saved = Vec::new();
+        for (key, script) in [
+            ("FINDEVIL_MMLS_BIN", &mmls),
+            ("FINDEVIL_FLS_BIN", &fls),
+            ("FINDEVIL_ICAT_BIN", &icat),
+        ] {
+            saved.push((key, std::env::var(key).ok()));
+            std::env::set_var(key, script);
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeMultiPartitionTsk {
+    fn drop(&mut self) {
+        for (key, prev) in &self.saved {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_artifacts_reads_every_filesystem_partition() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake full-disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("disk-multi-partition".to_string()),
+    })
+    .expect("case_open ok");
+
+    // Real layout of cfreds_2015_data_leakage_pc.dd (verified with mmls on the
+    // fixture host): a 100 MB NTFS "System Reserved" boot partition at sector
+    // 2048 *ahead of* the ~19.9 GB NTFS OS volume at sector 206848. Every
+    // registry/evtx/prefetch artifact lives on the second partition.
+    let mmls_output = "DOS Partition Table\n\
+                       Offset Sector: 0\n\
+                       Units are in 512-byte sectors\n\
+                       \n\
+                       \u{20}     Slot      Start        End          Length       Description\n\
+                       000:  Meta      0000000000   0000000000   0000000001   Primary Table (#0)\n\
+                       001:  -------   0000000000   0000002047   0000002048   Unallocated\n\
+                       002:  000:000   0000002048   0000206847   0000204800   NTFS / exFAT (0x07)\n\
+                       003:  000:001   0000206848   0041940991   0041734144   NTFS / exFAT (0x07)\n\
+                       004:  -------   0041940992   0041943039   0000002048   Unallocated\n";
+
+    let boot_files: &[(&str, &str, &[u8])] = &[("100", "$MFT", b"boot volume mft")];
+    let os_files: &[(&str, &str, &[u8])] = &[
+        ("200", "$MFT", b"os volume mft"),
+        ("201", "Windows/System32/config/SYSTEM", b"system hive"),
+        (
+            "202",
+            "Windows/System32/winevt/Logs/Security.evtx",
+            b"security log",
+        ),
+        ("203", "Windows/Prefetch/CMD.EXE-4A81B364.pf", b"prefetch"),
+    ];
+    let _tsk = FakeMultiPartitionTsk::install(
+        tmp.path(),
+        mmls_output,
+        &[(2048, boot_files), (206_848, os_files)],
+    );
+
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+
+    let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 1024,
+    })
+    .expect("extract artifacts");
+
+    // The OS volume — the SECOND filesystem partition — must be enumerated.
+    // The original bug listed only the first (boot) partition, so extraction
+    // saw 256 boot-volume MFT records and zero registry/evtx/prefetch.
+    let sources: Vec<String> = extracted
+        .artifacts
+        .iter()
+        .map(|a| a.source_path.to_string_lossy().to_string())
+        .collect();
+    assert!(
+        sources.contains(&"Windows/System32/config/SYSTEM".to_string()),
+        "registry hive on the OS volume must be extracted; sources={sources:?}"
+    );
+    assert!(
+        sources.contains(&"Windows/System32/winevt/Logs/Security.evtx".to_string()),
+        "event log on the OS volume must be extracted; sources={sources:?}"
+    );
+    assert!(
+        sources.contains(&"Windows/Prefetch/CMD.EXE-4A81B364.pf".to_string()),
+        "prefetch on the OS volume must be extracted; sources={sources:?}"
+    );
+
+    // Both volumes carry a `$MFT`; both must be extracted without either
+    // silently overwriting the other, and the preferred (largest = OS) volume
+    // keeps the flat `<class>/<rel_path>` layout downstream tooling knows.
+    let mfts: Vec<_> = extracted
+        .artifacts
+        .iter()
+        .filter(|a| a.artifact_class == "mft")
+        .collect();
+    assert_eq!(mfts.len(), 2, "one $MFT per NTFS volume; got {mfts:?}");
+    let flat = mfts
+        .iter()
+        .find(|a| a.extracted_path.ends_with("mft/$MFT"))
+        .expect("preferred-volume $MFT keeps the flat layout");
+    assert_eq!(
+        fs::read(&flat.extracted_path).unwrap(),
+        b"os volume mft",
+        "flat $MFT must come from the OS volume, not the boot partition"
+    );
+    let namespaced = mfts
+        .iter()
+        .find(|a| a.extracted_path.ends_with("mft/vol2048/$MFT"))
+        .expect("secondary-partition $MFT is namespaced by its sector offset");
+    assert_eq!(
+        fs::read(&namespaced.extracted_path).unwrap(),
+        b"boot volume mft"
+    );
+}

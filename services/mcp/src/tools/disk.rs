@@ -275,7 +275,20 @@ pub fn disk_extract_artifacts(
     create_dir(&output_dir)?;
     let wanted = wanted_kinds(&input.artifact_kinds);
 
-    let sector_offset = first_partition_sector_offset(&image_path);
+    // Enumerate EVERY filesystem partition mmls reports, not just the first: a
+    // Windows disk typically carries a ~100 MB NTFS "System Reserved" boot
+    // partition *ahead of* the OS volume, and reading only the first partition
+    // extracted 256 boot-volume MFT records and zero registry/evtx/prefetch —
+    // every artifact of interest lives on the volume the engine never opened.
+    // Partitions come back in preference order (largest first) so the
+    // fair-share budget favours the real OS volume; an empty list means a bare
+    // volume image that TSK reads at offset 0.
+    let partitions = filesystem_partitions(&image_path);
+    let sector_offsets: Vec<Option<u64>> = if partitions.is_empty() {
+        vec![None]
+    } else {
+        partitions.iter().map(|p| Some(p.start_sector)).collect()
+    };
 
     // Enumerate every file once and keep the wanted classes. Selection then
     // allocates the `limit` *fairly across classes* (round-robin) so a
@@ -295,37 +308,20 @@ pub fn disk_extract_artifacts(
     let mock_root: Option<PathBuf> = (mount.command.first().map(String::as_str) == Some("mock"))
         .then(|| mount.fs_root.clone())
         .flatten();
-    let (listed, via_walk) = match tsk_list(&image_path, sector_offset) {
-        Ok(files) if !files.is_empty() => (files, false),
-        tsk_result => match &mock_root {
-            Some(root) => (mock_list(root)?, true),
-            None => (tsk_result?, false),
-        },
-    };
-    let candidates: Vec<(&'static str, String, String)> = listed
-        .into_iter()
-        .filter_map(|(inode, path)| {
-            let class = classify_artifact_path(&path)?;
-            wanted
-                .get(class)
-                .copied()
-                .unwrap_or(false)
-                .then_some((class, inode, path))
-        })
-        .collect();
-    let ordered_candidates = order_artifacts(candidates);
+    let (listed, via_walk) = list_image_files(&image_path, &sector_offsets, mock_root.as_deref())?;
+    let ordered_candidates = order_artifacts(classify_candidates(listed, &wanted));
 
     let mut artifacts = Vec::new();
     let mut artifacts_skipped_oversize = 0;
-    for (class, inode, path) in ordered_candidates {
+    for candidate in ordered_candidates {
         if artifacts.len() >= input.limit {
             break;
         }
         match (via_walk, &mock_root) {
             (true, Some(root)) => mock_extract(
                 root,
-                &path,
-                class,
+                &candidate.rel_path,
+                candidate.class,
                 &output_dir,
                 input.max_artifact_bytes,
                 &mut artifacts,
@@ -333,10 +329,7 @@ pub fn disk_extract_artifacts(
             )?,
             _ => tsk_extract(
                 &image_path,
-                sector_offset,
-                &inode,
-                &path,
-                class,
+                &candidate,
                 &output_dir,
                 input.max_artifact_bytes,
                 &mut artifacts,
@@ -504,14 +497,14 @@ fn auto_mount_ewf(
 }
 
 /// Loop-mount an NTFS volume read-only with the kernel `ntfs3` driver, under
-/// sudo (the EWF device is root-owned). Tries offset 0 (bare volume image) then
-/// the first filesystem-partition offset from `mmls` (full disk image).
+/// sudo (the EWF device is root-owned). Tries offset 0 (bare volume image),
+/// then every filesystem-partition offset from `mmls` in preference order
+/// (largest first), so a full disk image mounts its OS volume rather than the
+/// ~100 MB System Reserved boot partition that precedes it.
 fn mount_ntfs_ro(device: &Path, mount_point: &Path) -> Result<(Vec<String>, String), DiskError> {
     let mount_bin = std::env::var("FINDEVIL_MOUNT_BIN").unwrap_or_else(|_| "mount".to_string());
     let mut offsets = vec![0u64];
-    if let Some(offset) = first_partition_byte_offset_sudo(device) {
-        offsets.push(offset);
-    }
+    offsets.extend(filesystem_partition_byte_offsets_sudo(device));
     let mut last_status = String::new();
     let mut last_stderr = String::new();
     for offset in offsets {
@@ -545,18 +538,24 @@ fn mount_ntfs_ro(device: &Path, mount_point: &Path) -> Result<(Vec<String>, Stri
     })
 }
 
-/// `mmls` first-filesystem-partition byte offset, run under sudo because the
-/// EWF device is root-owned. None when the image is a bare volume (no table).
-fn first_partition_byte_offset_sudo(image_path: &Path) -> Option<u64> {
-    let output = Command::new("sudo")
+/// Byte offsets of every filesystem partition in preference order, run under
+/// sudo because the EWF device is root-owned. The binary stays the fixed
+/// `mmls` (no env override) — a user-controlled path must not run under sudo.
+/// Empty when the image is a bare volume (no partition table).
+fn filesystem_partition_byte_offsets_sudo(image_path: &Path) -> Vec<u64> {
+    let Ok(output) = Command::new("sudo")
         .args(["-n", "mmls"])
         .arg(image_path)
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
-    parse_mmls_first_partition_offset(&String::from_utf8_lossy(&output.stdout))
+    partition_byte_offsets(order_partitions_by_preference(
+        parse_mmls_filesystem_partitions(&String::from_utf8_lossy(&output.stdout)),
+    ))
 }
 
 fn auto_mount_raw(
@@ -583,47 +582,56 @@ fn auto_mount_raw(
 
     let direct_status = result.1;
     let direct_stderr = result.2;
-    if let Some(offset) = first_partition_byte_offset(image_path) {
-        let offset_args = vec![
-            "-o".to_string(),
-            format!("ro,loop,offset={offset}"),
-            image_path.to_string_lossy().to_string(),
-            mount_point.to_string_lossy().to_string(),
-        ];
-        let offset_result = run_fixed(&bin, &offset_args)?;
-        if offset_result.0 {
-            return Ok((
-                "mounted".to_string(),
-                mount_point.to_path_buf(),
-                std::iter::once(bin).chain(offset_args).collect(),
-                offset_result.2,
-                format!("mounted first filesystem partition read-only with loop offset {offset}"),
-            ));
-        }
-        if bin == "mount" {
-            let sudo_result = run_sudo_fixed(&bin, &offset_args)?;
-            if sudo_result.0 {
+    let offsets = filesystem_partition_byte_offsets(image_path);
+    if !offsets.is_empty() {
+        // Try every filesystem partition in preference order (largest first —
+        // the OS volume) so a full disk image whose preferred partition can't
+        // be mounted still falls back to the next one.
+        let mut last_status = String::new();
+        let mut failures: Vec<String> = Vec::new();
+        for offset in &offsets {
+            let offset_args = vec![
+                "-o".to_string(),
+                format!("ro,loop,offset={offset}"),
+                image_path.to_string_lossy().to_string(),
+                mount_point.to_string_lossy().to_string(),
+            ];
+            let offset_result = run_fixed(&bin, &offset_args)?;
+            if offset_result.0 {
                 return Ok((
                     "mounted".to_string(),
                     mount_point.to_path_buf(),
-                    std::iter::once("sudo".to_string())
-                        .chain(std::iter::once("-n".to_string()))
-                        .chain(std::iter::once(bin))
-                        .chain(offset_args)
-                        .collect(),
-                    sudo_result.2,
-                    format!(
-                        "mounted first filesystem partition read-only with sudo loop offset {offset}"
-                    ),
+                    std::iter::once(bin).chain(offset_args).collect(),
+                    offset_result.2,
+                    format!("mounted filesystem partition read-only with loop offset {offset}"),
                 ));
             }
+            if bin == "mount" {
+                let sudo_result = run_sudo_fixed(&bin, &offset_args)?;
+                if sudo_result.0 {
+                    return Ok((
+                        "mounted".to_string(),
+                        mount_point.to_path_buf(),
+                        std::iter::once("sudo".to_string())
+                            .chain(std::iter::once("-n".to_string()))
+                            .chain(std::iter::once(bin))
+                            .chain(offset_args)
+                            .collect(),
+                        sudo_result.2,
+                        format!(
+                            "mounted filesystem partition read-only with sudo loop offset {offset}"
+                        ),
+                    ));
+                }
+            }
+            last_status = offset_result.1;
+            failures.push(format!("offset {offset} mount failed: {}", offset_result.2));
         }
         return Err(DiskError::SubprocessFailed {
-            status: offset_result.1,
+            status: last_status,
             stderr_tail: format!(
-                "direct mount failed ({direct_status}): {direct_stderr}\n\
-                 offset mount failed: {}",
-                offset_result.2
+                "direct mount failed ({direct_status}): {direct_stderr}\n{}",
+                failures.join("\n")
             ),
         });
     }
@@ -659,15 +667,53 @@ fn auto_mount_raw(
     })
 }
 
-fn first_partition_byte_offset(image_path: &Path) -> Option<u64> {
-    let output = Command::new("mmls").arg(image_path).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_mmls_first_partition_offset(&String::from_utf8_lossy(&output.stdout))
+/// One filesystem partition row from `mmls`: start and length in 512-byte
+/// sectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MmlsPartition {
+    start_sector: u64,
+    length_sectors: u64,
 }
 
-fn parse_mmls_first_partition_offset(output: &str) -> Option<u64> {
+/// Run `mmls` (override: `FINDEVIL_MMLS_BIN`, mirroring `FINDEVIL_FLS_BIN` /
+/// `FINDEVIL_ICAT_BIN`) and return the image's filesystem partitions in
+/// preference order (largest first). Empty for a bare volume image — no
+/// partition table, TSK reads it at offset 0.
+fn filesystem_partitions(image_path: &Path) -> Vec<MmlsPartition> {
+    let bin = std::env::var("FINDEVIL_MMLS_BIN").unwrap_or_else(|_| "mmls".to_string());
+    let Ok(output) = Command::new(bin).arg(image_path).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    order_partitions_by_preference(parse_mmls_filesystem_partitions(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Byte offsets (sector * 512) of every filesystem partition in preference
+/// order, for `mount -o loop,offset=`. Empty for a bare volume image.
+fn filesystem_partition_byte_offsets(image_path: &Path) -> Vec<u64> {
+    partition_byte_offsets(filesystem_partitions(image_path))
+}
+
+fn partition_byte_offsets(partitions: Vec<MmlsPartition>) -> Vec<u64> {
+    partitions
+        .into_iter()
+        .filter_map(|p| p.start_sector.checked_mul(512))
+        .collect()
+}
+
+/// Parse every filesystem partition row from `mmls` output, in table order.
+/// Meta / unallocated rows and rows whose description names no known
+/// filesystem are filtered out, exactly as the old first-match parser did —
+/// but EVERY matching row is returned. A Windows disk image typically carries
+/// a ~100 MB "System Reserved" NTFS boot partition ahead of the OS volume;
+/// stopping at the first match made the engine read the boot partition and
+/// miss every registry/evtx/prefetch artifact on the disk.
+fn parse_mmls_filesystem_partitions(output: &str) -> Vec<MmlsPartition> {
+    let mut partitions = Vec::new();
     for line in output.lines() {
         let lower = line.to_ascii_lowercase();
         if lower.contains("meta")
@@ -676,14 +722,40 @@ fn parse_mmls_first_partition_offset(output: &str) -> Option<u64> {
         {
             continue;
         }
-        let start_sector = line
+        // Row shape: `002:  000:000  <start>  <end>  <length>  NTFS / exFAT
+        // (0x07)`. The slot fields contain `:` and the description contains
+        // non-digits, so the first three all-digit fields are start, end,
+        // length.
+        let mut numbers = line
             .split_whitespace()
-            .find(|field| field.chars().all(|c| c.is_ascii_digit()))?
-            .parse::<u64>()
-            .ok()?;
-        return start_sector.checked_mul(512);
+            .filter(|field| field.chars().all(|c| c.is_ascii_digit()))
+            .filter_map(|field| field.parse::<u64>().ok());
+        let (Some(start_sector), Some(_end), Some(length_sectors)) =
+            (numbers.next(), numbers.next(), numbers.next())
+        else {
+            continue;
+        };
+        partitions.push(MmlsPartition {
+            start_sector,
+            length_sectors,
+        });
     }
-    None
+    partitions
+}
+
+/// Order partitions for extraction/mount preference: largest first, ties by
+/// lower start sector. On a real multi-partition disk the OS volume dwarfs the
+/// boot / System Reserved / recovery partitions (tens of GB vs ~100 MB), so
+/// largest-first points the artifact budget and the mount at the volume that
+/// actually holds the registry/evtx/prefetch tree — without OS-specific
+/// content probing that would not generalize to Linux or macOS disks.
+fn order_partitions_by_preference(mut partitions: Vec<MmlsPartition>) -> Vec<MmlsPartition> {
+    partitions.sort_by(|a, b| {
+        b.length_sectors
+            .cmp(&a.length_sectors)
+            .then_with(|| a.start_sector.cmp(&b.start_sector))
+    });
+    partitions
 }
 
 fn matches_filesystem_description(line: &str) -> bool {
@@ -800,11 +872,73 @@ fn run_fixed(bin: &str, args: &[String]) -> Result<(bool, String, String), DiskE
     ))
 }
 
-/// Sector offset of the first filesystem partition for `fls`/`icat -o`, or None
-/// for a bare volume image (TSK reads it at offset 0). mmls reports the start
-/// sector; the byte helper multiplies by 512, so divide it back to sectors.
-fn first_partition_sector_offset(image_path: &Path) -> Option<u64> {
-    first_partition_byte_offset(image_path).map(|bytes| bytes / 512)
+/// One row off a filesystem listing, before classification:
+/// `(partition_rank, sector_offset, inode, rel_path)`.
+type ListedFile = (usize, Option<u64>, String, String);
+
+/// List every live file across the image's filesystem partitions (one
+/// [`tsk_list`] per sector offset), tagging each row with its partition rank
+/// and `-o` offset. One unreadable partition must not lose the readable ones:
+/// a listing failure is surfaced only when *no* partition lists anything.
+/// When TSK lists nothing and `mock_root` is present (mock mounts only), falls
+/// back to walking that staged directory tree; the returned flag says whether
+/// the walk fallback was taken.
+fn list_image_files(
+    image_path: &Path,
+    sector_offsets: &[Option<u64>],
+    mock_root: Option<&Path>,
+) -> Result<(Vec<ListedFile>, bool), DiskError> {
+    let mut tsk_files: Vec<ListedFile> = Vec::new();
+    let mut list_error: Option<DiskError> = None;
+    for (rank, offset) in sector_offsets.iter().enumerate() {
+        match tsk_list(image_path, *offset) {
+            Ok(files) => tsk_files.extend(
+                files
+                    .into_iter()
+                    .map(|(inode, path)| (rank, *offset, inode, path)),
+            ),
+            Err(err) => list_error = list_error.or(Some(err)),
+        }
+    }
+    if !tsk_files.is_empty() {
+        return Ok((tsk_files, false));
+    }
+    match (mock_root, list_error) {
+        (Some(root), _) => Ok((
+            mock_list(root)?
+                .into_iter()
+                .map(|(inode, path)| (0, None, inode, path))
+                .collect(),
+            true,
+        )),
+        (None, Some(err)) => Err(err),
+        (None, None) => Ok((Vec::new(), false)),
+    }
+}
+
+/// Keep only listed files that classify into a wanted forensic class, carrying
+/// each file's partition tag through to extraction.
+fn classify_candidates(
+    listed: Vec<ListedFile>,
+    wanted: &BTreeMap<&'static str, bool>,
+) -> Vec<ArtifactCandidate> {
+    listed
+        .into_iter()
+        .filter_map(|(partition_rank, sector_offset, inode, rel_path)| {
+            let class = classify_artifact_path(&rel_path)?;
+            wanted
+                .get(class)
+                .copied()
+                .unwrap_or(false)
+                .then_some(ArtifactCandidate {
+                    class,
+                    inode,
+                    rel_path,
+                    sector_offset,
+                    partition_rank,
+                })
+        })
+        .collect()
 }
 
 /// Enumerate every live regular file in the image via `fls -r -p`, returning
@@ -937,6 +1071,21 @@ fn parse_fls_line(line: &str) -> Option<(String, String)> {
     Some((inode.to_string(), path.to_string()))
 }
 
+/// One extraction candidate: a classified file inside a specific filesystem
+/// partition of the image. `sector_offset` is the `fls`/`icat -o` value that
+/// reaches that partition (None = bare volume image or mock walk);
+/// `partition_rank` is the partition's preference order (0 = the preferred,
+/// largest volume) and breaks within-class ties so the OS volume's copy of a
+/// path beats a boot partition's copy to the extraction budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactCandidate {
+    class: &'static str,
+    inode: String,
+    rel_path: String,
+    sector_offset: Option<u64>,
+    partition_rank: usize,
+}
+
 /// Extract order: forensically critical classes first, broad yara targets last,
 /// so the `limit` never crowds out registry/MFT/prefetch.
 fn class_priority(class: &str) -> u8 {
@@ -1018,27 +1167,26 @@ fn artifact_subrank(class: &str, rel_path: &str) -> u8 {
 /// across classes* so no single voluminous class starves the rest. Classes are
 /// visited in [`class_priority`] order and drawn round-robin: every class with
 /// candidates gets a turn each pass, and a class that drains early hands its
-/// unused budget to the others. Within a class, [`artifact_subrank`] then path
-/// order decides which artifacts win the class's share. Pure (no I/O) so the
-/// allocation is unit-testable.
-fn select_artifacts(
-    candidates: Vec<(&'static str, String, String)>,
-    limit: usize,
-) -> Vec<(&'static str, String, String)> {
-    let mut buckets: BTreeMap<u8, Vec<(&'static str, String, String)>> = BTreeMap::new();
+/// unused budget to the others. Within a class, [`artifact_subrank`], then
+/// partition preference (the OS volume ahead of boot/recovery partitions),
+/// then path order decides which artifacts win the class's share. Pure (no
+/// I/O) so the allocation is unit-testable.
+fn select_artifacts(candidates: Vec<ArtifactCandidate>, limit: usize) -> Vec<ArtifactCandidate> {
+    let mut buckets: BTreeMap<u8, Vec<ArtifactCandidate>> = BTreeMap::new();
     for candidate in candidates {
         buckets
-            .entry(class_priority(candidate.0))
+            .entry(class_priority(candidate.class))
             .or_default()
             .push(candidate);
     }
-    let mut queues: Vec<VecDeque<(&'static str, String, String)>> = buckets
+    let mut queues: Vec<VecDeque<ArtifactCandidate>> = buckets
         .into_values()
         .map(|mut bucket| {
             bucket.sort_by(|a, b| {
-                artifact_subrank(a.0, &a.2)
-                    .cmp(&artifact_subrank(b.0, &b.2))
-                    .then_with(|| a.2.cmp(&b.2))
+                artifact_subrank(a.class, &a.rel_path)
+                    .cmp(&artifact_subrank(b.class, &b.rel_path))
+                    .then_with(|| a.partition_rank.cmp(&b.partition_rank))
+                    .then_with(|| a.rel_path.cmp(&b.rel_path))
             });
             VecDeque::from(bucket)
         })
@@ -1060,38 +1208,49 @@ fn select_artifacts(
 
 /// Fairly order every candidate so extraction can backfill rejected entries
 /// until the accepted-artifact limit is reached.
-fn order_artifacts(
-    candidates: Vec<(&'static str, String, String)>,
-) -> Vec<(&'static str, String, String)> {
+fn order_artifacts(candidates: Vec<ArtifactCandidate>) -> Vec<ArtifactCandidate> {
     let candidate_count = candidates.len();
     select_artifacts(candidates, candidate_count)
 }
 
-/// `icat` one inode out of the image into `output_dir/<class>/<rel_path>`,
+/// Destination directory for one candidate: `output_dir/<class>` for the
+/// preferred partition (rank 0) — the flat layout extraction has always
+/// produced — and `output_dir/<class>/vol<sector_offset>` for every further
+/// partition, so two filesystems carrying the same path (every NTFS volume
+/// has a `$MFT`) can never silently overwrite each other's extraction.
+fn candidate_dest_dir(output_dir: &Path, candidate: &ArtifactCandidate) -> PathBuf {
+    let class_dir = output_dir.join(candidate.class);
+    match (candidate.partition_rank, candidate.sector_offset) {
+        (0, _) | (_, None) => class_dir,
+        (_, Some(offset)) => class_dir.join(format!("vol{offset}")),
+    }
+}
+
+/// `icat` one inode out of its partition into
+/// `output_dir/<class>[/vol<offset>]/<rel_path>` (see [`candidate_dest_dir`]),
 /// streaming to disk (no in-memory buffering) and enforcing the size cap.
 /// A failed `icat` (unreadable inode) is skipped, not fatal.
-#[allow(clippy::too_many_arguments)]
 fn tsk_extract(
     image_path: &Path,
-    sector_offset: Option<u64>,
-    inode: &str,
-    rel_path: &str,
-    class: &str,
+    candidate: &ArtifactCandidate,
     output_dir: &Path,
     max_artifact_bytes: u64,
     out: &mut Vec<ExtractedDiskArtifact>,
     skipped_oversize: &mut usize,
 ) -> Result<(), DiskError> {
-    let dest = safe_join(&output_dir.join(class), rel_path);
+    let dest = safe_join(
+        &candidate_dest_dir(output_dir, candidate),
+        &candidate.rel_path,
+    );
     if let Some(parent) = dest.parent() {
         create_dir(parent)?;
     }
     let bin = std::env::var("FINDEVIL_ICAT_BIN").unwrap_or_else(|_| "icat".to_string());
     let mut command = Command::new(&bin);
-    if let Some(offset) = sector_offset {
+    if let Some(offset) = candidate.sector_offset {
         command.arg("-o").arg(offset.to_string());
     }
-    command.arg(image_path).arg(inode);
+    command.arg(image_path).arg(&candidate.inode);
     let file = fs::File::create(&dest).map_err(|source| DiskError::Io {
         path: dest.clone(),
         source,
@@ -1118,13 +1277,13 @@ fn tsk_extract(
         *skipped_oversize += 1;
         return Ok(());
     }
-    if !extracted_artifact_type_matches(class, &dest)? {
+    if !extracted_artifact_type_matches(candidate.class, &dest)? {
         fs::remove_file(&dest).map_err(|source| DiskError::Io { path: dest, source })?;
         return Ok(());
     }
     out.push(ExtractedDiskArtifact {
-        artifact_class: class.to_string(),
-        source_path: PathBuf::from(rel_path),
+        artifact_class: candidate.class.to_string(),
+        source_path: PathBuf::from(&candidate.rel_path),
         extracted_path: dest,
         size_bytes: size,
     });
@@ -1441,11 +1600,23 @@ fn tail_utf8_lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_subrank, class_priority, classify_artifact_path, mock_list, parse_fls_line,
-        parse_mmls_first_partition_offset, safe_join, select_artifacts, unmount_steps,
-        wanted_kinds,
+        artifact_subrank, candidate_dest_dir, class_priority, classify_artifact_path, mock_list,
+        order_partitions_by_preference, parse_fls_line, parse_mmls_filesystem_partitions,
+        partition_byte_offsets, safe_join, select_artifacts, unmount_steps, wanted_kinds,
+        ArtifactCandidate, MmlsPartition,
     };
     use std::path::Path;
+
+    /// Single-partition candidate shorthand for the fair-share tests.
+    fn cand(class: &'static str, inode: &str, rel_path: &str) -> ArtifactCandidate {
+        ArtifactCandidate {
+            class,
+            inode: inode.to_string(),
+            rel_path: rel_path.to_string(),
+            sector_offset: None,
+            partition_rank: 0,
+        }
+    }
 
     #[test]
     fn safe_join_strips_traversal_and_stays_under_base() {
@@ -1746,55 +1917,111 @@ mod tests {
         // three classes represented (the old global-priority sort extracted
         // zero evtx), and the canonical Security.evtx wins evtx's share over
         // the operational tail.
-        let mut candidates: Vec<(&'static str, String, String)> = Vec::new();
+        let mut candidates: Vec<ArtifactCandidate> = Vec::new();
         for i in 0..400 {
-            candidates.push((
+            candidates.push(cand(
                 "prefetch",
-                format!("{i}"),
-                format!("Windows/Prefetch/A{i:04}.pf"),
+                &format!("{i}"),
+                &format!("Windows/Prefetch/A{i:04}.pf"),
             ));
         }
         for i in 0..600 {
-            candidates.push((
+            candidates.push(cand(
                 "evtx",
-                format!("e{i}"),
-                format!(
+                &format!("e{i}"),
+                &format!(
                     "Windows/System32/winevt/Logs/Microsoft-Windows-Zzz{i:04}%4Operational.evtx"
                 ),
             ));
         }
-        candidates.push((
+        candidates.push(cand(
             "evtx",
-            "sec".to_string(),
-            "Windows/System32/winevt/Logs/Security.evtx".to_string(),
+            "sec",
+            "Windows/System32/winevt/Logs/Security.evtx",
         ));
-        candidates.push(("mft", "mft".to_string(), "$MFT".to_string()));
+        candidates.push(cand("mft", "mft", "$MFT"));
 
         let selected = select_artifacts(candidates, 50);
         assert_eq!(selected.len(), 50);
-        let classes: std::collections::HashSet<&str> = selected.iter().map(|c| c.0).collect();
+        let classes: std::collections::HashSet<&str> = selected.iter().map(|c| c.class).collect();
         assert!(classes.contains("prefetch"), "prefetch starved");
         assert!(classes.contains("evtx"), "evtx starved (the original bug)");
         assert!(classes.contains("mft"), "mft missing");
         assert!(
-            selected.iter().any(|c| c.2.ends_with("/Security.evtx")),
+            selected
+                .iter()
+                .any(|c| c.rel_path.ends_with("/Security.evtx")),
             "canonical Security.evtx must win evtx's fair share"
         );
+    }
+
+    #[test]
+    fn select_artifacts_prefers_the_preferred_partition_copy_within_a_class() {
+        // Every NTFS volume carries a `$MFT`. When both the boot partition and
+        // the OS volume offer one, the preferred (rank 0 = largest) volume's
+        // copy must be drawn first so a tight budget spends itself on the
+        // volume that actually holds the evidence.
+        let boot = ArtifactCandidate {
+            class: "mft",
+            inode: "100".to_string(),
+            rel_path: "$MFT".to_string(),
+            sector_offset: Some(2048),
+            partition_rank: 1,
+        };
+        let os = ArtifactCandidate {
+            class: "mft",
+            inode: "200".to_string(),
+            rel_path: "$MFT".to_string(),
+            sector_offset: Some(206_848),
+            partition_rank: 0,
+        };
+        let selected = select_artifacts(vec![boot.clone(), os.clone()], 1);
+        assert_eq!(selected, vec![os.clone()]);
+        // Order of arrival must not matter.
+        let selected = select_artifacts(vec![os.clone(), boot], 1);
+        assert_eq!(selected, vec![os]);
     }
 
     #[test]
     fn select_artifacts_caps_at_limit_and_handles_empty() {
         assert!(select_artifacts(Vec::new(), 10).is_empty());
         let candidates = vec![
-            ("mft", "1".to_string(), "$MFT".to_string()),
-            (
-                "prefetch",
-                "2".to_string(),
-                "Windows/Prefetch/X.pf".to_string(),
-            ),
+            cand("mft", "1", "$MFT"),
+            cand("prefetch", "2", "Windows/Prefetch/X.pf"),
         ];
         assert_eq!(select_artifacts(candidates.clone(), 1).len(), 1);
         assert_eq!(select_artifacts(candidates, 5).len(), 2); // limit above supply
+    }
+
+    #[test]
+    fn candidate_dest_dir_namespaces_secondary_partitions_only() {
+        let out = Path::new("/cases/abc/extracted/disk/x");
+        // Preferred partition (rank 0) keeps the flat layout downstream
+        // tooling has always seen; every further partition is namespaced by
+        // its sector offset so identical in-filesystem paths cannot collide.
+        let os = ArtifactCandidate {
+            class: "mft",
+            inode: "200".to_string(),
+            rel_path: "$MFT".to_string(),
+            sector_offset: Some(206_848),
+            partition_rank: 0,
+        };
+        assert_eq!(candidate_dest_dir(out, &os), out.join("mft"));
+        let boot = ArtifactCandidate {
+            partition_rank: 1,
+            sector_offset: Some(2048),
+            ..os.clone()
+        };
+        assert_eq!(
+            candidate_dest_dir(out, &boot),
+            out.join("mft").join("vol2048")
+        );
+        let bare = ArtifactCandidate {
+            sector_offset: None,
+            partition_rank: 0,
+            ..os
+        };
+        assert_eq!(candidate_dest_dir(out, &bare), out.join("mft"));
     }
 
     #[test]
@@ -1843,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn mmls_parser_returns_first_filesystem_partition_offset() {
+    fn mmls_parser_returns_single_filesystem_partition() {
         let output = r"DOS Partition Table
 Offset Sector: 0
 Units are in 512-byte sectors
@@ -1854,7 +2081,50 @@ Units are in 512-byte sectors
 002:  000:000   0000000063   0009510479   0009510417   NTFS / exFAT (0x07)
 ";
 
-        assert_eq!(parse_mmls_first_partition_offset(output), Some(63 * 512));
+        let partitions = parse_mmls_filesystem_partitions(output);
+        assert_eq!(
+            partitions,
+            vec![MmlsPartition {
+                start_sector: 63,
+                length_sectors: 9_510_417,
+            }]
+        );
+        assert_eq!(partition_byte_offsets(partitions), vec![63 * 512]);
+    }
+
+    #[test]
+    fn mmls_parser_returns_every_filesystem_partition() {
+        // Verbatim layout of cfreds_2015_data_leakage_pc.dd (verified with
+        // mmls against the fixture on the lab host): a Win7 ~100 MB NTFS
+        // "System Reserved" boot partition ahead of the ~19.9 GB NTFS OS
+        // volume. The old first-match parser stopped at sector 2048, so
+        // extraction only ever saw the boot partition — 256 MFT records, zero
+        // registry/prefetch/evtx.
+        let output = r"DOS Partition Table
+Offset Sector: 0
+Units are in 512-byte sectors
+
+      Slot      Start        End          Length       Description
+000:  Meta      0000000000   0000000000   0000000001   Primary Table (#0)
+001:  -------   0000000000   0000002047   0000002048   Unallocated
+002:  000:000   0000002048   0000206847   0000204800   NTFS / exFAT (0x07)
+003:  000:001   0000206848   0041940991   0041734144   NTFS / exFAT (0x07)
+004:  -------   0041940992   0041943039   0000002048   Unallocated
+";
+
+        assert_eq!(
+            parse_mmls_filesystem_partitions(output),
+            vec![
+                MmlsPartition {
+                    start_sector: 2048,
+                    length_sectors: 204_800,
+                },
+                MmlsPartition {
+                    start_sector: 206_848,
+                    length_sectors: 41_734_144,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1864,6 +2134,38 @@ Units are in 512-byte sectors
 001:  -------   0000000000   0000002047   0000002048   Unallocated
 ";
 
-        assert_eq!(parse_mmls_first_partition_offset(output), None);
+        assert_eq!(parse_mmls_filesystem_partitions(output), Vec::new());
+    }
+
+    #[test]
+    fn partition_preference_puts_the_largest_volume_first() {
+        // Largest-first so the extraction budget and the mount favour the OS
+        // volume over the boot partition that precedes it on disk; ties break
+        // toward the lower start sector for determinism.
+        let boot = MmlsPartition {
+            start_sector: 2048,
+            length_sectors: 204_800,
+        };
+        let os = MmlsPartition {
+            start_sector: 206_848,
+            length_sectors: 41_734_144,
+        };
+        assert_eq!(
+            order_partitions_by_preference(vec![boot, os]),
+            vec![os, boot]
+        );
+
+        let twin_a = MmlsPartition {
+            start_sector: 63,
+            length_sectors: 1000,
+        };
+        let twin_b = MmlsPartition {
+            start_sector: 5000,
+            length_sectors: 1000,
+        };
+        assert_eq!(
+            order_partitions_by_preference(vec![twin_b, twin_a]),
+            vec![twin_a, twin_b]
+        );
     }
 }
