@@ -429,7 +429,7 @@ Each is backed by a real tool call in a committed `audit.jsonl`:
 - **Windows event logs**: `evtx_query`, plus a Hayabusa/Sigma sweep at lead-tier (`hayabusa_scan`)
 - **NTFS USN journal**: `usnjrnl_query`
 - **Network**: PCAP triage (`pcap_triage`)
-- **Memory**: Volatility 3 active list, pool scan, cross-view, injection (`vol_pslist`, `vol_psscan`, `vol_psxview`, `vol_malfind`)
+- **Memory**: Volatility 3 active list, pool scan, cross-view, injection (`vol_pslist`, `vol_psscan`, `vol_psxview`, `vol_malfind`), plus command-line/console recovery through the allow-listed `vol_run` plugins (`windows.cmdline`, `windows.consoles`)
 - **Custody intake**: `case_open` SHA-256 over the evidence
 
 The long-tail verbs (`vol_run`, `ez_parse`, `plaso_parse`, `mac_triage`, `cloud_audit`,
