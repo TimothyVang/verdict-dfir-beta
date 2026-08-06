@@ -8534,6 +8534,294 @@ def process_sets_diverge(
     return False, "process views agree"
 
 
+# ---------------------------------------------------------------------------
+# Notable-application presence detectors (memory lane)
+# ---------------------------------------------------------------------------
+# The memory lane collects every process name from vol_pslist/vol_psscan but
+# used to synthesize only structural findings (DKOM/smear, malfind, uncommon
+# names) — a run could observe KeePass.exe/chrome.exe/mspaint.exe in its own
+# tool output and never state an application-level claim. These detectors turn
+# the ALREADY-collected names (no new tool call) into Pool-B PRESENCE findings.
+#
+# Two deliberate disciplines, both pinned by tests
+# (services/agent/tests/test_memory_notable_apps.py):
+#
+#   * PRESENCE wording only, never execution ("present/observed", never
+#     "ran/launched/started") and no T1059-family tag: vol_pslist/vol_psscan/
+#     vol_run are all artifact class "memory" (_ABLATION_TOOL_CLASS), so a
+#     memory-only execution claim can never clear the >=2-artifact-class
+#     execution gate (execution_requires_two_current_artifact_classes) and
+#     would be flagged rather than shipped.
+#
+#   * INFERRED tier, never CONFIRMED. "A process named keepass.exe is present"
+#     is a direct, cross-validated tool observation, but in this engine the
+#     CONFIRMED tier is what drives verdict escalation (compute_verdict: any
+#     CONFIRMED finding => SUSPICIOUS). Browsers, password managers and
+#     notepad are ubiquitous LEGITIMATE software; a CONFIRMED presence finding
+#     would flip every healthy machine running KeePass to SUSPICIOUS — a
+#     false-positive machine, not a tier-1 threat observation. The
+#     investigative content of the finding ("credential-store material may be
+#     recoverable / relevant") is an inference from an attacker- and
+#     user-controllable image name, which is exactly the INFERRED tier.
+
+BROWSER_PROCS: frozenset[str] = frozenset(
+    {
+        "chrome.exe",
+        "firefox.exe",
+        "msedge.exe",
+        "iexplore.exe",
+        "opera.exe",
+        "brave.exe",
+    }
+)
+
+# T1555 (Credentials from Password Stores) presence leads: a password manager
+# holds decrypted credential data in process memory while unlocked.
+CREDENTIAL_STORE_PROCS: frozenset[str] = frozenset(
+    {
+        "keepass.exe",
+        "keepassxc.exe",
+        "1password.exe",
+        "lastpass.exe",
+        "bitwarden.exe",
+    }
+)
+
+# Interactive user applications whose in-memory state preserves user-session
+# activity. Value = short activity descriptor composed into the finding text
+# for the apps actually observed (never a static blurb about apps not seen).
+_USER_APP_ACTIVITY: dict[str, str] = {
+    "mspaint.exe": "drawing/paint",
+    "wordpad.exe": "document editing",
+    "notepad.exe": "text editing",
+    "calc.exe": "calculator use",
+    "winword.exe": "document editing",
+    "excel.exe": "spreadsheet editing",
+    "powerpnt.exe": "presentation editing",
+}
+INTERACTIVE_USER_APP_PROCS: frozenset[str] = frozenset(_USER_APP_ACTIVITY)
+
+# Console hosts / command interpreters whose windows.cmdline rows evidence a
+# command window in the captured session.
+CONSOLE_HOST_PROCS: frozenset[str] = frozenset(
+    {"cmd.exe", "conhost.exe", "powershell.exe", "pwsh.exe"}
+)
+
+
+def _proc_names_to_pids(rows: list[dict[str, Any]] | None) -> dict[str, list[int]]:
+    """Map lowercased image name -> sorted unique PIDs for one process view."""
+    out: dict[str, list[int]] = {}
+    for row in rows or []:
+        name = _process_name(row)
+        if not name:
+            continue
+        pids = out.setdefault(name, [])
+        pid = _process_pid(row)
+        if pid is not None and pid not in pids:
+            pids.append(pid)
+    return {name: sorted(pids) for name, pids in out.items()}
+
+
+def _notable_sample(names: list[str], pids_by_name: dict[str, list[int]]) -> str:
+    parts = []
+    for name in names[:5]:
+        pids = pids_by_name.get(name, [])
+        if pids:
+            parts.append(f"{name} (pid {', '.join(str(p) for p in pids[:3])})")
+        else:
+            parts.append(name)
+    return ", ".join(parts)
+
+
+def detect_notable_applications(
+    pslist_rows: list[dict[str, Any]] | None,
+    psscan_rows: list[dict[str, Any]] | None,
+    tcid_pslist: str | None,
+    tcid_psscan: str | None,
+    case_id: str,
+    evidence_path: str,
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B presence findings for notable applications in the process views.
+
+    Purely driven by the process names vol_pslist/vol_psscan already returned —
+    no new tool call. ``derived_from`` cites ONLY the tool calls whose output
+    actually contains at least one process of the category (a psscan-only
+    observation must not fabricate a pslist corroboration); when both views
+    contain one, the finding cites both tool_call_ids (>=2-fact rule).
+    """
+    ident = finding_id_for or (lambda base: base)
+    in_pslist = _proc_names_to_pids(pslist_rows)
+    in_psscan = _proc_names_to_pids(psscan_rows)
+    all_names = set(in_pslist) | set(in_psscan)
+
+    def _source_sentence(seen_pslist: bool, seen_psscan: bool) -> str:
+        if seen_pslist and seen_psscan:
+            return (
+                "Presence cross-validated by vol_pslist (active-process walk) "
+                "and vol_psscan (pool-tag scan)."
+            )
+        if seen_pslist:
+            return "Presence observed in the vol_pslist active-process list (not recovered by vol_psscan)."
+        return "Presence observed in the vol_psscan pool-tag scan (not present in the vol_pslist view)."
+
+    findings: list[dict[str, Any]] = []
+    for base, procset, mitre, describe in (
+        ("f-B-notable-browser", BROWSER_PROCS, None, _describe_browser_presence),
+        ("f-B-notable-credstore", CREDENTIAL_STORE_PROCS, "T1555", _describe_credstore_presence),
+        ("f-B-notable-userapps", INTERACTIVE_USER_APP_PROCS, None, _describe_userapp_presence),
+    ):
+        names = sorted(all_names & procset)
+        if not names:
+            continue
+        seen_pslist = any(name in in_pslist for name in names)
+        seen_psscan = any(name in in_psscan for name in names)
+        derived = []
+        if seen_pslist and tcid_pslist:
+            derived.append(tcid_pslist)
+        if seen_psscan and tcid_psscan:
+            derived.append(tcid_psscan)
+        if not derived:
+            continue
+        pids_by_name = {
+            name: sorted({*in_pslist.get(name, []), *in_psscan.get(name, [])}) for name in names
+        }
+        sample = _notable_sample(names, pids_by_name)
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": ident(base),
+                "tool_call_id": derived[0],
+                "artifact_path": evidence_path,
+                "description": describe(sample, _source_sentence(seen_pslist, seen_psscan), names),
+                "confidence": "INFERRED",
+                "pool_origin": "B",
+                "mitre_technique": mitre,
+                "derived_from": derived,
+            }
+        )
+    return findings
+
+
+def _describe_browser_presence(sample: str, source: str, _names: list[str]) -> str:
+    return (
+        f"The memory image contains browser applications present in the recovered "
+        f"process list: {sample}. {source} Browser activity artifacts (history, "
+        f"cookies, session data) are typically recoverable from these processes' memory."
+    )
+
+
+def _describe_credstore_presence(sample: str, source: str, _names: list[str]) -> str:
+    return (
+        f"The memory image contains password-manager (credential-store) processes "
+        f"present in the recovered process list: {sample}. {source} Password managers "
+        f"hold decrypted credential data in process memory while unlocked, so "
+        f"credential-store material relevant to the case may be recoverable from this "
+        f"image (T1555 Credentials from Password Stores — a presence lead, not a "
+        f"credential-access claim)."
+    )
+
+
+def _describe_userapp_presence(sample: str, source: str, names: list[str]) -> str:
+    activities = ", ".join(sorted({_USER_APP_ACTIVITY[name] for name in names}))
+    return (
+        f"The memory image contains interactive user applications present in the "
+        f"recovered process list: {sample}. {source} User-session application "
+        f"activity ({activities}) is preserved in these processes' memory and may be "
+        f"recoverable from the image."
+    )
+
+
+def _console_command_rows(
+    cmdline_rows: list[dict[str, Any]] | None,
+) -> list[tuple[int | None, str, str]]:
+    """(pid, process, args) for console hosts with a READABLE command line.
+
+    Rows are the generic ``vol_run`` windows.cmdline shape (Vol3 JSON columns
+    ``PID``/``Process``/``Args``). Vol3 renders an unreadable PEB as an
+    ``Args`` string starting with "Required memory"; those rows are not a
+    recovered command line and are skipped.
+    """
+    hits: list[tuple[int | None, str, str]] = []
+    for row in cmdline_rows or []:
+        proc = str(row.get("Process") or row.get("process") or "").lower()
+        if proc not in CONSOLE_HOST_PROCS:
+            continue
+        args = row.get("Args", row.get("args"))
+        if not isinstance(args, str) or not args.strip():
+            continue
+        if args.strip().startswith("Required memory"):
+            continue
+        pid = row.get("PID", row.get("pid"))
+        try:
+            pid_int: int | None = int(pid)
+        except (TypeError, ValueError):
+            pid_int = None
+        hits.append((pid_int, proc, args.strip()))
+    return hits
+
+
+def detect_console_activity(
+    cmdline_rows: list[dict[str, Any]] | None,
+    consoles_rows: list[dict[str, Any]] | None,
+    tcid_cmdline: str | None,
+    tcid_consoles: str | None,
+    case_id: str,
+    evidence_path: str,
+    corroborating_tcids: tuple[str, ...] = (),
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B presence finding for console/command-line artifacts in memory.
+
+    Fires only on ACTUAL vol_run output: a windows.cmdline row for a console
+    host (cmd/conhost/powershell) with a readable recorded command line; when
+    windows.consoles rows were also recovered they are cited as the command
+    window screen-buffer evidence. Deliberately NO T1059 tag and presence
+    wording only: with memory as the only artifact class, an execution claim
+    cannot clear the >=2-artifact-class gate — the finding states what the
+    image preserves, not that an adversary executed anything. The raw command
+    line CONTENT is deliberately not quoted into the description (it is
+    attacker-controlled text; the audit chain retains the full tool output).
+    """
+    hits = _console_command_rows(cmdline_rows)
+    if not hits or not tcid_cmdline:
+        return []
+    ident = finding_id_for or (lambda base: base)
+    names = ", ".join(
+        f"{proc} (pid {pid})" if pid is not None else proc for pid, proc, _args in hits[:3]
+    )
+    description = (
+        f"The memory image contains console command-line artifacts: volatility "
+        f"windows.cmdline output preserved the command line recorded for {names}."
+    )
+    consoles_rows = consoles_rows or []
+    if consoles_rows and tcid_consoles:
+        description += (
+            f" windows.consoles output additionally preserved {len(consoles_rows)} "
+            f"console-session row(s) — command window screen-buffer content from the "
+            f"captured session."
+        )
+    derived = [tcid_cmdline]
+    if consoles_rows and tcid_consoles:
+        derived.append(tcid_consoles)
+    for tcid in corroborating_tcids:
+        if tcid and tcid not in derived:
+            derived.append(tcid)
+    return [
+        {
+            "case_id": case_id,
+            "finding_id": ident("f-B-console-cmdline"),
+            "tool_call_id": tcid_cmdline,
+            "artifact_path": evidence_path,
+            "description": description,
+            "confidence": "INFERRED",
+            "pool_origin": "B",
+            "mitre_technique": None,
+            "derived_from": derived,
+        }
+    ]
+
+
 def write_timeline_csv(timeline: list[dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "ts",
@@ -10109,6 +10397,151 @@ class Investigation:
                     "derived_from": [tcid_psscan],
                 }
             )
+
+        # Finding 4 — notable applications present in the process views.
+        # Driven entirely by the names ALREADY collected from vol_pslist and
+        # vol_psscan (no new tool call): browser, credential-store (T1555
+        # presence lead) and interactive user applications. Presence wording
+        # and INFERRED tier are deliberate — see detect_notable_applications.
+        notable = detect_notable_applications(
+            ps if isinstance(ps, list) else [],
+            psscan if isinstance(psscan, list) else [],
+            tcid_pslist,
+            tcid_psscan,
+            self.handle["id"],
+            evidence_path,
+            finding_id_for=lambda base: self._finding_id_for(base, evidence_path),
+        )
+        self.findings_pool_b.extend(notable)
+        if notable:
+            print(f"  notable applications: {len(notable)} presence finding(s)")
+
+        # Finding 5 — console/command-line artifacts via the allow-listed
+        # vol_run plugins. windows.cmdline is a cheap PEB walk; when it shows a
+        # console host with a readable recorded command line, windows.consoles
+        # is also run so the command-window screen buffer is preserved as
+        # corroborating output. Both plugins are artifact class "memory"
+        # (_ABLATION_TOOL_CLASS), so the resulting finding stays
+        # presence-worded with no T1059 tag — a memory-only execution claim
+        # cannot clear the >=2-artifact-class gate.
+        cmdline_rows: list[dict[str, Any]] = []
+        tcid_cmdline: str | None = None
+        if ps or psscan:
+            cmdline_args = {
+                "case_id": self.handle["id"],
+                "memory_path": evidence_path,
+                "plugin": "windows.cmdline",
+                "limit": 500,
+            }
+            cmdline_out = rust.call_tool("vol_run", cmdline_args)
+            cmdline_error = None
+            if "_error" in cmdline_out:
+                cmdline_error = str(
+                    cmdline_out["_error"].get("message", "vol_run windows.cmdline failed")
+                )
+                print(f"  vol_run windows.cmdline error: {cmdline_error[:80]}")
+                self.analysis_limitations.append(
+                    f"vol_run windows.cmdline failed: {cmdline_error}"
+                )
+                self._course_correct(
+                    py,
+                    "vol_run",
+                    cmdline_error,
+                    "defer (no command-line recovery this run)",
+                )
+                cmdline_out = {
+                    "_error": {"message": cmdline_error},
+                    "plugin": "windows.cmdline",
+                    "rows": [],
+                    "rows_seen": 0,
+                }
+            cmdline_rows = cmdline_out.get("rows", []) or []
+            cmdline_extra: dict[str, Any] = {
+                "tool": "windows.cmdline",
+                "rows_returned": len(cmdline_rows),
+                "rows_seen": cmdline_out.get("rows_seen", len(cmdline_rows)),
+            }
+            if cmdline_error:
+                cmdline_extra["error"] = cmdline_error
+            tcid_cmdline = self._record_tool(
+                py,
+                "vol_run",
+                self._output_hash(cmdline_out),
+                cmdline_extra,
+                arguments=cmdline_args,
+            )
+            print(f"  vol_run windows.cmdline: {len(cmdline_rows)} rows")
+
+        consoles_rows: list[dict[str, Any]] = []
+        tcid_consoles: str | None = None
+        if _console_command_rows(cmdline_rows):
+            consoles_args = {
+                "case_id": self.handle["id"],
+                "memory_path": evidence_path,
+                "plugin": "windows.consoles",
+                "limit": 200,
+            }
+            consoles_out = rust.call_tool("vol_run", consoles_args)
+            consoles_error = None
+            if "_error" in consoles_out:
+                consoles_error = str(
+                    consoles_out["_error"].get("message", "vol_run windows.consoles failed")
+                )
+                print(f"  vol_run windows.consoles error: {consoles_error[:80]}")
+                self.analysis_limitations.append(
+                    f"vol_run windows.consoles failed: {consoles_error}"
+                )
+                self._course_correct(
+                    py,
+                    "vol_run",
+                    consoles_error,
+                    "defer (command-line rows stand alone; no screen-buffer corroboration)",
+                )
+                consoles_out = {
+                    "_error": {"message": consoles_error},
+                    "plugin": "windows.consoles",
+                    "rows": [],
+                    "rows_seen": 0,
+                }
+            consoles_rows = consoles_out.get("rows", []) or []
+            consoles_extra: dict[str, Any] = {
+                "tool": "windows.consoles",
+                "rows_returned": len(consoles_rows),
+                "rows_seen": consoles_out.get("rows_seen", len(consoles_rows)),
+            }
+            if consoles_error:
+                consoles_extra["error"] = consoles_error
+            tcid_consoles = self._record_tool(
+                py,
+                "vol_run",
+                self._output_hash(consoles_out),
+                consoles_extra,
+                arguments=consoles_args,
+            )
+            print(f"  vol_run windows.consoles: {len(consoles_rows)} rows")
+
+        if tcid_cmdline:
+            # Cite the process views as corroboration ONLY when they actually
+            # contain a console host observed by windows.cmdline.
+            console_names = {name for _pid, name, _args in _console_command_rows(cmdline_rows)}
+            corroborating: list[str] = []
+            if console_names & {_process_name(p) for p in (ps or [])}:
+                corroborating.append(tcid_pslist)
+            elif console_names & {_process_name(p) for p in (psscan or [])}:
+                corroborating.append(tcid_psscan)
+            console_findings = detect_console_activity(
+                cmdline_rows,
+                consoles_rows,
+                tcid_cmdline,
+                tcid_consoles,
+                self.handle["id"],
+                evidence_path,
+                corroborating_tcids=tuple(corroborating),
+                finding_id_for=lambda base: self._finding_id_for(base, evidence_path),
+            )
+            self.findings_pool_b.extend(console_findings)
+            if console_findings:
+                print(f"  console activity: {len(console_findings)} presence finding(s)")
 
         # Save psscan for the report
         self.local_artifacts["psscan_json"] = json.dumps(psscan or [], separators=(",", ":"))
