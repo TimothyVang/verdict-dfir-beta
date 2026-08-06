@@ -143,6 +143,11 @@ _FINDING_MODEL_FIELDS = frozenset(
         # prediction the verifier checks against the cited output. Must survive
         # projection or the refutation gate never sees it and silently no-ops.
         "expectation",
+        # The ruled-out benign alternative (events.Finding.counter_hypothesis).
+        # Must survive projection or the opt-in anti-coherence gate
+        # (FIND_EVIL_REQUIRE_COUNTER_HYPOTHESIS_FINDING=1) rejects a CONFIRMED
+        # finding whose emitter genuinely recorded one.
+        "counter_hypothesis",
     }
 )
 
@@ -12535,6 +12540,8 @@ class Investigation:
         technique: str,
         confidence: str = "HYPOTHESIS",
         derived_from: list[str] | None = None,
+        asserted_values: list[dict[str, Any]] | None = None,
+        counter_hypothesis: str | None = None,
     ) -> None:
         target = self.findings_pool_a if pool == "A" else self.findings_pool_b
         if any(f.get("finding_id") == finding_id for f in target):
@@ -12552,6 +12559,14 @@ class Investigation:
         # SOUL.md: INFERRED findings cite the confirmed facts they rest on.
         if derived_from:
             finding["derived_from"] = list(derived_from)
+        # Fact-fidelity: the structured value(s) this finding claims are present
+        # in the cited tool output, re-extracted by the verifier's entailment
+        # check. Required for a CONFIRMED network finding (events.Finding gate).
+        if asserted_values:
+            finding["asserted_values"] = [dict(av) for av in asserted_values]
+        # The benign alternative this finding ruled out (anti-coherence gate).
+        if counter_hypothesis:
+            finding["counter_hypothesis"] = counter_hypothesis
         target.append(finding)
 
     def _disk_summary(self) -> dict[str, Any]:
@@ -12660,10 +12675,57 @@ class Investigation:
             if anon and (src, host) not in anon_seen:
                 anon_seen.add((src, host))
                 posted = method == "POST"
-                # POST = an actual submission to the service; with the contact it
-                # is two corroborating facts, so INFERRED. A bare GET is a lead.
-                confidence = "INFERRED" if posted else "HYPOTHESIS"
+                # A POST to a curated anonymous-email host is a DIRECTLY OBSERVED
+                # submission parsed from the capture — a tier-1 fact per the
+                # confidence hierarchy (tool_call_id + raw output excerpt +
+                # asserted_values the verifier re-extracts), so it is born
+                # CONFIRMED. The >=2-artifact-class rule is scoped to EXECUTION
+                # claims; this is identity-attribution evidence, not execution
+                # (the correlator classifies it as non-execution). A bare GET is
+                # mere contact and stays a HYPOTHESIS lead.
+                confidence = "CONFIRMED" if posted else "HYPOTHESIS"
                 verb = "submitted a request (HTTP POST) to" if posted else "contacted"
+                asserted_values: list[dict[str, Any]] | None = None
+                counter_hypothesis: str | None = None
+                if posted:
+                    # Raw row values (not display-normalized ones) so the
+                    # entailment check re-extracts them from the replayed
+                    # pcap_triage parsed_output (http_requests[*]: src, host,
+                    # method, ...). The record assertion co-locates host+method
+                    # (+src) in ONE row — a GET to the same host elsewhere in
+                    # the capture cannot vacuously satisfy the POST claim.
+                    raw_method = str(row.get("method") or "").strip()
+                    raw_src = str(row.get("src") or "").strip()
+                    constraints: dict[str, str] = {"host": host, "method": raw_method}
+                    if raw_src:
+                        constraints["src"] = raw_src
+                    asserted_values = [
+                        {
+                            "path": "http_requests[*]",
+                            "expected": json.dumps(constraints, sort_keys=True),
+                            "match": "record",
+                        },
+                        {
+                            "path": "http_requests[*].host",
+                            "expected": host,
+                            "match": "exact",
+                        },
+                    ]
+                    if raw_src:
+                        asserted_values.append(
+                            {
+                                "path": "http_requests[*].src",
+                                "expected": raw_src,
+                                "match": "exact",
+                            }
+                        )
+                    counter_hypothesis = (
+                        "A passive or automated fetch (ad/prefetch/redirect GET) "
+                        "could touch the service without a user submission; ruled "
+                        "out because the observed request method in the capture "
+                        "is POST — a client submission to the service, not a "
+                        "passive retrieval."
+                    )
                 self._network_finding(
                     "B",
                     self._finding_id_for(f"f-B-pcap-anon-email-{host}", artifact_path),
@@ -12682,6 +12744,8 @@ class Investigation:
                     None,
                     confidence=confidence,
                     derived_from=[tcid],
+                    asserted_values=asserted_values,
+                    counter_hypothesis=counter_hypothesis,
                 )
                 emitted += 1
                 continue
