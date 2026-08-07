@@ -355,7 +355,7 @@ fn firefox_has_last_visit_date(conn: &Connection) -> Result<bool, rusqlite::Erro
 
 /// Firefox 2.x/3.0-era `places.sqlite` (e.g. 2008 evidence): derive the last
 /// visit per place from `moz_historyvisits`. Without that table the rows still
-/// carry url/title/visit_count - a dateless visited-URL fact beats a hard
+/// carry `url`/`title`/`visit_count` - a dateless visited-URL fact beats a hard
 /// error on real evidence.
 fn read_firefox_legacy(
     conn: &Connection,
@@ -441,7 +441,6 @@ mod tests {
         assert_eq!(webkit_micros_to_iso(0), None);
         assert_eq!(unix_micros_to_iso(0), None);
     }
-
 
     fn mem_conn() -> Connection {
         Connection::open_in_memory().expect("in-memory sqlite")
