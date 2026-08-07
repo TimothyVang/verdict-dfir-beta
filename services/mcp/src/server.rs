@@ -93,6 +93,17 @@ const SERVER_NAME: &str = "findevil-mcp";
 const ERR_INVALID_PARAMS: i64 = -32602;
 const ERR_INTERNAL: i64 = -32603;
 
+/// Machine-readable class carried in a JSON-RPC `error.data.kind` when a tool
+/// could not run because its EXTERNAL BINARY is not installed on this host.
+///
+/// It is deliberately NOT a new error code: the transport-level failure is still
+/// `-32603`, so a client that ignores `data` behaves exactly as before.
+/// `data.kind` is the additive, typed channel that lets a caller tell "this lane
+/// is unavailable on this host" from "this tool failed on evidence it could
+/// reach" without pattern-matching English prose. See
+/// [`crate::tools::PrerequisiteGap`] for which errors qualify.
+const MISSING_PREREQUISITE: &str = "missing_prerequisite";
+
 /// Tool descriptor — name, human-readable description, schema producer,
 /// the dispatch closure, plus MCP annotations that agent UIs render
 /// (e.g. a "destructive" badge or a network-icon).
@@ -161,6 +172,27 @@ impl ToolAnnotations {
 enum ToolError {
     InvalidParams(String),
     Internal(String),
+    /// The tool's external binary is absent, so the tool cannot run AT ALL on
+    /// this host. Distinct from [`ToolError::Internal`] because the caller must
+    /// be able to record it as a lane-level coverage gap instead of a failure of
+    /// the case — see [`MISSING_PREREQUISITE`].
+    MissingPrerequisite(String),
+}
+
+/// Classify one tool's error into the JSON-RPC failure it should surface as.
+///
+/// Every shell-out dispatcher funnels its non-user-input errors through here, so
+/// the "is this an unmet prerequisite?" decision lives in ONE place and is made
+/// on the tool's own error TYPE — never on the text of the message.
+fn tool_err<E>(tool: &str, e: &E) -> ToolError
+where
+    E: std::fmt::Display + crate::tools::PrerequisiteGap,
+{
+    if e.is_missing_prerequisite() {
+        ToolError::MissingPrerequisite(format!("{tool}: {e}"))
+    } else {
+        ToolError::Internal(format!("{tool}: {e}"))
+    }
 }
 
 /// Run the stdio server until stdin closes. Returns on EOF or fatal
@@ -1225,9 +1257,26 @@ fn dispatch(line: &str, registry: &[ToolEntry]) -> Option<String> {
     let id = id.unwrap_or(Value::Null);
     Some(match result {
         Ok(value) => make_success_response(&id, &value),
-        Err(ToolError::InvalidParams(msg)) => make_error_response(&id, ERR_INVALID_PARAMS, &msg),
-        Err(ToolError::Internal(msg)) => make_error_response(&id, ERR_INTERNAL, &msg),
+        Err(e) => tool_error_response(&id, e),
     })
+}
+
+/// Render a [`ToolError`] as its JSON-RPC error response.
+///
+/// Split out of `handle_message` so the wire shape — in particular the typed
+/// `data.kind` an unmet prerequisite carries — is directly testable without
+/// arranging an absent binary in the test process's environment.
+fn tool_error_response(id: &Value, err: ToolError) -> String {
+    match err {
+        ToolError::InvalidParams(msg) => make_error_response(id, ERR_INVALID_PARAMS, &msg),
+        ToolError::Internal(msg) => make_error_response(id, ERR_INTERNAL, &msg),
+        ToolError::MissingPrerequisite(msg) => make_error_response_with_data(
+            id,
+            ERR_INTERNAL,
+            &msg,
+            &json!({"kind": MISSING_PREREQUISITE}),
+        ),
+    }
 }
 
 fn handle_initialize(_params: &Value) -> Value {
@@ -1494,7 +1543,7 @@ fn dispatch_hayabusa_scan(args: Value) -> Result<Value, ToolError> {
             | crate::tools::HayabusaError::EvtxDirNotDirectory(_)
             | crate::tools::HayabusaError::RuleSetNotFound(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("hayabusa_scan: {e}"))),
+        Err(e) => Err(tool_err("hayabusa_scan", &e)),
     }
 }
 
@@ -1551,7 +1600,7 @@ fn dispatch_pcap_triage(args: Value) -> Result<Value, ToolError> {
             | crate::tools::PcapTriageError::PcapNotRegular(_)
             | crate::tools::PcapTriageError::InvalidAnalyzer(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("pcap_triage: {e}"))),
+        Err(e) => Err(tool_err("pcap_triage", &e)),
     }
 }
 
@@ -1568,7 +1617,7 @@ fn dispatch_vol_pslist(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::VolError::MemoryNotFound(_)
             | crate::tools::VolError::MemoryNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vol_pslist: {e}"))),
+        Err(e) => Err(tool_err("vol_pslist", &e)),
     }
 }
 
@@ -1582,7 +1631,7 @@ fn dispatch_vol_psscan(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::VolPsscanError::MemoryNotFound(_)
             | crate::tools::VolPsscanError::MemoryNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vol_psscan: {e}"))),
+        Err(e) => Err(tool_err("vol_psscan", &e)),
     }
 }
 
@@ -1596,7 +1645,7 @@ fn dispatch_vol_psxview(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::VolPsxviewError::MemoryNotFound(_)
             | crate::tools::VolPsxviewError::MemoryNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vol_psxview: {e}"))),
+        Err(e) => Err(tool_err("vol_psxview", &e)),
     }
 }
 
@@ -1611,7 +1660,7 @@ fn dispatch_vol_malfind(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::VolMalfindError::MemoryNotFound(_)
             | crate::tools::VolMalfindError::MemoryNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vol_malfind: {e}"))),
+        Err(e) => Err(tool_err("vol_malfind", &e)),
     }
 }
 
@@ -1629,7 +1678,7 @@ fn dispatch_vol_run(args: Value) -> Result<Value, ToolError> {
             | crate::tools::VolRunError::MemoryNotFound(_)
             | crate::tools::VolRunError::MemoryNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vol_run: {e}"))),
+        Err(e) => Err(tool_err("vol_run", &e)),
     }
 }
 
@@ -1645,7 +1694,7 @@ fn dispatch_ez_parse(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::EzParseError::ToolNotAllowed(_)
             | crate::tools::EzParseError::ArtifactNotFound(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("ez_parse: {e}"))),
+        Err(e) => Err(tool_err("ez_parse", &e)),
     }
 }
 
@@ -1660,7 +1709,7 @@ fn dispatch_plaso_parse(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::PlasoParseError::ParserNotAllowed(_)
             | crate::tools::PlasoParseError::ArtifactNotFound(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("plaso_parse: {e}"))),
+        Err(e) => Err(tool_err("plaso_parse", &e)),
     }
 }
 
@@ -1688,7 +1737,7 @@ fn dispatch_pst_parse(args: Value) -> Result<Value, ToolError> {
         Err(e @ crate::tools::PstParseError::ArtifactNotFound(_)) => {
             Err(ToolError::InvalidParams(format!("{e}")))
         }
-        Err(e) => Err(ToolError::Internal(format!("pst_parse: {e}"))),
+        Err(e) => Err(tool_err("pst_parse", &e)),
     }
 }
 
@@ -1703,7 +1752,7 @@ fn dispatch_mac_triage(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::MacTriageError::ModuleNotAllowed(_)
             | crate::tools::MacTriageError::ImageNotFound(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("mac_triage: {e}"))),
+        Err(e) => Err(tool_err("mac_triage", &e)),
     }
 }
 
@@ -1735,7 +1784,7 @@ fn dispatch_journalctl_query(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::JournalctlQueryError::NotFound(_)
             | crate::tools::JournalctlQueryError::NotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("journalctl_query: {e}"))),
+        Err(e) => Err(tool_err("journalctl_query", &e)),
     }
 }
 
@@ -1750,7 +1799,7 @@ fn dispatch_login_accounting(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::LoginAccountingError::NotFound(_)
             | crate::tools::LoginAccountingError::NotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("login_accounting: {e}"))),
+        Err(e) => Err(tool_err("login_accounting", &e)),
     }
 }
 
@@ -1765,7 +1814,7 @@ fn dispatch_ausearch(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::AusearchError::NotFound(_)
             | crate::tools::AusearchError::NotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("ausearch: {e}"))),
+        Err(e) => Err(tool_err("ausearch", &e)),
     }
 }
 
@@ -1781,7 +1830,7 @@ fn dispatch_nfdump_query(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::NfdumpQueryError::FlowNotFound(_)
             | crate::tools::NfdumpQueryError::FlowNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("nfdump_query: {e}"))),
+        Err(e) => Err(tool_err("nfdump_query", &e)),
     }
 }
 
@@ -1796,7 +1845,7 @@ fn dispatch_suricata_eve(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::SuricataEveError::PcapNotFound(_)
             | crate::tools::SuricataEveError::PcapNotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("suricata_eve: {e}"))),
+        Err(e) => Err(tool_err("suricata_eve", &e)),
     }
 }
 
@@ -1813,7 +1862,7 @@ fn dispatch_indx_parse(args: Value) -> Result<Value, ToolError> {
         Err(
             e @ (crate::tools::IndxError::NotFound(_) | crate::tools::IndxError::NotRegular(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("indx_parse: {e}"))),
+        Err(e) => Err(tool_err("indx_parse", &e)),
     }
 }
 
@@ -1828,7 +1877,7 @@ fn dispatch_vel_collect(args: Value) -> Result<Value, ToolError> {
             e @ (crate::tools::VelCollectError::InvalidArtifactName(_)
             | crate::tools::VelCollectError::InvalidArgName(_)),
         ) => Err(ToolError::InvalidParams(format!("{e}"))),
-        Err(e) => Err(ToolError::Internal(format!("vel_collect: {e}"))),
+        Err(e) => Err(tool_err("vel_collect", &e)),
     }
 }
 
@@ -1874,6 +1923,21 @@ fn make_error_response(id: &Value, code: i64, message: &str) -> String {
         "error": {
             "code": code,
             "message": message,
+        },
+    }))
+}
+
+/// Same envelope plus the optional JSON-RPC 2.0 `error.data` member, which the
+/// spec reserves for exactly this: additional, machine-readable information
+/// about the error. Clients that do not read it see an ordinary error.
+fn make_error_response_with_data(id: &Value, code: i64, message: &str, data: &Value) -> String {
+    serialize_envelope(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": data,
         },
     }))
 }
@@ -2137,5 +2201,163 @@ mod tests {
                 .len(),
             64
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unmet external-binary prerequisites are TYPED, not spelled out (REG-1).
+    //
+    // Every shell-out tool degrades to its own `BinaryNotFound` when the backing
+    // binary is absent. Over the wire that used to be indistinguishable from a
+    // real parse failure: both arrive as -32603 with a human-readable string. The
+    // engine then counted a host without libpst as a case-level tool failure and
+    // scored the whole case NOT_READY (m57-jean, nist-data-leakage, 2026-08-07).
+    //
+    // The fix is a machine-readable class on the wire (`error.data.kind`), so the
+    // client never has to guess from the message text — and the BOUNDARY holds: a
+    // PST that exists and fails to parse is still a real failure.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_missing_external_binary_is_typed_as_a_prerequisite_gap() {
+        use crate::tools::PrerequisiteGap;
+        assert!(crate::tools::PstParseError::BinaryNotFound.is_missing_prerequisite());
+        assert!(crate::tools::HayabusaError::BinaryNotFound.is_missing_prerequisite());
+        assert!(crate::tools::PlasoParseError::BinaryNotFound {
+            binary: "log2timeline.py".to_string()
+        }
+        .is_missing_prerequisite());
+        assert!(crate::tools::EzParseError::BinaryNotFound {
+            binary: "lecmd".to_string()
+        }
+        .is_missing_prerequisite());
+        assert!(crate::tools::VolError::BinaryNotFound.is_missing_prerequisite());
+    }
+
+    #[test]
+    fn a_real_parse_failure_is_not_a_prerequisite_gap() {
+        use crate::tools::PrerequisiteGap;
+        // The PST EXISTS and readpst choked on it. Naming the binary in the
+        // message must NOT make this look like an absence.
+        assert!(!crate::tools::PstParseError::SubprocessFailed {
+            binary: "readpst".to_string(),
+            status: "exit status: 2".to_string(),
+            stderr_tail: "unable to read the PST header block".to_string(),
+        }
+        .is_missing_prerequisite());
+        assert!(
+            !crate::tools::PstParseError::ArtifactNotFound(std::path::PathBuf::from("/x.pst"))
+                .is_missing_prerequisite()
+        );
+        assert!(!crate::tools::HayabusaError::SubprocessFailed {
+            exit_code: 1,
+            stderr: "hayabusa binary not on PATH".to_string(),
+        }
+        .is_missing_prerequisite());
+    }
+
+    #[test]
+    fn tool_err_routes_a_binary_gap_away_from_internal() {
+        let gap = tool_err("pst_parse", &crate::tools::PstParseError::BinaryNotFound);
+        assert!(matches!(gap, ToolError::MissingPrerequisite(_)), "{gap:?}");
+        let real = tool_err(
+            "pst_parse",
+            &crate::tools::PstParseError::SubprocessFailed {
+                binary: "readpst".to_string(),
+                status: "exit status: 2".to_string(),
+                stderr_tail: "bad header".to_string(),
+            },
+        );
+        assert!(matches!(real, ToolError::Internal(_)), "{real:?}");
+    }
+
+    #[test]
+    fn missing_prerequisite_reaches_the_client_as_a_typed_data_kind() {
+        let out = tool_error_response(
+            &json!(7),
+            ToolError::MissingPrerequisite("pst_parse: no PST reader found".to_string()),
+        );
+        let resp: Value = serde_json::from_str(&out).expect(&out);
+        assert_eq!(resp["id"], json!(7));
+        assert_eq!(resp["error"]["code"], json!(ERR_INTERNAL));
+        assert_eq!(resp["error"]["data"]["kind"], json!(MISSING_PREREQUISITE));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no PST reader found"));
+    }
+
+    #[test]
+    fn an_ordinary_internal_error_carries_no_data_kind() {
+        let out = tool_error_response(
+            &json!(8),
+            ToolError::Internal("pst_parse: PST reader readpst failed".to_string()),
+        );
+        let resp: Value = serde_json::from_str(&out).expect(&out);
+        assert_eq!(resp["error"]["code"], json!(ERR_INTERNAL));
+        assert!(resp["error"].get("data").is_none(), "{resp}");
+    }
+
+    #[test]
+    fn every_shell_out_tool_classifies_its_own_binary_gap() {
+        use crate::tools::PrerequisiteGap;
+        // Consistency pin: the treatment is per-CLASS, not a pst_parse one-off.
+        // Each entry is (is_gap, description) so a failure names the tool.
+        let cases: Vec<(bool, &str)> = vec![
+            (
+                crate::tools::AusearchError::BinaryNotFound.is_missing_prerequisite(),
+                "ausearch",
+            ),
+            (
+                crate::tools::IndxError::BinaryNotFound.is_missing_prerequisite(),
+                "indx_parse",
+            ),
+            (
+                crate::tools::JournalctlQueryError::BinaryNotFound.is_missing_prerequisite(),
+                "journalctl_query",
+            ),
+            (
+                crate::tools::LoginAccountingError::BinaryNotFound.is_missing_prerequisite(),
+                "login_accounting",
+            ),
+            (
+                crate::tools::MacTriageError::BinaryNotFound.is_missing_prerequisite(),
+                "mac_triage",
+            ),
+            (
+                crate::tools::NfdumpQueryError::BinaryNotFound.is_missing_prerequisite(),
+                "nfdump_query",
+            ),
+            (
+                crate::tools::PcapTriageError::BinaryNotFound.is_missing_prerequisite(),
+                "pcap_triage",
+            ),
+            (
+                crate::tools::SuricataEveError::BinaryNotFound.is_missing_prerequisite(),
+                "suricata_eve",
+            ),
+            (
+                crate::tools::VelCollectError::BinaryNotFound.is_missing_prerequisite(),
+                "vel_collect",
+            ),
+            (
+                crate::tools::VolMalfindError::BinaryNotFound.is_missing_prerequisite(),
+                "vol_malfind",
+            ),
+            (
+                crate::tools::VolPsscanError::BinaryNotFound.is_missing_prerequisite(),
+                "vol_psscan",
+            ),
+            (
+                crate::tools::VolPsxviewError::BinaryNotFound.is_missing_prerequisite(),
+                "vol_psxview",
+            ),
+            (
+                crate::tools::VolRunError::BinaryNotFound.is_missing_prerequisite(),
+                "vol_run",
+            ),
+        ];
+        for (is_gap, tool) in cases {
+            assert!(is_gap, "{tool} must classify BinaryNotFound as a gap");
+        }
     }
 }

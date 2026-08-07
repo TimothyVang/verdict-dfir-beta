@@ -258,6 +258,17 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
         (find_evil_auto.py:9361) — the bridge refusing an out-of-scope tool request.
         That is the guardrail WORKING, not the run breaking, so ``rejected`` calls
         are excluded.
+      * An unmet EXTERNAL-BINARY prerequisite is recorded as
+        ``{"error": ..., "skipped": True, "skip_reason": "missing_prerequisite"}``
+        (``find_evil_auto.py::_mark_prerequisite_skip``) — a tool whose backing
+        binary is not installed on this host, so one lane produced no coverage and
+        said so in ``analysis_limitations``. That is a DATASET/host gap, not the
+        engine falling over, so ``skipped`` calls are excluded too. Without this,
+        a runner without libpst turned m57-jean and nist-data-leakage from an
+        honest ``FAIL recall=0`` into NOT_READY — charging the engine for a
+        missing optional package. The marker is set ONLY from the MCP server's
+        typed error class, so a tool that failed on evidence it could reach is
+        unaffected and still counts.
       * A failure the engine RETRIED and got through is not a failure to see the
         evidence. Recovery is per-tool: the tool that failed later succeeded. We do
         NOT mirror the engine's consecutive-failure streak
@@ -289,7 +300,7 @@ def _run_completed(verdict_doc: dict[str, Any]) -> tuple[bool, list[str]]:
         name = str(tc.get("tool") or "unnamed tool")
         if not tc.get("error"):
             succeeded.add(name)
-        elif not tc.get("rejected"):
+        elif not (tc.get("rejected") or tc.get("skipped")):
             failed.add(name)
     unrecovered = sorted(failed - succeeded)
     if unrecovered:

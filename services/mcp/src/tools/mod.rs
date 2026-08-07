@@ -142,3 +142,73 @@ pub use zeek_summary::{
     path_looks_like_zeek_log, zeek_summary, ZeekCount, ZeekSummaryError, ZeekSummaryInput,
     ZeekSummaryOutput,
 };
+
+// ---------------------------------------------------------------------------
+// Unmet external-binary prerequisites.
+// ---------------------------------------------------------------------------
+
+/// A tool error that may be an unmet EXTERNAL-BINARY prerequisite rather than a
+/// failure to read the evidence.
+///
+/// Nineteen tools in this surface shell out to a maintained third-party binary
+/// (Volatility, plaso, hayabusa, the EZ tools, libpst/libpff, tshark/zeek, ...)
+/// and each degrades to its own typed `BinaryNotFound` when that binary is not
+/// installed. Semantically that is *the lane is unavailable on this host* — a
+/// coverage gap for one artifact class — and it is categorically different from
+/// the same tool failing on an artifact it CAN reach.
+///
+/// Off the wire the two used to be indistinguishable: both left the server as
+/// JSON-RPC `-32603` carrying a human-readable string, so the only way to tell
+/// them apart downstream was to grep the message for words like "not found".
+/// That is fragile in both directions — `pst_parse`'s absence message contains
+/// none of the engine's existing absence markers, while its *`SubprocessFailed`*
+/// message names `readpst` and would match a naive one. So the distinction is
+/// carried as a TYPE here and surfaced to the client as a machine-readable
+/// `error.data.kind` (see [`crate::server`]).
+///
+/// Implement this for every tool error enum that has a `BinaryNotFound`-class
+/// variant, and for nothing else: a tool that runs fully in-process (`evtx_query`,
+/// `mft_timeline`, `web_triage`, ...) has no prerequisite to be missing.
+pub trait PrerequisiteGap {
+    /// True when this error says the tool's external binary is absent.
+    ///
+    /// It must stay FALSE for every error reachable with the binary present —
+    /// a non-zero exit, an unparseable output, a missing artifact — because the
+    /// caller treats a `true` here as "skip this lane, the case is still sound".
+    fn is_missing_prerequisite(&self) -> bool;
+}
+
+/// Implement [`PrerequisiteGap`] for error enums whose absence variant is named
+/// `BinaryNotFound`. The `{ .. }` pattern matches unit, tuple, and struct
+/// variants alike, so one arm covers `BinaryNotFound`,
+/// `BinaryNotFound { binary }`, and any future shape.
+macro_rules! impl_binary_not_found_gap {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl PrerequisiteGap for $ty {
+            fn is_missing_prerequisite(&self) -> bool {
+                matches!(self, Self::BinaryNotFound { .. })
+            }
+        })+
+    };
+}
+
+impl_binary_not_found_gap!(
+    ausearch::AusearchError,
+    ez_parse::EzParseError,
+    hayabusa_scan::HayabusaError,
+    indx_parse::IndxError,
+    journalctl_query::JournalctlQueryError,
+    login_accounting::LoginAccountingError,
+    mac_triage::MacTriageError,
+    nfdump_query::NfdumpQueryError,
+    pcap_triage::PcapTriageError,
+    plaso_parse::PlasoParseError,
+    pst_parse::PstParseError,
+    suricata_eve::SuricataEveError,
+    vel_collect::VelCollectError,
+    vol_malfind::VolMalfindError,
+    vol_pslist::VolError,
+    vol_psscan::VolPsscanError,
+    vol_psxview::VolPsxviewError,
+    vol_run::VolRunError,
+);
