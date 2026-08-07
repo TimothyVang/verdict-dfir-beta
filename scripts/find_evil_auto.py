@@ -929,6 +929,273 @@ def suspicious_prefetch_tool_hint(executable_name: str) -> tuple[str, str] | Non
     return None
 
 
+# Dual-use ENCRYPTION tooling, deliberately kept in its OWN table rather than
+# folded into SUSPICIOUS_PREFETCH_TOOL_HINTS. That table feeds
+# Investigation._prefetch_exec_findings, which the UserAssist corroboration loop
+# promotes to CONFIRMED — and any CONFIRMED finding makes compute_verdict return
+# SUSPICIOUS. Encryption tooling is standard legitimate software (developers
+# sign commits with GnuPG; whole populations run BitLocker), so routing it
+# through the hacking-tool path would flip healthy hosts to SUSPICIOUS. These
+# hints only ever produce INFERRED presence findings.
+#
+# ``family`` drives which claim the observation can support:
+#   openpgp   -> OpenPGP artifacts on disk + third-party tooling present
+#   container -> third-party volume/file encryption tooling present
+#   bitlocker -> an encrypted VOLUME was present on the host
+#
+# The BitLocker entries are the USER-FACING binaries only: BdeUnlock is the
+# interactive unlock prompt and BitLockerWizard is the setup UI, so both imply a
+# human met a protected volume. The always-resident service binaries (BdeUISrv,
+# FVENotify, BDESVC) are deliberately absent — they run on a stock Windows image
+# whether or not any volume is protected, so keying on them would fire
+# everywhere.
+ENCRYPTION_TOOL_PREFETCH_HINTS: tuple[tuple[str, str, str], ...] = (
+    ("GPG", "openpgp", "GnuPG/OpenPGP command-line and agent binaries"),
+    ("GNUPG", "openpgp", "GnuPG distribution package"),
+    ("GPG4WIN", "openpgp", "Gpg4win OpenPGP suite"),
+    ("KLEOPATRA", "openpgp", "Kleopatra OpenPGP certificate manager"),
+    ("VERACRYPT", "container", "VeraCrypt encrypted-container tool"),
+    ("TRUECRYPT", "container", "TrueCrypt encrypted-container tool"),
+    ("AXCRYPT", "container", "AxCrypt file-encryption tool"),
+    ("BDEUNLOCK", "bitlocker", "BitLocker interactive unlock prompt"),
+    ("BITLOCKERWIZARD", "bitlocker", "BitLocker setup/configuration wizard"),
+)
+
+# Needles matched as a PREFIX rather than anywhere in the name. "GPG" is short
+# enough to appear inside an unrelated word; every real GnuPG binary
+# (gpg/gpg2/gpgconf/gpgsm/gpg-agent/gpgme-w32spawn/gpg4win-<ver>) starts with it.
+_ENCRYPTION_PREFIX_ONLY_NEEDLES = frozenset({"GPG"})
+
+# Families that are third-party software rather than a stock Windows feature.
+# BitLocker ships with Windows, so a BitLocker-only host makes no tooling claim.
+#
+# NOTE ON ATT&CK: the obvious label here is T1588.002 (Obtain Capabilities:
+# Tool) and the alihadi-09 ground-truth key does use it. This engine must not:
+# T1588.002 is an OFF-HOST, pre-attack technique, and
+# test_mitre_mappings.test_no_execution_artifact_tagged_obtain_capabilities
+# bans assigning it to anything detected on a host image (a prior report review
+# caught exactly that over-mapping). Software being present on a disk is not an
+# adversary acquiring it, so the tooling finding carries no technique at all.
+# The recall scorer matches on description tokens, never on mitre_technique
+# (accuracy._is_eligible), so this costs nothing but a wrong label.
+_THIRD_PARTY_ENCRYPTION_FAMILIES = ("openpgp", "container")
+
+_PREFETCH_NAME_SUFFIX_RE = re.compile(r"-[0-9A-F]{8}\.pf$", re.IGNORECASE)
+
+
+def encryption_tool_prefetch_hint(executable_name: str) -> tuple[str, str] | None:
+    """Return ``(family, tool_description)`` for a dual-use encryption binary.
+
+    Returns None for everything else — including the always-resident BitLocker
+    service binaries, which are not in the table on purpose (see above).
+    """
+    upper_name = PurePosixPath(str(executable_name).replace("\\", "/")).name.upper()
+    for needle, family, description in ENCRYPTION_TOOL_PREFETCH_HINTS:
+        if needle in _ENCRYPTION_PREFIX_ONLY_NEEDLES:
+            if upper_name.startswith(needle):
+                return family, description
+        elif needle in upper_name:
+            return family, description
+    return None
+
+
+def _encryption_display_name(observation: dict[str, Any]) -> str:
+    """The binary name to show: what the parser reported, else the .pf basename
+    with the prefetch hash suffix trimmed."""
+    reported = observation.get("executable_name")
+    if reported:
+        return str(reported)
+    artifact = str(observation.get("artifact_name") or "")
+    return _PREFETCH_NAME_SUFFIX_RE.sub("", artifact) or artifact
+
+
+def _encryption_sample(group: list[dict[str, Any]]) -> str:
+    """``NAME (run_count=N), ...`` for the observations actually parsed."""
+    parts = [f"{obs['_name']} (run_count={obs.get('run_count', 0)})" for obs in group[:6]]
+    if len(group) > 6:
+        parts.append(f"+{len(group) - 6} more")
+    return ", ".join(parts)
+
+
+def _encryption_asserted_values(primary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Structured facts the verifier re-extracts from the replayed
+    ``prefetch_parse`` output (top-level ``run_count`` / ``executable_name``).
+
+    ``executable_name`` is asserted only when the tool genuinely returned it —
+    the .pf-basename fallback would not resolve against the raw output.
+    """
+    asserted: list[dict[str, Any]] = [
+        {"path": "run_count", "expected": str(primary.get("run_count", 0)), "match": "int"}
+    ]
+    if primary.get("executable_name"):
+        asserted.append(
+            {
+                "path": "executable_name",
+                "expected": str(primary["executable_name"]),
+                "match": "exact",
+            }
+        )
+    return asserted
+
+
+def _encryption_finding(
+    *,
+    base_id: str,
+    group: list[dict[str, Any]],
+    case_id: str,
+    description: str,
+    technique: str | None,
+    ident: Callable[[str], str],
+) -> dict[str, Any]:
+    primary = group[0]
+    return {
+        "case_id": case_id,
+        "finding_id": ident(base_id),
+        "tool_call_id": str(primary["tool_call_id"]),
+        "artifact_path": str(primary.get("artifact_path") or ""),
+        "description": description,
+        "confidence": "INFERRED",
+        "pool_origin": "B",
+        "mitre_technique": technique,
+        "derived_from": [str(obs["tool_call_id"]) for obs in group],
+        "asserted_values": _encryption_asserted_values(primary),
+    }
+
+
+# The dual-use caveat every encryption finding must carry verbatim. Encryption
+# is the one artifact class where the tool's own existence reads as incriminating
+# to a non-specialist, so the sentence is a constant rather than per-emitter
+# prose that could drift out of one description.
+_DUAL_USE_CAVEAT = (
+    "Encryption is dual-use and ubiquitous in legitimate work: presence alone "
+    "is not malicious intent."
+)
+
+
+def detect_encryption_tooling(
+    observations: list[dict[str, Any]] | None,
+    case_id: str,
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B INFERRED presence findings for dual-use encryption tooling.
+
+    Driven entirely by prefetch names ``prefetch_parse`` already returned — no
+    new tool call. Each observation is ``{executable_name, artifact_name,
+    run_count, artifact_path, tool_call_id}``; ``derived_from`` cites ONLY the
+    prefetch calls that actually observed a member of that family.
+
+    PRESENCE wording only (never "ran"/"executed"/"launched"): prefetch is a
+    single artifact class, so an execution claim could not clear the
+    >=2-artifact-class gate and would be flagged rather than shipped. INFERRED
+    tier only — see ENCRYPTION_TOOL_PREFETCH_HINTS for why CONFIRMED would be a
+    false-positive machine.
+    """
+    ident = finding_id_for or (lambda base: base)
+    by_family: dict[str, list[dict[str, Any]]] = {}
+    tool_descriptions: dict[str, list[str]] = {}
+    for obs in observations or []:
+        if not obs.get("tool_call_id"):
+            continue
+        name = _encryption_display_name(obs)
+        hit = encryption_tool_prefetch_hint(name) if name else None
+        if not hit:
+            continue
+        family, tool_description = hit
+        by_family.setdefault(family, []).append({**obs, "_name": name})
+        descriptions = tool_descriptions.setdefault(family, [])
+        if tool_description not in descriptions:
+            descriptions.append(tool_description)
+    for group in by_family.values():
+        group.sort(key=lambda obs: str(obs["_name"]).upper())
+
+    findings: list[dict[str, Any]] = []
+
+    openpgp = by_family.get("openpgp") or []
+    if openpgp:
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-openpgp-artifacts",
+                group=openpgp,
+                case_id=case_id,
+                technique="T1027",
+                ident=ident,
+                description=(
+                    "GPG encryption artifacts are present on disk. Windows Prefetch "
+                    "holds records of an installed OpenPGP toolchain — "
+                    f"{_encryption_sample(openpgp)} "
+                    f"({', '.join(tool_descriptions['openpgp'])}). Windows writes a Prefetch "
+                    "record only for a binary loaded from this system, so an OpenPGP "
+                    "installation is present on this volume; an installation of that shape "
+                    "keeps keyrings under the user profile and produces .gpg/.asc ciphertext. "
+                    "INFERRED: this lane read Prefetch only and did not enumerate keyrings or "
+                    ".gpg data, so the on-disk key material is inferred from the installation "
+                    f"footprint rather than listed. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    bitlocker = by_family.get("bitlocker") or []
+    if bitlocker:
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-volume-bitlocker",
+                group=bitlocker,
+                case_id=case_id,
+                # No MITRE technique: BitLocker is stock Windows functionality,
+                # not adversary tradecraft. Tagging it would be an over-claim.
+                technique=None,
+                ident=ident,
+                description=(
+                    "A BitLocker-protected volume is present on this host. Windows Prefetch "
+                    "holds records of the user-facing BitLocker binaries — "
+                    f"{_encryption_sample(bitlocker)} "
+                    f"({', '.join(tool_descriptions['bitlocker'])}). Those binaries surface only "
+                    "when a person unlocks or configures a protected drive, so an encrypted "
+                    "volume or container was attached to this machine. The always-resident "
+                    "BitLocker service binaries are deliberately excluded from this test, "
+                    "because they appear on a stock Windows image whether or not any drive is "
+                    "protected. INFERRED: this lane read Prefetch only — it did not read "
+                    "BitLocker volume metadata or encrypted-container signatures off the media, "
+                    f"so the volume itself was not examined. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    third_party = [
+        obs for fam in _THIRD_PARTY_ENCRYPTION_FAMILIES for obs in by_family.get(fam, [])
+    ]
+    if third_party:
+        third_party.sort(key=lambda obs: str(obs["_name"]).upper())
+        summary = ", ".join(
+            desc
+            for fam in _THIRD_PARTY_ENCRYPTION_FAMILIES
+            for desc in tool_descriptions.get(fam, [])
+        )
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-tooling-present",
+                group=third_party,
+                case_id=case_id,
+                # No technique on purpose — see _THIRD_PARTY_ENCRYPTION_FAMILIES.
+                # Software sitting on a host attests possession, not an ATT&CK
+                # behaviour, and the off-host T1588.002 label is banned here.
+                technique=None,
+                ident=ident,
+                description=(
+                    "Third-party encryption tooling is installed on this host. Windows "
+                    f"Prefetch holds records for {_encryption_sample(third_party)} ({summary}). "
+                    "Windows writes a Prefetch record only for a binary loaded from this "
+                    "system, so these are on-disk traces of encryption utilities kept on the "
+                    "machine. INFERRED: Prefetch is one artifact class — corroborate with "
+                    "registry install keys, the owning user account, and the encrypted data "
+                    f"itself before treating this as anti-forensic activity. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    return findings
+
+
 def _userassist_exe(encoded_name: str) -> str | None:
     """Decode a UserAssist value name (ROT13) and return the executed .exe
     basename, or None for non-execution entries (shortcut/RUNPIDL records).
@@ -11282,6 +11549,33 @@ class Investigation:
             "asserted_values": asserted,
         }
 
+    def _emit_encryption_tooling_findings(
+        self, observations: list[dict[str, Any]] | None
+    ) -> None:
+        """Emit the dual-use encryption presence leads into Pool B.
+
+        CRITICAL: these findings are appended to ``findings_pool_b`` ONLY. They
+        must never enter ``self._prefetch_exec_findings`` — that list is what
+        ``_corroborate_execution_with_userassist`` promotes to CONFIRMED, and a
+        CONFIRMED finding makes ``compute_verdict`` return SUSPICIOUS. A user
+        who opens Kleopatra or unlocks a BitLocker drive would then flip the
+        whole host to SUSPICIOUS. See test_encryption_tooling.py.
+        """
+        findings = detect_encryption_tooling(
+            observations,
+            self.handle["id"],
+            finding_id_for=lambda base: self._finding_id_for(
+                base, str((observations or [{}])[0].get("artifact_path") or "")
+            ),
+        )
+        if not findings:
+            return
+        self.findings_pool_b.extend(findings)
+        print(
+            f"  encryption tooling: {len(findings)} dual-use presence "
+            "finding(s) (INFERRED)"
+        )
+
     def _emit_registry_persistence_findings(
         self,
         candidates: list[dict[str, Any]],
@@ -12454,6 +12748,10 @@ class Investigation:
             for e in prefetch_entries
         ]
         prefetch_outs = self._parallel_tool_calls(rust, prefetch_specs, timeout=600.0)
+        # Successfully-parsed prefetch names, collected for the dual-use
+        # encryption detector that runs once after the loop (aggregate per-case
+        # findings, not one per .pf).
+        encryption_observations: list[dict[str, Any]] = []
         for entry, (_name, args), out in zip(
             prefetch_entries, prefetch_specs, prefetch_outs, strict=True
         ):
@@ -12523,6 +12821,22 @@ class Investigation:
                 # this lead to a CONFIRMED, two-artifact-class execution finding.
                 exe_base = PurePosixPath(str(exe).replace("\\", "/")).name.lower()
                 self._prefetch_exec_findings.append((exe_base, prefetch_finding))
+            if not error:
+                encryption_observations.append(
+                    {
+                        "executable_name": out.get("executable_name"),
+                        "artifact_name": PurePosixPath(path.replace("\\", "/")).name,
+                        "run_count": out.get("run_count", 0),
+                        "artifact_path": path,
+                        "tool_call_id": tcid,
+                    }
+                )
+
+        # Dual-use encryption tooling. Deliberately NOT routed through
+        # _prefetch_exec_findings: that list gets promoted to CONFIRMED by
+        # UserAssist corroboration, which would escalate the verdict on a host
+        # whose only "evil" is that someone encrypts their files.
+        self._emit_encryption_tooling_findings(encryption_observations)
 
         lnk_entries = sorted(by_class.get("lnk", []), key=_lnk_triage_sort_key)[:80]
         lnk_specs: list[tuple[str, dict[str, Any]]] = [
