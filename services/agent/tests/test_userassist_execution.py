@@ -204,7 +204,13 @@ class TestExecutionFindingEmission:
         rows = [_row(key, names)]
         inv._collect_registry_execution_candidates(rows, hive, key, tcid)
 
-    def test_shared_root_with_two_artifact_classes_is_confirmed(self) -> None:
+    def test_two_registry_artifacts_are_one_class_so_the_lead_stays_hypothesis(self) -> None:
+        # UserAssist and the Compatibility Assistant Store are two independent
+        # execution ARTIFACTS but both live in the registry, i.e. ONE artifact
+        # class. CLAUDE.md/SOUL.md require >=2 CLASSES for an execution claim,
+        # and report_qa's execution_requires_two_current_artifact_classes gate
+        # counts classes, not artifacts — so anything above HYPOTHESIS here
+        # would both over-claim and fail the engine's own release gate.
         inv = self._inv()
         hive = "/x/registry/Users/IEUser/NTUSER.DAT"
         self._record(
@@ -225,11 +231,11 @@ class TestExecutionFindingEmission:
         findings = inv.findings_pool_a + inv.findings_pool_b
         assert len(findings) == 1, findings
         f = findings[0]
-        assert f["confidence"] == "CONFIRMED"
+        assert f["confidence"] == "HYPOTHESIS"
         assert f["mitre_technique"] == "T1204.002"
         assert "SysInternals.exe" in f["description"]
         assert "tc-ua-1" in f["derived_from"] and "tc-cs-1" in f["derived_from"]
-        assert f["asserted_values"], "a CONFIRMED finding must declare re-extractable values"
+        assert f["asserted_values"], "even a lead declares its re-extractable value"
 
     def test_confirmed_assertions_entail_against_raw_registry_output(self) -> None:
         inv = self._inv()
@@ -272,11 +278,13 @@ class TestExecutionFindingEmission:
         other = _raw_registry_output([_row(UA_COUNT_KEY, [_rot13("C:\\Users\\bob\\x.exe")])])
         assert not check_entailment(avs, other).passed
 
-    def test_per_user_installer_with_two_classes_stays_inferred(self) -> None:
+    def test_per_user_installer_with_prefetch_never_reaches_confirmed(self) -> None:
         # THE false-positive floor. alihadi-09-encrypt's IEUser hive records
-        # these installers in both UserAssist and the Compatibility Assistant
-        # Store; the golden requires the run to stay INDETERMINATE, and
-        # compute_verdict escalates on ANY CONFIRMED finding.
+        # these installers in BOTH registry execution artifacts, and its
+        # Prefetch directory is intact so a genuine second artifact class also
+        # records them. Two classes alone must not be enough: the golden
+        # requires INDETERMINATE and compute_verdict escalates to SUSPICIOUS on
+        # ANY CONFIRMED finding. The shared-root gate is what holds the floor.
         inv = self._inv()
         hive = "/x/registry/Users/IEUser/NTUSER.DAT"
         benign = [
@@ -284,12 +292,15 @@ class TestExecutionFindingEmission:
             "C:\\Users\\IEUser\\AppData\\Local\\Downloads\\7z2201-x64.exe",
             "C:\\Users\\IEUser\\AppData\\Local\\Downloads\\HxDSetup\\HxDSetup.exe",
         ]
+        for path in benign:
+            name = path.rsplit("\\", 1)[-1].lower()
+            inv._prefetch_exec_index[name] = ("tc-pf-x", None)
         self._record(inv, hive, UA_COUNT_KEY, "tc-ua-1", [_rot13(p) for p in benign])
         self._record(inv, hive, COMPAT_STORE_KEY, "tc-cs-1", benign)
         inv._emit_registry_execution_findings()
         findings = inv.findings_pool_a + inv.findings_pool_b
         assert findings, "the leads are still surfaced"
-        assert all(f["confidence"] == "INFERRED" for f in findings), [
+        assert all(f["confidence"] != "CONFIRMED" for f in findings), [
             (f["finding_id"], f["confidence"]) for f in findings
         ]
 
@@ -307,7 +318,7 @@ class TestExecutionFindingEmission:
         inv._emit_registry_execution_findings()
         assert inv.findings_pool_a + inv.findings_pool_b == []
 
-    def test_single_artifact_class_in_a_shared_root_is_an_inferred_lead(self) -> None:
+    def test_single_registry_artifact_in_a_shared_root_is_a_hypothesis_lead(self) -> None:
         inv = self._inv()
         self._record(
             inv,
@@ -319,13 +330,15 @@ class TestExecutionFindingEmission:
         inv._emit_registry_execution_findings()
         findings = inv.findings_pool_a + inv.findings_pool_b
         assert len(findings) == 1
-        assert findings[0]["confidence"] == "INFERRED"
+        assert findings[0]["confidence"] == "HYPOTHESIS"
 
-    def test_prefetch_supplies_the_second_class_for_a_shared_root(self) -> None:
+    def test_any_parsed_prefetch_supplies_the_second_class(self) -> None:
+        # The second class must come from ANY prefetch the lane parsed, not
+        # only from the curated suspicious-tool hint list: a payload nobody has
+        # named yet still leaves a .pf, and gating on the hint list would make
+        # the corroboration depend on a name allowlist rather than on evidence.
         inv = self._inv()
-        inv._prefetch_exec_findings.append(
-            ("stager.exe", {"finding_id": "f-B-prefetch-stager", "tool_call_id": "tc-pf-1"})
-        )
+        inv._prefetch_exec_index["stager.exe"] = ("tc-pf-1", "2019-03-19T13:00:00Z")
         self._record(
             inv,
             "/x/NTUSER.DAT",
@@ -337,6 +350,56 @@ class TestExecutionFindingEmission:
         f = (inv.findings_pool_a + inv.findings_pool_b)[0]
         assert f["confidence"] == "CONFIRMED"
         assert "tc-pf-1" in f["derived_from"]
+
+    def test_prefetch_supplies_the_second_class_for_a_shared_root(self) -> None:
+        # Prefetch is a genuinely DIFFERENT artifact class, so registry +
+        # prefetch clears the two-class bar. Combined with a shared,
+        # world-writable placement this is the one CONFIRMED shape.
+        inv = self._inv()
+        inv._prefetch_exec_index["stager.exe"] = ("tc-pf-1", None)
+        self._record(
+            inv,
+            "/x/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13("C:\\ProgramData\\stager.exe")],
+        )
+        inv._emit_registry_execution_findings()
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "CONFIRMED"
+        assert "tc-pf-1" in f["derived_from"]
+
+    def test_confirmed_finding_records_the_second_class_on_the_timeline(self) -> None:
+        # report_qa's execution_requires_two_current_artifact_classes gate reads
+        # artifact classes off the timeline events linked to the finding. A
+        # CONFIRMED execution claim whose second class never reaches the
+        # timeline fails the engine's own release gate.
+        inv = self._inv()
+        inv._prefetch_exec_index["stager.exe"] = ("tc-pf-1", None)
+        self._record(
+            inv,
+            "/x/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13("C:\\ProgramData\\stager.exe")],
+        )
+        inv._emit_registry_execution_findings()
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert inv.execution_corroboration.get(f["finding_id"]) == ["tc-pf-1"]
+
+    def test_prefetch_in_a_user_profile_stays_below_confirmed(self) -> None:
+        inv = self._inv()
+        inv._prefetch_exec_index["setup.exe"] = ("tc-pf-1", None)
+        self._record(
+            inv,
+            "/x/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13("C:\\Users\\bob\\Downloads\\setup.exe")],
+        )
+        inv._emit_registry_execution_findings()
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "INFERRED"
 
 
 class TestUserAssistDecoupledFromPrefetch:

@@ -9222,6 +9222,12 @@ class Investigation:
         # and so UserAssist is consulted whether or not prefetch found anything.
         self._userassist_exec_index: dict[str, tuple[str, str | None]] = {}
         self._registry_exec_candidates: list[tuple[str, str, dict[str, Any]]] = []
+        # EVERY prefetch the lane parsed (exe basename -> tool_call_id, ts), not
+        # just the ones that matched a suspicious-tool hint. This is the second
+        # ARTIFACT CLASS a registry execution lead needs; keying it off the hint
+        # list instead would make corroboration depend on a name allowlist
+        # rather than on the evidence actually parsed.
+        self._prefetch_exec_index: dict[str, tuple[str, str | None]] = {}
         self.evtx_summary: dict[str, Any] | None = None
         # EVTX summary is accumulated across every evtx_query call (one per
         # file). A trailing empty log used to reset records_seen to 0 because
@@ -12190,26 +12196,32 @@ class Investigation:
     def _emit_registry_execution_findings(self) -> None:
         """Emit execution leads from the per-user registry execution artifacts.
 
-        Confidence policy, and why it is not simply "two classes => CONFIRMED":
+        Two independent axes decide the tier, and BOTH must clear for CONFIRMED.
 
-        * Two independent execution artifacts (UserAssist + Compatibility
-          Assistant Store, or UserAssist + Prefetch) clear the SOUL.md
-          >=2-artifact-class bar for asserting that the binary RAN.
-        * That alone does not make the run reportable. A user running an
-          installer they downloaded into their OWN profile
-          (``...\\AppData\\Local\\Downloads\\setup.exe``) is the most common
-          benign pattern on a Windows host, and both keys record it. Asserting
-          CONFIRMED there is a false positive by ordinary DFIR standards, and
-          because ``compute_verdict`` escalates on ANY CONFIRMED finding it
-          would also flip a benign host's verdict.
-        * A binary executed from a SHARED, world-writable root
-          (``C:\\Users\\Public\\``, ``ProgramData``, ``Windows\\Temp``) is
-          different in kind: no legitimate installer runs a program from there,
-          and those directories are the classic staging locations. Two artifact
-          classes plus that placement is CONFIRMED.
+        **Artifact classes (the SOUL.md / CLAUDE.md execution bar).** UserAssist
+        and the Compatibility Assistant Store are two independent execution
+        ARTIFACTS, but both live in the registry — that is ONE artifact class.
+        The rule counts classes, and ``report_qa``'s
+        ``execution_requires_two_current_artifact_classes`` gate counts them the
+        same way, so a registry-only pair can never rise above HYPOTHESIS
+        without both over-claiming and failing the engine's own release gate.
+        Prefetch recording the same binary is a genuinely different class and is
+        what lifts the lead.
 
-        Everything else is INFERRED, and a per-user path with only ONE artifact
-        class is not emitted at all — one registry key recording a downloaded
+        **Placement.** Even two classes do not make a run reportable. A user
+        running an installer they downloaded into their OWN profile
+        (``...\\AppData\\Local\\Downloads\\setup.exe``) is the most common
+        benign pattern on any Windows host and both registry keys record it;
+        CONFIRMED there is a false positive by ordinary DFIR standards, and
+        because ``compute_verdict`` escalates on ANY CONFIRMED finding it would
+        flip a benign host's verdict too. A binary run from a SHARED,
+        world-writable root (``C:\\Users\\Public\\``, ``ProgramData``,
+        ``Windows\\Temp``) is different in kind — no legitimate installer runs a
+        program from there.
+
+        So: CONFIRMED = second class AND shared root; INFERRED = second class,
+        per-user root; HYPOTHESIS = registry only. A per-user path with a single
+        registry artifact is not emitted at all — one key recording a downloaded
         installer is noise on every host.
         """
         if not self._registry_exec_candidates:
@@ -12227,10 +12239,6 @@ class Investigation:
                 # Prefer the UserAssist row as the primary citation: its value
                 # name is the fact the finding asserts.
                 slot["cand"] = cand
-        prefetch_tcids = {
-            exe_base: str(f.get("tool_call_id") or "")
-            for exe_base, f in self._prefetch_exec_findings
-        }
         # Shared-root placements first so a per-hive cap never drops the
         # high-signal ones in favour of ordinary user downloads.
         ordered = sorted(
@@ -12250,25 +12258,30 @@ class Investigation:
             exe_name = str(cand.get("exe_name") or "")
             shared = bool(cand.get("shared_root"))
             sources: dict[str, tuple[str, dict[str, Any]]] = slot["sources"]
-            classes = [
-                "registry/UserAssist (per-user GUI execution)"
+            registry_artifacts = [
+                "UserAssist (per-user GUI execution)"
                 if kind == "userassist_exec"
-                else "registry/Program Compatibility Assistant Store"
+                else "the Program Compatibility Assistant Store"
                 for kind in sources
             ]
             derived = [tcid for tcid, _ in sources.values()]
-            pf_tcid = prefetch_tcids.get(exe_name)
-            if pf_tcid:
-                classes.append("Windows Prefetch")
-                if pf_tcid not in derived:
-                    derived.append(pf_tcid)
-            corroborated = len(classes) >= 2
-            if not corroborated and not shared:
+            # Prefetch is the only genuinely DIFFERENT artifact class available
+            # here; the two registry keys are one class no matter how many of
+            # them agree.
+            pf_hit = self._prefetch_exec_index.get(exe_name)
+            pf_tcid = pf_hit[0] if pf_hit else None
+            if pf_tcid and pf_tcid not in derived:
+                derived.append(pf_tcid)
+            second_class = bool(pf_tcid)
+            if not second_class and not shared and len(sources) < 2:
                 continue
             primary_tcid, primary_cand = sources.get(
                 "userassist_exec", next(iter(sources.values()))
             )
-            confidence = "CONFIRMED" if (corroborated and shared) else "INFERRED"
+            if second_class:
+                confidence = "CONFIRMED" if shared else "INFERRED"
+            else:
+                confidence = "HYPOTHESIS"
             placement = (
                 f"{cand.get('writable_root')} — a shared, world-writable location no "
                 "legitimate installer runs a program from"
@@ -12276,20 +12289,19 @@ class Investigation:
                 else f"{cand.get('writable_root')} (a user-writable location; running a "
                 "downloaded program from there is also an ordinary benign pattern)"
             )
+            registry_text = " and ".join(registry_artifacts)
             corroboration = (
-                f"{len(classes)} independent artifact classes record it: "
-                + "; ".join(classes)
-                + "."
-                if corroborated
-                else "Only one artifact class records it, so the run is a lead, not a "
-                "corroborated execution fact."
+                f"Two artifact classes record the run: the registry ({registry_text}) "
+                "and Windows Prefetch."
+                if second_class
+                else f"The registry records it ({registry_text}), but that is a single "
+                "artifact class, so the run is a lead rather than a corroborated "
+                "execution fact — a second class (prefetch, MFT, EVTX) is needed."
             )
             safe = re.sub(r"[^a-z0-9]+", "-", exe_name).strip("-") or "exe"
             finding = {
                 "case_id": self.handle["id"],
-                "finding_id": self._finding_id_for(
-                    f"f-A-userassist-exec-{safe}", hive_path
-                ),
+                "finding_id": self._finding_id_for(f"f-A-userassist-exec-{safe}", hive_path),
                 "tool_call_id": primary_tcid,
                 "artifact_path": hive_path,
                 "description": (
@@ -12317,6 +12329,23 @@ class Investigation:
             }
             self.findings_pool_a.append(finding)
             emitted += 1
+            if pf_tcid:
+                # report_qa counts a finding's artifact classes off the TIMELINE
+                # events linked to it, so the prefetch class has to reach the
+                # timeline or the two-class execution gate fails the very claim
+                # prefetch is what justifies.
+                fid = str(finding["finding_id"])
+                self.execution_corroboration.setdefault(fid, []).append(pf_tcid)
+                self._timeline_add(
+                    (pf_hit[1] if pf_hit else None)
+                    or cand.get("last_write_time_iso")
+                    or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "prefetch_parse",
+                    "prefetch",
+                    f"Windows Prefetch records execution of {exe_name}",
+                    pf_tcid,
+                    {"executable_name": exe_name},
+                )
             print(f"  pool-A execution finding: {finding['finding_id']} ({confidence})")
 
     def _promote_prefetch_findings_with_userassist(self) -> None:
@@ -12659,6 +12688,16 @@ class Investigation:
                     {"run_count": out.get("run_count", 0), "prefetch_path": path},
                 )
             print(f"  prefetch_parse: {path} runs={out.get('run_count', 0)}")
+            # Index EVERY successfully parsed prefetch, not just hint matches:
+            # this is the second artifact class a registry (UserAssist /
+            # Compatibility Assistant) execution lead needs, and a payload
+            # nobody has named yet still leaves a .pf.
+            parsed_exe = str(out.get("executable_name") or "")
+            if parsed_exe and not error:
+                self._prefetch_exec_index.setdefault(
+                    PurePosixPath(parsed_exe.replace("\\", "/")).name.lower(),
+                    (tcid, next(iter(out.get("last_run_times_iso") or []), None)),
+                )
             hint = suspicious_prefetch_tool_hint(str(exe))
             if hint and out.get("run_count", 0):
                 tool_description, technique = hint
