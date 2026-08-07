@@ -442,7 +442,6 @@ mod tests {
         assert_eq!(unix_micros_to_iso(0), None);
     }
 
-
     fn mem_conn() -> Connection {
         Connection::open_in_memory().expect("in-memory sqlite")
     }

@@ -184,6 +184,11 @@ Args: `{case_id, artifact_path}`
 Returns: `{is_oe_dbx, is_message_store, message_subject_count, subjects[], senders[], newsgroups[], hacking_newsgroups[]}`
 Use when: a carved Outlook Express `.dbx` mail/news store is in scope. **Pure Rust, in-process — no subprocess, no external binary** (no other parser reads DBX). Validates the OE file signature (`CF AD 12 FE`) before walking the store and extracts RFC822 `Subject`/`From`/`Newsgroups` headers. HONEST SCOPE: header-level only — no message bodies and no deleted-message recovery — so a recovered subject or newsgroup CONFIRMS store *content* (a mail/news-artifact fact at header granularity), never execution; intent stays a separate `hypothesis:` layer.
 
+### pst_parse
+Args: `{case_id, artifact_path, limit?}`
+Returns: `{is_pst, backend, message_count, messages_truncated, attachment_count, messages[]: {subject, from_display, from_address, reply_to_display, reply_to_address, to[], date, attachments[]: {name, extension, content_type}}}`
+Use when: a carved Outlook `.pst`/`.ost` mail store is in scope (artifact class `mail_store`). Validates the PST signature (`!BDN`) before any subprocess, then exports through libpst (`readpst -e -D -q -o`) or libpff (`pffexport -q -f text -t`) — fixed argv, no shell — and parses each exported RFC822 header block. INSTALL-FIRST (`apt install pst-utils` or `libpff-utils`); `$PST_READER_BIN` then PATH; a host with neither returns typed `BinaryNotFound`. HONEST SCOPE: envelope-level only — no bodies, no deleted-item recovery, and attachment *names/types*, not attachment content. A `reply_to_address` that differs from `from_address` is a header fact (reply-address divergence), not proof of who sent the mail; intent and actor identity stay out of scope.
+
 ---
 
 ## Python crypto + ACH tools (`findevil-agent-mcp`)

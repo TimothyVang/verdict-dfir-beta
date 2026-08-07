@@ -34,6 +34,7 @@ pub mod oe_dbx_parse;
 pub mod pcap_triage;
 pub mod plaso_parse;
 pub mod prefetch_parse;
+pub mod pst_parse;
 pub mod regf;
 pub mod registry_query;
 pub mod suricata_eve;
@@ -98,6 +99,9 @@ pub use plaso_parse::{
 };
 pub use prefetch_parse::{
     path_looks_like_prefetch, prefetch_parse, PrefetchError, PrefetchInput, PrefetchOutput,
+};
+pub use pst_parse::{
+    pst_parse, PstAttachment, PstMessage, PstParseError, PstParseInput, PstParseOutput,
 };
 pub use registry_query::{
     path_looks_like_hive, registry_query, RegistryEntry, RegistryError, RegistryInput,

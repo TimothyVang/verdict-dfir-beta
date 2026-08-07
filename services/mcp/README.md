@@ -62,6 +62,7 @@ Per Spec #2 §6 (which enumerates 11) plus memory cross-validation, disk mount/e
 | `zeek_summary` | `tools/zeek_summary.rs` | in-process TSV parser | B (network) |
 | `pcap_triage` | `tools/pcap_triage.rs` | fixed subprocess: `tshark` or `zeek` | B (network) |
 | `oe_dbx_parse` | `tools/oe_dbx_parse.rs` | in-process: OE-signature-validated DBX reader (RFC822 headers) | A/B (mail/news store) |
+| `pst_parse` | `tools/pst_parse.rs` | fixed subprocess: `readpst` (libpst) or `pffexport` (libpff) | A/B (Outlook mail store) |
 
 The `vol_pslist` + `vol_psscan` pair is deliberately redundant — pslist walks the kernel's `PsActiveProcessHead` linked list, psscan signature-scans EPROCESS pool memory. Divergence between the two outputs IS the forensic finding (T1014/Rootkit, DKOM unlink). `vol_psxview` is the follow-up cross-view corroborator; do not fold these tools together.
 
