@@ -49,6 +49,22 @@ dev = [
   "mypy>=1.11",
 ]
 
+# PEP 735 dependency group — uv installs the `dev` group BY DEFAULT on a bare
+# `uv run` / `uv sync`, unlike the `[project.optional-dependencies]` extra above
+# which needs `--extra dev`. Without it `uv run pytest` finds no pytest in this
+# venv, falls through PATH to a user-global pytest on the system Python, and
+# that interpreter cannot see the editable `findevil-agent` path dep — so every
+# test errored with `ModuleNotFoundError: No module named 'findevil_agent'` on a
+# clean checkout. services/agent already carries this group for the same reason.
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5.0",
+  "ruff>=0.7.4",
+  "mypy>=1.11",
+]
+
 [project.scripts]
 # Lets the `.mcp.json` use a clean entry point alongside `python -m`.
 findevil-agent-mcp = "findevil_agent_mcp.server:run"

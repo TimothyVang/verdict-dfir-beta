@@ -40,6 +40,7 @@ const GROUPS: ToolGroup[] = [
       "plaso_parse",
       "indx_parse",
       "oe_dbx_parse",
+      "pst_parse",
       "vol_pslist",
       "vol_psscan",
       "vol_psxview",

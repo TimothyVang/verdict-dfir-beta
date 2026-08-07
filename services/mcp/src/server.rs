@@ -58,6 +58,7 @@ use crate::tools::{
     pcap_triage::pcap_triage,
     plaso_parse::plaso_parse,
     prefetch_parse::prefetch_parse,
+    pst_parse::pst_parse,
     registry_query::registry_query,
     suricata_eve::suricata_eve,
     sysmon_network_query::sysmon_network_query,
@@ -68,14 +69,16 @@ use crate::tools::{
     vol_psscan::vol_psscan,
     vol_psxview::vol_psxview,
     vol_run::vol_run,
+    web_triage::web_triage,
     yara_scan::yara_scan,
     zeek_summary::zeek_summary,
     AusearchInput, BrowserHistoryInput, CaseOpenInput, CloudAuditInput, DiskExtractArtifactsInput,
     DiskMountInput, DiskUnmountInput, EvtxQueryInput, EzParseInput, HayabusaInput, IndxParseInput,
     JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput, NfdumpQueryInput,
-    OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, RegistryInput,
+    OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, PstParseInput, RegistryInput,
     SuricataEveInput, SysmonNetworkInput, UsnJrnlInput, VelCollectInput, VolMalfindInput,
-    VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, YaraInput, ZeekSummaryInput,
+    VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, WebTriageInput, YaraInput,
+    ZeekSummaryInput,
 };
 use crate::CRATE_VERSION;
 
@@ -503,6 +506,19 @@ fn build_registry() -> Vec<ToolEntry> {
             handler: |args| dispatch_sysmon_network_query(args),
         },
         ToolEntry {
+            name: "web_triage",
+            description: "Parse a web-tier artifact carved off a disk image: an Apache/nginx/IIS request log, or a server-side script from a web root. Auto-detects which. For a request log it returns the flagged requests with their client IP, method, target, status, user agent, line number, and the exploitation indicators that fired (SQL injection union/tautology/information_schema/meta-function, encoded quote, path traversal, webshell invocation, command injection, scanner user agent), plus per-indicator and per-client counts. For a script it returns the shell/eval/obfuscation/socket primitives found with line numbers and snippets, and whether the combination matches a webshell pattern. Pure Rust, no subprocess. Use AFTER disk_extract_artifacts on web_log / webroot_script artifacts. ERRORS: artifact not found/not a regular file/unreadable.",
+            annotations: ToolAnnotations {
+                title: "Triage Web Log or Web-Root Script",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<WebTriageInput>(),
+            handler: |args| dispatch_web_triage(args),
+        },
+        ToolEntry {
             name: "zeek_summary",
             description: "Summarize Zeek TSV logs from a file or directory using pure Rust/standard parsing. Handles conn.log, dns.log, http.log, ssl.log, and tls.log when present, returning top hosts, DNS queries, HTTP hosts, notable connections, row counts, and parse_errors. Use AFTER case_open on extracted Zeek logs. ERRORS: zeek path not found/unreadable.",
             annotations: ToolAnnotations {
@@ -789,6 +805,36 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<OeDbxParseInput>(),
             handler: |args| dispatch_oe_dbx_parse(args),
+        },
+        ToolEntry {
+            name: "pst_parse",
+            description: "Parse an Outlook mail store (.pst personal folders / .ost offline \
+                 store) and return each message's RFC822 envelope. No other product tool reads \
+                 a PST (plaso has no PST parser; oe_dbx_parse is Outlook-Express-only; \
+                 browser_history is SQLite-only), so without this the host's mail is invisible. \
+                 Returns per message: subject, from_display/from_address, \
+                 reply_to_display/reply_to_address (a Reply-To that differs from From is the \
+                 classic reply-address spoofing tell), to[], date, and attachments[] with name \
+                 + extension + content_type. Header-level reader, not a body reconstructor; \
+                 output is deduped/sorted and carries no per-run export path, so it is stable \
+                 for verify_finding replay. Returns is_pst=false for non-PST input (e.g. a .dbx \
+                 — use oe_dbx_parse for those) WITHOUT running a subprocess. Use AFTER \
+                 case_open / disk_extract_artifacts (artifact class mail_store); artifact_path \
+                 is one .pst/.ost file. Default limit 2000, ceiling 20000. \
+                 Binary discovery: $PST_READER_BIN first, then readpst (libpst), then \
+                 pffexport (libpff) on PATH. \
+                 ERRORS: ArtifactNotFound (verify the path), BinaryNotFound (install libpst / \
+                 libpff — apt: pst-utils or libpff-utils), SubprocessFailed (check \
+                 stderr_tail), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse Outlook Mail Store (.pst/.ost)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<PstParseInput>(),
+            handler: |args| dispatch_pst_parse(args),
         },
         ToolEntry {
             name: "mac_triage",
@@ -1467,6 +1513,20 @@ fn dispatch_sysmon_network_query(args: Value) -> Result<Value, ToolError> {
     }
 }
 
+fn dispatch_web_triage(args: Value) -> Result<Value, ToolError> {
+    let input: WebTriageInput = parse_args(args)?;
+    match web_triage(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::WebTriageError::NotFound(_)
+            | crate::tools::WebTriageError::NotRegular(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("web_triage: {e}"))),
+    }
+}
+
 fn dispatch_zeek_summary(args: Value) -> Result<Value, ToolError> {
     let input: ZeekSummaryInput = parse_args(args)?;
     match zeek_summary(&input) {
@@ -1615,6 +1675,20 @@ fn dispatch_oe_dbx_parse(args: Value) -> Result<Value, ToolError> {
             Err(ToolError::InvalidParams(format!("{e}")))
         }
         Err(e) => Err(ToolError::Internal(format!("oe_dbx_parse: {e}"))),
+    }
+}
+
+fn dispatch_pst_parse(args: Value) -> Result<Value, ToolError> {
+    let input: PstParseInput = parse_args(args)?;
+    // ArtifactNotFound is a user-input error; surface as -32602.
+    match pst_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::PstParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("pst_parse: {e}"))),
     }
 }
 
@@ -1923,6 +1997,8 @@ mod tests {
             "vel_collect",
             "browser_history",
             "oe_dbx_parse",
+            "web_triage",
+            "pst_parse",
         ];
         assert_eq!(names.len(), expected.len());
         for want in expected {

@@ -7,7 +7,7 @@ pitch see [README.md](README.md); for run modes and every flag see
 VERDICT supports a default deterministic `scripts/verdict` run, an optional beta-native
 `scripts/verdict --agent` loop, and [Claude Code](https://claude.com/claude-code) for canonical
 interactive/cloud operation. Installation builds the two product MCP servers and the host DFIR
-toolchain; Claude Code auto-spawns the servers from `.mcp.json` on session start. The product surface is 45 tools total: 32 Rust DFIR tools in
+toolchain; Claude Code auto-spawns the servers from `.mcp.json` on session start. The product surface is 47 audit-chained product tools: 34 Rust DFIR tools in
 `findevil-mcp` plus 13 Python crypto/ACH/memory/ACP/expert-feedback tools in
 `findevil-agent-mcp`.
 
@@ -23,7 +23,7 @@ installers, and Node 20 via `fnm` when needed (best-effort, since Node is option
 
 | Tool | Version | Why | Required? |
 |---|---|---|---|
-| Rust + Cargo | 1.88 (pinned in `rust-toolchain.toml`) | builds `findevil-mcp` (32 DFIR tools) | **yes** |
+| Rust + Cargo | 1.88 (pinned in `rust-toolchain.toml`) | builds `findevil-mcp` (34 DFIR tools) | **yes** |
 | uv | latest | syncs the Python `findevil-agent-mcp` env (13 tools) | **yes** |
 | Python | 3.11–3.12 | runs the Python `findevil-agent-mcp` + smoke/score tooling | **yes** |
 | git | recent | clones the repo; used by the smokes | **yes** |

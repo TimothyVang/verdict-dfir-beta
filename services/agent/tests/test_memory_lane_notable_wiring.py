@@ -151,11 +151,14 @@ def test_memory_lane_emits_notable_and_console_findings(
         "f-B-console-cmdline",
     } <= bases
 
-    # vol_run drove exactly the two allow-listed plugins, cmdline before consoles.
+    # vol_run drove the allow-listed console plugins in order: cmdline, then
+    # consoles, then cmdscan — the canned consoles rows carry no CommandHistory
+    # entry, so the second command-history attempt is genuinely warranted.
     plugins = [args["plugin"] for tool, args in rust.calls if tool == "vol_run"]
-    assert plugins == ["windows.cmdline", "windows.consoles"]
+    assert plugins == ["windows.cmdline", "windows.consoles", "windows.cmdscan"]
 
-    # tc-001 pslist, tc-002 malfind, tc-003 psscan, tc-004 cmdline, tc-005 consoles
+    # tc-001 pslist, tc-002 malfind, tc-003 psscan, tc-004 cmdline,
+    # tc-005 consoles, tc-006 cmdscan
     by_base = {f["finding_id"]: f for f in inv.findings_pool_b}
     assert by_base["f-B-notable-browser"]["derived_from"] == ["tc-001", "tc-003"]
     # console finding: cmdline + consoles + pslist corroboration (cmd.exe is in
@@ -164,7 +167,7 @@ def test_memory_lane_emits_notable_and_console_findings(
 
     # The vol_run calls are recorded in the audited tool_calls list.
     vol_run_records = [tc for tc in inv.tool_calls if tc["tool"] == "vol_run"]
-    assert [tc["tool_call_id"] for tc in vol_run_records] == ["tc-004", "tc-005"]
+    assert [tc["tool_call_id"] for tc in vol_run_records] == ["tc-004", "tc-005", "tc-006"]
 
 
 def test_memory_lane_skips_consoles_when_no_console_host(

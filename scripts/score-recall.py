@@ -38,6 +38,22 @@ PASS rule (exit 0) requires ALL of:
     fails the run even on an open-world key. Generic extra findings are reported
     but do not fail, so surfacing a real claim the key omitted is not punished.
 
+Exit codes (a harness must be able to tell these four apart):
+  0  PASS      — scored, and the run cleared the key.
+  1  FAIL      — scored, and the run did not. ``<case>/recall-score.json`` holds
+                 the metrics behind the verdict.
+  2  ERROR     — could not score: no case dir / no verdict.json / no golden
+                 resolved, or the key is broken (unsupported ``scoring_status``,
+                 ``min_recall_percent: null`` stub). A maintainer has to fix
+                 something.
+  3  EXCLUDED  — the KEY declares itself unscoreable (``scoring_status:
+                 not_ready``). Nothing was measured and nothing failed; the
+                 golden asked not to be scored, and its ``not_ready_reason`` is
+                 printed and written to ``<case>/recall-excluded.json``. A caller
+                 that folds this into 1 or 2 is reporting a dataset decision as an
+                 engine result — the dishonest direction, because it presents a
+                 failure with no metrics behind it.
+
 Usage:
     python scripts/score-recall.py <case-dir> [--golden goldens/<id>] [--quiet]
     python scripts/score-recall.py                 # newest dir under tmp/auto-runs/
@@ -71,6 +87,15 @@ _acc_spec.loader.exec_module(_accuracy)
 newest_case_dir = _accuracy.newest_case_dir
 resolve_golden = _accuracy.resolve_golden
 score = _accuracy.score
+GoldenNotScoreable = _accuracy.GoldenNotScoreable
+
+# Named so callers (scripts/l3-run-goldens.sh, any board) stop hard-coding ints.
+# 3 mirrors scripts/fixture-readiness.py, which already returns 3 for NOT_READY
+# and 2 for a checker error — same distinction, same numbers.
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_ERROR = 2
+EXIT_NOT_SCOREABLE = 3
 
 
 def _print_report(result: dict[str, Any]) -> None:
@@ -126,6 +151,56 @@ def _print_report(result: dict[str, Any]) -> None:
     print(f"  RESULT   : {'PASS' if result['pass'] else 'FAIL'}")
 
 
+def _print_exclusion(exc: GoldenNotScoreable, *, quiet: bool) -> None:
+    """Say EXCLUDED, name the key, and quote the key's own reason.
+
+    Deliberately never prints "FAIL" or a metric: there is nothing measured here.
+    Goes to stderr alongside the other non-result messages so a harness capturing
+    stdout for a report does not pick this up as one.
+    """
+    print(f"=== EXCLUDED (not scoreable) — {exc.case_id} ===", file=sys.stderr)
+    print(f"  golden   : {exc.golden_path}", file=sys.stderr)
+    print(f"  declared : scoring_status={exc.scoring_status}", file=sys.stderr)
+    print(
+        f"  reason   : {exc.reason or '(the key gives no not_ready_reason)'}",
+        file=sys.stderr,
+    )
+    if not quiet:
+        print(
+            "  This golden asked not to be scored. No accuracy claim — for or "
+            "against the engine — can be made from it.",
+            file=sys.stderr,
+        )
+
+
+def _write_exclusion_marker(
+    case_dir: Path, golden_path: Path, exc: GoldenNotScoreable
+) -> Path:
+    """Record the exclusion machine-readably, in a file that is NOT a score.
+
+    A board reading ``recall-score.json`` must not find a document it can mistake
+    for metrics, so this is a separate filename carrying no ``pass`` / ``recall_*``
+    keys at all — only the key's declaration.
+    """
+    marker = case_dir / "recall-excluded.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "excluded": True,
+                "case_id": exc.case_id,
+                "case_dir": str(case_dir),
+                "golden": str(golden_path),
+                "scoring_status": exc.scoring_status,
+                "reason": exc.reason,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
 def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if a not in ("--quiet",)]
     quiet = "--quiet" in argv
@@ -144,10 +219,10 @@ def main(argv: list[str]) -> int:
         print(
             "  (no case dir given and none found under tmp/auto-runs/)", file=sys.stderr
         )
-        return 2
+        return EXIT_ERROR
     if not (case_dir / "verdict.json").is_file():
         print(f"error: {case_dir}/verdict.json not found", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
     golden_path = resolve_golden(case_dir, golden_override)
     if golden_path is None:
@@ -156,22 +231,30 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         print("  pass one explicitly with --golden goldens/<case-id>", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
     try:
         result = score(case_dir, golden_path)
+    except GoldenNotScoreable as exc:
+        # The KEY said "do not score me". That is a dataset decision, not an
+        # accuracy failure and not a maintainer bug, so it gets its own exit code
+        # and its own marker file — never a recall-score.json, because there is no
+        # score to put in one.
+        _print_exclusion(exc, quiet=quiet)
+        _write_exclusion_marker(case_dir, golden_path, exc)
+        return EXIT_NOT_SCOREABLE
     except ValueError as exc:
         # e.g. an unpopulated stub golden (min_recall_percent: null). Report the
         # golden by name rather than dying in a traceback.
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ERROR
     if not quiet:
         _print_report(result)
     out = case_dir / "recall-score.json"
     out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if not quiet:
         print(f"\nwrote {out}")
-    return 0 if result["pass"] else 1
+    return EXIT_PASS if result["pass"] else EXIT_FAIL
 
 
 if __name__ == "__main__":

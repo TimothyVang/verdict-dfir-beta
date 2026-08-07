@@ -5,7 +5,7 @@
 //! tool invocations; tests and Windows use the explicit `mock` mode so normal
 //! CI never needs FUSE, libewf, or administrator privileges.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,11 @@ use uuid::Uuid;
 const LEDGER_NAME: &str = "session_resources.json";
 const STDERR_TAIL_BYTES: usize = 4096;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Hard cap on deleted-but-resident artifacts recovered per extraction, so a
+/// filesystem holding tens of thousands of unallocated MFT records can never
+/// swamp the class budget (or the icat call count) with carved candidates.
+const MAX_RECOVERED_DELETED: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +68,9 @@ pub enum ArtifactKind {
     MacosActivity,
     MacosLaunchd,
     MacosFsevents,
+    WebLog,
+    WebrootScript,
+    MailStore,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -118,6 +126,15 @@ pub struct ExtractedDiskArtifact {
     pub source_path: PathBuf,
     pub extracted_path: PathBuf,
     pub size_bytes: u64,
+    /// True when this artifact was carved out of a *deleted* directory entry
+    /// whose MFT record was still resident, rather than read from a live file.
+    /// The bytes are genuine (the signature check below rejects reallocated
+    /// clusters), but the provenance is different and a reader must see it:
+    /// a recovered artifact can be a stale copy and its parent directory
+    /// listing no longer vouches for it. `serde(default)` so a ledger written
+    /// before this field still deserializes.
+    #[serde(default)]
+    pub recovered_deleted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -129,7 +146,17 @@ pub struct DiskExtractArtifactsOutput {
     pub artifacts: Vec<ExtractedDiskArtifact>,
     pub artifacts_seen: usize,
     pub artifacts_skipped_oversize: usize,
+    /// How many of `artifacts` were carved from deleted-but-resident entries.
+    #[serde(default)]
+    pub artifacts_recovered_deleted: usize,
     pub max_artifact_bytes: u64,
+    /// Scoped gaps the extraction itself observed — today: a Prefetch directory
+    /// that exists but yields zero *allocated* files. The caller folds these
+    /// into the case's analysis limitations. An extraction that silently
+    /// returns nothing for a wiped directory is indistinguishable from one that
+    /// found nothing to wipe, which is the bug this field closes.
+    #[serde(default)]
+    pub analysis_limitations: Vec<String>,
     pub ledger_path: PathBuf,
 }
 
@@ -309,7 +336,18 @@ pub fn disk_extract_artifacts(
         .then(|| mount.fs_root.clone())
         .flatten();
     let (listed, via_walk) = list_image_files(&image_path, &sector_offsets, mock_root.as_deref())?;
-    let ordered_candidates = order_artifacts(classify_candidates(listed, &wanted));
+    let candidates = classify_candidates(listed.clone(), &wanted);
+    let recovered_candidates = candidates.iter().filter(|c| c.recovered_deleted).count();
+    // A wiped Prefetch directory must be REPORTED, not silently no-op'd: the
+    // count below is what a reader needs to tell "this host never ran the
+    // program" from "the evidence of it running was destroyed".
+    let mut analysis_limitations: Vec<String> = Vec::new();
+    if wanted.get("prefetch").copied().unwrap_or(false) {
+        if let Some(limitation) = prefetch_wipe_limitation(&listed, recovered_candidates) {
+            analysis_limitations.push(limitation);
+        }
+    }
+    let ordered_candidates = order_artifacts(candidates);
 
     let mut artifacts = Vec::new();
     let mut artifacts_skipped_oversize = 0;
@@ -363,7 +401,9 @@ pub fn disk_extract_artifacts(
         output_dir,
         artifacts_seen: artifacts.len(),
         artifacts_skipped_oversize,
+        artifacts_recovered_deleted: artifacts.iter().filter(|a| a.recovered_deleted).count(),
         max_artifact_bytes: input.max_artifact_bytes,
+        analysis_limitations,
         artifacts,
         ledger_path,
     })
@@ -872,9 +912,26 @@ fn run_fixed(bin: &str, args: &[String]) -> Result<(bool, String, String), DiskE
     ))
 }
 
-/// One row off a filesystem listing, before classification:
-/// `(partition_rank, sector_offset, inode, rel_path)`.
-type ListedFile = (usize, Option<u64>, String, String);
+/// One row off a filesystem listing, before classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListedFile {
+    partition_rank: usize,
+    sector_offset: Option<u64>,
+    inode: String,
+    rel_path: String,
+    /// False when `fls` marked the directory entry deleted (`*`). The inode is
+    /// still real — [`classify_candidates`] decides which classes are worth
+    /// recovering from it.
+    allocated: bool,
+}
+
+/// One parsed `fls -p` row: a regular file with a usable inode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlsRow {
+    inode: String,
+    rel_path: String,
+    allocated: bool,
+}
 
 /// List every live file across the image's filesystem partitions (one
 /// [`tsk_list`] per sector offset), tagging each row with its partition rank
@@ -892,11 +949,13 @@ fn list_image_files(
     let mut list_error: Option<DiskError> = None;
     for (rank, offset) in sector_offsets.iter().enumerate() {
         match tsk_list(image_path, *offset) {
-            Ok(files) => tsk_files.extend(
-                files
-                    .into_iter()
-                    .map(|(inode, path)| (rank, *offset, inode, path)),
-            ),
+            Ok(files) => tsk_files.extend(files.into_iter().map(|row| ListedFile {
+                partition_rank: rank,
+                sector_offset: *offset,
+                inode: row.inode,
+                rel_path: row.rel_path,
+                allocated: row.allocated,
+            })),
             Err(err) => list_error = list_error.or(Some(err)),
         }
     }
@@ -907,7 +966,14 @@ fn list_image_files(
         (Some(root), _) => Ok((
             mock_list(root)?
                 .into_iter()
-                .map(|(inode, path)| (0, None, inode, path))
+                .map(|(inode, rel_path)| ListedFile {
+                    partition_rank: 0,
+                    sector_offset: None,
+                    inode,
+                    rel_path,
+                    // A staged mock tree has no unallocated entries.
+                    allocated: true,
+                })
                 .collect(),
             true,
         )),
@@ -916,37 +982,137 @@ fn list_image_files(
     }
 }
 
+/// Classes whose *deleted* entries are worth recovering when the class has no
+/// allocated files left at all. Prefetch only, deliberately: a .pf is a small
+/// file whose MFT record usually stays resident after an SDelete-style wipe, and
+/// it is the artifact class an attacker who wipes the directory is trying to
+/// erase. A deleted registry hive or event log is a large, fragmented, usually
+/// unrecoverable partial — carving those would fill the ledger with garbage that
+/// still fails to parse.
+const RECOVER_DELETED_CLASSES: &[&str] = &["prefetch"];
+
+/// True when this class's deleted entries may be recovered.
+fn class_recovers_deleted(class: &str) -> bool {
+    RECOVER_DELETED_CLASSES.contains(&class)
+}
+
 /// Keep only listed files that classify into a wanted forensic class, carrying
 /// each file's partition tag through to extraction.
+///
+/// Deleted entries are normally dropped. The one exception is a
+/// [`RECOVER_DELETED_CLASSES`] class with **zero allocated files anywhere in the
+/// listing** — the anti-forensic shape, where the lane would otherwise no-op
+/// silently. Recovery is deliberately a fallback and not a general expansion:
+/// when live files of that class exist the normal lane already reports on them,
+/// and pulling hundreds of extra carved candidates would take the shared
+/// extraction budget away from other classes for marginal gain. Recovered rows
+/// are capped at [`MAX_RECOVERED_DELETED`] and labelled `recovered_deleted` so
+/// the provenance travels with the artifact.
 fn classify_candidates(
     listed: Vec<ListedFile>,
     wanted: &BTreeMap<&'static str, bool>,
 ) -> Vec<ArtifactCandidate> {
-    listed
-        .into_iter()
-        .filter_map(|(partition_rank, sector_offset, inode, rel_path)| {
-            let class = classify_artifact_path(&rel_path)?;
-            wanted
-                .get(class)
-                .copied()
-                .unwrap_or(false)
-                .then_some(ArtifactCandidate {
-                    class,
-                    inode,
-                    rel_path,
-                    sector_offset,
-                    partition_rank,
-                })
-        })
-        .collect()
+    let allocated_classes: BTreeSet<&'static str> = listed
+        .iter()
+        .filter(|row| row.allocated)
+        .filter_map(|row| classify_artifact_path(&row.rel_path))
+        .collect();
+    let mut recovered = 0usize;
+    let mut out = Vec::new();
+    for row in listed {
+        let Some(class) = classify_artifact_path(&row.rel_path) else {
+            continue;
+        };
+        if !wanted.get(class).copied().unwrap_or(false) {
+            continue;
+        }
+        if !row.allocated {
+            if !class_recovers_deleted(class)
+                || allocated_classes.contains(class)
+                || recovered >= MAX_RECOVERED_DELETED
+            {
+                continue;
+            }
+            recovered += 1;
+        }
+        out.push(ArtifactCandidate {
+            class,
+            inode: row.inode,
+            rel_path: row.rel_path,
+            sector_offset: row.sector_offset,
+            partition_rank: row.partition_rank,
+            recovered_deleted: !row.allocated,
+        });
+    }
+    out
 }
 
-/// Enumerate every live regular file in the image via `fls -r -p`, returning
-/// `(inode, relative_path)` pairs. Reads the image directly (no mount).
-fn tsk_list(
-    image_path: &Path,
-    sector_offset: Option<u64>,
-) -> Result<Vec<(String, String)>, DiskError> {
+/// Report a Prefetch directory that exists in the listing but yields ZERO
+/// allocated files — the SDelete/anti-forensics shape. Pure so the message is
+/// unit-testable. Returning None (intact or absent directory) keeps a normal
+/// host's output free of noise.
+fn prefetch_wipe_limitation(listed: &[ListedFile], recovered: usize) -> Option<String> {
+    let (mut total, mut allocated) = (0usize, 0usize);
+    for row in listed {
+        if classify_artifact_path(&row.rel_path) == Some("prefetch") {
+            total += 1;
+            if row.allocated {
+                allocated += 1;
+            }
+        }
+    }
+    if total == 0 || allocated > 0 {
+        return None;
+    }
+    Some(format!(
+        "Windows Prefetch directory holds {total} entries and ZERO are allocated — every .pf file \
+         is deleted, which is what secure-deletion / anti-forensic wiping (e.g. SDelete) looks \
+         like. {recovered} entry/entries were recovered from still-resident MFT records and \
+         carry a valid prefetch signature; the remainder could not be recovered. Execution \
+         history from Prefetch is INCOMPLETE for this host — absence of a program here is not \
+         evidence it never ran."
+    ))
+}
+
+/// Minimum content signature a *recovered* (deleted) artifact must carry before
+/// it is kept. Only recovered rows are checked: an allocated file that fails a
+/// signature test is a real artifact worth surfacing (truncated, corrupt), while
+/// a carved blob that fails is almost always a cluster the filesystem has since
+/// reallocated to something else. Classes with no signature defined pass.
+///
+/// Prefetch: Win8/10 files are MAM-compressed (`MAM\x04`); Win XP/Vista/7 files
+/// are uncompressed with `SCCA` at offset 4.
+fn recovered_content_matches(class: &str, path: &Path) -> Result<bool, DiskError> {
+    if class != "prefetch" {
+        return Ok(true);
+    }
+    let head = read_head(path, 8)?;
+    if head.len() < 8 {
+        return Ok(false);
+    }
+    Ok(&head[0..4] == b"MAM\x04" || &head[4..8] == b"SCCA")
+}
+
+/// Read at most `n` leading bytes of a file (no whole-file buffering).
+fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, DiskError> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).map_err(|source| DiskError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut buf = vec![0u8; n];
+    let read = file.read(&mut buf).map_err(|source| DiskError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    buf.truncate(read);
+    Ok(buf)
+}
+
+/// Enumerate every regular file in the image via `fls -r -p`, returning one
+/// [`FlsRow`] each (allocated and deleted-but-resident alike). Reads the image
+/// directly (no mount).
+fn tsk_list(image_path: &Path, sector_offset: Option<u64>) -> Result<Vec<FlsRow>, DiskError> {
     let bin = std::env::var("FINDEVIL_FLS_BIN").unwrap_or_else(|_| "fls".to_string());
     let mut command = Command::new(&bin);
     command.args(["-r", "-p"]);
@@ -1045,30 +1211,50 @@ fn mock_extract(
         source_path: PathBuf::from(rel_path),
         extracted_path: dest,
         size_bytes: size,
+        recovered_deleted: false,
     });
     Ok(())
 }
 
-/// Parse one `fls -p` line into `(inode, relative_path)` for a live regular
-/// file. Lines look like `r/r 380861-128-4:\tWindows/System32/config/SYSTEM`.
-/// Returns None for directories, deleted entries (marked `*`), and non-files.
-fn parse_fls_line(line: &str) -> Option<(String, String)> {
+/// Parse one `fls -p` line into an [`FlsRow`]. Lines look like
+/// `r/r 380861-128-4:\tWindows/System32/config/SYSTEM`, and a deleted entry
+/// carries a `*` marker: `-/r * 32749-128-4:\tWindows/Prefetch/X.pf`.
+///
+/// The type field is `<name-type>/<metadata-type>`. For a *deleted* entry the
+/// directory-entry side is frequently gone (`-/r`) while the MFT metadata still
+/// says "regular file" — on a wiped Prefetch directory that is the majority
+/// shape, so accepting only `r/r` would still miss most of it. A deleted row is
+/// therefore kept when EITHER side says `r`; the caller decides which classes
+/// are worth recovering.
+///
+/// Returns None for directories, non-files, and `r/-`-style rows whose metadata
+/// is gone (inode 0) — those have no data runs left to `icat`.
+fn parse_fls_line(line: &str) -> Option<FlsRow> {
     let (kind, rest) = line.split_once(char::is_whitespace)?;
-    if !kind.starts_with("r/r") {
+    let (name_type, meta_type) = kind.split_once('/')?;
+    if name_type != "r" && meta_type != "r" {
         return None;
     }
     let rest = rest.trim_start();
-    if rest.starts_with('*') {
-        // deleted entry — not reliably recoverable, skip.
-        return None;
-    }
+    let (allocated, rest) = rest
+        .strip_prefix('*')
+        .map_or((true, rest), |after| (false, after.trim_start()));
     let (inode, path) = rest.split_once(':')?;
     let inode = inode.trim();
     let path = path.trim();
     if inode.is_empty() || path.is_empty() {
         return None;
     }
-    Some((inode.to_string(), path.to_string()))
+    // TSK prints inode 0 when the metadata record itself is unavailable; there
+    // is nothing to extract from it and `icat 0` would just fail.
+    if inode.split('-').next().unwrap_or(inode) == "0" {
+        return None;
+    }
+    Some(FlsRow {
+        inode: inode.to_string(),
+        rel_path: path.to_string(),
+        allocated,
+    })
 }
 
 /// One extraction candidate: a classified file inside a specific filesystem
@@ -1084,6 +1270,10 @@ struct ArtifactCandidate {
     rel_path: String,
     sector_offset: Option<u64>,
     partition_rank: usize,
+    /// Carved from a deleted directory entry whose MFT record was still
+    /// resident. Gates the extra content-signature check and travels onto the
+    /// emitted [`ExtractedDiskArtifact`].
+    recovered_deleted: bool,
 }
 
 /// Extract order: forensically critical classes first, broad yara targets last,
@@ -1119,6 +1309,12 @@ fn class_priority(class: &str) -> u8 {
         "macos_activity" => 22,
         "macos_launchd" => 23,
         "macos_fsevents" => 24,
+        // Web tier: a small, high-signal set (a handful of request logs; the
+        // web root's scripts) that must not be crowded out by the generic sweep.
+        "web_log" => 25,
+        "webroot_script" => 26,
+        // Local mail stores (Outlook .pst/.ost, Outlook Express .dbx).
+        "mail_store" => 27,
         // Generic content sweep is always last.
         "yara_target" => 50,
         _ => 99,
@@ -1135,9 +1331,51 @@ fn class_priority(class: &str) -> u8 {
 /// task-scheduler, defender, winrm, wmi, terminal-services, applocker); tier 2
 /// = the per-provider operational tail.
 fn artifact_subrank(class: &str, rel_path: &str) -> u8 {
-    if class != "evtx" {
+    match class {
+        "evtx" => evtx_subrank(rel_path),
+        "webroot_script" => webroot_script_subrank(rel_path),
+        _ => 0,
+    }
+}
+
+/// Draw order within `webroot_script`. A web root holds hundreds of shipped
+/// application scripts and only a handful of files the web server itself can
+/// write; a dropped shell lands in the writable ones. Tier 0 = a script in an
+/// upload/temp/cache directory (attacker-writable by design); tier 1 = a script
+/// sitting directly at the document root (also unusual for a packaged app);
+/// tier 2 = the shipped application tree.
+fn webroot_script_subrank(rel_path: &str) -> u8 {
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let dir = lower.rsplit_once('/').map_or("", |(d, _)| d);
+    if [
+        "upload",
+        "uploads",
+        "tmp",
+        "temp",
+        "cache",
+        "files",
+        "images",
+        "img",
+        "media",
+        "avatars",
+        "attachments",
+        "data",
+    ]
+    .iter()
+    .any(|w| dir.ends_with(&format!("/{w}")) || dir == *w)
+    {
         return 0;
     }
+    if ["htdocs", "wwwroot", "public_html", "www", "webroot"]
+        .iter()
+        .any(|root| dir.ends_with(root))
+    {
+        return 1;
+    }
+    2
+}
+
+fn evtx_subrank(rel_path: &str) -> u8 {
     let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or("");
     if name == "security.evtx"
@@ -1281,11 +1519,19 @@ fn tsk_extract(
         fs::remove_file(&dest).map_err(|source| DiskError::Io { path: dest, source })?;
         return Ok(());
     }
+    // A carved blob whose signature is wrong is a reallocated cluster, not the
+    // artifact the deleted name promised. Drop it rather than hand a downstream
+    // parser bytes that belong to something else.
+    if candidate.recovered_deleted && !recovered_content_matches(candidate.class, &dest)? {
+        fs::remove_file(&dest).map_err(|source| DiskError::Io { path: dest, source })?;
+        return Ok(());
+    }
     out.push(ExtractedDiskArtifact {
         artifact_class: candidate.class.to_string(),
         source_path: PathBuf::from(&candidate.rel_path),
         extracted_path: dest,
         size_bytes: size,
+        recovered_deleted: candidate.recovered_deleted,
     });
     Ok(())
 }
@@ -1326,9 +1572,83 @@ fn classify_artifact_path(rel: &str) -> Option<&'static str> {
     let rel = rel.replace('\\', "/").to_ascii_lowercase();
     let name = rel.rsplit('/').next().unwrap_or(rel.as_str());
     classify_windows_specific(name, &rel)
+        .or_else(|| classify_web_tier(name, &rel))
         .or_else(|| classify_linux(name, &rel))
         .or_else(|| classify_macos(name, &rel))
         .or_else(|| classify_windows_generic(&rel))
+}
+
+/// Web-tier classes. OS-agnostic on purpose: Apache ships inside XAMPP on
+/// Windows, IIS writes W3C logs under `inetpub`, and the same stack on Linux
+/// puts logs under `/var/log`. Tried before the Linux and generic sweeps so
+/// `var/log/apache2/access.log` reaches the request-log parser instead of the
+/// untyped `linux_log` bucket, and a webroot under `users/` reaches the
+/// webshell heuristic instead of the generic yara sweep.
+fn classify_web_tier(name: &str, rel: &str) -> Option<&'static str> {
+    if is_web_request_log(name, rel) {
+        Some("web_log")
+    } else if is_webroot_script(name, rel) {
+        Some("webroot_script")
+    } else {
+        None
+    }
+}
+
+/// A web server's request/error log. Matched on the server's *log directory*
+/// plus the canonical filename, so a `.pid` or an installer log sitting in the
+/// same directory is not mistaken for request traffic.
+fn is_web_request_log(name: &str, rel: &str) -> bool {
+    let in_server_log_dir = [
+        "/apache/logs/",
+        "/apache2/",
+        "/httpd/",
+        "/nginx/",
+        "/lighttpd/",
+        "/logs/w3svc",
+    ]
+    .iter()
+    .any(|dir| rel.contains(dir))
+        || rel.starts_with("apache/logs/")
+        || rel.contains("inetpub/logs/");
+    let canonical_name = matches!(
+        name,
+        "access.log"
+            | "access_log"
+            | "error.log"
+            | "error_log"
+            | "ssl_access.log"
+            | "ssl_request.log"
+            | "other_vhosts_access.log"
+    ) || (name.starts_with("access.log.") || name.starts_with("access_log."))
+        || (name.starts_with("u_ex") && has_extension(name, "log"));
+    // `*.access` (per-vhost nginx/lighttpd naming) is self-describing.
+    (in_server_log_dir && canonical_name) || has_extension(name, "access")
+}
+
+/// A server-side script living in a web root — the place a webshell lands.
+/// Requires BOTH a document-root marker in the path and an executable
+/// server-script extension: static content is not a script, and a build script
+/// outside a web root is not web-reachable.
+fn is_webroot_script(name: &str, rel: &str) -> bool {
+    let in_web_root = [
+        "htdocs/",
+        "wwwroot/",
+        "inetpub/",
+        "public_html/",
+        "www/",
+        "webapps/",
+        "web-root/",
+        "webroot/",
+    ]
+    .iter()
+    .any(|root| rel.starts_with(root) || rel.contains(&format!("/{root}")));
+    in_web_root
+        && [
+            "php", "php3", "php4", "php5", "php7", "phps", "phtml", "asp", "aspx", "ashx", "asmx",
+            "jsp", "jspx", "jspf", "cfm", "cgi",
+        ]
+        .iter()
+        .any(|ext| has_extension(name, ext))
 }
 
 /// Windows filesystem + registry + decoded execution/persistence/anti-forensic
@@ -1372,6 +1692,13 @@ fn classify_windows_specific(name: &str, rel: &str) -> Option<&'static str> {
         Some("ie_history")
     } else if name == "thumbs.db" || name.ends_with(".thumbcache") {
         Some("thumbnail")
+    } else if has_extension(name, "pst") || has_extension(name, "ost") || has_extension(name, "dbx")
+    {
+        // Local mail stores: Outlook personal folders (.pst) / offline store
+        // (.ost) and the legacy Outlook Express folder format (.dbx). Carving
+        // them is what lets the mail lane run without a mounted filesystem —
+        // the TSK extractor works rootless, a loopback mount does not.
+        Some("mail_store")
     } else if rel.contains("/system32/tasks/") || rel.starts_with("windows/system32/tasks/") {
         Some("scheduled_task")
     } else if matches!(
@@ -1473,6 +1800,9 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
             "macos_activity",
             "macos_launchd",
             "macos_fsevents",
+            "web_log",
+            "webroot_script",
+            "mail_store",
         ]
     } else {
         kinds
@@ -1504,6 +1834,9 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
                 ArtifactKind::MacosActivity => "macos_activity",
                 ArtifactKind::MacosLaunchd => "macos_launchd",
                 ArtifactKind::MacosFsevents => "macos_fsevents",
+                ArtifactKind::WebLog => "web_log",
+                ArtifactKind::WebrootScript => "webroot_script",
+                ArtifactKind::MailStore => "mail_store",
             })
             .collect()
     };
@@ -1600,11 +1933,13 @@ fn tail_utf8_lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_subrank, candidate_dest_dir, class_priority, classify_artifact_path, mock_list,
-        order_partitions_by_preference, parse_fls_line, parse_mmls_filesystem_partitions,
-        partition_byte_offsets, safe_join, select_artifacts, unmount_steps, wanted_kinds,
-        ArtifactCandidate, MmlsPartition,
+        artifact_subrank, candidate_dest_dir, class_priority, classify_artifact_path,
+        classify_candidates, mock_list, order_partitions_by_preference, parse_fls_line,
+        parse_mmls_filesystem_partitions, partition_byte_offsets, prefetch_wipe_limitation,
+        recovered_content_matches, safe_join, select_artifacts, unmount_steps, wanted_kinds,
+        ArtifactCandidate, ArtifactKind, ListedFile, MmlsPartition, MAX_RECOVERED_DELETED,
     };
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     /// Single-partition candidate shorthand for the fair-share tests.
@@ -1615,6 +1950,18 @@ mod tests {
             rel_path: rel_path.to_string(),
             sector_offset: None,
             partition_rank: 0,
+            recovered_deleted: false,
+        }
+    }
+
+    /// One `fls` row as [`list_image_files`] would hand it to the classifier.
+    fn listed_row(inode: &str, rel_path: &str, allocated: bool) -> ListedFile {
+        ListedFile {
+            partition_rank: 0,
+            sector_offset: None,
+            inode: inode.to_string(),
+            rel_path: rel_path.to_string(),
+            allocated,
         }
     }
 
@@ -1687,23 +2034,158 @@ mod tests {
 
     #[test]
     fn parse_fls_line_extracts_inode_and_path_for_live_files() {
+        let row = parse_fls_line("r/r 380861-128-4:\tWindows/System32/config/SYSTEM")
+            .expect("live file parses");
+        assert_eq!(row.inode, "380861-128-4");
+        assert_eq!(row.rel_path, "Windows/System32/config/SYSTEM");
+        assert!(row.allocated, "an unmarked fls row is an allocated file");
+    }
+
+    #[test]
+    fn parse_fls_line_keeps_deleted_entries_that_still_carry_an_inode() {
+        // `*` marks a deleted name. When the MFT record is still resident the
+        // inode is real and `icat` recovers the data runs — the only way to read
+        // a Prefetch directory an attacker wiped.
+        let row = parse_fls_line("r/r * 84023-128-4:\tWindows/Prefetch/CSRSS.EXE-8C04D631.pf")
+            .expect("deleted-but-resident entry parses");
+        assert_eq!(row.inode, "84023-128-4");
+        assert_eq!(row.rel_path, "Windows/Prefetch/CSRSS.EXE-8C04D631.pf");
+        assert!(!row.allocated);
+
+        // TSK prints `-/r` when the directory-entry type is gone but the MFT
+        // metadata still says "regular file". On a wiped Prefetch directory that
+        // is the majority shape, so keying only on `r/r` still misses most of it.
+        let row = parse_fls_line("-/r * 32749-128-4:\tWindows/Prefetch/SDELETE.EXE-257E3D6D.pf")
+            .expect("deleted entry with metadata-only type parses");
+        assert_eq!(row.inode, "32749-128-4");
+        assert!(!row.allocated);
+    }
+
+    #[test]
+    fn parse_fls_line_skips_dirs_unrecoverable_deletes_and_blanks() {
+        assert_eq!(parse_fls_line("d/d 282867-144-5:\tUsers"), None);
+        // `r/-` + inode 0: the MFT record is gone, there is nothing to icat.
         assert_eq!(
-            parse_fls_line("r/r 380861-128-4:\tWindows/System32/config/SYSTEM"),
-            Some((
-                "380861-128-4".to_string(),
-                "Windows/System32/config/SYSTEM".to_string(),
-            ))
+            parse_fls_line("r/- * 0:\tWindows/Prefetch/SMSS.EXE-1DCD0EB1.pf"),
+            None
+        );
+        assert_eq!(parse_fls_line(""), None);
+    }
+
+    #[test]
+    fn classify_candidates_recovers_deleted_prefetch_when_none_are_allocated() {
+        // A wiped Prefetch directory: every .pf deleted. Recovery is the only
+        // way the lane sees any execution history at all.
+        let listed = vec![
+            listed_row("100", "$MFT", true),
+            listed_row("101", "Windows/Prefetch/SDELETE.EXE-1.pf", false),
+            listed_row("102", "Windows/Prefetch/CSRSS.EXE-2.pf", false),
+        ];
+        let wanted = wanted_kinds(&[]);
+        let candidates = classify_candidates(listed, &wanted);
+        let recovered: Vec<&ArtifactCandidate> = candidates
+            .iter()
+            .filter(|c| c.class == "prefetch")
+            .collect();
+        assert_eq!(recovered.len(), 2, "both wiped .pf entries recovered");
+        assert!(
+            recovered.iter().all(|c| c.recovered_deleted),
+            "recovered rows must be labelled recovered-deleted"
+        );
+        assert!(candidates
+            .iter()
+            .any(|c| c.class == "mft" && !c.recovered_deleted));
+    }
+
+    #[test]
+    fn classify_candidates_leaves_deleted_prefetch_alone_when_allocated_ones_exist() {
+        // Recovery is a targeted fallback for a wiped directory, not a general
+        // budget expansion: when live .pf files exist the normal lane already
+        // reports execution history and the extraction budget stays where it is.
+        let listed = vec![
+            listed_row("101", "Windows/Prefetch/CMD.EXE-1.pf", true),
+            listed_row("102", "Windows/Prefetch/SDELETE.EXE-2.pf", false),
+        ];
+        let wanted = wanted_kinds(&[]);
+        let candidates = classify_candidates(listed, &wanted);
+        let prefetch: Vec<&ArtifactCandidate> = candidates
+            .iter()
+            .filter(|c| c.class == "prefetch")
+            .collect();
+        assert_eq!(prefetch.len(), 1);
+        assert!(!prefetch[0].recovered_deleted);
+    }
+
+    #[test]
+    fn classify_candidates_never_recovers_deleted_non_prefetch_classes() {
+        // Only prefetch is recovered. A deleted hive or event log is far more
+        // likely to be an unrecoverable partial than a resident 4 KB .pf, and
+        // carving them silently would inflate the ledger with garbage.
+        let listed = vec![
+            listed_row("201", "Windows/System32/config/SOFTWARE", false),
+            listed_row("202", "Windows/System32/winevt/Logs/Security.evtx", false),
+        ];
+        let wanted = wanted_kinds(&[]);
+        assert!(classify_candidates(listed, &wanted).is_empty());
+    }
+
+    #[test]
+    fn classify_candidates_caps_recovered_deleted_prefetch() {
+        let listed: Vec<ListedFile> = (0..(MAX_RECOVERED_DELETED + 50))
+            .map(|i| listed_row(&format!("{i}"), &format!("Windows/Prefetch/A{i}.pf"), false))
+            .collect();
+        let wanted = wanted_kinds(&[]);
+        assert_eq!(
+            classify_candidates(listed, &wanted).len(),
+            MAX_RECOVERED_DELETED
         );
     }
 
     #[test]
-    fn parse_fls_line_skips_dirs_deleted_and_blanks() {
-        assert_eq!(parse_fls_line("d/d 282867-144-5:\tUsers"), None);
-        assert_eq!(
-            parse_fls_line("r/r * 999-128-1:\tWindows/Prefetch/x.pf"),
-            None
+    fn wiped_prefetch_directory_becomes_an_analysis_limitation() {
+        // The silent-gap bug: a Prefetch directory holding only deleted entries
+        // used to report artifact_counts.prefetch = 0 with NO limitation, so a
+        // reader could not tell "no prefetch on this host" from "every prefetch
+        // file was wiped".
+        let listed = vec![
+            listed_row("100", "$MFT", true),
+            listed_row("101", "Windows/Prefetch/SDELETE.EXE-1.pf", false),
+            listed_row("102", "Windows/Prefetch/CSRSS.EXE-2.pf", false),
+        ];
+        let limitation = prefetch_wipe_limitation(&listed, 2).expect("limitation emitted");
+        assert!(limitation.contains("Prefetch"), "{limitation}");
+        assert!(limitation.contains('2'), "{limitation}");
+        assert!(
+            limitation.to_ascii_lowercase().contains("deleted"),
+            "{limitation}"
         );
-        assert_eq!(parse_fls_line(""), None);
+    }
+
+    #[test]
+    fn intact_or_absent_prefetch_directory_emits_no_limitation() {
+        let intact = vec![listed_row("101", "Windows/Prefetch/CMD.EXE-1.pf", true)];
+        assert_eq!(prefetch_wipe_limitation(&intact, 0), None);
+        let no_prefetch = vec![listed_row("100", "$MFT", true)];
+        assert_eq!(prefetch_wipe_limitation(&no_prefetch, 0), None);
+    }
+
+    #[test]
+    fn recovered_prefetch_content_requires_a_prefetch_signature() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Win10 compressed prefetch.
+        let mam = dir.path().join("mam.pf");
+        std::fs::write(&mam, b"MAM\x04\x7a\x88\x00\x00rest").unwrap();
+        assert!(recovered_content_matches("prefetch", &mam).unwrap());
+        // Win7/XP uncompressed prefetch: "SCCA" at offset 4.
+        let scca = dir.path().join("scca.pf");
+        std::fs::write(&scca, b"\x17\x00\x00\x00SCCArest").unwrap();
+        assert!(recovered_content_matches("prefetch", &scca).unwrap());
+        // A reused cluster: the inode now belongs to something else.
+        let junk = dir.path().join("junk.pf");
+        std::fs::write(&junk, b"\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        assert!(!recovered_content_matches("prefetch", &junk).unwrap());
+        // Classes with no recovery signature pass through.
+        assert!(recovered_content_matches("registry", &junk).unwrap());
     }
 
     #[test]
@@ -1843,6 +2325,223 @@ mod tests {
         );
     }
 
+    /// Env-gated selection check against a REAL image listing.
+    /// `WEB_TIER_FLS_LISTING=/path/to/fls-output cargo test -p findevil-mcp
+    /// --lib selection_over_a_real_image_listing -- --nocapture`
+    #[test]
+    fn selection_over_a_real_image_listing_keeps_the_web_tier() {
+        let Ok(listing) = std::env::var("WEB_TIER_FLS_LISTING") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&listing).expect("listing readable");
+        let mut candidates: Vec<ArtifactCandidate> = Vec::new();
+        for line in text.lines() {
+            let Some(row) = parse_fls_line(line) else {
+                continue;
+            };
+            if let Some(class) = classify_artifact_path(&row.rel_path) {
+                candidates.push(cand(class, &row.inode, &row.rel_path));
+            }
+        }
+        let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
+        for c in &candidates {
+            *by_class.entry(c.class).or_insert(0) += 1;
+        }
+        println!("candidates by class: {by_class:?}");
+        let selected = select_artifacts(candidates, 500);
+        let mut sel_by_class: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in &selected {
+            *sel_by_class.entry(s.class).or_insert(0) += 1;
+        }
+        println!("selected {} of 500: {sel_by_class:?}", selected.len());
+        for want in [
+            "xampp/apache/logs/access.log",
+            "xampp/htdocs/DVWA/hackable/uploads/phpshell.php",
+            "xampp/htdocs/DVWA/hackable/uploads/phpshell2.php",
+        ] {
+            let hit = selected.iter().any(|c| c.rel_path == want);
+            println!("  selected {want}: {hit}");
+            assert!(hit, "budget dropped {want}");
+        }
+    }
+
+    #[test]
+    fn classify_artifact_path_matches_web_tier_classes() {
+        // Web server request logs — the primary record of an exploitation
+        // attempt against a public-facing app. Apache (incl. XAMPP on Windows),
+        // Apache on Linux (no `.log` suffix), IIS W3C, and nginx.
+        assert_eq!(
+            classify_artifact_path("xampp/apache/logs/access.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("xampp\\apache\\logs\\error.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/apache2/access.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/httpd/access_log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("inetpub/logs/LogFiles/W3SVC1/u_ex150902.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/nginx/site.access"),
+            Some("web_log")
+        );
+        // Not every file under an apache logs dir is a request log.
+        assert_eq!(classify_artifact_path("xampp/apache/logs/httpd.pid"), None);
+        assert_eq!(
+            classify_artifact_path("xampp/apache/logs/install.log"),
+            None
+        );
+
+        // Server-side scripts living in a web root — where a webshell lands.
+        assert_eq!(
+            classify_artifact_path("xampp/htdocs/DVWA/hackable/uploads/phpshell.php"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("inetpub/wwwroot/cmd.aspx"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("var/www/html/index.php"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("home/bob/public_html/shell.phtml"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("opt/tomcat/webapps/ROOT/cmd.jsp"),
+            Some("webroot_script")
+        );
+        // Static web content is not a script; a script outside a web root is
+        // not a webroot script.
+        assert_eq!(classify_artifact_path("xampp/htdocs/index.html"), None);
+        assert_eq!(classify_artifact_path("tools/build.php"), None);
+    }
+
+    #[test]
+    fn web_tier_classes_win_over_generic_and_linux_sweeps() {
+        // A webroot under a user's home must classify as webroot_script, not the
+        // generic `users/` yara sweep, or the webshell heuristic never sees it.
+        assert_eq!(
+            classify_artifact_path("Users/web/public_html/shell.php"),
+            Some("webroot_script")
+        );
+        // Apache logs under /var/log must classify as web_log, not linux_log —
+        // linux_log has no request parser.
+        assert_eq!(
+            classify_artifact_path("var/log/apache2/access.log"),
+            Some("web_log")
+        );
+        // A non-web file under /var/log still classifies as linux_log.
+        assert_eq!(
+            classify_artifact_path("var/log/auth.log"),
+            Some("linux_log")
+        );
+    }
+
+    #[test]
+    fn webroot_script_subrank_puts_writable_dirs_before_shipped_app_tree() {
+        // A web root holds hundreds of shipped application scripts; the ones an
+        // attacker can write sit in upload/temp/cache dirs. The fair-share
+        // budget per class is small, so those must be drawn first.
+        let uploads = "xampp/htdocs/DVWA/hackable/uploads/phpshell.php";
+        let shipped = "xampp/htdocs/dashboard/faq.php";
+        assert!(
+            artifact_subrank("webroot_script", uploads)
+                < artifact_subrank("webroot_script", shipped)
+        );
+        assert!(
+            artifact_subrank("webroot_script", "inetpub/wwwroot/upload/x.aspx")
+                < artifact_subrank("webroot_script", "inetpub/wwwroot/app/views/list.aspx")
+        );
+        // Other classes keep a flat sub-rank.
+        assert_eq!(
+            artifact_subrank("registry", "Windows/System32/config/SAM"),
+            0
+        );
+    }
+
+    #[test]
+    fn wanted_kinds_default_includes_web_tier_classes() {
+        let wanted = wanted_kinds(&[]);
+        for class in ["web_log", "webroot_script"] {
+            assert!(wanted.contains_key(class), "default set missing {class}");
+        }
+        let explicit = wanted_kinds(&[ArtifactKind::WebLog, ArtifactKind::WebrootScript]);
+        assert!(explicit.contains_key("web_log"));
+        assert!(explicit.contains_key("webroot_script"));
+    }
+
+    #[test]
+    fn class_priority_ranks_web_tier_before_generic_yara_sweep() {
+        assert!(class_priority("web_log") < class_priority("yara_target"));
+        assert!(class_priority("webroot_script") < class_priority("yara_target"));
+    }
+
+    #[test]
+    fn classify_artifact_path_recognises_mail_stores() {
+        // Outlook personal-folders / offline store and the legacy Outlook
+        // Express folder format. Without a class of their own the mail store is
+        // never carved, so the mail lane has nothing to parse on a rootless run.
+        assert_eq!(
+            classify_artifact_path(
+                "Documents and Settings/Jean/Local Settings/Application Data/Microsoft/Outlook/outlook.pst"
+            ),
+            Some("mail_store")
+        );
+        assert_eq!(
+            classify_artifact_path("Users/bob/AppData/Local/Microsoft/Outlook/bob@corp.com.ost"),
+            Some("mail_store")
+        );
+        assert_eq!(
+            classify_artifact_path(
+                "Documents and Settings/Jean/Local Settings/Application Data/Identities/{GUID}/Microsoft/Outlook Express/Inbox.dbx"
+            ),
+            Some("mail_store")
+        );
+        // Case-insensitive: fls emits the on-disk casing verbatim.
+        assert_eq!(
+            classify_artifact_path("Users/bob/Documents/Outlook Files/ARCHIVE.PST"),
+            Some("mail_store")
+        );
+        // A mail store outside any users/ tree still classifies (it must not
+        // fall through to the generic yara sweep, which never matches here).
+        assert_eq!(
+            classify_artifact_path("data/mail/archive.pst"),
+            Some("mail_store")
+        );
+    }
+
+    #[test]
+    fn wanted_kinds_default_includes_mail_store() {
+        assert!(wanted_kinds(&[]).contains_key("mail_store"));
+    }
+
+    #[test]
+    fn wanted_kinds_maps_explicit_mail_store_request() {
+        let wanted = wanted_kinds(std::slice::from_ref(&super::ArtifactKind::MailStore));
+        assert!(wanted.contains_key("mail_store"));
+        assert_eq!(wanted.len(), 1);
+    }
+
+    #[test]
+    fn class_priority_draws_mail_store_before_generic_yara_sweep() {
+        // A mail store is a decoded high-value class: it must be drawn ahead of
+        // the broad content sweep so the extraction budget cannot crowd it out.
+        assert!(class_priority("mail_store") < class_priority("yara_target"));
+        assert!(class_priority("mail_store") < class_priority("_unmapped_class_"));
+    }
+
     #[test]
     fn wanted_kinds_default_includes_extended_classes() {
         // Default extraction (empty artifact_kinds) must carve the new classes,
@@ -1967,6 +2666,7 @@ mod tests {
             rel_path: "$MFT".to_string(),
             sector_offset: Some(2048),
             partition_rank: 1,
+            recovered_deleted: false,
         };
         let os = ArtifactCandidate {
             class: "mft",
@@ -1974,6 +2674,7 @@ mod tests {
             rel_path: "$MFT".to_string(),
             sector_offset: Some(206_848),
             partition_rank: 0,
+            recovered_deleted: false,
         };
         let selected = select_artifacts(vec![boot.clone(), os.clone()], 1);
         assert_eq!(selected, vec![os.clone()]);
@@ -2005,6 +2706,7 @@ mod tests {
             rel_path: "$MFT".to_string(),
             sector_offset: Some(206_848),
             partition_rank: 0,
+            recovered_deleted: false,
         };
         assert_eq!(candidate_dest_dir(out, &os), out.join("mft"));
         let boot = ArtifactCandidate {

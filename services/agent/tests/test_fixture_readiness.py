@@ -382,6 +382,27 @@ def test_l3_runner_fails_on_readiness_errors_but_skips_not_ready() -> None:
     assert "OVERALL_EXIT=1" in text
 
 
+def test_l3_runner_excludes_not_scoreable_goldens_instead_of_failing_them() -> None:
+    """Exit 3 from the scorer is EXCLUDED-by-key, not an accuracy failure.
+
+    The runner used to map ANY non-zero from score-recall.py to
+    "FAIL ... (see <case>/recall-score.json)" — and on the refusal paths that file
+    is never written, so the operator was pointed at nothing. Three branches now:
+    0 PASS, 3 EXCLUDED (no OVERALL_EXIT change), anything else FAIL.
+    """
+    text = (_SCRIPTS / "l3-run-goldens.sh").read_text(encoding="utf-8")
+
+    assert "score_exit=$?" in text
+    assert 'if [[ "${score_exit}" -eq 3 ]]' in text
+    assert 'log "EXCLUDED ${fixture}:' in text
+    # The excluded branch must not mark the whole run failed.
+    excluded = text.index('log "EXCLUDED ${fixture}:')
+    fail = text.index('log "FAIL ${fixture}: recall below target', excluded)
+    assert "OVERALL_EXIT=1" not in text[excluded:fail]
+    # And the real-FAIL message still points at the file that path actually writes.
+    assert "recall-score.json" in text[fail : fail + 200]
+
+
 def test_l3_runner_copies_only_staging_root_and_uses_analysis_entrypoint() -> None:
     text = (_SCRIPTS / "l3-run-goldens.sh").read_text(encoding="utf-8")
 

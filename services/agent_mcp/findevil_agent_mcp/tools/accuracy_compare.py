@@ -16,6 +16,12 @@ citation), so the score is attestable without ever masquerading as a Case Findin
 
 Read-only: it reads ``verdict.json`` + the golden and (optionally) appends to the
 audit log. It never mutates evidence and never touches ``verdict.json``.
+
+Not every key is scoreable. When the golden carries ``scoring_status: not_ready``
+the shared core raises :class:`findevil_agent.accuracy.GoldenNotScoreable` (a
+``ValueError`` subclass carrying ``case_id`` / ``reason``) and this shim writes NO
+audit record — an exclusion is not a diagnostic result. Callers should surface it
+as "excluded by the key", never as an accuracy failure.
 """
 
 from __future__ import annotations
@@ -236,7 +242,9 @@ SPEC = ToolSpec(
         "score is attestable. Inputs: case_dir (required, has verdict.json), "
         "golden_path (optional override), audit_log_path (optional, to record the "
         "diagnostic). On error: verdict.json or the golden was not found — pass "
-        "golden_path explicitly."
+        "golden_path explicitly. A golden marked scoring_status=not_ready raises "
+        "GoldenNotScoreable and writes no audit record: that golden declared itself "
+        "unscoreable, so report it as EXCLUDED, never as an accuracy failure."
     ),
     input_model=AccuracyCompareInput,
     output_model=AccuracyCompareOutput,

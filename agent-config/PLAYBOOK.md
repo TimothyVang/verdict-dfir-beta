@@ -50,12 +50,12 @@ the matching `investigate_*` method too, or the two paths drift.**
 
 ---
 
-## Tool inventory (45 product tools)
+## Tool inventory (46 product tools)
 
 The complete typed surface both paths can drive. Argument/output shapes live in `TOOLS.md`; this is
 the at-a-glance map of *what exists* and *when it runs*.
 
-### Rust `findevil-mcp` (32) — DFIR primitives, read-only on evidence, SHA-256 every output
+### Rust `findevil-mcp` (33) — DFIR primitives, read-only on evidence, SHA-256 every output
 
 | Tool | What | Runs for |
 |---|---|---|
@@ -68,6 +68,7 @@ the at-a-glance map of *what exists* and *when it runs*.
 | `prefetch_parse` | Per-binary execution evidence (run_count, last-run times) | disk |
 | `registry_query` | Run/RunOnce/IFEO/Services/WMI/Tasks keys | disk |
 | `browser_history` | Visited-URL timeline from an extracted Chrome/Edge `History` or Firefox `places.sqlite` (read-only, `immutable=1`) | disk (browser DB) |
+| `web_triage` | Exploitation indicators in an Apache/nginx/IIS request log; webshell primitives in a web-root script | disk (web tier) |
 | `evtx_query` | Parse a single `.evtx` (EID histogram, 4624/4625/4688/7045…) | evtx, disk, velo |
 | `hayabusa_scan` | Sigma rules over an EVTX **directory** (dir-based; not single files) | evtx-dir, velo, disk-extracted |
 | `yara_scan` | YARA over a memory image or extracted disk yara-targets | memory, disk (if targets) |
@@ -280,5 +281,5 @@ Even in unattended mode, halt and surface to the analyst when:
 ## What this playbook is NOT
 
 - **Not a script.** The supervisor is the agent; this file is its prior. If a case looks weird, deviate.
-- **Not exhaustive of DFIR.** It covers what the 32 typed Rust MCP tools can reach, including the allow-listed `plaso_parse`, `vol_run`, `ez_parse`, `mac_triage`, and `cloud_audit` long-tail verbs. If the case needs broad unstructured carving, a parser outside the allow-lists, or interactive packet reconstruction beyond `pcap_triage` / `zeek_summary` / `suricata_eve`, surface that as a gap to the analyst. (Browser history IS covered now — see `browser_history`.)
+- **Not exhaustive of DFIR.** It covers what the 33 typed Rust MCP tools can reach, including the allow-listed `plaso_parse`, `vol_run`, `ez_parse`, `mac_triage`, and `cloud_audit` long-tail verbs. If the case needs broad unstructured carving, a parser outside the allow-lists, or interactive packet reconstruction beyond `pcap_triage` / `zeek_summary` / `suricata_eve`, surface that as a gap to the analyst. (Browser history IS covered now — see `browser_history`.)
 - **Not a substitute for SOUL.md or AGENTS.md.** Read those first; this file is the operational layer that sits below the epistemic and role-definition layers.

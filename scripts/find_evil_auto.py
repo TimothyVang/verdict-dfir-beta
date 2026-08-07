@@ -29,10 +29,12 @@ same SHA-256 (chain of custody) but a fresh case_id and fresh manifest.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import email.utils
 import hashlib
 import ipaddress
 import json
@@ -57,8 +59,11 @@ try:
         MEMORY_EXTS as _PLAYBOOK_MEMORY_EXTS,
         RAW_DISK_EXTS as _PLAYBOOK_RAW_DISK_EXTS,
         REGISTRY_HIVE_NAMES as _PLAYBOOK_REGISTRY_HIVE_NAMES,
+        WEBROOT_SCRIPT_EXTS as _PLAYBOOK_WEBROOT_SCRIPT_EXTS,
         classify_artifact_path as _playbook_classify,
         detect_evidence_type as _playbook_detect,
+        path_is_web_request_log as _playbook_is_web_log,
+        path_is_webroot_script as _playbook_is_webroot_script,
     )
 
     _PLAYBOOK_AVAILABLE = True
@@ -792,6 +797,9 @@ EXTRACTED_DISK_CLASSES = {
     "legacy_evt",
     "ie_history",
     "thumbnail",
+    # Outlook .pst/.ost and Outlook Express .dbx, carved by TSK so the mail
+    # lane runs without a filesystem mount.
+    "mail_store",
 }
 YARA_TARGET_EXTS = (
     ".bat",
@@ -816,8 +824,102 @@ YARA_TARGET_EXTS = (
 )
 NETWORK_CLASSES = {"pcap", "zeek", "sysmon_network"}
 CLOUD_CLASSES = {"cloud"}
+
+# Web-tier artifact classes. Deliberately NOT folded into
+# EXTRACTED_DISK_CLASSES: that set drives the decoded-Windows-artifact dispatch
+# (ez_parse / plaso_parse / registry_query / mft_timeline). The web tier has its
+# own reader (``web_triage``) and its own emitters, so it gets its own lane and
+# its own routing set.
+WEB_TIER_CLASSES = {"web_log", "webroot_script"}
+
+WEBROOT_SCRIPT_EXTS: tuple[str, ...] = (
+    _PLAYBOOK_WEBROOT_SCRIPT_EXTS
+    if _PLAYBOOK_AVAILABLE
+    else (
+        ".php",
+        ".php3",
+        ".php4",
+        ".php5",
+        ".php7",
+        ".phps",
+        ".phtml",
+        ".asp",
+        ".aspx",
+        ".ashx",
+        ".asmx",
+        ".jsp",
+        ".jspx",
+        ".jspf",
+        ".cfm",
+        ".cgi",
+    )
+)
+
+_WEB_ROOT_MARKERS: tuple[str, ...] = (
+    "htdocs/",
+    "wwwroot/",
+    "inetpub/",
+    "public_html/",
+    "www/",
+    "webapps/",
+    "webroot/",
+)
+_WEB_LOG_NAMES = frozenset(
+    {
+        "access.log",
+        "access_log",
+        "error.log",
+        "error_log",
+        "ssl_access.log",
+        "ssl_request.log",
+        "other_vhosts_access.log",
+    }
+)
+_WEB_LOG_DIR_MARKERS: tuple[str, ...] = (
+    "/apache/logs/",
+    "/apache2/",
+    "/httpd/",
+    "/nginx/",
+    "/lighttpd/",
+    "/logs/w3svc",
+    "inetpub/logs/",
+)
+
+
+def path_is_web_request_log(lower_name: str, lower_path: str) -> bool:
+    """True for a web server's request/error log (Apache, nginx, IIS W3C).
+
+    Delegates to the playbook package when it is importable so the host engine
+    and the packaged agent never drift; the inline body is the bare-python3
+    fallback (the host runs 3.10 and cannot import ``findevil_agent``).
+    """
+    if _PLAYBOOK_AVAILABLE:
+        return _playbook_is_web_log(lower_name, lower_path)
+    in_log_dir = lower_path.startswith("apache/logs/") or any(
+        marker in lower_path for marker in _WEB_LOG_DIR_MARKERS
+    )
+    canonical = (
+        lower_name in _WEB_LOG_NAMES
+        or lower_name.startswith("access.log.")
+        or lower_name.startswith("access_log.")
+        or (lower_name.startswith("u_ex") and lower_name.endswith(".log"))
+    )
+    return (in_log_dir and canonical) or lower_name.endswith(".access")
+
+
+def path_is_webroot_script(lower_name: str, lower_path: str) -> bool:
+    """True for a server-side script living under a web document root."""
+    if _PLAYBOOK_AVAILABLE:
+        return _playbook_is_webroot_script(lower_name, lower_path)
+    in_web_root = any(
+        lower_path.startswith(marker) or f"/{marker}" in lower_path
+        for marker in _WEB_ROOT_MARKERS
+    )
+    return in_web_root and lower_name.endswith(WEBROOT_SCRIPT_EXTS)
+
+
 VELOCIRAPTOR_ZIP_EXTRACT_CLASSES = (
-    EXTRACTED_DISK_CLASSES | NETWORK_CLASSES | {"evtx", "yara_target"}
+    EXTRACTED_DISK_CLASSES | NETWORK_CLASSES | WEB_TIER_CLASSES | {"evtx", "yara_target"}
 )
 
 # Cloud/identity-plane providers allow-listed by the Rust ``cloud_audit`` verb
@@ -870,10 +972,30 @@ SUSPICIOUS_PREFETCH_TOOL_HINTS = (
     ("ETHEREAL", "Ethereal packet-capture tool", "T1040"),
     ("MIRC", "mIRC client that can support IRC-based communications", "T1204.002"),
     ("LOOKATLAN", "Look@LAN network discovery tool", "T1046"),
+    # Anti-forensics: secure-deletion utilities overwrite file content so the
+    # data cannot be carved back. Their OWN prefetch entry surviving is the
+    # tell — indicator removal on the host (T1070.004).
+    (
+        "SDELETE",
+        "SDelete secure-deletion / anti-forensic file-wiping tool",
+        "T1070.004",
+    ),
+    ("ERASER", "Eraser secure-deletion / anti-forensic file-wiping tool", "T1070.004"),
+    ("CCLEANER", "CCleaner artifact/trace-cleaning tool", "T1070.004"),
+    ("BLEACHBIT", "BleachBit artifact/trace-cleaning tool", "T1070.004"),
 )
 MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = int(
     os.environ.get("FINDEVIL_VELOCIRAPTOR_ZIP_MAX_MEMBER_BYTES", str(512 * 1024 * 1024))
 )
+# Row caps for the two disk timeline parsers. Both are SCAN caps, not just
+# output caps: mft_timeline and usnjrnl_query stop reading once the cap is hit,
+# so a low value silently truncates the evidence rather than merely trimming the
+# report. On a 20 GB Windows 7 volume the $MFT holds ~78k records (a 5,000-row
+# cap stopped inside Windows/ and never reached Users/ or Program Files) and the
+# $J holds ~317k (a 200k cap stopped a day short of the staging activity). The
+# defaults cover a consumer volume end to end; override on very large images.
+DISK_MFT_ROW_LIMIT = int(os.environ.get("FINDEVIL_MFT_ROW_LIMIT", "250000"))
+DISK_USN_ROW_LIMIT = int(os.environ.get("FINDEVIL_USN_ROW_LIMIT", "2000000"))
 REGISTRY_HIVE_NAMES = (
     _PLAYBOOK_REGISTRY_HIVE_NAMES
     if _PLAYBOOK_AVAILABLE
@@ -928,25 +1050,327 @@ def suspicious_prefetch_tool_hint(executable_name: str) -> tuple[str, str] | Non
     return None
 
 
-def _userassist_exe(encoded_name: str) -> str | None:
-    """Decode a UserAssist value name (ROT13) and return the executed .exe
-    basename, or None for non-execution entries (shortcut/RUNPIDL records).
+# Dual-use ENCRYPTION tooling, deliberately kept in its OWN table rather than
+# folded into SUSPICIOUS_PREFETCH_TOOL_HINTS. That table feeds
+# Investigation._prefetch_exec_findings, which the UserAssist corroboration loop
+# promotes to CONFIRMED — and any CONFIRMED finding makes compute_verdict return
+# SUSPICIOUS. Encryption tooling is standard legitimate software (developers
+# sign commits with GnuPG; whole populations run BitLocker), so routing it
+# through the hacking-tool path would flip healthy hosts to SUSPICIOUS. These
+# hints only ever produce INFERRED presence findings.
+#
+# ``family`` drives which claim the observation can support:
+#   openpgp   -> OpenPGP artifacts on disk + third-party tooling present
+#   container -> third-party volume/file encryption tooling present
+#   bitlocker -> an encrypted VOLUME was present on the host
+#
+# The BitLocker entries are the USER-FACING binaries only: BdeUnlock is the
+# interactive unlock prompt and BitLockerWizard is the setup UI, so both imply a
+# human met a protected volume. The always-resident service binaries (BdeUISrv,
+# FVENotify, BDESVC) are deliberately absent — they run on a stock Windows image
+# whether or not any volume is protected, so keying on them would fire
+# everywhere.
+ENCRYPTION_TOOL_PREFETCH_HINTS: tuple[tuple[str, str, str], ...] = (
+    ("GPG", "openpgp", "GnuPG/OpenPGP command-line and agent binaries"),
+    ("GNUPG", "openpgp", "GnuPG distribution package"),
+    ("GPG4WIN", "openpgp", "Gpg4win OpenPGP suite"),
+    ("KLEOPATRA", "openpgp", "Kleopatra OpenPGP certificate manager"),
+    ("VERACRYPT", "container", "VeraCrypt encrypted-container tool"),
+    ("TRUECRYPT", "container", "TrueCrypt encrypted-container tool"),
+    ("AXCRYPT", "container", "AxCrypt file-encryption tool"),
+    ("BDEUNLOCK", "bitlocker", "BitLocker interactive unlock prompt"),
+    ("BITLOCKERWIZARD", "bitlocker", "BitLocker setup/configuration wizard"),
+)
 
-    UserAssist (NTUSER\\...\\Explorer\\UserAssist\\<GUID>\\Count) records
-    per-user GUI program execution. ``UEME_RUNPATH:<full path>`` entries name
-    a launched executable; ``UEME_RUNPIDL`` entries are folder/shortcut opens
-    and are not execution evidence.
+# Needles matched as a PREFIX rather than anywhere in the name. "GPG" is short
+# enough to appear inside an unrelated word; every real GnuPG binary
+# (gpg/gpg2/gpgconf/gpgsm/gpg-agent/gpgme-w32spawn/gpg4win-<ver>) starts with it.
+_ENCRYPTION_PREFIX_ONLY_NEEDLES = frozenset({"GPG"})
+
+# Families that are third-party software rather than a stock Windows feature.
+# BitLocker ships with Windows, so a BitLocker-only host makes no tooling claim.
+#
+# NOTE ON ATT&CK: the obvious label here is T1588.002 (Obtain Capabilities:
+# Tool) and the alihadi-09 ground-truth key does use it. This engine must not:
+# T1588.002 is an OFF-HOST, pre-attack technique, and
+# test_mitre_mappings.test_no_execution_artifact_tagged_obtain_capabilities
+# bans assigning it to anything detected on a host image (a prior report review
+# caught exactly that over-mapping). Software being present on a disk is not an
+# adversary acquiring it, so the tooling finding carries no technique at all.
+# The recall scorer matches on description tokens, never on mitre_technique
+# (accuracy._is_eligible), so this costs nothing but a wrong label.
+_THIRD_PARTY_ENCRYPTION_FAMILIES = ("openpgp", "container")
+
+_PREFETCH_NAME_SUFFIX_RE = re.compile(r"-[0-9A-F]{8}\.pf$", re.IGNORECASE)
+
+
+def encryption_tool_prefetch_hint(executable_name: str) -> tuple[str, str] | None:
+    """Return ``(family, tool_description)`` for a dual-use encryption binary.
+
+    Returns None for everything else — including the always-resident BitLocker
+    service binaries, which are not in the table on purpose (see above).
+    """
+    upper_name = PurePosixPath(str(executable_name).replace("\\", "/")).name.upper()
+    for needle, family, description in ENCRYPTION_TOOL_PREFETCH_HINTS:
+        if needle in _ENCRYPTION_PREFIX_ONLY_NEEDLES:
+            if upper_name.startswith(needle):
+                return family, description
+        elif needle in upper_name:
+            return family, description
+    return None
+
+
+def _encryption_display_name(observation: dict[str, Any]) -> str:
+    """The binary name to show: what the parser reported, else the .pf basename
+    with the prefetch hash suffix trimmed."""
+    reported = observation.get("executable_name")
+    if reported:
+        return str(reported)
+    artifact = str(observation.get("artifact_name") or "")
+    return _PREFETCH_NAME_SUFFIX_RE.sub("", artifact) or artifact
+
+
+def _encryption_sample(group: list[dict[str, Any]]) -> str:
+    """``NAME (run_count=N), ...`` for the observations actually parsed."""
+    parts = [f"{obs['_name']} (run_count={obs.get('run_count', 0)})" for obs in group[:6]]
+    if len(group) > 6:
+        parts.append(f"+{len(group) - 6} more")
+    return ", ".join(parts)
+
+
+def _encryption_asserted_values(primary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Structured facts the verifier re-extracts from the replayed
+    ``prefetch_parse`` output (top-level ``run_count`` / ``executable_name``).
+
+    ``executable_name`` is asserted only when the tool genuinely returned it —
+    the .pf-basename fallback would not resolve against the raw output.
+    """
+    asserted: list[dict[str, Any]] = [
+        {"path": "run_count", "expected": str(primary.get("run_count", 0)), "match": "int"}
+    ]
+    if primary.get("executable_name"):
+        asserted.append(
+            {
+                "path": "executable_name",
+                "expected": str(primary["executable_name"]),
+                "match": "exact",
+            }
+        )
+    return asserted
+
+
+def _encryption_finding(
+    *,
+    base_id: str,
+    group: list[dict[str, Any]],
+    case_id: str,
+    description: str,
+    technique: str | None,
+    ident: Callable[[str], str],
+) -> dict[str, Any]:
+    primary = group[0]
+    return {
+        "case_id": case_id,
+        "finding_id": ident(base_id),
+        "tool_call_id": str(primary["tool_call_id"]),
+        "artifact_path": str(primary.get("artifact_path") or ""),
+        "description": description,
+        "confidence": "INFERRED",
+        "pool_origin": "B",
+        "mitre_technique": technique,
+        "derived_from": [str(obs["tool_call_id"]) for obs in group],
+        "asserted_values": _encryption_asserted_values(primary),
+    }
+
+
+# The dual-use caveat every encryption finding must carry verbatim. Encryption
+# is the one artifact class where the tool's own existence reads as incriminating
+# to a non-specialist, so the sentence is a constant rather than per-emitter
+# prose that could drift out of one description.
+_DUAL_USE_CAVEAT = (
+    "Encryption is dual-use and ubiquitous in legitimate work: presence alone "
+    "is not malicious intent."
+)
+
+
+def detect_encryption_tooling(
+    observations: list[dict[str, Any]] | None,
+    case_id: str,
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B INFERRED presence findings for dual-use encryption tooling.
+
+    Driven entirely by prefetch names ``prefetch_parse`` already returned — no
+    new tool call. Each observation is ``{executable_name, artifact_name,
+    run_count, artifact_path, tool_call_id}``; ``derived_from`` cites ONLY the
+    prefetch calls that actually observed a member of that family.
+
+    PRESENCE wording only (never "ran"/"executed"/"launched"): prefetch is a
+    single artifact class, so an execution claim could not clear the
+    >=2-artifact-class gate and would be flagged rather than shipped. INFERRED
+    tier only — see ENCRYPTION_TOOL_PREFETCH_HINTS for why CONFIRMED would be a
+    false-positive machine.
+    """
+    ident = finding_id_for or (lambda base: base)
+    by_family: dict[str, list[dict[str, Any]]] = {}
+    tool_descriptions: dict[str, list[str]] = {}
+    for obs in observations or []:
+        if not obs.get("tool_call_id"):
+            continue
+        name = _encryption_display_name(obs)
+        hit = encryption_tool_prefetch_hint(name) if name else None
+        if not hit:
+            continue
+        family, tool_description = hit
+        by_family.setdefault(family, []).append({**obs, "_name": name})
+        descriptions = tool_descriptions.setdefault(family, [])
+        if tool_description not in descriptions:
+            descriptions.append(tool_description)
+    for group in by_family.values():
+        group.sort(key=lambda obs: str(obs["_name"]).upper())
+
+    findings: list[dict[str, Any]] = []
+
+    openpgp = by_family.get("openpgp") or []
+    if openpgp:
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-openpgp-artifacts",
+                group=openpgp,
+                case_id=case_id,
+                technique="T1027",
+                ident=ident,
+                description=(
+                    "GPG encryption artifacts are present on disk. Windows Prefetch "
+                    "holds records of an installed OpenPGP toolchain — "
+                    f"{_encryption_sample(openpgp)} "
+                    f"({', '.join(tool_descriptions['openpgp'])}). Windows writes a Prefetch "
+                    "record only for a binary loaded from this system, so an OpenPGP "
+                    "installation is present on this volume; an installation of that shape "
+                    "keeps keyrings under the user profile and produces .gpg/.asc ciphertext. "
+                    "INFERRED: this lane read Prefetch only and did not enumerate keyrings or "
+                    ".gpg data, so the on-disk key material is inferred from the installation "
+                    f"footprint rather than listed. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    bitlocker = by_family.get("bitlocker") or []
+    if bitlocker:
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-volume-bitlocker",
+                group=bitlocker,
+                case_id=case_id,
+                # No MITRE technique: BitLocker is stock Windows functionality,
+                # not adversary tradecraft. Tagging it would be an over-claim.
+                technique=None,
+                ident=ident,
+                description=(
+                    "A BitLocker-protected volume is present on this host. Windows Prefetch "
+                    "holds records of the user-facing BitLocker binaries — "
+                    f"{_encryption_sample(bitlocker)} "
+                    f"({', '.join(tool_descriptions['bitlocker'])}). Those binaries surface only "
+                    "when a person unlocks or configures a protected drive, so an encrypted "
+                    "volume or container was attached to this machine. The always-resident "
+                    "BitLocker service binaries are deliberately excluded from this test, "
+                    "because they appear on a stock Windows image whether or not any drive is "
+                    "protected. INFERRED: this lane read Prefetch only — it did not read "
+                    "BitLocker volume metadata or encrypted-container signatures off the media, "
+                    f"so the volume itself was not examined. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    third_party = [
+        obs for fam in _THIRD_PARTY_ENCRYPTION_FAMILIES for obs in by_family.get(fam, [])
+    ]
+    if third_party:
+        third_party.sort(key=lambda obs: str(obs["_name"]).upper())
+        summary = ", ".join(
+            desc
+            for fam in _THIRD_PARTY_ENCRYPTION_FAMILIES
+            for desc in tool_descriptions.get(fam, [])
+        )
+        findings.append(
+            _encryption_finding(
+                base_id="f-B-encryption-tooling-present",
+                group=third_party,
+                case_id=case_id,
+                # No technique on purpose — see _THIRD_PARTY_ENCRYPTION_FAMILIES.
+                # Software sitting on a host attests possession, not an ATT&CK
+                # behaviour, and the off-host T1588.002 label is banned here.
+                technique=None,
+                ident=ident,
+                description=(
+                    "Third-party encryption tooling is installed on this host. Windows "
+                    f"Prefetch holds records for {_encryption_sample(third_party)} ({summary}). "
+                    "Windows writes a Prefetch record only for a binary loaded from this "
+                    "system, so these are on-disk traces of encryption utilities kept on the "
+                    "machine. INFERRED: Prefetch is one artifact class — corroborate with "
+                    "registry install keys, the owning user account, and the encrypted data "
+                    f"itself before treating this as anti-forensic activity. {_DUAL_USE_CAVEAT}"
+                ),
+            )
+        )
+
+    return findings
+
+# UserAssist bookkeeping value names that are not program-execution records.
+# ``UEME_RUNPIDL`` is a folder/shortcut open; the CTL* names are session and
+# UI counters. Everything else under an execution GUID's Count subkey is a path.
+_USERASSIST_NON_EXEC_PREFIXES = (
+    "ueme_runpidl",
+    "ueme_ctl",
+    "ueme_uistart",
+    "ueme_uiqcut",
+)
+
+
+def _userassist_path(encoded_name: str) -> str | None:
+    """Decode a UserAssist value name (ROT13) into the executed program path, or
+    None for non-execution entries.
+
+    UserAssist (``NTUSER\\...\\Explorer\\UserAssist\\<GUID>\\Count``) records
+    per-user GUI program execution. Two on-disk shapes exist and BOTH must
+    decode — supporting only the first is why a Windows 10 image's UserAssist
+    read as empty:
+
+    * **XP / 2003:** ``UEME_RUNPATH:<full path>`` names a launched executable.
+    * **Windows 7 and later:** the prefix is gone; the value name IS the path,
+      either absolute (``C:\\Users\\Public\\Downloads\\X.exe``) or relative to a
+      KNOWNFOLDERID (``{1AC14E77-...}\\cmd.exe`` = System32).
+
+    Returns the decoded path with its original case. Only ``.exe`` targets are
+    execution evidence — a ``.lnk`` value name is a shortcut launch record and
+    names the shortcut, not the binary.
     """
     if not encoded_name:
         return None
     try:
-        decoded = codecs.decode(encoded_name, "rot_13").lower()
+        decoded = codecs.decode(encoded_name, "rot_13")
     except (UnicodeDecodeError, LookupError, ValueError):
         return None
-    if "ueme_runpath" not in decoded:
+    lowered = decoded.lower()
+    if lowered.startswith(_USERASSIST_NON_EXEC_PREFIXES):
         return None
-    tail = decoded.rsplit(":", 1)[-1]
-    base = PurePosixPath(tail.replace("\\", "/")).name
+    if lowered.startswith("ueme_runpath"):
+        # Legacy form: everything after the FIRST colon is the path (the path
+        # itself contains a drive-letter colon, so rsplit would truncate it).
+        decoded = decoded.split(":", 1)[-1].lstrip()
+        lowered = decoded.lower()
+    if not lowered.endswith(".exe"):
+        return None
+    return decoded or None
+
+
+def _userassist_exe(encoded_name: str) -> str | None:
+    """Decode a UserAssist value name and return the executed .exe basename
+    (lowercased), or None for non-execution entries."""
+    path = _userassist_path(encoded_name)
+    if path is None:
+        return None
+    base = PurePosixPath(path.replace("\\", "/")).name.lower()
     return base if base.endswith(".exe") else None
 
 
@@ -1120,6 +1544,18 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "artifact_class": "browser_db",
             "evidence_type": "extracted_disk",
             "parser_tool": "browser_history",
+        }
+    if path_is_web_request_log(lower_name, lower_path):
+        return {
+            "artifact_class": "web_log",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
+        }
+    if path_is_webroot_script(lower_name, lower_path):
+        return {
+            "artifact_class": "webroot_script",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
         }
     if lower_name.endswith(YARA_TARGET_EXTS):
         return {
@@ -1837,22 +2273,32 @@ _BACKUP_HIVE_MARKERS = ("\\repair\\", "/repair/", "\\regback\\", "/regback/")
 def _prioritize_registry_hives(
     entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Sort discovered registry hives so live hives precede backup copies.
+    """Sort discovered registry hives so the highest-value hives are triaged first.
 
-    Pure, stable function. A disk extraction can hold BOTH the live SYSTEM hive
-    (``WINDOWS/system32/config/system``) and a stale backup (``WINDOWS/repair/
-    system``); the modern equivalent is ``config\\RegBack``. Triaging the backup
-    first can exhaust the registry_query budget before the live hive's USBSTOR /
-    MountedDevices keys are ever queried, silently losing a real lead. This
-    de-prioritizes the backup copies (they are still queried if budget remains —
-    never dropped) while preserving the relative order of everything else.
+    Pure, stable function with two tiers, both driven by the same budget
+    problem: the disk lane spends a bounded number of registry_query calls, and
+    whatever sorts last is silently never queried.
+
+    1. Live hives before backup copies. An extraction can hold BOTH the live
+       SYSTEM hive (``WINDOWS/system32/config/system``) and a stale backup
+       (``WINDOWS/repair/system``, or the modern ``config\\RegBack``).
+    2. Machine hives (SYSTEM / SOFTWARE / SAM / SECURITY) before per-user hives
+       (NTUSER.DAT / UsrClass.dat). A modern image carries one SYSTEM hive but
+       five or more user hives at eight triage keys each; sorting the user hives
+       first exhausts the budget before SYSTEM's USBSTOR / MountedDevices keys
+       are ever read, which is exactly how the removable-media lead disappears
+       on a multi-user host. Backup copies and user hives are de-prioritized,
+       never dropped — they are still queried if budget remains.
     """
 
-    def _is_backup(entry: dict[str, Any]) -> int:
+    def _rank(entry: dict[str, Any]) -> tuple[int, int]:
         path = str(entry.get("path") or "").lower()
-        return 1 if any(m in path for m in _BACKUP_HIVE_MARKERS) else 0
+        is_backup = 1 if any(m in path for m in _BACKUP_HIVE_MARKERS) else 0
+        name = PurePosixPath(path.replace("\\", "/")).name
+        is_user_hive = 1 if name in {"ntuser.dat", "usrclass.dat"} else 0
+        return (is_backup, is_user_hive)
 
-    return sorted(entries or [], key=_is_backup)
+    return sorted(entries or [], key=_rank)
 
 
 # Packet-capture / sniffing / network-recon toolkit tells in a service name or
@@ -1927,6 +2373,148 @@ def registry_service_recon_candidates(
     return out
 
 
+# --- per-user execution artifacts (UserAssist + Program Compatibility Assistant)
+
+_USERASSIST_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+_COMPAT_STORE_KEY = (
+    r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags"
+    r"\Compatibility Assistant\Store"
+)
+
+# Roots any *unprivileged* account can write AND that no legitimate installer
+# uses as a program's home. These are the classic staging/masquerading
+# locations, and a binary executed from one is a real DFIR tell on any Windows
+# host. "Shared" because they are visible to every local account, unlike a
+# per-user profile folder.
+_SHARED_WRITABLE_ROOTS: tuple[tuple[str, str], ...] = (
+    ("\\users\\public\\", "the shared Public user profile"),
+    ("\\users\\all users\\", "the shared All Users profile"),
+    ("\\documents and settings\\all users\\", "the shared All Users profile"),
+    ("\\programdata\\", "ProgramData"),
+    ("\\windows\\temp\\", "the Windows temp directory"),
+    ("\\perflogs\\", "PerfLogs"),
+)
+# Per-user writable roots. Executing a downloaded installer out of one of these
+# is the single most common BENIGN pattern on a Windows host, so a hit here is
+# a lead, never on its own proof of anything malicious.
+_USER_PROFILE_WRITABLE_ROOTS: tuple[str, ...] = (
+    "\\appdata\\",
+    "\\downloads\\",
+    "\\desktop\\",
+    "\\documents\\",
+    "\\local settings\\",
+    "\\temp\\",
+)
+# Bare drive-root temp/staging directories (``C:\Temp\x.exe``).
+_DRIVE_ROOT_WRITABLE_RE = re.compile(
+    r"^[a-z]:\\(temp|tmp|intel|recovery)\\", re.IGNORECASE
+)
+
+
+def _execution_path_writable_root(exe_path: str) -> tuple[str, bool] | None:
+    """Classify where an executed binary lived.
+
+    Returns ``(label, shared)`` when the path sits under a user-writable root —
+    ``shared`` marks the world-writable staging roots no installer legitimately
+    uses — or None for system/vendor-owned locations (``C:\\Windows``,
+    ``C:\\Program Files``) and KNOWNFOLDERID-relative UserAssist names, which
+    every Windows host carries by the dozen. Pure, so the policy is testable
+    without an Investigation.
+    """
+    if not exe_path:
+        return None
+    normalized = exe_path.replace("/", "\\")
+    if normalized.startswith("{"):
+        # KNOWNFOLDERID-relative (System32, Program Files, Start Menu): the
+        # binary is vendor-owned, not user-written.
+        return None
+    lowered = normalized.lower()
+    # A path with no directory component tells us nothing about writability.
+    if "\\" not in lowered:
+        return None
+    for marker, label in _SHARED_WRITABLE_ROOTS:
+        if marker in lowered:
+            return label, True
+    if _DRIVE_ROOT_WRITABLE_RE.match(lowered):
+        return "a drive-root staging directory", True
+    if (
+        lowered.startswith(("c:\\windows\\", "\\windows\\"))
+        or "\\program files" in lowered
+    ):
+        return None
+    for marker in _USER_PROFILE_WRITABLE_ROOTS:
+        if marker in lowered:
+            return "the user's own profile", False
+    if lowered.startswith(("c:\\users\\", "\\users\\", "c:\\documents and settings\\")):
+        return "the user's own profile", False
+    return None
+
+
+def registry_execution_candidates(
+    rows: list[dict[str, Any]], key_path: str | None
+) -> list[dict[str, Any]]:
+    """Classify UserAssist / Compatibility-Assistant rows into execution candidates.
+
+    Pure function. Two independent per-user execution artifacts live in
+    NTUSER.DAT and both record the FULL PATH of the program that ran:
+
+    * ``...\\Explorer\\UserAssist\\<GUID>\\Count`` — per-user GUI execution. The
+      value name is the ROT13 of the path.
+    * ``...\\AppCompatFlags\\Compatibility Assistant\\Store`` — the Program
+      Compatibility Assistant's record of a program it observed running. The
+      value name is the literal path.
+
+    Only paths under a user-writable root become candidates (see
+    :func:`_execution_path_writable_root`): a stock ``C:\\Windows`` or
+    ``C:\\Program Files`` binary appears in these keys on every machine and
+    carries no signal. The raw value name is carried through so a downstream
+    finding can assert it against the re-run ``registry_query`` output.
+    """
+    key = str(key_path or "").replace("/", "\\").lower()
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        row_key = str(row.get("key_path") or "").replace("/", "\\")
+        row_key_lower = row_key.lower()
+        is_userassist = "\\userassist\\" in row_key_lower and row_key_lower.endswith(
+            "\\count"
+        )
+        is_compat_store = row_key_lower.endswith("compatibility assistant\\store")
+        if not is_userassist and not is_compat_store:
+            # Fall back to the requested key when the row omits its own path.
+            is_userassist = "\\userassist" in key and not row_key
+            is_compat_store = (
+                key.endswith("compatibility assistant\\store") and not row_key
+            )
+        if not is_userassist and not is_compat_store:
+            continue
+        for value in row.get("values") or []:
+            if not isinstance(value, dict):
+                continue
+            name = str(value.get("name") or "")
+            exe_path = _userassist_path(name) if is_userassist else name
+            if not exe_path or not exe_path.lower().endswith(".exe"):
+                continue
+            placement = _execution_path_writable_root(exe_path)
+            if placement is None:
+                continue
+            label, shared = placement
+            out.append(
+                {
+                    "kind": "userassist_exec" if is_userassist else "compatstore_exec",
+                    "exe_path": exe_path,
+                    "exe_name": PurePosixPath(exe_path.replace("\\", "/")).name.lower(),
+                    "value_name": name,
+                    "writable_root": label,
+                    "shared_root": shared,
+                    "hive_key": row_key or str(key_path or ""),
+                    "last_write_time_iso": row.get("last_write_time_iso"),
+                }
+            )
+    return out
+
+
 # Triage keys whose payload lives in nested subkeys (everything else is flat).
 _RECURSIVE_TRIAGE_KEYS = frozenset(
     {
@@ -1940,8 +2528,23 @@ _RECURSIVE_TRIAGE_KEYS = frozenset(
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedMRU",
         r"Software\Microsoft\Windows\Shell\BagMRU",
         r"Software\Microsoft\Windows\ShellNoRoam\BagMRU",
+        # UserAssist's value names live two levels down, under <GUID>\Count.
+        _USERASSIST_KEY,
     }
 )
+
+# Triage keys EXEMPT from the per-run registry_query budget. On a real Windows
+# disk that budget is already exhausted by the SYSTEM Services sweep and the
+# MRU/shellbag keys before the later per-user hives are reached — an execution
+# key that can be crowded out is a key that silently never runs, which is the
+# failure this whole lane exists to fix. The exemption is bounded: two keys per
+# NTUSER.DAT, and the hive list is already capped.
+_EXECUTION_TRIAGE_KEYS = frozenset({_USERASSIST_KEY, _COMPAT_STORE_KEY})
+
+# Cap on standalone registry execution leads per run. A busy user profile can
+# hold dozens of these; shared-root placements are emitted first so the cap
+# never drops a high-signal one in favour of ordinary user downloads.
+_MAX_REGISTRY_EXEC_FINDINGS = 8
 
 _USBSTOR_SERIAL_RE = re.compile(
     r"\\enum\\usbstor\\disk&ven_(?P<ven>[^&\\]*)&prod_(?P<prod>[^&\\]*)[^\\]*\\(?P<serial>[^\\]+)$",
@@ -2452,6 +3055,186 @@ _DOWNLOADED_APP_ROOTS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Web tier — request-log exploitation and web-root script webshells
+# ---------------------------------------------------------------------------
+
+# Indicators from ``web_triage`` that describe attack STRUCTURE rather than mere
+# encoding. A quote or a SQL comment on its own shows up in ordinary traffic
+# (``?q=o%27brien``), so those never promote a request on their own; every name
+# here is a request shape that has no benign reading.
+WEB_STRUCTURAL_EXPLOIT_INDICATORS = frozenset(
+    {
+        "sqli_union_select",
+        "sqli_boolean_tautology",
+        "sqli_information_schema",
+        "sqli_meta_function",
+        "path_traversal",
+        "webshell_invocation",
+        "command_injection",
+        "scanner_user_agent",
+    }
+)
+
+_WEB_SQLI_INDICATORS = frozenset(
+    {
+        "sqli_union_select",
+        "sqli_boolean_tautology",
+        "sqli_information_schema",
+        "sqli_meta_function",
+    }
+)
+
+# Report order for the structural indicators, most decisive first. A log from a
+# real intrusion carries thousands of flagged lines; the finding quotes one
+# example per behaviour in this order so an analyst sees the strongest evidence
+# rather than whichever request had the longest URL.
+_WEB_INDICATOR_RANK = (
+    "sqli_union_select",
+    "sqli_information_schema",
+    "sqli_meta_function",
+    "sqli_boolean_tautology",
+    "webshell_invocation",
+    "command_injection",
+    "path_traversal",
+    "scanner_user_agent",
+)
+
+
+def web_exploit_rank(indicator: str) -> int:
+    """Position of ``indicator`` in the report order; unknown names sort last."""
+    try:
+        return _WEB_INDICATOR_RANK.index(indicator)
+    except ValueError:
+        return len(_WEB_INDICATOR_RANK)
+
+
+def web_exploit_examples(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One representative request per structural indicator, in report order."""
+    best: dict[str, dict[str, Any]] = {}
+    for cand in candidates:
+        indicator = str(cand.get("indicator") or "")
+        current = best.get(indicator)
+        if current is None or (cand.get("line_number") or 0) < (current.get("line_number") or 0):
+            best[indicator] = cand
+    return [best[name] for name in sorted(best, key=web_exploit_rank)]
+
+# Directories a web server accepts writes into. A server-side script sitting in
+# one of these is not part of the shipped application — the application ships
+# its code in its own tree, not in the folder it saves uploads to.
+_WEB_WRITABLE_DIR_NAMES = frozenset(
+    {
+        "upload",
+        "uploads",
+        "tmp",
+        "temp",
+        "cache",
+        "files",
+        "images",
+        "img",
+        "media",
+        "avatars",
+        "attachments",
+        "data",
+    }
+)
+
+
+def web_exploit_candidates(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Structural exploitation observations in one ``web_triage`` access-log output.
+
+    Pure function. One candidate per (flagged request, structural indicator), so
+    a single request that carries both ``union select`` and
+    ``information_schema`` reports both facts. Requests whose only indicators are
+    an encoded quote or a SQL comment terminator are dropped: those appear in
+    ordinary traffic and are corroboration, not a claim.
+    """
+    if str(out.get("artifact_kind") or "") != "access_log":
+        return []
+    candidates: list[dict[str, Any]] = []
+    for hit in out.get("exploit_hits") or []:
+        if not isinstance(hit, dict):
+            continue
+        for indicator in sorted(str(i) for i in (hit.get("indicators") or [])):
+            if indicator not in WEB_STRUCTURAL_EXPLOIT_INDICATORS:
+                continue
+            candidates.append(
+                {
+                    "indicator": indicator,
+                    "line_number": hit.get("line_number"),
+                    "timestamp": hit.get("timestamp"),
+                    "client_ip": str(hit.get("client_ip") or ""),
+                    "method": str(hit.get("method") or ""),
+                    "target": str(hit.get("target") or ""),
+                    "status": str(hit.get("status") or ""),
+                    "user_agent": str(hit.get("user_agent") or ""),
+                }
+            )
+    return candidates
+
+
+def webshell_script_candidate(out: dict[str, Any]) -> dict[str, Any] | None:
+    """The webshell observation for one ``web_triage`` web-root script output.
+
+    Pure function. Returns ``None`` unless the tool's own primitive combination
+    matched a webshell pattern. ``writable_location`` records whether the script
+    sits in a directory the web server writes into (upload/temp/cache) — that
+    separates a dropped shell from vulnerable application source that happens to
+    call a shell, and the emitter uses it to pick the confidence tier.
+    """
+    if str(out.get("artifact_kind") or "") != "webroot_script":
+        return None
+    if not out.get("is_probable_webshell"):
+        return None
+    path = str(out.get("artifact_path") or "")
+    lower = path.replace("\\", "/").lower()
+    parent = lower.rsplit("/", 2)[-2] if lower.count("/") >= 1 else ""
+    hits = [h for h in (out.get("script_hits") or []) if isinstance(h, dict)]
+    return {
+        "path": path,
+        "writable_location": parent in _WEB_WRITABLE_DIR_NAMES,
+        "directory": parent,
+        "indicators": sorted({str(h.get("indicator")) for h in hits}),
+        "hits": hits[:10],
+    }
+
+
+def web_root_relative_path(path: str) -> str:
+    """The in-image path from the document root down, for display and for
+    matching an extracted script back to its ``$MFT`` row."""
+    lower = str(path).replace("\\", "/").lower()
+    for marker in _WEB_ROOT_MARKERS:
+        index = lower.find(marker)
+        if index != -1:
+            return lower[index:]
+    return lower.rsplit("/", 1)[-1]
+
+
+def web_mft_row_for(rel_path: str, mft_index: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Find the ``$MFT`` row for a web-root-relative path.
+
+    The two readers see different prefixes of the same file: ``web_triage`` is
+    handed the EXTRACTED copy (``<case>/extracted/disk/<id>/xampp/htdocs/...``)
+    while ``mft_timeline`` reports the IN-IMAGE path (``xampp/htdocs/...``), so
+    the join is on the shared tail. A bare filename (no separator) is never
+    suffix-matched — that would bind two unrelated files with the same name.
+    """
+    if not mft_index or not rel_path:
+        return None
+    rel = rel_path.replace("\\", "/").lower().lstrip("/")
+    exact = mft_index.get(rel)
+    if isinstance(exact, dict):
+        return exact
+    if "/" not in rel:
+        return None
+    matches = [
+        row
+        for key, row in mft_index.items()
+        if isinstance(row, dict) and (key.endswith(rel) or rel.endswith(key))
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Classify $MFT rows into hacking-tool artifact candidates.
 
@@ -2484,6 +3267,291 @@ def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, An
                     }
                 )
                 break
+    return out
+
+
+# --------------------------------------------------------------------------
+# Anti-forensic wiping/cleaning tooling (T1070.004).
+#
+# Deliberately a SEPARATE table from SUSPICIOUS_PREFETCH_TOOL_HINTS (network
+# recon/sniffing tooling) and from _HACKING_TOOL_PATH_TOKENS (intrusion toolkit
+# footprint): a secure-delete utility is not an intrusion tool, it is indicator
+# removal, and it carries its own technique. Tokens are matched against a file
+# BASENAME, so they must be specific enough not to collide with OS components.
+# --------------------------------------------------------------------------
+ANTI_FORENSIC_TOOL_HINTS: tuple[tuple[str, str], ...] = (
+    ("eraser", "Eraser secure-deletion tool"),
+    ("ccleaner", "CCleaner system/trace cleaner"),
+    # The CCleaner installer ships as ccsetupNNN.exe; it names the same product.
+    ("ccsetup", "CCleaner system/trace cleaner (installer)"),
+    ("sdelete", "Sysinternals SDelete secure-delete utility"),
+    ("bleachbit", "BleachBit disk/trace cleaner"),
+    ("privazer", "PrivaZer trace cleaner"),
+    ("wipefile", "WipeFile secure-deletion tool"),
+)
+# One technique for the whole table: running a wiper is Indicator Removal ->
+# File Deletion. Presence alone is never an execution claim; the emitter says so.
+ANTI_FORENSIC_TECHNIQUE = "T1070.004"
+
+# --------------------------------------------------------------------------
+# Third-party cloud-storage sync clients (T1567.002 channel).
+#
+# OneDrive/SkyDrive are deliberately ABSENT: they ship with every modern Windows
+# build, so their presence carries no signal and including them would fire this
+# detector on essentially every benign Windows host. Tokens are specific product
+# names -- a bare "mega" would collide with the megasas/megasr storage drivers.
+# --------------------------------------------------------------------------
+CLOUD_SYNC_CLIENT_HINTS: tuple[tuple[str, str], ...] = (
+    ("googledrivesync", "google drive"),
+    ("google drive", "google drive"),
+    ("dropbox", "dropbox"),
+    ("megasync", "mega"),
+    ("box sync", "box"),
+    ("boxsync", "box"),
+    ("pcloud", "pcloud"),
+    ("nextcloud", "nextcloud"),
+    ("tresorit", "tresorit"),
+)
+# Host tokens for the browser lane. Cloud-storage web endpoints and personal
+# webmail are separate exfil channels, so they are classified separately.
+CLOUD_STORAGE_URL_HINTS: tuple[tuple[str, str], ...] = (
+    ("drive.google.com", "google drive"),
+    ("docs.google.com", "google drive"),
+    ("dropbox.com", "dropbox"),
+    ("mega.nz", "mega"),
+    ("mega.co.nz", "mega"),
+    ("box.com", "box"),
+    ("wetransfer.com", "wetransfer"),
+    ("mediafire.com", "mediafire"),
+    ("4shared.com", "4shared"),
+    ("pcloud.com", "pcloud"),
+)
+WEBMAIL_URL_HINTS: tuple[tuple[str, str], ...] = (
+    ("mail.google.com", "gmail"),
+    ("mail.yahoo.", "yahoo mail"),
+    ("outlook.live.com", "outlook.com"),
+    ("mail.live.com", "outlook.com"),
+    ("mail.naver.com", "naver mail"),
+    ("mail.daum.net", "daum mail"),
+    ("mail.zoho.com", "zoho mail"),
+    ("webmail.", "webmail"),
+    ("roundcube", "roundcube webmail"),
+)
+
+
+def _anti_forensic_token(basename_lower: str) -> str | None:
+    """The wiper token matched by a lowercased basename, normalized to a product."""
+    for token, _label in ANTI_FORENSIC_TOOL_HINTS:
+        if token in basename_lower:
+            # ccsetup is the CCleaner installer; report it as the product.
+            return "ccleaner" if token == "ccsetup" else token
+    return None
+
+
+def anti_forensic_tool_hint(name: str) -> tuple[str, str] | None:
+    """Return ``(tool label, technique)`` when ``name`` is a known wiper.
+
+    Pure function over a file/executable basename. Case-insensitive substring
+    match against :data:`ANTI_FORENSIC_TOOL_HINTS`; ``None`` for everything else.
+    """
+    low = PurePosixPath(str(name or "").replace("\\", "/")).name.lower()
+    if not low:
+        return None
+    for token, label in ANTI_FORENSIC_TOOL_HINTS:
+        if token in low:
+            return label, ANTI_FORENSIC_TECHNIQUE
+    return None
+
+
+def cloud_sync_client_hint(name: str) -> tuple[str, str] | None:
+    """Return ``(service, technique)`` when ``name`` names a third-party sync client.
+
+    Pure function over a path segment or executable basename. OS-bundled
+    OneDrive/SkyDrive is intentionally not recognized (see
+    :data:`CLOUD_SYNC_CLIENT_HINTS`).
+    """
+    low = str(name or "").replace("\\", "/").lower()
+    if not low:
+        return None
+    for token, service in CLOUD_SYNC_CLIENT_HINTS:
+        if token in low:
+            return service, "T1567.002"
+    return None
+
+
+def _anti_forensic_evidence_kind(path_lower: str) -> str | None:
+    """Classify how an MFT path carries wiper evidence, or None if it does not.
+
+    ``prefetch_residue`` -- a ``.pf`` under Windows/Prefetch (the filesystem
+    record that a prefetch file was written for the binary). ``installed`` --
+    the tool under Program Files or the Windows installer cache. ``downloaded``
+    -- the installer sitting in a user-writable download/desktop/documents root.
+    ``user_state`` -- the tool's per-user state directory. Anything else (an OS
+    binary that merely contains a token) is not evidence.
+    """
+    if "/prefetch/" in path_lower and path_lower.endswith(".pf"):
+        return "prefetch_residue"
+    if "program files" in path_lower or "/windows/installer/" in path_lower:
+        return "installed"
+    if any(root in path_lower for root in _DOWNLOADED_APP_ROOTS):
+        return "downloaded"
+    if "/appdata/" in path_lower or "/application data/" in path_lower:
+        return "user_state"
+    return None
+
+
+def mft_anti_forensic_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify $MFT rows into anti-forensic wiping/cleaning tool candidates.
+
+    Pure function. A row qualifies when its basename carries a known wiper token
+    AND the path is one of the evidence shapes in
+    :func:`_anti_forensic_evidence_kind` -- so an OS binary that merely contains
+    a token substring is not flagged. Deduped by tool, keeping the strongest
+    evidence kind (prefetch residue > installed > downloaded > user state).
+    """
+    rank = {"prefetch_residue": 3, "installed": 2, "downloaded": 1, "user_state": 0}
+    best: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("full_path") or row.get("name") or "")
+        if not path:
+            continue
+        low = path.lower().replace("\\", "/")
+        tool = _anti_forensic_token(PurePosixPath(low).name)
+        if tool is None:
+            continue
+        evidence = _anti_forensic_evidence_kind(low)
+        if evidence is None:
+            continue
+        hint = anti_forensic_tool_hint(low)
+        candidate = {
+            "tool": tool,
+            "label": hint[0] if hint else tool,
+            "path": path,
+            "evidence": evidence,
+            "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+            "record_number": row.get("record_number"),
+        }
+        current = best.get(tool)
+        if current is None or rank[evidence] > rank[str(current["evidence"])]:
+            best[tool] = candidate
+    return [best[tool] for tool in sorted(best)]
+
+
+def mft_cloud_sync_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify $MFT rows into third-party cloud-sync client candidates.
+
+    Pure function. Matches the full path (a sync folder such as
+    ``Users/<u>/Google Drive`` is as much evidence as the client binary), so the
+    token table must not carry a bare product prefix that collides with OS
+    filenames. Deduped by service.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("full_path") or row.get("name") or "")
+        if not path:
+            continue
+        low = path.lower().replace("\\", "/")
+        hint = cloud_sync_client_hint(low)
+        if hint is None:
+            continue
+        service = hint[0]
+        best.setdefault(
+            service,
+            {
+                "service": service,
+                "path": path,
+                "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+                "record_number": row.get("record_number"),
+            },
+        )
+    return [best[service] for service in sorted(best)]
+
+
+def browser_cloud_service_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify browser_history rows into cloud-storage / webmail visits.
+
+    Pure function over ``browser_history`` output rows
+    (``{url, title, last_visit_time_iso, visit_count}``). Cloud storage and
+    webmail are distinct exfil channels and are labeled separately. Search
+    traffic to a provider's homepage is NOT a channel visit -- the host must be
+    the storage/mail endpoint itself. Deduped by (kind, service).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    tables = (("cloud_storage", CLOUD_STORAGE_URL_HINTS), ("webmail", WEBMAIL_URL_HINTS))
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "")
+        low = url.lower()
+        if not low:
+            continue
+        for kind, table in tables:
+            service = next((svc for token, svc in table if token in low), None)
+            if service is None:
+                continue
+            key = (kind, service)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    {
+                        "kind": kind,
+                        "service": service,
+                        "url": url,
+                        "last_visit_time_iso": row.get("last_visit_time_iso"),
+                        "visit_count": row.get("visit_count"),
+                    }
+                )
+            break
+    return out
+
+
+def prefetch_tool_executions(
+    rows: list[dict[str, Any]],
+    hint: Callable[[str], tuple[str, str] | None],
+) -> list[dict[str, Any]]:
+    """Match parsed prefetch executions against a tool-hint table.
+
+    Pure function. ``rows`` are per-``prefetch_parse`` records
+    (``{tool_call_id, executable_name, run_count, artifact_path}``); a row is an
+    execution only when ``run_count`` is non-zero -- Prefetch writes the file
+    because the binary RAN, and a zero count means the parse gave us no run
+    evidence to cite. The matched wiper token is reported as ``tool`` and a
+    matched cloud service as ``service``, so one helper feeds both emitters.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        exe = str(row.get("executable_name") or "")
+        try:
+            run_count = int(row.get("run_count") or 0)
+        except (TypeError, ValueError):
+            run_count = 0
+        if not exe or run_count <= 0:
+            continue
+        matched = hint(exe)
+        if matched is None:
+            continue
+        label, _technique = matched
+        entry: dict[str, Any] = {
+            "executable_name": exe,
+            "run_count": run_count,
+            "label": label,
+            "tool_call_id": row.get("tool_call_id"),
+            "artifact_path": row.get("artifact_path"),
+        }
+        token = _anti_forensic_token(PurePosixPath(exe.replace("\\", "/")).name.lower())
+        if token is not None:
+            entry["tool"] = token
+        else:
+            # Non-wiper tables (cloud sync) report the service instead.
+            entry["service"] = label
+        out.append(entry)
     return out
 
 
@@ -2884,6 +3952,463 @@ def ie_history_illicit_candidates(
             }
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Mail-store detectors (``pst_parse`` / ``oe_dbx_parse`` message envelopes).
+#
+# A host's mail lives in an Outlook ``.pst``/``.ost`` or a legacy Outlook
+# Express ``.dbx``; ``disk_extract_artifacts`` carves both as the ``mail_store``
+# class. These are pure header comparisons over whatever the parser actually
+# returned -- no image-specific names, domains, or subjects anywhere. Each one
+# reports a HEADER fact: what the message claims, not who typed it. Per
+# CLAUDE.md, actor identity and intent stay out of scope for host artifacts.
+# ---------------------------------------------------------------------------
+
+# Attachment tells for a spreadsheet (structured/tabular data). Extension OR
+# media type is enough -- an export can carry either.
+_SPREADSHEET_EXTS = frozenset({"xls", "xlsx", "xlsm", "xlsb", "csv", "ods", "tsv"})
+_SPREADSHEET_MEDIA_TOKENS = ("excel", "spreadsheet", "csv", "ms-excel")
+# Reply/forward prefixes stripped when grouping a conversation. Kept broad
+# enough for the common non-English clients an enterprise store carries.
+_THREAD_PREFIXES = ("re:", "fw:", "fwd:", "aw:", "sv:", "vs:", "tr:", "rv:", "antw:")
+# Floor on messages before an exchange is called a thread. Two messages is a
+# question and an answer; three or more is a sustained conversation.
+_THREAD_MIN_MESSAGES = 3
+
+
+def _email_domain(address: Any) -> str:
+    """Lowercased domain part of an address, or `''` when there is none."""
+    text = str(address or "").strip().lower()
+    _, _, domain = text.rpartition("@")
+    return domain.strip().strip(">").strip()
+
+
+def _normalize_address(address: Any) -> str:
+    return str(address or "").strip().lower()
+
+
+def mail_internal_domains(messages: list[dict[str, Any]]) -> set[str]:
+    """The organisation's own mail domain(s), derived from the store itself.
+
+    A mailbox is dominated by its own organisation's addresses, so the most
+    frequent domain across every ``From``/``To`` address IS the internal one.
+    Deriving it from the evidence (instead of a configured list) keeps every
+    downstream "external" judgement evidence-agnostic: it works for any store
+    from any organisation. Ties resolve alphabetically so the result is
+    deterministic.
+    """
+    counts: dict[str, int] = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        addresses = [message.get("from_address"), *(message.get("to") or [])]
+        for address in addresses:
+            domain = _email_domain(address)
+            if domain:
+                counts[domain] = counts.get(domain, 0) + 1
+    if not counts:
+        return set()
+    top = max(counts.values())
+    return {sorted(d for d, c in counts.items() if c == top)[0]}
+
+
+def _is_external(address: Any, internal_domains: set[str]) -> bool:
+    domain = _email_domain(address)
+    return bool(domain) and domain not in internal_domains
+
+
+def _registrable_domain(domain: str) -> str:
+    """The organisation-level domain: the last two labels of `domain`.
+
+    A newsletter sent from ``newsletters@n.example.org`` with
+    ``Reply-To: do-not-reply@example.org`` is one organisation's own bulk
+    mailer, not a spoof, so a divergence inside one registrable domain must not
+    be reported. This is the deliberately crude PSL-free rule: it can merge two
+    parties under a shared public suffix (``a.co.uk`` and ``b.co.uk``), which
+    only ever SUPPRESSES a report -- the safe direction for a CONFIRMED claim.
+    """
+    labels = [label for label in str(domain or "").split(".") if label]
+    if len(labels) < 2:
+        return ".".join(labels)
+    return ".".join(labels[-2:])
+
+
+def _same_organisation(left: Any, right: Any) -> bool:
+    a, b = _registrable_domain(_email_domain(left)), _registrable_domain(_email_domain(right))
+    return bool(a) and a == b
+
+
+def _displayed_address(display: Any) -> str:
+    """The address a display name IS, when the display name is itself an
+    address. Mail clients show the display name, so a display name that reads
+    as an address is the identity the reader believes they are corresponding
+    with -- and it need not be the address a reply reaches."""
+    text = _normalize_address(display)
+    return text if "@" in text and " " not in text else ""
+
+
+def mail_reply_address_divergence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages where the address shown is not the address mail actually goes to.
+
+    Three pure header comparisons, all of the same shape -- a DISPLAYED address
+    beside the ACTUAL one, differing across an organisation boundary:
+
+    * ``reply_to_vs_from``        -- ``Reply-To`` differs from ``From``.
+    * ``sender_display_vs_from``  -- the ``From`` display name is itself an
+      address, and not the sending address (the RFC822
+      ``actual@host (displayed@host)`` form).
+    * ``recipient_display_vs_to`` -- a recipient's stored display name is an
+      address that is not among the addresses the message was actually sent to.
+
+    Divergences inside one organisation (bulk mailers, shared reply mailboxes)
+    are excluded: they are ordinary mail-system behaviour, not a spoofing tell.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        row = {
+            "folder": str(message.get("folder") or ""),
+            "subject": str(message.get("subject") or ""),
+            "date": str(message.get("date") or ""),
+            "from_address": _normalize_address(message.get("from_address")),
+            "from_display": str(message.get("from_display") or ""),
+        }
+        sender = _normalize_address(message.get("from_address"))
+        reply_to = _normalize_address(message.get("reply_to_address"))
+        if reply_to and sender and reply_to != sender and not _same_organisation(sender, reply_to):
+            out.append(
+                {**row, "basis": "reply_to_vs_from", "displayed": sender, "actual": reply_to}
+            )
+            continue
+
+        shown = _displayed_address(message.get("from_display"))
+        if shown and sender and shown != sender and not _same_organisation(shown, sender):
+            out.append(
+                {**row, "basis": "sender_display_vs_from", "displayed": shown, "actual": sender}
+            )
+            continue
+
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        for display in message.get("to_display") or []:
+            shown = _displayed_address(display)
+            if not shown or shown in recipients:
+                continue
+            actual = next(
+                (r for r in recipients if r and not _same_organisation(shown, r)),
+                "",
+            )
+            if actual:
+                out.append(
+                    {
+                        **row,
+                        "basis": "recipient_display_vs_to",
+                        "displayed": shown,
+                        "actual": actual,
+                    }
+                )
+                break
+    return out
+
+
+def mail_impersonation_candidates(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Messages whose headers claim an inside identity while pointing outside.
+
+    Two independent bases, both pure header comparisons:
+
+    * ``internal_display_name_external_sender`` -- the ``From`` display name is
+      one the store elsewhere pairs with an internal address (so it names a
+      principal of this organisation), but this message's sending address is
+      outside the organisation's own domain.
+    * ``internal_sender_external_reply_to`` -- the ``From`` address is inside the
+      organisation, yet replies are directed outside it.
+
+    Both describe what the headers assert. Neither identifies an author.
+    """
+    if not internal_domains:
+        return []
+    internal_display_names: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        display = str(message.get("from_display") or "").strip().lower()
+        if display and not _is_external(message.get("from_address"), internal_domains):
+            internal_display_names.add(display)
+
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        display = str(message.get("from_display") or "").strip()
+        sender = _normalize_address(message.get("from_address"))
+        reply_to = _normalize_address(message.get("reply_to_address"))
+        sender_external = _is_external(sender, internal_domains)
+        reply_external = bool(reply_to) and _is_external(reply_to, internal_domains)
+        if display and display.lower() in internal_display_names and sender_external:
+            basis = "internal_display_name_external_sender"
+        elif sender and not sender_external and reply_external:
+            basis = "internal_sender_external_reply_to"
+        else:
+            continue
+        out.append(
+            {
+                "basis": basis,
+                "folder": str(message.get("folder") or ""),
+                "subject": str(message.get("subject") or ""),
+                "display_name": display,
+                "from_address": sender,
+                "reply_to_address": reply_to,
+                "recipients": [_normalize_address(r) for r in (message.get("to") or [])],
+                "date": str(message.get("date") or ""),
+            }
+        )
+    return out
+
+
+def _is_spreadsheet_attachment(attachment: Any) -> bool:
+    if not isinstance(attachment, dict):
+        return False
+    extension = str(attachment.get("extension") or "").strip().lower()
+    if not extension:
+        _, _, tail = str(attachment.get("name") or "").rpartition(".")
+        extension = tail.strip().lower()
+    if extension in _SPREADSHEET_EXTS:
+        return True
+    media = str(attachment.get("content_type") or "").lower()
+    return any(token in media for token in _SPREADSHEET_MEDIA_TOKENS)
+
+
+def mail_attachment_egress_candidates(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Messages that carry a spreadsheet attachment from an inside sender to at
+    least one recipient outside the organisation's own mail domain.
+
+    Spreadsheets are the structured-data case: name extension or MIME media
+    type identifies one on any host. This reports the transfer the mail store
+    itself records -- sender, recipients, attachment name and type -- and
+    nothing about the file's contents, which the header-level parser never saw.
+    """
+    if not internal_domains:
+        return []
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        sender = _normalize_address(message.get("from_address"))
+        if not sender or _is_external(sender, internal_domains):
+            continue
+        external = sorted(
+            {
+                _normalize_address(r)
+                for r in (message.get("to") or [])
+                if _is_external(r, internal_domains)
+            }
+        )
+        if not external:
+            continue
+        for attachment in message.get("attachments") or []:
+            if not _is_spreadsheet_attachment(attachment):
+                continue
+            out.append(
+                {
+                    "folder": str(message.get("folder") or ""),
+                    "subject": str(message.get("subject") or ""),
+                    "from_address": sender,
+                    "external_recipients": external,
+                    "attachment": str(attachment.get("name") or ""),
+                    "attachment_type": str(attachment.get("content_type") or "")
+                    or str(attachment.get("extension") or ""),
+                    "date": str(message.get("date") or ""),
+                }
+            )
+    return out
+
+
+# libpff renders a MAPI timestamp as `Mon DD, YYYY HH:MM:SS.fffffffff UTC`.
+_MAIL_MAPI_DATE_RE = re.compile(
+    r"^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*UTC$"
+)
+_MAIL_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _mail_date_instant(value: Any) -> datetime | None:
+    """A message date as an aware UTC instant, or None when it will not parse.
+
+    A store carries TWO date formats: RFC822 transport dates on mail it
+    received, and libpff's MAPI property rendering on mail the host composed.
+    Sorting those as text is meaningless -- "Jul 20" sorts before
+    "Sat, 19 Jul" -- so any reported span must order on parsed instants, and
+    report nothing at all when a value does not parse.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _MAIL_MAPI_DATE_RE.match(text)
+    if match:
+        month = _MAIL_MONTHS.get(match.group(1).lower())
+        if not month:
+            return None
+        try:
+            return datetime(
+                int(match.group(3)),
+                month,
+                int(match.group(2)),
+                int(match.group(4)),
+                int(match.group(5)),
+                int(match.group(6)),
+                # timezone.utc, not datetime.UTC: this module is also run by
+                # maintainer scripts under a bare python3, which can be 3.10.
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _thread_key(subject: Any) -> str:
+    """Subject with every reply/forward prefix stripped, lowercased. Used to
+    report the distinct topics an exchange covered, not to group it."""
+    text = " ".join(str(subject or "").split()).lower()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _THREAD_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                changed = True
+    return text
+
+
+def mail_counterparty_escalation(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Two-way exchanges with one address outside the organisation's own domain.
+
+    Grouped by WHO the exchange is with, not by subject text. Subject threading
+    fragments a real conversation the moment a reply rewrites the subject, and
+    it lumps a mailbox's bulk mail into one enormous pseudo-thread -- a store
+    of newsletters produces a single 167-message "thread" that means nothing.
+    Grouping by counterparty models the exchange an analyst cares about.
+
+    An exchange qualifies only when mail went BOTH ways: inbound volume alone
+    is a mailing list, not a conversation, which is what keeps newsletters and
+    alert feeds out of the result on any host. The row reports the shape --
+    message counts per direction, the topics covered, the date span, how many
+    messages carried a reply-address divergence, and what left the organisation
+    -- so a downstream lead can describe the exchange without asserting intent.
+    """
+    if not internal_domains:
+        return []
+    diverging_keys = {
+        (row["folder"], row["subject"], row["date"])
+        for row in mail_reply_address_divergence(messages)
+    }
+    groups: dict[str, dict[str, Any]] = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        sender = _normalize_address(message.get("from_address"))
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        inbound = _is_external(sender, internal_domains)
+        counterparties = (
+            [sender] if inbound else [r for r in recipients if _is_external(r, internal_domains)]
+        )
+        for counterparty in counterparties:
+            if not counterparty:
+                continue
+            group = groups.setdefault(
+                counterparty,
+                {
+                    "counterparty": counterparty,
+                    "message_count": 0,
+                    "inbound_count": 0,
+                    "outbound_count": 0,
+                    "diverging_message_count": 0,
+                    "subjects": set(),
+                    "dates": set(),
+                    "outbound_attachments": set(),
+                },
+            )
+            group["message_count"] += 1
+            group["inbound_count" if inbound else "outbound_count"] += 1
+            key = (
+                str(message.get("folder") or ""),
+                str(message.get("subject") or ""),
+                str(message.get("date") or ""),
+            )
+            if key in diverging_keys:
+                group["diverging_message_count"] += 1
+            topic = _thread_key(message.get("subject"))
+            if topic:
+                group["subjects"].add(topic)
+            if message.get("date"):
+                group["dates"].add(str(message.get("date")))
+            if not inbound:
+                for attachment in message.get("attachments") or []:
+                    if isinstance(attachment, dict) and attachment.get("name"):
+                        group["outbound_attachments"].add(str(attachment["name"]))
+
+    out: list[dict[str, Any]] = []
+    for counterparty in sorted(groups):
+        group = groups[counterparty]
+        # Two-way contact is the floor: a one-directional feed is not an
+        # exchange no matter how many messages it carries.
+        if not (group["inbound_count"] and group["outbound_count"]):
+            continue
+        # Only report a span when every date in the exchange parses; a
+        # partially ordered span would be a guess presented as a fact.
+        instants = [(_mail_date_instant(d), d) for d in group["dates"]]
+        dates = (
+            [d for _, d in sorted(instants, key=lambda pair: pair[0])]
+            if instants and all(i is not None for i, _ in instants)
+            else []
+        )
+        out.append(
+            {
+                "counterparty": counterparty,
+                "message_count": group["message_count"],
+                "inbound_count": group["inbound_count"],
+                "outbound_count": group["outbound_count"],
+                "diverging_message_count": group["diverging_message_count"],
+                "subjects": sorted(group["subjects"]),
+                "outbound_attachments": sorted(group["outbound_attachments"]),
+                "first_date": dates[0] if dates else "",
+                "last_date": dates[-1] if dates else "",
+            }
+        )
+    return out
+
+
+def mail_store_tool_for(artifact_path: Any) -> str | None:
+    """Which parser reads this carved mail store, or None when neither does.
+
+    ``mail_store`` is one extraction class covering two unrelated on-disk
+    formats, so the lane routes by extension: Outlook personal-folders/offline
+    stores go to ``pst_parse``, legacy Outlook Express folders to
+    ``oe_dbx_parse``.
+    """
+    name = PurePosixPath(str(artifact_path or "").replace("\\", "/")).name.lower()
+    if name.endswith((".pst", ".ost")):
+        return "pst_parse"
+    if name.endswith(".dbx"):
+        return "oe_dbx_parse"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3414,6 +4939,7 @@ TOOL_ARTIFACT_CLASSES = {
     "sysmon_network_query": "network",
     "usnjrnl_query": "usnjrnl",
     "vel_collect": "velociraptor",
+    "web_triage": "web",
     "vol_malfind": "memory",
     "vol_pslist": "memory",
     "vol_psscan": "memory",
@@ -3568,6 +5094,25 @@ TIMESTAMP_SOURCE_BY_TOOL: dict[str, str] = {
 
 # Windows logon-type numeric codes -> analyst-readable labels (MEMORY.md: Type 3
 # = network, Type 10 = RemoteInteractive/RDP).
+# EVTX record budget for one ``evtx_query`` call. The orchestrator used to ask
+# for 500, which silently dropped the tail of any real Security log — the Ali
+# Hadi case-1 Security.evtx holds 636 records, so every logon after record 500
+# was invisible to the rules below. This matches the Rust tool's own default;
+# a log that still exceeds it is reported as a limitation, never dropped
+# silently (see ``evtx_truncation_limitation``).
+EVTX_QUERY_LIMIT = 10_000
+
+# Timeline events kept per event log. Independent of EVTX_QUERY_LIMIT on
+# purpose: every record is SCANNED for findings, but a 10k-row timeline per log
+# across twenty logs would bury the analyst, so the timeline keeps a window.
+EVTX_TIMELINE_ROWS = 500
+
+# Interactive logon families for EID 4624. Type 10 is RemoteInteractive (RDP);
+# 2/7/11 are console, workstation-unlock, and cached-interactive — all of them
+# mean a human-facing session, which is what a lateral-movement or
+# credential-abuse question is actually about.
+INTERACTIVE_LOGON_TYPES = frozenset({"2", "7", "10", "11"})
+
 LOGON_TYPE_LABELS: dict[str, str] = {
     "2": "Interactive",
     "3": "Network",
@@ -3694,6 +5239,27 @@ def _flatten_evtx_eventdata(data: Any) -> dict[str, str]:
                     if isinstance(text, (str, int, float)):
                         result.setdefault(key, str(text))
     return result
+
+
+def evtx_truncation_limitation(path: str, records_seen: int, row_count: int) -> str | None:
+    """Say so when an event log was bigger than the record budget.
+
+    Truncation itself is a budget decision; leaving it UNSAID is the bug. A run
+    that analysed the first N records of a larger log has scoped coverage, and
+    the verdict must carry that scope rather than read as a full review.
+    """
+    try:
+        seen = int(records_seen)
+        rows = int(row_count)
+    except (TypeError, ValueError):
+        return None
+    if seen < EVTX_QUERY_LIMIT and rows < EVTX_QUERY_LIMIT:
+        return None
+    return (
+        f"evtx_query returned the first {EVTX_QUERY_LIMIT} records of {path}; the log is "
+        "at least that long, so records past the budget were truncated and NOT analysed. "
+        "Conclusions from this log are scoped to the records examined."
+    )
 
 
 def _format_account(account: Any, domain: Any) -> str:
@@ -7517,7 +9083,10 @@ def _disk_summary_template() -> dict[str, Any]:
         "version": 1,
         "scope": "extracted_disk_artifacts_only",
         "artifact_counts": {
-            name: 0 for name in sorted(EXTRACTED_DISK_CLASSES | {"evtx", "yara_target"})
+            name: 0
+            for name in sorted(
+                EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"evtx", "yara_target"}
+            )
         },
         "tool_summaries": {},
         "timeline_event_count": 0,
@@ -7960,6 +9529,223 @@ def _host_is_suspicious(host: str) -> tuple[bool, str]:
     return False, ""
 
 
+# --- HTTP cookie payloads: archives smuggled through a cookie field ---------
+#
+# A cookie value is a client-controlled opaque string, which makes it a standing
+# covert channel: an archive can be base64-encoded and pushed out a few kilobytes
+# per request while every packet still reads as ordinary web browsing. Detection
+# has to look at the VALUE — a `has_cookie` boolean cannot tell a session id from
+# a container in flight.
+#
+# Container magics recognized on the decoded prefix. Each is >=3 bytes so a random
+# base64 session id cannot land on one by accident (a 3-byte magic is ~1 in 1.7e7,
+# a 4-byte magic ~1 in 4.3e9); 2-byte magics are deliberately excluded.
+ARCHIVE_CONTAINER_MAGICS: tuple[tuple[bytes, str], ...] = (
+    (b"PK\x03\x04", "ZIP archive (local file header)"),
+    (b"PK\x05\x06", "ZIP archive (end-of-central-directory record)"),
+    (b"PK\x07\x08", "ZIP archive (data-descriptor / spanned record)"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"\xfd7zXZ\x00", "XZ compressed stream"),
+    (b"BZh9", "bzip2 archive"),
+    (b"\x1f\x8b\x08", "gzip compressed stream"),
+)
+# Floor on encoded length. Short values (session ids, GUIDs, counters) are the
+# false-positive population; a container header plus any useful metadata is well
+# past this.
+ARCHIVE_COOKIE_MIN_B64_LEN = 32
+# Floor on DECODED length, so a value that base64-decodes to only a few bytes
+# cannot satisfy a magic and nothing else.
+ARCHIVE_COOKIE_MIN_DECODED_LEN = 24
+_B64_ALPHABET = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+# ZIP local file header: magic(4) ... name_len@26 extra_len@28 name@30.
+_ZIP_LOCAL_HEADER_MAGIC = b"PK\x03\x04"
+_ZIP_NAME_LEN_OFFSET = 26
+_ZIP_NAME_OFFSET = 30
+_MAX_MEMBER_PATH_LEN = 200
+# Administrative / hidden-share path shapes. An archive member that came from one
+# of these was read from a share, which by definition needed an account with
+# rights to it. General SMB/host-share vocabulary, not one dataset's directory.
+_ADMIN_SHARE_SEGMENT_RE = re.compile(r"^(admin[_ -]?share|admin\$|ipc\$|print\$|[a-z]\$)$")
+# How many distinct registrable domains one destination address must answer to
+# before its Host headers stop being credible. Real virtual hosting exists, so
+# this alone is never a finding — it only ever qualifies a payload observation.
+HOST_MULTIPLEX_MIN_DOMAINS = 5
+# Second-level suffixes that are registry-operated, so the registrable name is
+# one label further left (bbc.co.uk, not co.uk).
+_MULTIPART_TLD_SECOND_LABELS = {"co", "com", "net", "org", "ac", "gov", "edu", "or", "ne"}
+
+
+def _decode_base64_prefix(value: str) -> bytes | None:
+    """Decode the leading base64 of ``value``, or None if it is not base64.
+
+    Tolerates a truncated prefix (the tool caps cookie values) by trimming to a
+    whole number of 4-character groups, and accepts the URL-safe alphabet.
+    """
+    text = (value or "").strip()
+    if len(text) < ARCHIVE_COOKIE_MIN_B64_LEN or not _B64_ALPHABET.match(text):
+        return None
+    body = text.replace("-", "+").replace("_", "/").rstrip("=")
+    body = body[: len(body) // 4 * 4]
+    if len(body) < ARCHIVE_COOKIE_MIN_B64_LEN:
+        return None
+    try:
+        # binascii.Error (what b64decode raises on bad padding/alphabet) is a
+        # ValueError subclass, so this catches both.
+        blob = base64.b64decode(body, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return blob if len(blob) >= ARCHIVE_COOKIE_MIN_DECODED_LEN else None
+
+
+def _zip_local_member_path(blob: bytes) -> str:
+    """The member path from a ZIP local file header, or "" when unreadable.
+
+    A ZIP's first member name is the single most useful fact about a smuggled
+    archive: it says WHICH file was collected and from where.
+    """
+    if not blob.startswith(_ZIP_LOCAL_HEADER_MAGIC) or len(blob) < _ZIP_NAME_OFFSET:
+        return ""
+    name_len = int.from_bytes(blob[_ZIP_NAME_LEN_OFFSET : _ZIP_NAME_LEN_OFFSET + 2], "little")
+    if not 0 < name_len <= _MAX_MEMBER_PATH_LEN:
+        return ""
+    raw = blob[_ZIP_NAME_OFFSET : _ZIP_NAME_OFFSET + name_len]
+    if len(raw) < name_len:
+        return ""
+    name = raw.decode("utf-8", "replace").strip("\x00").strip()
+    # A real member path is printable text; anything else means we mis-parsed.
+    return name if name and name.isprintable() else ""
+
+
+def cookie_payload_archive(value: str) -> tuple[str, str] | None:
+    """``(container_label, member_path)`` when a cookie value carries an encoded
+    archive/container, else None. ``member_path`` is "" when the container
+    exposes no readable member name.
+    """
+    blob = _decode_base64_prefix(value)
+    if blob is None:
+        return None
+    for magic, label in ARCHIVE_CONTAINER_MAGICS:
+        if blob.startswith(magic):
+            return label, _zip_local_member_path(blob)
+    return None
+
+
+def archive_member_share_segment(member_path: str) -> str:
+    """The administrative/hidden-share path segment in ``member_path``, or "".
+
+    Keys on the share-name SHAPE (``ADMIN$``, ``C$``, ``IPC$``, ``Admin_share``),
+    never on a particular dataset's directory name.
+    """
+    for segment in re.split(r"[\\/]+", str(member_path or "")):
+        candidate = segment.strip()
+        if candidate and _ADMIN_SHARE_SEGMENT_RE.match(candidate.lower()):
+            return candidate
+    return ""
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort eTLD+1 for a Host header (``vids.myspace.com`` ->
+    ``myspace.com``). IP-literal and single-label hosts are returned as-is.
+    """
+    clean = str(host or "").strip().strip(".").lower().split(":")[0]
+    if not clean or _is_external_ip(clean):
+        return clean
+    labels = [label for label in clean.split(".") if label]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if len(labels[-1]) == 2 and labels[-2] in _MULTIPART_TLD_SECOND_LABELS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def host_multiplexed_destinations(requests: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """External destinations whose observed Host headers name too many unrelated
+    sites to be genuine: ``{dst_ip: [registrable domains]}``.
+
+    A `Host:` header is client-supplied. When one address is addressed as a dozen
+    unrelated registrable domains, the headers cannot all be true of it — which is
+    what an open relay/proxy looks like from the client side.
+    """
+    by_dst: dict[str, set[str]] = {}
+    for row in requests:
+        if not isinstance(row, dict):
+            continue
+        dst = str(row.get("dst") or "").strip()
+        domain = registrable_domain(str(row.get("host") or ""))
+        if not dst or not domain or not _is_external_ip(dst):
+            continue
+        by_dst.setdefault(dst, set()).add(domain)
+    return {
+        dst: sorted(domains)
+        for dst, domains in by_dst.items()
+        if len(domains) >= HOST_MULTIPLEX_MIN_DOMAINS
+    }
+
+
+def pcap_cookie_archive_channels(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Requests that carry an encoded archive in a cookie to a Host-multiplexed
+    destination — the two-prong covert-channel observation.
+
+    Both prongs are required. The payload alone could be a site legitimately
+    round-tripping compressed state in a cookie; the multiplexing alone is
+    ordinary shared hosting or a CDN. Together they are a client pushing a
+    container to an address that lies about what site it is.
+    """
+    multiplexed = host_multiplexed_destinations(requests)
+    if not multiplexed:
+        return []
+    channels: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in requests:
+        if not isinstance(row, dict):
+            continue
+        dst = str(row.get("dst") or "").strip()
+        domains = multiplexed.get(dst)
+        if not domains:
+            continue
+        for cookie in row.get("cookies") or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "").strip()
+            hit = cookie_payload_archive(value)
+            if not hit:
+                continue
+            container, member_path = hit
+            key = (dst, name, value[:32])
+            if key in seen:
+                continue
+            seen.add(key)
+            channels.append(
+                {
+                    "src": str(row.get("src") or "").strip(),
+                    "dst": dst,
+                    "host": str(row.get("host") or "").strip(),
+                    "method": (str(row.get("method") or "GET").strip() or "GET"),
+                    "cookie_name": name,
+                    "cookie_value": value,
+                    "container": container,
+                    "member_path": member_path,
+                    "share_segment": archive_member_share_segment(member_path),
+                    "spoofed_domains": list(domains),
+                }
+            )
+    return channels
+
+
+def row_cookie_carries_archive(row: dict[str, Any]) -> bool:
+    """True when any cookie on this request is an encoded container.
+
+    Such a cookie is a payload, not a session token, so the webmail/social-media
+    ACCOUNT-attribution readings of `has_cookie` must not be applied to it.
+    """
+    for cookie in row.get("cookies") or []:
+        if isinstance(cookie, dict) and cookie_payload_archive(str(cookie.get("value") or "")):
+            return True
+    return False
+
+
 def _conversation_is_notable(row: dict[str, Any]) -> tuple[bool, str]:
     dst = row.get("dst") or row.get("destination_ip")
     if not _is_external_ip(dst):
@@ -8065,13 +9851,41 @@ def evtx_rows_to_findings(
     # parent PID can be resolved to a name. Samples without command-line auditing
     # carry only ProcessId (parent PID), not ParentProcessName.
     pid_to_name: dict[str, str] = {}
+    # Pre-pass: accounts with at least one FAILED logon in this same log. The
+    # interactive-logon rule below arms only for those accounts — a successful
+    # console logon on its own happens on every healthy Windows host every day,
+    # so an unconditional lead would be noise, not signal.
+    failed_logon_accounts: set[str] = set()
+    # account -> every interactive-family 4624 in this log, so the finding can
+    # report the whole session pattern rather than whichever record came first.
+    interactive_logons: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        if _event_id_value(row.get("event_id")) == 4688:
+        eid_pre = _event_id_value(row.get("event_id"))
+        if eid_pre == 4688:
             pre = _extract_evtx_entities(row.get("data") or {}, 4688)
             new_pid = _norm_pid(pre.get("pid"))
             new_name = _win_basename(pre.get("process"))
             if new_pid and new_name:
                 pid_to_name[new_pid] = new_name
+        elif eid_pre == 4625:
+            pre = _extract_evtx_entities(row.get("data") or {}, 4625)
+            account = str(pre.get("account") or "").strip().lower()
+            if account and account not in ("-", "anonymous logon"):
+                failed_logon_accounts.add(account)
+        elif eid_pre == 4624:
+            pre = _extract_evtx_entities(row.get("data") or {}, 4624)
+            logon_type_pre = str(pre.get("logon_type") or "").strip()
+            account = str(pre.get("account") or "").strip().lower()
+            if logon_type_pre in INTERACTIVE_LOGON_TYPES and account:
+                interactive_logons.setdefault(account, []).append(
+                    {
+                        "record_id": row.get("record_id"),
+                        "logon_type": logon_type_pre,
+                        "source_ip": str(pre.get("source_ip") or "").strip(),
+                        "account": pre.get("account"),
+                        "domain": pre.get("domain"),
+                    }
+                )
     for row in rows:
         event_id = _event_id_value(row.get("event_id"))
         channel = str(row.get("channel") or "")
@@ -8240,9 +10054,66 @@ def evtx_rows_to_findings(
                     "domain": ent.get("domain") or ent.get("subject_domain"),
                     "source_ip": ent.get("source_ip"),
                 }
-        elif event_id == 4624 and "rdp_logon" not in seen_kinds:
+        elif event_id == 4624 and not {"rdp_logon", "interactive_logon"} <= seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
-            if str(ent.get("logon_type") or "") == "10":
+            logon_type = str(ent.get("logon_type") or "").strip()
+            if logon_type != "10" and logon_type in INTERACTIVE_LOGON_TYPES:
+                # Interactive session that is NOT RDP: console (2), unlock (7),
+                # or cached-interactive (11). Only reported for an account that
+                # also shows failed logons in this log — a session established
+                # for a name someone was also guessing at.
+                account = str(ent.get("account") or "").strip().lower()
+                if (
+                    "interactive_logon" not in seen_kinds
+                    and account
+                    and account in failed_logon_accounts
+                ):
+                    seen_kinds.add("interactive_logon")
+                    sessions = interactive_logons.get(account) or []
+                    who = _format_account(ent.get("account"), ent.get("domain")) or "an account"
+                    types = sorted({s["logon_type"] for s in sessions} or {logon_type})
+                    type_text = ", ".join(
+                        f"{ltype} ({LOGON_TYPE_LABELS.get(ltype, 'Type ' + ltype)})"
+                        for ltype in types
+                    )
+                    sources = sorted(
+                        {s["source_ip"] for s in sessions if s["source_ip"] not in ("", "-")}
+                    )
+                    src_note = ""
+                    if sources:
+                        src_note = f" from {', '.join(sources)}"
+                        if any(src in ("127.0.0.1", "::1") for src in sources):
+                            src_note += (
+                                " (a loopback address, which Windows also reports for an "
+                                "ordinary console logon, so the address alone does not "
+                                "establish a remote or tunnelled origin)"
+                            )
+                    records = ", ".join(str(s["record_id"]) for s in sessions[:6]) or str(record_id)
+                    findings.append(
+                        {
+                            "case_id": case_id,
+                            "finding_id": "f-B-evtx-interactive-logon",
+                            "tool_call_id": tool_call_id,
+                            "artifact_path": artifact_path,
+                            "description": (
+                                f"EVTX Security EID 4624 records {len(sessions) or 1} successful "
+                                f"interactive logon record(s) of type {type_text} for "
+                                f"{who}{src_note} (records {records}), and the same account also "
+                                "has EID 4625 failed logons in this log. A session was "
+                                "established on the host for a name that was also being "
+                                "attempted unsuccessfully; treat this as a valid-accounts / "
+                                "credential-abuse lead until corroborated with in-session "
+                                "activity. The session's transport is unestablished: this log "
+                                "carries no type-10 (RemoteInteractive) record and no "
+                                "TerminalServices channel, so the finding is scoped to the "
+                                "session existing, not to how the operator reached the console."
+                            ),
+                            "confidence": "HYPOTHESIS",
+                            "pool_origin": "B",
+                            "mitre_technique": "T1078",
+                        }
+                    )
+            if logon_type == "10" and "rdp_logon" not in seen_kinds:
                 seen_kinds.add("rdp_logon")
                 who = _format_account(ent.get("account"), ent.get("domain")) or "an account"
                 src = ent.get("source_ip")
@@ -8416,32 +10287,213 @@ def recover_agent_high_signal_findings(
 
 
 _ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".cab", ".tar", ".gz", ".tgz", ".ace", ".arj")
+# Archive formats a USER reaches for when collecting files. ``.cab`` is excluded
+# on purpose: it is Microsoft's OS/driver packaging format, so every Windows
+# Update and Office install churns create-then-delete .cab records that have
+# nothing to do with a person collecting data.
+_USER_ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".tar", ".gz", ".tgz", ".ace", ".arj")
+# Servicing / cache naming that is machine-generated, not user-chosen.
+_OS_PACKAGE_ARCHIVE_RE = re.compile(
+    r"(^windows\d)|(\bkb\d{6,})|(^wsusscan)|(^package$)|(^source$)|(^ie\d+-)|(^[0-9a-f]{6,}$)",
+    re.IGNORECASE,
+)
+# What a person stages and then removes: documents and delivered executables.
+# ``.dll`` is deliberately absent -- the NGEN/servicing caches create and delete
+# thousands of them and none of that is a staged file.
+_STAGED_DOC_EXTS = (
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".pdf",
+    ".hwp",
+    ".rtf",
+    ".csv",
+    ".odt",
+    ".ods",
+)
+_STAGED_EXE_EXTS = (".exe", ".msi", ".ps1", ".bat", ".vbs", ".scr")
+_USN_CREATE_FLAGS = frozenset({"FILE_CREATE", "DATA_EXTEND", "RENAME_NEW_NAME"})
+# Machine-generated filenames: installer scratch (``c883.msi``), PowerShell
+# policy probes (``__PSScriptPolicyTest_*``), Office lock files (``~$doc.docx``),
+# GUID/hex temp names, servicing packages. A person staging data names the file;
+# these names are minted by software, so they are never a staged-file claim. The
+# hex-stem branch requires at least one a-f letter so an all-digit user filename
+# ("2015.xlsx") is not swept up with the installer scratch.
+_MACHINE_GENERATED_NAME_RE = re.compile(
+    "|".join(
+        (
+            r"^__",
+            r"^~\$",
+            r"^\{[0-9a-f-]{8,}\}",
+            r"^(?=.{4,}$)[0-9a-f]*[a-f][0-9a-f]*$",
+            r"^config$",
+            r"^ie\d+-",
+        )
+    ),
+    re.IGNORECASE,
+)
+# "Collect then clean up" means the archive was removed in the same episode it
+# was built. A zip that sat on disk for years before being deleted is ordinary
+# housekeeping, not staging, so the create->delete span is bounded.
+USN_STAGING_EPISODE_MAX_SECONDS = 7 * 24 * 60 * 60
+# How close a deletion has to sit to a staging event before it reads as part of
+# the same episode. 30 minutes keeps the correlation to one working session --
+# wide enough for a copy-then-clean-up sequence, narrow enough that unrelated
+# OS servicing churn hours away is not swept in.
+USN_POST_STAGING_WINDOW_SECONDS = 30 * 60
+
+
+def _usn_ts(value: Any) -> datetime | None:
+    """Parse a USN ``timestamp_iso`` (``...Z``) into an aware datetime, or None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def usn_staging_candidates(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Classify USN change records into staging + post-staging-deletion leads.
+
+    Pure function over ``usnjrnl_query`` rows
+    (``{usn, timestamp_iso, filename, reason_flags, mft_entry}``).
+
+    ``archives`` -- a user-archive filename that was created (or renamed into
+    existence) and LATER deleted. A rename pair (``RENAME_OLD_NAME`` then
+    ``RENAME_NEW_NAME`` on the same ``mft_entry``) records the name the archive
+    was given, which is how a disguised document shows up here.
+
+    ``post_staging_deletions`` -- document/executable deletions that fall within
+    :data:`USN_POST_STAGING_WINDOW_SECONDS` of a staging event. The staging
+    pivot is required: a deletion on its own is ordinary file-system activity
+    and is never reported.
+
+    The journal establishes names, order and timing only -- never a file's
+    contents, its path, or that anything moved off the host.
+    """
+    empty: dict[str, list[dict[str, Any]]] = {"archives": [], "post_staging_deletions": []}
+    if not rows:
+        return empty
+
+    created: dict[str, str] = {}
+    renamed_from: dict[str, str] = {}
+    pending_rename: dict[Any, str] = {}
+    archives: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("filename") or "")
+        if not name:
+            continue
+        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
+        entry = row.get("mft_entry")
+        if "RENAME_OLD_NAME" in flags:
+            pending_rename[entry] = name
+        if "RENAME_NEW_NAME" in flags and entry in pending_rename:
+            renamed_from.setdefault(name, pending_rename.pop(entry))
+        low = name.lower()
+        if not low.endswith(_USER_ARCHIVE_EXTS):
+            continue
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        if _OS_PACKAGE_ARCHIVE_RE.search(stem):
+            continue
+        if "FILE_DELETE" in flags and name in created:
+            created_iso = created.pop(name)
+            deleted_iso = str(row.get("timestamp_iso") or "")
+            created_ts, deleted_ts = _usn_ts(created_iso), _usn_ts(deleted_iso)
+            if (
+                created_ts is not None
+                and deleted_ts is not None
+                and (deleted_ts - created_ts).total_seconds() > USN_STAGING_EPISODE_MAX_SECONDS
+            ):
+                # Built long before it was removed -> housekeeping, not staging.
+                continue
+            archives.append(
+                {
+                    "name": name,
+                    "created_iso": created_iso,
+                    "deleted_iso": deleted_iso,
+                    "renamed_from": renamed_from.get(name),
+                }
+            )
+            continue
+        if flags & _USN_CREATE_FLAGS:
+            created.setdefault(name, str(row.get("timestamp_iso") or ""))
+
+    pivots = [ts for ts in (_usn_ts(a.get("created_iso")) for a in archives) if ts is not None]
+    if not pivots:
+        return {"archives": archives, "post_staging_deletions": []}
+
+    window = timedelta(seconds=USN_POST_STAGING_WINDOW_SECONDS)
+    deletions: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
+        if "FILE_DELETE" not in flags:
+            continue
+        name = str(row.get("filename") or "")
+        low = name.lower()
+        if not (low.endswith(_STAGED_DOC_EXTS) or low.endswith(_STAGED_EXE_EXTS)):
+            continue
+        if low.endswith(_USER_ARCHIVE_EXTS):
+            continue
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        if _MACHINE_GENERATED_NAME_RE.search(stem):
+            continue
+        ts = _usn_ts(row.get("timestamp_iso"))
+        if ts is None or not any(abs(ts - pivot) <= window for pivot in pivots):
+            continue
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        deletions.append({"name": name, "deleted_iso": row.get("timestamp_iso")})
+    return {"archives": archives, "post_staging_deletions": deletions}
 
 
 def usn_rows_to_findings(
     rows: list[dict[str, Any]], tool_call_id: str, case_id: str, artifact_path: str
 ) -> list[dict[str, Any]]:
-    """Detect an archive staged then deleted in the USN journal (T1560.001).
+    """Turn USN change records into the archive-staging and cleanup leads.
 
-    An archive filename showing both a create (FILE_CREATE / DATA_EXTEND) and a
-    later FILE_DELETE is an archive-staging and cleanup pattern (T1560.001 plus
-    T1070.004). The USN records do not establish archive contents or movement.
-    Emitted once as INFERRED (a two-record correlation over one artifact).
+    Two findings, from two different record patterns, so each can bind to its
+    own ground-truth claim:
+
+    * ``f-B-usn-archive-staged-deleted`` (T1560.001) -- user archives created
+      and later deleted, naming the document each archive was renamed from when
+      the journal records the rename pair.
+    * ``f-B-usn-post-staging-deletion`` (T1070) -- document/executable deletions
+      inside the window after a staging event.
+
+    Both stay INFERRED: these are multi-record correlations over ONE artifact
+    class. The journal does not establish archive contents, file paths, or that
+    anything left the host, and neither description claims it.
     """
+    candidates = usn_staging_candidates(rows)
+    archives = candidates["archives"]
+    deletions = candidates["post_staging_deletions"]
     findings: list[dict[str, Any]] = []
-    created_names: set[str] = set()
-    staged_deleted_name: str | None = None
-    for row in rows:
-        name = str(row.get("filename") or "")
-        if not name.lower().endswith(_ARCHIVE_EXTS):
-            continue
-        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
-        if "FILE_DELETE" in flags and name in created_names:
-            staged_deleted_name = name
-            break
-        if flags & {"FILE_CREATE", "DATA_EXTEND"}:
-            created_names.add(name)
-    if staged_deleted_name:
+
+    if archives:
+        listing = "; ".join(
+            f"'{a['name']}' created {a.get('created_iso')} then deleted {a.get('deleted_iso')}"
+            + (f" (renamed from '{a['renamed_from']}')" if a.get("renamed_from") else "")
+            for a in archives[:6]
+        )
+        sources = sorted({str(a["renamed_from"]) for a in archives if a.get("renamed_from")})
+        disguise = (
+            " Each archive name was applied by renaming an existing user document "
+            f"({', '.join(sources[:6])}), so the compressed container was given an "
+            "innocuous name rather than created under its source name."
+            if sources
+            else ""
+        )
         findings.append(
             {
                 "case_id": case_id,
@@ -8449,17 +10501,50 @@ def usn_rows_to_findings(
                 "tool_call_id": tool_call_id,
                 "artifact_path": artifact_path,
                 "description": (
-                    f"USN journal shows archive '{staged_deleted_name}' created and then "
-                    "deleted (FILE_CREATE/DATA_EXTEND followed by FILE_DELETE); "
-                    "a collect-then-clean-up archive staging pattern (T1560.001) "
-                    "with indicator removal via file deletion (T1070.004). These "
-                    "records do not establish archive contents or data movement. "
-                    "Corroborate with archiver execution and an independently "
-                    "observed transfer channel."
+                    "USN journal timeline records user documents archived into "
+                    f"compressed containers and the archives later removed: {listing}. "
+                    "Creation followed by deletion of a user-chosen archive is a "
+                    "collect-then-clean-up staging pattern (T1560.001) with indicator "
+                    f"removal via file deletion (T1070.004).{disguise} Windows "
+                    "servicing packages (.cab) are excluded from this classification. "
+                    "These change records establish names, order and timing only -- "
+                    "not archive contents, not the files' directories, and not that "
+                    "any data moved. Corroborate with archiver execution and an "
+                    "independently observed transfer channel."
                 ),
                 "confidence": "INFERRED",
                 "pool_origin": "B",
                 "mitre_technique": "T1560.001",
+                "derived_from": [tool_call_id],
+            }
+        )
+
+    if deletions:
+        names = ", ".join(d["name"] for d in deletions[:8])
+        more = f" (and {len(deletions) - 8} more)" if len(deletions) > 8 else ""
+        first_ts = deletions[0].get("deleted_iso")
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": "f-B-usn-post-staging-deletion",
+                "tool_call_id": tool_call_id,
+                "artifact_path": artifact_path,
+                "description": (
+                    f"USN journal delete records following the archive staging events "
+                    f"land immediately after them: {len(deletions)} document/executable "
+                    f"file(s) were "
+                    f"deleted within {USN_POST_STAGING_WINDOW_SECONDS // 60} minutes of "
+                    f"an archive being staged, beginning {first_ts} -- {names}{more}. "
+                    "Deletion of the source files right after they were collected is "
+                    "indicator removal (T1070) and an anti-forensics step. The journal "
+                    "records the deletion order and timing; it does not establish that "
+                    "the files were copied anywhere first, nor which directory they "
+                    "were in. Corroborate with the MFT, Recycle Bin and removable-media "
+                    "artifacts."
+                ),
+                "confidence": "INFERRED",
+                "pool_origin": "B",
+                "mitre_technique": "T1070",
                 "derived_from": [tool_call_id],
             }
         )
@@ -8827,6 +10912,359 @@ def detect_console_activity(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Recovered-command detector (memory lane)
+# ---------------------------------------------------------------------------
+# detect_console_activity states that console artifacts are PRESENT. This
+# detector answers the narrower question a DFIR analyst actually cares about:
+# did volatility recover a COMMAND? Two genuine sources, both allow-listed
+# vol_run plugins:
+#
+#   * windows.consoles / windows.cmdscan — a CommandHistory row whose ``Data``
+#     column holds a command the operator typed into the console. Both plugins
+#     render the same TreeGrid columns (PID, Process, ConsoleInfo, Property,
+#     Address, Data).
+#   * windows.cmdline — an interpreter invoked WITH a command payload
+#     (``cmd.exe /c ...``, ``powershell -enc ...``). A bare
+#     ``"C:\\Windows\\system32\\cmd.exe"`` is an open shell, not a recovered
+#     command, and deliberately emits nothing.
+#
+# Tier discipline, pinned by services/agent/tests/test_memory_command_execution.py:
+#
+#   * A T1059* tag makes _claims_execution() true. The report-QA gate
+#     execution_requires_two_current_artifact_classes rejects a CONFIRMED or
+#     INFERRED execution claim whose classes are a subset of
+#     {memory, yara, evtx}, and _ablate_single_class_execution independently
+#     downgrades a single-class CONFIRMED execution claim. So a memory-only
+#     recovered command is emitted at HYPOTHESIS — a scoped lead — and cannot
+#     escalate the verdict. That is the engine's >=2-artifact-class law applied
+#     honestly, not a hedge.
+#   * The CONFIRMED tier additionally needs a TELL. Same reasoning as
+#     registry_persistence_candidates: compute_verdict treats any CONFIRMED
+#     finding as SUSPICIOUS, so an administrator typing ``dir`` must not flip a
+#     healthy host. Only a recovered command carrying a hostile tell
+#     (encoded/hidden PowerShell, shadow-copy destruction, log clearing,
+#     account manipulation, LOLBin download) reaches CONFIRMED, and only when a
+#     second, non-memory artifact class corroborates it.
+
+# Command interpreters whose recovered command payload is a T1059 sub-technique.
+# conhost.exe is deliberately absent: it is the console HOST, its command line
+# is always the bare conhost path, and it never carries a command payload.
+_INTERPRETER_TECHNIQUE: dict[str, str] = {
+    "cmd.exe": "T1059.003",
+    "powershell.exe": "T1059.001",
+    "pwsh.exe": "T1059.001",
+}
+
+# Switches that mean "everything after this is a command for the interpreter".
+# Anything else on the command line (window size, colour, working directory) is
+# shell configuration, not a command. PowerShell accepts unambiguous switch
+# prefixes, so the prefixes are enumerated rather than guessed at match time.
+_CMD_PAYLOAD_SWITCHES: tuple[str, ...] = ("/c", "/k", "/r")
+_PWSH_PAYLOAD_SWITCHES: tuple[str, ...] = (
+    "-c",
+    "-com",
+    "-comm",
+    "-comma",
+    "-comman",
+    "-command",
+    "-e",
+    "-ec",
+    "-en",
+    "-enc",
+    "-enco",
+    "-encod",
+    "-encode",
+    "-encoded",
+    "-encodedc",
+    "-encodedcommand",
+    "-f",
+    "-fi",
+    "-fil",
+    "-file",
+)
+_COMMAND_PAYLOAD_SWITCHES: dict[str, tuple[str, ...]] = {
+    "cmd.exe": _CMD_PAYLOAD_SWITCHES,
+    "powershell.exe": _PWSH_PAYLOAD_SWITCHES,
+    "pwsh.exe": _PWSH_PAYLOAD_SWITCHES,
+}
+
+# Vol3 renders an unreadable PEB as an Args string starting with this text.
+_UNREADABLE_ARGS_PREFIX = "required memory"
+
+# A windows.consoles / windows.cmdscan Property naming a typed command.
+_CONSOLE_COMMAND_PROPERTY = re.compile(r"CommandHistory_\d+_Command_\d+", re.IGNORECASE)
+
+# volatility3's refusal to build a conhost symbol table for an unsupported
+# Windows build. windows.consoles and windows.cmdscan share that code path, so
+# this error from one is proof the other cannot succeed on the same image.
+_CONHOST_UNSUPPORTED_RE = re.compile(
+    r"this version of windows is not supported", re.IGNORECASE
+)
+
+# Hostile tells in a RECOVERED command. Each is a behaviour an analyst would
+# escalate on sight, not a name that merely looks unusual. The gate exists so
+# the CONFIRMED tier (and therefore compute_verdict's SUSPICIOUS escalation)
+# cannot be reached by ordinary administration.
+SUSPICIOUS_COMMAND_TELLS: tuple[tuple[str, str], ...] = (
+    ("-enc ", "base64-encoded PowerShell command"),
+    ("-encodedcommand", "base64-encoded PowerShell command"),
+    ("frombase64string", "inline base64 decoding"),
+    ("-w hidden", "hidden PowerShell window"),
+    ("-windowstyle hidden", "hidden PowerShell window"),
+    ("invoke-expression", "dynamic code evaluation"),
+    ("iex(", "dynamic code evaluation"),
+    ("iex ", "dynamic code evaluation"),
+    ("downloadstring", "in-memory remote payload fetch"),
+    ("downloadfile", "remote payload fetch"),
+    ("invoke-webrequest", "remote payload fetch"),
+    ("-urlcache", "certutil used as a downloader"),
+    ("bitsadmin /transfer", "bitsadmin used as a downloader"),
+    ("vssadmin delete shadows", "shadow-copy destruction"),
+    ("wbadmin delete catalog", "backup catalog destruction"),
+    ("bcdedit /set", "boot configuration tampering"),
+    ("wevtutil cl", "event-log clearing"),
+    ("clear-eventlog", "event-log clearing"),
+    ("cipher /w", "free-space wiping"),
+    ("net user", "local account manipulation"),
+    ("net1 user", "local account manipulation"),
+    ("net localgroup administrators", "administrator group manipulation"),
+    ("schtasks /create", "scheduled-task creation"),
+    ("sc create", "service creation"),
+    ("psexec", "remote execution tooling"),
+    ("process call create", "WMI remote process creation"),
+    ("mimikatz", "credential-dumping tooling"),
+    ("rundll32 javascript", "rundll32 script execution"),
+)
+
+
+def _command_tells(command: str) -> list[str]:
+    """Hostile tells present in a recovered command, sorted and de-duplicated."""
+    lowered = " ".join(str(command or "").lower().split())
+    return sorted({label for token, label in SUSPICIOUS_COMMAND_TELLS if token in lowered})
+
+
+def _strip_leading_image(args: str) -> str:
+    """The command line with its leading executable token removed.
+
+    Handles the quoted (``"C:\\...\\cmd.exe" /c dir``) and bare
+    (``powershell.exe -enc ...``) forms Vol3 emits. Returns "" when nothing
+    follows the image path — the bare interactive shell.
+    """
+    text = str(args or "").strip()
+    if text.startswith('"'):
+        closing = text.find('"', 1)
+        return "" if closing == -1 else text[closing + 1 :].strip()
+    parts = text.split(None, 1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def recovered_command_payload(process: str, args: str) -> str | None:
+    """The command an interpreter was invoked WITH, or ``None``.
+
+    ``None`` means "no command was recovered": a non-interpreter process, an
+    unreadable PEB, a bare interpreter path, or an interpreter carrying only
+    configuration switches. Pure and deterministic, so the offline verifier
+    reaches the same answer from the same row.
+    """
+    switches = _COMMAND_PAYLOAD_SWITCHES.get(str(process or "").strip().lower())
+    if not switches:
+        return None
+    text = str(args or "").strip()
+    if not text or text.lower().startswith(_UNREADABLE_ARGS_PREFIX):
+        return None
+    tokens = _strip_leading_image(text).split()
+    for index, token in enumerate(tokens):
+        if token.lower() in switches:
+            return " ".join(tokens[index:]).strip() or None
+    return None
+
+
+def console_history_commands(
+    rows: list[dict[str, Any]] | None,
+) -> list[tuple[int | None, str, str]]:
+    """``(pid, property, command)`` for every recovered command-history row.
+
+    Rows are the generic ``vol_run`` shape for ``windows.consoles`` /
+    ``windows.cmdscan``. Only ``CommandHistory_<n>_Command_<m>`` properties are
+    typed commands; screen geometry, titles and alias rows are console metadata
+    and are skipped.
+    """
+    hits: list[tuple[int | None, str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        prop = str(row.get("Property") or row.get("property") or "")
+        if not _CONSOLE_COMMAND_PROPERTY.search(prop):
+            continue
+        data = row.get("Data", row.get("data"))
+        if not isinstance(data, str) or not data.strip():
+            continue
+        try:
+            pid: int | None = int(row.get("PID", row.get("pid")))
+        except (TypeError, ValueError):
+            pid = None
+        hits.append((pid, prop, data.strip()))
+    return hits
+
+
+def cmdline_command_payloads(
+    rows: list[dict[str, Any]] | None,
+) -> list[tuple[int | None, str, str, str]]:
+    """``(pid, process, args, payload)`` for interpreters invoked with a command."""
+    hits: list[tuple[int | None, str, str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        proc = str(row.get("Process") or row.get("process") or "")
+        args = str(row.get("Args", row.get("args")) or "")
+        payload = recovered_command_payload(proc, args)
+        if not payload:
+            continue
+        try:
+            pid: int | None = int(row.get("PID", row.get("pid")))
+        except (TypeError, ValueError):
+            pid = None
+        hits.append((pid, proc, args, payload))
+    return hits
+
+
+def _recovered_command_confidence(tells: list[str], corroborating_classes: tuple[str, ...]) -> str:
+    """Tier for a recovered-command finding.
+
+    Memory is the only artifact class this lane cites on its own, and a T1059
+    tag makes the finding an execution claim, so a memory-only recovery is a
+    HYPOTHESIS lead. With a genuine second (non-memory) artifact class the
+    finding reaches INFERRED, and CONFIRMED only when the recovered command
+    also carries a hostile tell.
+    """
+    if not {c for c in corroborating_classes if c and c != "memory"}:
+        return "HYPOTHESIS"
+    return "CONFIRMED" if tells else "INFERRED"
+
+
+def _recovered_command_claim(
+    history_rows: list[dict[str, Any]] | None,
+    cmdline_rows: list[dict[str, Any]] | None,
+    tcid_history: str | None,
+    tcid_cmdline: str | None,
+) -> tuple[str, str, str, list[str], list[dict[str, Any]]] | None:
+    """``(tool_call_id, technique, source_sentence, commands, asserted_values)``.
+
+    Console history wins over a command line when both are available: a typed
+    command is stronger evidence than a process's own invocation. Returns
+    ``None`` when nothing was recovered.
+    """
+    history_hits = console_history_commands(history_rows)
+    if history_hits and tcid_history:
+        pids = sorted({pid for pid, _prop, _cmd in history_hits if pid is not None})
+        scope = f" for console host pid {', '.join(str(p) for p in pids)}" if pids else ""
+        first_pid, first_prop, first_cmd = history_hits[0]
+        return (
+            tcid_history,
+            "T1059.003",
+            (
+                f"volatility console command-history recovery returned "
+                f"{len(history_hits)} typed command(s){scope}"
+            ),
+            [command for _pid, _prop, command in history_hits],
+            [
+                {
+                    "path": "rows[*]",
+                    "expected": json.dumps({"Property": first_prop, "Data": first_cmd}),
+                    "match": "record",
+                }
+            ],
+        )
+    payload_hits = cmdline_command_payloads(cmdline_rows)
+    if not payload_hits or not tcid_cmdline:
+        return None
+    first_pid, first_proc, first_args, _first_payload = payload_hits[0]
+    return (
+        tcid_cmdline,
+        _INTERPRETER_TECHNIQUE.get(first_proc.lower(), "T1059"),
+        (
+            f"volatility windows.cmdline recovered the command line of "
+            f"{first_proc.lower()} (pid {first_pid}), which was invoked with a command"
+        ),
+        [payload for _pid, _proc, _args, payload in payload_hits],
+        [
+            {
+                "path": "rows[*]",
+                "expected": json.dumps({"Process": first_proc, "Args": first_args}),
+                "match": "record",
+            }
+        ],
+    )
+
+
+def detect_command_execution(
+    cmdline_rows: list[dict[str, Any]] | None,
+    history_rows: list[dict[str, Any]] | None,
+    tcid_cmdline: str | None,
+    tcid_history: str | None,
+    case_id: str,
+    evidence_path: str,
+    corroborating_tcids: tuple[str, ...] = (),
+    corroborating_classes: tuple[str, ...] = (),
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B finding for a command volatility actually RECOVERED from memory.
+
+    Fires only on real recovered output — a console command-history row, or an
+    interpreter command line carrying a command payload. ``asserted_values``
+    bind the interpreter/property and the recovered command text inside ONE
+    row, so the verifier's deterministic entailment check re-extracts the exact
+    claim from the re-run ``vol_run`` output and a misread cannot launder
+    through a valid ``tool_call_id``.
+    """
+    claim = _recovered_command_claim(history_rows, cmdline_rows, tcid_history, tcid_cmdline)
+    if claim is None:
+        return []
+    primary_tcid, technique, source, commands, asserted = claim
+    tells = sorted({tell for command in commands for tell in _command_tells(command)})
+    confidence = _recovered_command_confidence(tells, corroborating_classes)
+    tell_sentence = (
+        f" The recovered command carries {', '.join(tells)}."
+        if tells
+        else (
+            " No hostile tell is present in the recovered text; this is reported as a "
+            "recovered command, not as a malicious one."
+        )
+    )
+    scope_sentence = (
+        (
+            " Memory is the only artifact class supporting this claim, so it is scoped as a "
+            "lead: attributing execution to an actor needs a second artifact class."
+        )
+        if confidence == "HYPOTHESIS"
+        else ""
+    )
+    derived = [primary_tcid]
+    if tcid_cmdline and tcid_cmdline not in derived:
+        derived.append(tcid_cmdline)
+    for tcid in corroborating_tcids:
+        if tcid and tcid not in derived:
+            derived.append(tcid)
+    return [
+        {
+            "case_id": case_id,
+            "finding_id": (finding_id_for or (lambda base: base))("f-B-recovered-command"),
+            "tool_call_id": primary_tcid,
+            "artifact_path": evidence_path,
+            "description": (
+                f"Recovered command from memory: {source}. Command text: "
+                f"{'; '.join(commands[:3])}.{tell_sentence}{scope_sentence}"
+            ),
+            "confidence": confidence,
+            "pool_origin": "B",
+            "mitre_technique": technique,
+            "derived_from": derived,
+            "asserted_values": asserted,
+        }
+    ]
+
+
 def write_timeline_csv(timeline: list[dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "ts",
@@ -9011,6 +11449,27 @@ class Investigation:
         # (exe basename lower, finding dict) for prefetch suspicious-tool findings,
         # used to corroborate execution against UserAssist after registry parsing.
         self._prefetch_exec_findings: list[tuple[str, dict[str, Any]]] = []
+        # Per-user execution artifacts indexed off the NTUSER.DAT triage keys
+        # (UserAssist + Program Compatibility Assistant Store). Populated by
+        # _collect_registry_execution_candidates so both the standalone
+        # execution leads and the prefetch promotion read ONE set of queries —
+        # and so UserAssist is consulted whether or not prefetch found anything.
+        self._userassist_exec_index: dict[str, tuple[str, str | None]] = {}
+        self._registry_exec_candidates: list[tuple[str, str, dict[str, Any]]] = []
+        # EVERY prefetch the lane parsed (exe basename -> tool_call_id, ts), not
+        # just the ones that matched a suspicious-tool hint. This is the second
+        # ARTIFACT CLASS a registry execution lead needs; keying it off the hint
+        # list instead would make corroboration depend on a name allowlist
+        # rather than on the evidence actually parsed.
+        self._prefetch_exec_index: dict[str, tuple[str, str | None]] = {}
+        # Exfil/staging candidates collected as the disk lanes run. The MFT lane
+        # finishes long before the prefetch and browser lanes, so the wiper and
+        # cloud-channel findings are emitted at the END of the disk sweep once
+        # every corroborating class has had its turn — that is what lets them
+        # cite two independent artifact classes instead of one.
+        self._disk_wiper_candidates: list[dict[str, Any]] = []
+        self._disk_cloud_candidates: list[dict[str, Any]] = []
+        self._browser_cloud_candidates: list[dict[str, Any]] = []
         self.evtx_summary: dict[str, Any] | None = None
         # EVTX summary is accumulated across every evtx_query call (one per
         # file). A trailing empty log used to reset records_seen to 0 because
@@ -10479,6 +12938,7 @@ class Investigation:
 
         consoles_rows: list[dict[str, Any]] = []
         tcid_consoles: str | None = None
+        consoles_error: str | None = None
         if _console_command_rows(cmdline_rows):
             consoles_args = {
                 "case_id": self.handle["id"],
@@ -10487,7 +12947,6 @@ class Investigation:
                 "limit": 200,
             }
             consoles_out = rust.call_tool("vol_run", consoles_args)
-            consoles_error = None
             if "_error" in consoles_out:
                 consoles_error = str(
                     consoles_out["_error"].get("message", "vol_run windows.consoles failed")
@@ -10525,6 +12984,85 @@ class Investigation:
             )
             print(f"  vol_run windows.consoles: {len(consoles_rows)} rows")
 
+        # windows.cmdscan — the SECOND console-history attempt. windows.consoles
+        # walks the conhost screen buffer; windows.cmdscan brute-force scans for
+        # CommandHistory structures and can recover typed commands the screen
+        # buffer no longer holds. Only worth the scan when consoles recovered no
+        # command-history row.
+        #
+        # Deliberate skip: both plugins resolve the same conhost symbol table
+        # (volatility3 consoles.Consoles.create_conhost_symbol_table), so an
+        # unsupported-Windows-version failure from consoles means cmdscan fails
+        # identically. Measured on the lab host against the MemLabs Lab 1 Win7
+        # x64 image with volatility3 2.28.0: both plugins raise
+        # "NotImplementedError: This version of Windows is not supported:
+        # 6.1 15.7601!" from that same call. Re-running the doomed lookup buys
+        # no evidence, so the shared limitation is recorded once instead.
+        cmdscan_rows: list[dict[str, Any]] = []
+        tcid_cmdscan: str | None = None
+        if tcid_consoles and not console_history_commands(consoles_rows):
+            if consoles_error and _CONHOST_UNSUPPORTED_RE.search(consoles_error):
+                self.analysis_limitations.append(
+                    "vol_run windows.cmdscan skipped: windows.consoles already failed with "
+                    "volatility's \"This version of Windows is not supported\" error and "
+                    "cmdscan resolves the same conhost symbol table, so no console command "
+                    "history is recoverable from this image with this volatility build"
+                )
+                print("  vol_run windows.cmdscan: skipped (conhost symbols unsupported)")
+            else:
+                cmdscan_args = {
+                    "case_id": self.handle["id"],
+                    "memory_path": evidence_path,
+                    "plugin": "windows.cmdscan",
+                    "limit": 200,
+                }
+                cmdscan_out = rust.call_tool("vol_run", cmdscan_args)
+                cmdscan_error = None
+                if "_error" in cmdscan_out:
+                    cmdscan_error = str(
+                        cmdscan_out["_error"].get("message", "vol_run windows.cmdscan failed")
+                    )
+                    print(f"  vol_run windows.cmdscan error: {cmdscan_error[:80]}")
+                    self.analysis_limitations.append(
+                        f"vol_run windows.cmdscan failed: {cmdscan_error}"
+                    )
+                    self._course_correct(
+                        py,
+                        "vol_run",
+                        cmdscan_error,
+                        "defer (no console command history recovered this run)",
+                    )
+                    cmdscan_out = {
+                        "_error": {"message": cmdscan_error},
+                        "plugin": "windows.cmdscan",
+                        "rows": [],
+                        "rows_seen": 0,
+                    }
+                cmdscan_rows = cmdscan_out.get("rows", []) or []
+                cmdscan_extra: dict[str, Any] = {
+                    "tool": "windows.cmdscan",
+                    "rows_returned": len(cmdscan_rows),
+                    "rows_seen": cmdscan_out.get("rows_seen", len(cmdscan_rows)),
+                }
+                if cmdscan_error:
+                    cmdscan_extra["error"] = cmdscan_error
+                tcid_cmdscan = self._record_tool(
+                    py,
+                    "vol_run",
+                    self._output_hash(cmdscan_out),
+                    cmdscan_extra,
+                    arguments=cmdscan_args,
+                )
+                print(f"  vol_run windows.cmdscan: {len(cmdscan_rows)} rows")
+
+        # Cite the plugin whose output actually holds the recovered commands.
+        if console_history_commands(cmdscan_rows):
+            history_rows, tcid_history = cmdscan_rows, tcid_cmdscan
+        elif console_history_commands(consoles_rows):
+            history_rows, tcid_history = consoles_rows, tcid_consoles
+        else:
+            history_rows, tcid_history = [], None
+
         if tcid_cmdline:
             # Cite the process views as corroboration ONLY when they actually
             # contain a console host observed by windows.cmdline.
@@ -10547,6 +13085,31 @@ class Investigation:
             self.findings_pool_b.extend(console_findings)
             if console_findings:
                 print(f"  console activity: {len(console_findings)} presence finding(s)")
+
+            # Finding 6 — a command volatility actually RECOVERED (console
+            # history, or an interpreter invoked with a command payload). The
+            # corroborating tool calls available here are process views, which
+            # are the SAME artifact class as vol_run ("memory"), so the finding
+            # is emitted as a scoped HYPOTHESIS lead: a T1059 tag is an
+            # execution claim and SOUL.md's >=2-artifact-class rule does not
+            # let one class carry it. detect_command_execution takes the
+            # non-memory classes as a parameter so a future cross-lane
+            # corroboration (EVTX 4688 / Sysmon 1 quoting the same command) can
+            # raise the tier without re-deriving the claim.
+            recovered = detect_command_execution(
+                cmdline_rows,
+                history_rows,
+                tcid_cmdline,
+                tcid_history,
+                self.handle["id"],
+                evidence_path,
+                corroborating_tcids=tuple(corroborating),
+                corroborating_classes=("memory",),
+                finding_id_for=lambda base: self._finding_id_for(base, evidence_path),
+            )
+            self.findings_pool_b.extend(recovered)
+            if recovered:
+                print(f"  recovered commands: {len(recovered)} finding(s)")
 
         # Save psscan for the report
         self.local_artifacts["psscan_json"] = json.dumps(psscan or [], separators=(",", ":"))
@@ -10614,7 +13177,7 @@ class Investigation:
         evtx_args = {
             "case_id": self.handle["id"],
             "evtx_path": evidence_path,
-            "limit": 500,
+            "limit": EVTX_QUERY_LIMIT,
         }
         out = rust.call_tool("evtx_query", evtx_args)
         evtx_error = None
@@ -10652,7 +13215,10 @@ class Investigation:
             arguments=evtx_args,
         )
         print(f"  evtx_query: {len(rows)}/{seen} rows, {pe} parse errors")
-        for row in rows[:500]:
+        truncation = evtx_truncation_limitation(evidence_path, seen, len(rows))
+        if truncation and truncation not in self.analysis_limitations:
+            self.analysis_limitations.append(truncation)
+        for row in rows[:EVTX_TIMELINE_ROWS]:
             event_id = row.get("event_id")
             record_id = row.get("record_id")
             entities = _extract_evtx_entities(row.get("data") or {}, event_id)
@@ -10726,6 +13292,31 @@ class Investigation:
                 self.findings_pool_b.append(finding)
             else:
                 self.findings_pool_a.append(finding)
+
+    def _record_disk_extract_limitations(
+        self, extracted: dict[str, Any], evidence_path: str
+    ) -> None:
+        """Fold the scoped gaps ``disk_extract_artifacts`` observed into the
+        case's analysis limitations.
+
+        Today that is a Prefetch directory holding zero allocated files (the
+        secure-deletion shape). The tool can see it — it is looking at the raw
+        ``fls`` listing — and the engine cannot, so a limitation the engine
+        drops on the floor leaves exactly the silent gap this lane exists to
+        close: ``artifact_counts.prefetch = 0`` reading identically to a host
+        that simply never ran anything.
+        """
+        for limitation in extracted.get("analysis_limitations") or []:
+            text = str(limitation).strip()
+            if text and text not in self.analysis_limitations:
+                self.analysis_limitations.append(text)
+                print(f"  disk_extract_artifacts limitation: {text[:160]}")
+        recovered = int(extracted.get("artifacts_recovered_deleted") or 0)
+        if recovered:
+            print(
+                f"  disk_extract_artifacts recovered {recovered} deleted-but-resident "
+                f"artifact(s) from {evidence_path}"
+            )
 
     def investigate_disk(
         self, rust: SshMcpClient, py: SshMcpClient, evidence_path: str | None = None
@@ -10881,6 +13472,7 @@ class Investigation:
                 self.analysis_limitations.append(
                     f"disk_extract_artifacts skipped {skipped_oversize} oversized artifact(s); rerun with a targeted extraction plan if those paths are needed."
                 )
+            self._record_disk_extract_limitations(extracted, evidence_path)
 
             evtx_entries: list[dict[str, Any]] = []
             for artifact in artifacts:
@@ -10888,7 +13480,7 @@ class Investigation:
                 artifact_class = artifact.get("artifact_class")
                 if not path:
                     continue
-                if artifact_class in EXTRACTED_DISK_CLASSES | {"yara_target"}:
+                if artifact_class in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}:
                     extracted_entries.append(
                         {
                             "path": path,
@@ -10984,6 +13576,13 @@ class Investigation:
             return [
                 r"Software\Microsoft\Windows\CurrentVersion\Run",
                 r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                # Per-user execution artifacts, queried UNCONDITIONALLY: these
+                # used to be reachable only through the prefetch-corroboration
+                # path, so a host whose Prefetch directory had been wiped was
+                # never asked what the user actually ran. Both are budget-exempt
+                # (see _EXECUTION_TRIAGE_KEYS).
+                _USERASSIST_KEY,
+                _COMPAT_STORE_KEY,
                 r"Software\Microsoft\Search Assistant\ACMru",
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery",
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs",
@@ -11063,6 +13662,33 @@ class Investigation:
             "derived_from": [tcid],
             "asserted_values": asserted,
         }
+
+    def _emit_encryption_tooling_findings(
+        self, observations: list[dict[str, Any]] | None
+    ) -> None:
+        """Emit the dual-use encryption presence leads into Pool B.
+
+        CRITICAL: these findings are appended to ``findings_pool_b`` ONLY. They
+        must never enter ``self._prefetch_exec_findings`` — that list is what
+        ``_corroborate_execution_with_userassist`` promotes to CONFIRMED, and a
+        CONFIRMED finding makes ``compute_verdict`` return SUSPICIOUS. A user
+        who opens Kleopatra or unlocks a BitLocker drive would then flip the
+        whole host to SUSPICIOUS. See test_encryption_tooling.py.
+        """
+        findings = detect_encryption_tooling(
+            observations,
+            self.handle["id"],
+            finding_id_for=lambda base: self._finding_id_for(
+                base, str((observations or [{}])[0].get("artifact_path") or "")
+            ),
+        )
+        if not findings:
+            return
+        self.findings_pool_b.extend(findings)
+        print(
+            f"  encryption tooling: {len(findings)} dual-use presence "
+            "finding(s) (INFERRED)"
+        )
 
     def _emit_registry_persistence_findings(
         self,
@@ -11456,14 +14082,19 @@ class Investigation:
                 "tool_call_id": tcid,
                 "artifact_path": hive_path,
                 "description": (
-                    f"hypothesis: USB external storage device insertion history present: "
-                    f"{device} (serial {cand.get('serial')}) recorded under "
-                    f"{cand.get('hive_key')} (registry_query, last_write "
-                    f"{cand.get('last_write_time_iso')}). USBSTOR records that an "
-                    "external drive was connected — relevant to staging/exfiltration "
-                    "if corroborated (LNK/shellbag paths on the volume, file activity "
-                    "near the insertion time). Insertion alone proves connection, "
-                    "never data transfer."
+                    f"hypothesis: a USB mass-storage class device was connected to this "
+                    f"host: {device} (serial {cand.get('serial')}), recorded in the "
+                    f"SYSTEM registry hive under {cand.get('hive_key')} "
+                    f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
+                    "The USBSTOR enumeration key is this device's insertion history: "
+                    "Windows writes it when it loads the USB mass-storage driver, so it "
+                    "records that external removable media was attached — the channel a "
+                    "user would stage data onto. Insertion alone proves connection, "
+                    "never data transfer: "
+                    "corroborate the first-insertion time with setupapi.dev.log, the "
+                    "drive letter with MountedDevices, and any file movement with "
+                    "LNK/shellbag paths on the volume and filesystem activity near the "
+                    "insertion time."
                 ),
                 "confidence": "HYPOTHESIS",
                 "pool_origin": "B",
@@ -11472,6 +14103,372 @@ class Investigation:
             }
             self.findings_pool_b.append(finding)
             print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
+
+    def _index_mft_web_paths(self, rows: list[dict[str, Any]], tcid: str) -> None:
+        """Record creation times for web-root paths seen in an ``$MFT`` parse.
+
+        Only web-root paths are kept: the index exists so the webshell finding
+        can cite a creation timestamp read by a DIFFERENT tool than the one that
+        read the file's bytes, and holding the whole MFT would be a needless
+        copy of a 5000-row table.
+        """
+        index = getattr(self, "_mft_web_paths", None)
+        if index is None:
+            index = {}
+            self._mft_web_paths = index
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            raw = str(row.get("full_path") or row.get("name") or "")
+            if not raw:
+                continue
+            lower = raw.replace("\\", "/").lower().lstrip("/")
+            if not lower.endswith(WEBROOT_SCRIPT_EXTS):
+                continue
+            if not any(
+                lower.startswith(marker) or f"/{marker}" in lower
+                for marker in _WEB_ROOT_MARKERS
+            ):
+                continue
+            index.setdefault(
+                lower,
+                {
+                    "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+                    "tool_call_id": tcid,
+                },
+            )
+
+    def _investigate_web_tier_artifacts(
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        by_class: dict[str, list[dict[str, Any]]],
+        disk_summary: dict[str, Any],
+    ) -> None:
+        """Parse extracted web-tier artifacts and emit the web-lane findings.
+
+        Two artifact classes, one reader: ``web_triage`` auto-detects a request
+        log from a web-root script. Every finding cites the ``web_triage`` call
+        that produced it, so ``verify_finding`` can re-run the exact parse — the
+        reason this lane is a Rust tool rather than orchestrator-side parsing.
+        """
+        log_entries = by_class.get("web_log", [])[:10]
+        script_entries = by_class.get("webroot_script", [])[:60]
+        if not log_entries and not script_entries:
+            return
+        print(
+            f"\n=== web-tier investigation ({len(log_entries)} log(s), "
+            f"{len(script_entries)} web-root script(s)) ==="
+        )
+        specs: list[tuple[str, dict[str, Any]]] = [
+            (
+                "web_triage",
+                {
+                    "case_id": self.handle["id"],
+                    "artifact_path": str(entry["path"]),
+                    "limit": 200,
+                },
+            )
+            for entry in [*log_entries, *script_entries]
+        ]
+        outs = self._parallel_tool_calls(rust, specs, timeout=900.0)
+        exploit_total = 0
+        webshell_total = 0
+        for (_name, args), out in zip(specs, outs, strict=True):
+            path = str(args["artifact_path"])
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(f"web_triage failed for {path}: {error}")
+                out = {
+                    "_error": {"message": error},
+                    "artifact_kind": "unknown",
+                    "exploit_hits": [],
+                    "exploit_hit_count": 0,
+                    "script_hits": [],
+                    "is_probable_webshell": False,
+                }
+            kind = str(out.get("artifact_kind") or "unknown")
+            tcid = self._record_tool(
+                py,
+                "web_triage",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "artifact_kind": kind,
+                    "lines_seen": out.get("lines_seen", 0),
+                    "requests_parsed": out.get("requests_parsed", 0),
+                    "exploit_hit_count": out.get("exploit_hit_count", 0),
+                    "is_probable_webshell": bool(out.get("is_probable_webshell")),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "web_triage",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "artifact_kind": kind,
+                    "exploit_hit_count": out.get("exploit_hit_count", 0),
+                    "indicators": [
+                        c.get("indicator")
+                        for c in (out.get("indicator_counts") or [])[:8]
+                        if isinstance(c, dict)
+                    ],
+                    "script_indicators": [
+                        c.get("indicator")
+                        for c in (out.get("script_indicator_counts") or [])[:8]
+                        if isinstance(c, dict)
+                    ],
+                    **({"error": error} if error else {}),
+                },
+            )
+            if error:
+                continue
+            for hit in (out.get("exploit_hits") or [])[:200]:
+                if not isinstance(hit, dict):
+                    continue
+                self._timeline_add(
+                    hit.get("timestamp_iso") or hit.get("timestamp"),
+                    "web_triage",
+                    "web",
+                    (
+                        f"web request flagged: {hit.get('method')} {hit.get('target')} "
+                        f"-> {hit.get('status')}"
+                    ),
+                    tcid,
+                    {
+                        "source_ip": hit.get("client_ip"),
+                        "indicators": hit.get("indicators"),
+                        "line_number": hit.get("line_number"),
+                    },
+                )
+            candidates = web_exploit_candidates(out)
+            if candidates:
+                exploit_total += 1
+                self._emit_web_exploit_finding(candidates, out, path, tcid)
+            shell = webshell_script_candidate(out)
+            if shell:
+                webshell_total += 1
+                self._emit_webshell_finding(
+                    shell, out, tcid, getattr(self, "_mft_web_paths", {})
+                )
+        print(
+            f"  web_triage: {len(specs)} artifact(s), {exploit_total} with exploitation "
+            f"indicators, {webshell_total} probable webshell(s)"
+        )
+
+    def _emit_web_exploit_finding(
+        self,
+        candidates: list[dict[str, Any]],
+        out: dict[str, Any],
+        log_path: str,
+        tcid: str,
+    ) -> None:
+        """Emit ONE Pool A finding for exploitation attempts against the web app.
+
+        CONFIRMED, and only about what a request log can actually establish: the
+        requests were RECEIVED and their shape is an attack. The log records the
+        attempt, not its outcome — the response status is quoted so a reader can
+        see what the server answered, but successful exploitation is not claimed
+        here. The webshell finding, if one is emitted, carries the "it worked"
+        half separately.
+        """
+        if not candidates:
+            return
+        clients = sorted({c["client_ip"] for c in candidates if c.get("client_ip")})
+        shown = web_exploit_examples(candidates)
+        indicators = [str(c["indicator"]) for c in shown]
+        # The most decisive observation drives the asserted values: a wrong
+        # anchor here should reject the finding, so it must be the request the
+        # description actually leads with.
+        primary = shown[0]
+        sqli = [i for i in indicators if i in _WEB_SQLI_INDICATORS]
+        examples = "; ".join(
+            f"{c['indicator']} at line {c['line_number']} [{c['timestamp']}] "
+            f"{c['client_ip']} {c['method']} {str(c['target'])[:140]} -> {c['status']}"
+            for c in shown[:5]
+        )
+        lede = (
+            "SQL injection attempts against the web application"
+            if sqli
+            else "Exploitation attempts against the web application"
+        )
+        asserted: list[dict[str, Any]] = [
+            {
+                "path": "exploit_hits[*]",
+                "expected": json.dumps(
+                    {
+                        "client_ip": primary["client_ip"],
+                        "target": primary["target"][:120],
+                    }
+                ),
+                "match": "record",
+            }
+        ]
+        # The attacking client is a hard identity anchor: a wrong IP has no
+        # near-miss reading, so the verifier rejects rather than downgrades.
+        if primary.get("client_ip"):
+            asserted.append(
+                {
+                    "path": "exploit_hits[*].client_ip",
+                    "expected": primary["client_ip"],
+                    "match": "exact",
+                }
+            )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for("f-A-web-exploit-attempt", log_path),
+            "tool_call_id": tcid,
+            "artifact_path": log_path,
+            "description": (
+                f"{lede} are recorded in the web server access log "
+                f"({out.get('exploit_hit_count', len(candidates))} flagged request(s) of "
+                f"{out.get('requests_parsed', 0)} parsed, from "
+                f"{', '.join(clients) or 'an unrecorded client'}). The payloads carry "
+                f"{', '.join(indicators)}, one example each: {examples}. "
+                "Parsed from the server's own "
+                "request log by web_triage; the log is a record of the requests the "
+                "server RECEIVED, so this is an exploitation attempt against a "
+                "public-facing application. The response codes are quoted above as "
+                "observed — whether the injection succeeded is not asserted by this "
+                "finding and needs the application, database, or web-root evidence."
+            ),
+            "confidence": "CONFIRMED",
+            "pool_origin": "A",
+            "mitre_technique": "T1190",
+            "derived_from": [tcid],
+            "asserted_values": asserted,
+        }
+        self.findings_pool_a.append(finding)
+        print(
+            f"  pool-A web finding: {finding['finding_id']} (CONFIRMED, "
+            f"{len(candidates)} indicator hit(s), clients={','.join(clients) or '-'})"
+        )
+
+    def _emit_webshell_finding(
+        self,
+        candidate: dict[str, Any] | None,
+        out: dict[str, Any],
+        tcid: str,
+        mft_index: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Emit ONE Pool A finding for a webshell in the web root.
+
+        Confidence is decided by LOCATION, not by wording: a script that reaches
+        an exec/eval primitive from request input AND sits in a directory the web
+        server writes into (upload/temp/cache) is a dropped shell — CONFIRMED.
+        The same primitives inside the shipped application tree are equally real
+        but have a competing benign reading (vulnerable application source), so
+        that stays INFERRED.
+
+        ``$MFT`` corroboration, when the same path was recovered from the
+        filesystem metadata, adds the creation timestamp and a second cited tool
+        call — the file's existence and its creation time then rest on two
+        independent readers.
+        """
+        if not candidate:
+            return
+        path = str(candidate["path"])
+        rel = web_root_relative_path(path)
+        indicators = candidate["indicators"]
+        seen_lines: set[tuple[Any, str]] = set()
+        unique_hits: list[dict[str, Any]] = []
+        for hit in candidate["hits"]:
+            key = (hit.get("line_number"), str(hit.get("snippet") or ""))
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            unique_hits.append(hit)
+        snippets = "; ".join(
+            f"line {h.get('line_number')}: {str(h.get('snippet') or '')[:200]}"
+            for h in unique_hits[:3]
+        )
+        derived = [tcid]
+        mft_note = ""
+        mft_row = web_mft_row_for(rel, mft_index)
+        if mft_row:
+            created = mft_row.get("created")
+            mft_tcid = str(mft_row.get("tool_call_id") or "")
+            if mft_tcid and mft_tcid not in derived:
+                derived.append(mft_tcid)
+            if created:
+                mft_note = (
+                    f" The MFT records a creation time of {created} for the same path "
+                    f"(tool_call {mft_tcid}) — a second, independent reader of the same file."
+                )
+        # Say what the primitives actually are. A shell that reads its commands
+        # off a socket is not "request-driven"; claiming it would be wrong even
+        # though both are webshells.
+        if "request_driven_exec" in indicators:
+            mechanism = "passes request input straight into a command/eval primitive"
+        elif "reverse_shell_socket" in indicators:
+            mechanism = (
+                "opens a raw TCP client socket and evaluates what it reads back — a "
+                "reverse shell rather than a request-driven one"
+            )
+        elif "dotnet_process_start" in indicators or "asp_eval" in indicators:
+            mechanism = "launches a process / evaluates request data through the ASP runtime"
+        else:
+            mechanism = "combines an execution primitive with obfuscation or error suppression"
+        writable = bool(candidate["writable_location"])
+        if writable:
+            confidence = "CONFIRMED"
+            location_note = (
+                f"The script sits in '{candidate['directory']}', a directory the web "
+                "server accepts writes into rather than part of the application's "
+                "shipped code tree."
+            )
+        else:
+            confidence = "INFERRED"
+            location_note = (
+                "The script sits inside the shipped application tree, where the same "
+                "primitives also occur in deliberately vulnerable or legitimately "
+                "shell-invoking source, so a dropped-shell reading is inferred, not "
+                "established."
+            )
+        primary_hit = candidate["hits"][0] if candidate["hits"] else {}
+        asserted: list[dict[str, Any]] = [
+            {
+                "path": "artifact_kind",
+                "expected": "webroot_script",
+                "match": "exact",
+            }
+        ]
+        if primary_hit:
+            asserted.append(
+                {
+                    "path": "script_hits[*]",
+                    "expected": json.dumps(
+                        {
+                            "indicator": str(primary_hit.get("indicator") or ""),
+                            "snippet": str(primary_hit.get("snippet") or "")[:120],
+                        }
+                    ),
+                    "match": "record",
+                }
+            )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for("f-A-webshell", path, force_suffix=True),
+            "tool_call_id": tcid,
+            "artifact_path": path,
+            "description": (
+                f"Webshell script written to the web root at {rel}: the file "
+                f"{mechanism} ({', '.join(indicators)}) — {snippets}. "
+                f"{location_note}{mft_note} Read by web_triage over the "
+                "extracted file's own bytes, so this rests on the script's content, "
+                "not on a filename or a signature pack."
+            ),
+            "confidence": confidence,
+            "pool_origin": "A",
+            "mitre_technique": "T1505.003",
+            "derived_from": derived,
+            "asserted_values": asserted,
+        }
+        self.findings_pool_a.append(finding)
+        print(f"  pool-A webshell finding: {finding['finding_id']} ({confidence}) {rel}")
 
     def _emit_mft_hacking_tool_finding(
         self,
@@ -11517,6 +14514,205 @@ class Investigation:
         }
         self.findings_pool_a.append(finding)
         print(f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))")
+
+    def _prefetch_execution_rows(self) -> list[dict[str, Any]]:
+        """Every parsed prefetch execution recorded so far, as detector rows.
+
+        Read back out of ``self.tool_calls`` rather than stashed by the prefetch
+        lane: ``_record_tool`` already flattens ``executable_name`` / ``run_count``
+        onto each ``prefetch_parse`` entry, so the tool-hint detectors can be fed
+        without the prefetch lane knowing about them.
+        """
+        return [
+            {
+                "tool_call_id": tc.get("tool_call_id"),
+                "executable_name": tc.get("executable_name"),
+                "run_count": tc.get("run_count"),
+                "artifact_path": tc.get("artifact_path"),
+            }
+            for tc in self.tool_calls
+            if tc.get("tool") == "prefetch_parse" and tc.get("executable_name")
+        ]
+
+    def _emit_anti_forensic_tool_finding(
+        self,
+        disk_candidates: list[dict[str, Any]],
+        prefetch_candidates: list[dict[str, Any]],
+    ) -> None:
+        """Emit ONE Pool B finding for anti-forensic wiping/cleaning tooling.
+
+        One aggregate finding (not one per tool) so the recall matcher binds it
+        to a single ground-truth claim. INFERRED, never CONFIRMED: the strongest
+        thing on offer is a filesystem record of the tool plus a Prefetch run
+        count, which is a two-labeled-fact correlation about the TOOL — it never
+        establishes what the tool was pointed at or what it destroyed. Both
+        artifact classes are cited when both are present so the >=2-class
+        execution gate is satisfied by real provenance, not by wording.
+        """
+        if not disk_candidates and not prefetch_candidates:
+            return
+        tools = sorted(
+            {str(c.get("tool") or "") for c in disk_candidates + prefetch_candidates if c.get("tool")}
+        )
+        labels = sorted(
+            {str(c.get("label") or "") for c in disk_candidates + prefetch_candidates if c.get("label")}
+        )
+        derived = sorted(
+            {
+                str(c.get("tool_call_id"))
+                for c in disk_candidates + prefetch_candidates
+                if c.get("tool_call_id")
+            }
+        )
+        primary = (prefetch_candidates or disk_candidates)[0]
+        artifact_path = str(primary.get("artifact_path") or "")
+        disk_text = (
+            "; ".join(
+                f"{c.get('path')} ({c.get('evidence')}, created {c.get('created')})"
+                for c in disk_candidates[:6]
+            )
+            or "no filesystem record cited"
+        )
+        if prefetch_candidates:
+            run_text = "; ".join(
+                f"{c.get('executable_name')} run_count={c.get('run_count')}"
+                for c in prefetch_candidates[:6]
+            )
+            execution_text = (
+                "Windows Prefetch records that the tool was executed on this host: "
+                f"{run_text}. Prefetch and the filesystem records are two independent "
+                "artifact classes."
+            )
+            confidence = "INFERRED"
+        else:
+            execution_text = (
+                "No parsed Prefetch run count is cited here, so this stands as a "
+                "tool-presence lead — installation is not execution."
+            )
+            confidence = "HYPOTHESIS"
+        finding = {
+            "case_id": self.handle["id"],
+            # force_suffix: a case can hold several disk images, each running the
+            # disk sweep once. Without a per-artifact suffix every image's finding
+            # would share one id and the duplicate check would reject the batch.
+            "finding_id": self._finding_id_for(
+                "f-B-anti-forensic-tool", artifact_path, force_suffix=True
+            ),
+            "tool_call_id": str(primary.get("tool_call_id") or ""),
+            "artifact_path": artifact_path,
+            "description": (
+                "Anti-forensic wiping/cleaning tooling is present on this host and was "
+                f"executed to destroy on-disk traces: {', '.join(labels)}. "
+                f"Filesystem records (MFT): {disk_text}. {execution_text} A secure-delete "
+                "or trace-cleaning utility on a host under investigation is indicator "
+                "removal (T1070.004) and directly degrades the remaining evidence. What "
+                "these artifacts do NOT establish is which files or registry keys the "
+                "tool was pointed at, or that any specific evidence was destroyed — "
+                f"tools observed: {', '.join(tools)}. Corroborate with UserAssist, the "
+                "tool's own logs and gaps in the filesystem timeline."
+            ),
+            "confidence": confidence,
+            "pool_origin": "B",
+            "mitre_technique": ANTI_FORENSIC_TECHNIQUE,
+            "derived_from": derived,
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B anti-forensic finding: {finding['finding_id']} "
+            f"({confidence}, {len(tools)} tool(s))"
+        )
+
+    def _emit_cloud_sync_channel_finding(
+        self,
+        disk_candidates: list[dict[str, Any]],
+        prefetch_candidates: list[dict[str, Any]],
+        browser_candidates: list[dict[str, Any]],
+    ) -> None:
+        """Emit ONE Pool B finding for a third-party cloud-storage sync channel.
+
+        Deliberately worded as a CHANNEL observation, never as exfiltration. The
+        server-enforced two-prong gate wants collection/staging evidence AND an
+        independently observed egress; disk artifacts supply only the first, so
+        asserting a transfer here would be an over-claim that the gate exists to
+        stop. The finding states that a sync client was installed and run (and
+        which cloud/webmail endpoints the browser recorded, when it recorded
+        any) and leaves the transfer claim to network evidence.
+        """
+        if not disk_candidates and not prefetch_candidates and not browser_candidates:
+            return
+        services = sorted(
+            {
+                str(c.get("service") or "")
+                for c in disk_candidates + prefetch_candidates + browser_candidates
+                if c.get("service")
+            }
+        )
+        derived = sorted(
+            {
+                str(c.get("tool_call_id"))
+                for c in disk_candidates + prefetch_candidates + browser_candidates
+                if c.get("tool_call_id")
+            }
+        )
+        primary = (prefetch_candidates or disk_candidates or browser_candidates)[0]
+        artifact_path = str(primary.get("artifact_path") or "")
+        disk_text = (
+            "; ".join(
+                f"{c.get('path')} (created {c.get('created')})" for c in disk_candidates[:6]
+            )
+            or "no filesystem record cited"
+        )
+        run_text = (
+            "; ".join(
+                f"{c.get('executable_name')} run_count={c.get('run_count')}"
+                for c in prefetch_candidates[:4]
+            )
+            or "no parsed Prefetch run count cited"
+        )
+        web_text = (
+            " Browser history additionally records visits to "
+            + "; ".join(
+                f"{c.get('service')} ({c.get('kind')}) {c.get('url')}"
+                for c in browser_candidates[:4]
+            )
+            + "."
+            if browser_candidates
+            else ""
+        )
+        finding = {
+            "case_id": self.handle["id"],
+            # force_suffix: see _emit_anti_forensic_tool_finding — one id per
+            # disk image, not one id shared across every image in the case.
+            "finding_id": self._finding_id_for(
+                "f-B-cloud-sync-channel", artifact_path, force_suffix=True
+            ),
+            "tool_call_id": str(primary.get("tool_call_id") or ""),
+            "artifact_path": artifact_path,
+            "description": (
+                "hypothesis: a third-party cloud storage sync client was installed and "
+                f"used on this host, giving the user an off-host data channel: "
+                f"{', '.join(services)}. Filesystem records (MFT): {disk_text}. Windows "
+                f"Prefetch: {run_text}.{web_text} A personal cloud storage client is a "
+                "candidate off-host data channel (T1567.002) because anything placed in "
+                "its synced folder leaves the host automatically. OS-bundled OneDrive is "
+                "excluded from this classification. This finding is deliberately scoped "
+                "to the CHANNEL: these host artifacts show it existed and that the "
+                "client ran, they do NOT record which files were synced, and the "
+                "presence/egress two-prong rule is not met without independent "
+                "network or provider-side evidence. Corroborate with the client's sync "
+                "database, the provider's audit log and network evidence before "
+                "concluding that data left this host."
+            ),
+            "confidence": "HYPOTHESIS",
+            "pool_origin": "B",
+            "mitre_technique": "T1567.002",
+            "derived_from": derived,
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B cloud-channel finding: {finding['finding_id']} "
+            f"(HYPOTHESIS, {len(services)} service(s))"
+        )
 
     def _emit_lnk_removable_media_finding(
         self,
@@ -11906,59 +15102,462 @@ class Investigation:
             f"(HYPOTHESIS, {len(groups)} hacking group(s) across {len(stores)} folder(s))"
         )
 
-    def _corroborate_execution_with_userassist(
-        self,
-        rust: SshMcpClient,
-        py: SshMcpClient,
-        by_class: dict[str, list[dict[str, Any]]],
+    def investigate_mail_stores(
+        self, rust: SshMcpClient, py: SshMcpClient, entries: list[dict[str, Any]]
     ) -> None:
+        """Parse every carved ``mail_store`` artifact and run the mail detectors.
+
+        ``mail_store`` is one extraction class covering two unrelated formats, so
+        each artifact is routed by extension: Outlook ``.pst``/``.ost`` to
+        ``pst_parse``, legacy Outlook Express ``.dbx`` to ``oe_dbx_parse``. Both
+        are audit-chained Rust verbs, so a resulting Finding cites a real
+        ``tool_call_id`` AND survives ``verify_finding`` replay.
+
+        Unlike the OE lane this needs no live mount: ``disk_extract_artifacts``
+        already copied the store into the case directory with The Sleuth Kit, so
+        the cited path is durable and the lane runs on a rootless host.
+        """
+        if not entries:
+            return
+        for entry in entries[:20]:
+            path = str(entry.get("path") or "")
+            tool = mail_store_tool_for(path)
+            if not tool:
+                continue
+            args: dict[str, Any] = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool(tool, args, timeout=1800.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            messages = out.get("messages") or [] if not error else []
+            tcid = self._record_tool(
+                py,
+                tool,
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "message_count": out.get("message_count", len(messages)),
+                    "attachment_count": out.get("attachment_count", 0),
+                    "backend": out.get("backend"),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            if error:
+                # A host without libpst/libpff returns a typed BinaryNotFound.
+                # Record the coverage gap honestly instead of implying the mail
+                # store held nothing.
+                self.analysis_limitations.append(
+                    f"{tool} could not read the mail store {path}: {error}"
+                )
+                print(f"  {tool}: {path} error={error[:120]}")
+                continue
+            print(f"  {tool}: {path} messages={len(messages)}")
+            self._emit_mail_store_findings(messages, path, tcid)
+
+    def _emit_mail_store_findings(
+        self, messages: list[dict[str, Any]], store_path: str, tcid: str
+    ) -> None:
+        """Emit the mail lane's Pool A findings from one store's envelopes.
+
+        Every claim here is a HEADER fact recovered from the parsed store, and
+        each says so: the store records what the message headers assert, never
+        who composed or transmitted the message (CLAUDE.md keeps actor identity
+        and intent out of scope for host artifacts). CONFIRMED is reserved for
+        the pure comparisons — the two header fields either differ or they do
+        not — with the inferential reading carried at INFERRED.
+        """
+        internal = mail_internal_domains(messages)
+        if not internal:
+            return
+        domain_text = ", ".join(sorted(internal))
+        divergences = mail_reply_address_divergence(messages)
+        diverging_keys = {(r["folder"], r["subject"], r["date"]) for r in divergences}
+
+        if divergences:
+            sample = "; ".join(
+                f"displayed {row['displayed']} but mail actually reaches {row['actual']} "
+                f"(subject '{row['subject']}', folder '{row['folder']}', {row['date']})"
+                for row in divergences[:4]
+            )
+            self._append_mail_finding(
+                base="f-A-mail-reply-to-divergence",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED",
+                mitre="T1534",
+                description=(
+                    f"The reply address diverges from the displayed address on "
+                    f"{len(divergences)} email message(s) in this mail store: {sample}. A "
+                    "reply to such a message is addressed to a mailbox other than the one "
+                    "the message displays — the reply-address divergence (spoofing) "
+                    "indicator. Both values were parsed from the message headers the store "
+                    "holds, and divergences inside a single organisation (bulk mailers, "
+                    "shared reply mailboxes) were excluded. This is a fact about those "
+                    "headers, not a statement about who sent or composed the message."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*]",
+                        "expected": json.dumps(
+                            {
+                                "subject": divergences[0]["subject"],
+                                "from_address": divergences[0]["from_address"],
+                            }
+                        ),
+                        "match": "record",
+                    }
+                ],
+            )
+
+        for row in mail_impersonation_candidates(messages, internal)[:1]:
+            corroborated = (row["folder"], row["subject"], row["date"]) in diverging_keys
+            if row["basis"] == "internal_display_name_external_sender":
+                basis_text = (
+                    f"the From display name '{row['display_name']}' is one this store "
+                    f"elsewhere pairs with an address inside the organisation's own mail "
+                    f"domain ({domain_text}), but this message was sent from "
+                    f"{row['from_address']}, outside it"
+                )
+            else:
+                basis_text = (
+                    f"the From address {row['from_address']} is inside the organisation's "
+                    f"own mail domain ({domain_text}) while its Reply-To "
+                    f"{row['reply_to_address']} is outside it"
+                )
+            reply_text = (
+                f" Its Reply-To is {row['reply_to_address']}." if row["reply_to_address"] else ""
+            )
+            recipients = ", ".join(row["recipients"]) or "the mailbox owner"
+            self._append_mail_finding(
+                base="f-A-mail-impersonation",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED" if corroborated else "INFERRED",
+                mitre="T1566.001",
+                description=(
+                    f"Email impersonating an internal principal, targeting {recipients}: "
+                    f"{basis_text}.{reply_text} Subject: '{row['subject']}' "
+                    f"(folder '{row['folder']}', {row['date']}). This is the "
+                    "spear-phishing header pattern — a message that presents an inside "
+                    "identity while its reply path leaves the organisation. Parsed from "
+                    "the mail store's RFC822 headers. Header fact only: the store records "
+                    "what the headers assert, not who sent or composed the message."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*]",
+                        "expected": json.dumps(
+                            {
+                                "from_display": row["display_name"],
+                                "from_address": row["from_address"],
+                            }
+                        ),
+                        "match": "record",
+                    }
+                ],
+            )
+
+        for row in mail_attachment_egress_candidates(messages, internal)[:1]:
+            recipients = ", ".join(row["external_recipients"])
+            self._append_mail_finding(
+                base="f-A-mail-attachment-egress",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED",
+                mitre="T1567",
+                description=(
+                    f"A spreadsheet attachment left the organisation as an email "
+                    f"attachment: '{row['attachment']}' ({row['attachment_type']}) was sent "
+                    f"from {row['from_address']} to {recipients}, outside the "
+                    f"organisation's own mail domain ({domain_text}). Subject: "
+                    f"'{row['subject']}'; mail folder '{row['folder']}'; {row['date']}. "
+                    "Parsed from the message headers of the mail store carved off the "
+                    "disk image (artifact class mail_store) — the store records the "
+                    "attachment's name and media type and the addresses it went to; the "
+                    "header-level parser never read the file's contents, so what the "
+                    "spreadsheet held is not established here."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*].attachments[*].name",
+                        "expected": row["attachment"],
+                        "match": "exact",
+                    }
+                ],
+            )
+
+        for row in mail_counterparty_escalation(messages, internal)[:1]:
+            if not row["diverging_message_count"] and not row["outbound_attachments"]:
+                # A two-way exchange with no divergence and nothing leaving the
+                # organisation is ordinary business mail, not a lead.
+                continue
+            topics = "; ".join(f"'{s}'" for s in row["subjects"][:4]) or "no subject"
+            if row["outbound_attachments"]:
+                shape = (
+                    "The message timeline across the exchange shows escalation from the "
+                    "opening message to a data transfer: "
+                    f"{', '.join(row['outbound_attachments'])} left the organisation as an "
+                    "attachment on a message sent from this mailbox."
+                )
+            else:
+                shape = (
+                    "The message timeline across the exchange shows a sustained two-way "
+                    "conversation rather than one-directional mail."
+                )
+            self._append_mail_finding(
+                base="f-A-mail-thread-escalation",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="INFERRED",
+                mitre=None,
+                description=(
+                    f"A reconstructed email conversation thread with {row['counterparty']}, "
+                    f"outside the organisation's own mail domain ({domain_text}): "
+                    f"{row['message_count']} messages ({row['inbound_count']} received, "
+                    f"{row['outbound_count']} sent) across the topics {topics}, from "
+                    f"{row['first_date']} to {row['last_date']}. "
+                    f"{row['diverging_message_count']} of those messages carry a "
+                    f"reply-address divergence. {shape} INFERRED from the message envelopes "
+                    "the mail store holds — the conversation's shape is a parsed fact; the "
+                    "participants' intent is not established by a host artifact."
+                ),
+                asserted_values=None,
+            )
+
+    def _append_mail_finding(
+        self,
+        *,
+        base: str,
+        store_path: str,
+        tcid: str,
+        confidence: str,
+        mitre: str | None,
+        description: str,
+        asserted_values: list[dict[str, Any]] | None,
+    ) -> None:
+        finding: dict[str, Any] = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for(base, store_path),
+            "tool_call_id": tcid,
+            "artifact_path": store_path,
+            "description": description,
+            "confidence": confidence,
+            "pool_origin": "A",
+            "mitre_technique": mitre,
+            "derived_from": [tcid],
+        }
+        if asserted_values:
+            finding["asserted_values"] = [dict(av) for av in asserted_values]
+        self.findings_pool_a.append(finding)
+        print(f"  pool-A mail finding: {finding['finding_id']} ({confidence})")
+
+    def _collect_registry_execution_candidates(
+        self,
+        rows: list[dict[str, Any]],
+        hive_path: str,
+        key_path: str | None,
+        tcid: str,
+    ) -> None:
+        """Index one UserAssist / Compatibility-Assistant ``registry_query`` result.
+
+        Called from the per-hive triage loop, so the keys are read ONCE (with a
+        recorded tool call, timeline entry and disk-summary merge) and every
+        consumer below reads this index instead of re-querying. Two consumers:
+        :meth:`_emit_registry_execution_findings` (standalone execution leads)
+        and :meth:`_promote_prefetch_findings_with_userassist` (the existing
+        prefetch upgrade).
+        """
+        # Every decoded .exe, writable-root or not, feeds the prefetch promotion:
+        # a hacking tool that ran out of C:\Program Files still corroborates its
+        # prefetch entry. The writable-root filter applies only to the
+        # standalone leads below, which have no prefetch finding behind them.
+        row_key_is_userassist = (
+            "\\userassist" in str(key_path or "").replace("/", "\\").lower()
+        )
+        if row_key_is_userassist:
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                ts = row.get("last_write_time_iso")
+                for value in row.get("values") or []:
+                    if not isinstance(value, dict):
+                        continue
+                    exe = _userassist_exe(str(value.get("name", "")))
+                    if exe:
+                        self._userassist_exec_index.setdefault(exe, (tcid, ts))
+        for cand in registry_execution_candidates(rows, key_path):
+            self._registry_exec_candidates.append((hive_path, tcid, cand))
+
+    def _emit_registry_execution_findings(self) -> None:
+        """Emit execution leads from the per-user registry execution artifacts.
+
+        Two independent axes decide the tier, and BOTH must clear for CONFIRMED.
+
+        **Artifact classes (the SOUL.md / CLAUDE.md execution bar).** UserAssist
+        and the Compatibility Assistant Store are two independent execution
+        ARTIFACTS, but both live in the registry — that is ONE artifact class.
+        The rule counts classes, and ``report_qa``'s
+        ``execution_requires_two_current_artifact_classes`` gate counts them the
+        same way, so a registry-only pair can never rise above HYPOTHESIS
+        without both over-claiming and failing the engine's own release gate.
+        Prefetch recording the same binary is a genuinely different class and is
+        what lifts the lead.
+
+        **Placement.** Even two classes do not make a run reportable. A user
+        running an installer they downloaded into their OWN profile
+        (``...\\AppData\\Local\\Downloads\\setup.exe``) is the most common
+        benign pattern on any Windows host and both registry keys record it;
+        CONFIRMED there is a false positive by ordinary DFIR standards, and
+        because ``compute_verdict`` escalates on ANY CONFIRMED finding it would
+        flip a benign host's verdict too. A binary run from a SHARED,
+        world-writable root (``C:\\Users\\Public\\``, ``ProgramData``,
+        ``Windows\\Temp``) is different in kind — no legitimate installer runs a
+        program from there.
+
+        So: CONFIRMED = second class AND shared root; INFERRED = second class,
+        per-user root; HYPOTHESIS = registry only. A per-user path with a single
+        registry artifact is not emitted at all — one key recording a downloaded
+        installer is noise on every host.
+        """
+        if not self._registry_exec_candidates:
+            return
+        # exe_path -> {"hive", "tcids": {kind: tcid}, "cands": [...]}
+        grouped: dict[str, dict[str, Any]] = {}
+        for hive_path, tcid, cand in self._registry_exec_candidates:
+            key = f"{hive_path}::{str(cand.get('exe_path') or '').lower()}"
+            slot = grouped.setdefault(
+                key,
+                {"hive": hive_path, "sources": {}, "cand": cand},
+            )
+            slot["sources"].setdefault(str(cand.get("kind")), (tcid, cand))
+            if cand.get("kind") == "userassist_exec":
+                # Prefer the UserAssist row as the primary citation: its value
+                # name is the fact the finding asserts.
+                slot["cand"] = cand
+        # Shared-root placements first so a per-hive cap never drops the
+        # high-signal ones in favour of ordinary user downloads.
+        ordered = sorted(
+            grouped.values(),
+            key=lambda slot: (
+                not slot["cand"].get("shared_root"),
+                str(slot["cand"]["exe_path"]),
+            ),
+        )
+        emitted = 0
+        for slot in ordered:
+            if emitted >= _MAX_REGISTRY_EXEC_FINDINGS:
+                break
+            cand = slot["cand"]
+            hive_path = str(slot["hive"])
+            exe_path = str(cand.get("exe_path") or "")
+            exe_name = str(cand.get("exe_name") or "")
+            shared = bool(cand.get("shared_root"))
+            sources: dict[str, tuple[str, dict[str, Any]]] = slot["sources"]
+            registry_artifacts = [
+                "UserAssist (per-user GUI execution)"
+                if kind == "userassist_exec"
+                else "the Program Compatibility Assistant Store"
+                for kind in sources
+            ]
+            derived = [tcid for tcid, _ in sources.values()]
+            # Prefetch is the only genuinely DIFFERENT artifact class available
+            # here; the two registry keys are one class no matter how many of
+            # them agree.
+            pf_hit = self._prefetch_exec_index.get(exe_name)
+            pf_tcid = pf_hit[0] if pf_hit else None
+            if pf_tcid and pf_tcid not in derived:
+                derived.append(pf_tcid)
+            second_class = bool(pf_tcid)
+            if not second_class and not shared and len(sources) < 2:
+                continue
+            primary_tcid, primary_cand = sources.get(
+                "userassist_exec", next(iter(sources.values()))
+            )
+            if second_class:
+                confidence = "CONFIRMED" if shared else "INFERRED"
+            else:
+                confidence = "HYPOTHESIS"
+            placement = (
+                f"{cand.get('writable_root')} — a shared, world-writable location no "
+                "legitimate installer runs a program from"
+                if shared
+                else f"{cand.get('writable_root')} (a user-writable location; running a "
+                "downloaded program from there is also an ordinary benign pattern)"
+            )
+            registry_text = " and ".join(registry_artifacts)
+            corroboration = (
+                f"Two artifact classes record the run: the registry ({registry_text}) "
+                "and Windows Prefetch."
+                if second_class
+                else f"The registry records it ({registry_text}), but that is a single "
+                "artifact class, so the run is a lead rather than a corroborated "
+                "execution fact — a second class (prefetch, MFT, EVTX) is needed."
+            )
+            safe = re.sub(r"[^a-z0-9]+", "-", exe_name).strip("-") or "exe"
+            finding = {
+                "case_id": self.handle["id"],
+                "finding_id": self._finding_id_for(f"f-A-userassist-exec-{safe}", hive_path),
+                "tool_call_id": primary_tcid,
+                "artifact_path": hive_path,
+                "description": (
+                    f"{exe_path} was executed by this user account. It lives under "
+                    f"{placement}. {corroboration} "
+                    f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
+                    "This states execution and placement only — it does not, on its own, "
+                    "establish what the program did."
+                ),
+                "confidence": confidence,
+                "pool_origin": "A",
+                "mitre_technique": "T1204.002",
+                "derived_from": derived,
+                # The re-run registry_query output must still carry the value
+                # name this finding decoded, so a misread cannot ride a valid
+                # tool_call_id. UserAssist names are ROT13-encoded, hence the
+                # encoded form is what is asserted.
+                "asserted_values": [
+                    {
+                        "path": "entries[*].values[*].name",
+                        "expected": str(primary_cand.get("value_name") or ""),
+                        "match": "exact",
+                    }
+                ],
+            }
+            self.findings_pool_a.append(finding)
+            emitted += 1
+            if pf_tcid:
+                # report_qa counts a finding's artifact classes off the TIMELINE
+                # events linked to it, so the prefetch class has to reach the
+                # timeline or the two-class execution gate fails the very claim
+                # prefetch is what justifies.
+                fid = str(finding["finding_id"])
+                self.execution_corroboration.setdefault(fid, []).append(pf_tcid)
+                self._timeline_add(
+                    (pf_hit[1] if pf_hit else None)
+                    or cand.get("last_write_time_iso")
+                    or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "prefetch_parse",
+                    "prefetch",
+                    f"Windows Prefetch records execution of {exe_name}",
+                    pf_tcid,
+                    {"executable_name": exe_name},
+                )
+            print(f"  pool-A execution finding: {finding['finding_id']} ({confidence})")
+
+    def _promote_prefetch_findings_with_userassist(self) -> None:
         """Promote a prefetch execution lead to CONFIRMED when a UserAssist entry
         (per-user GUI execution, in NTUSER.DAT) records the same binary. Prefetch
         and UserAssist are two independent artifact classes, so together they clear
         the SOUL.md >=2-artifact-class bar for an execution claim. The registry
         tool_call_id is recorded in ``self.execution_corroboration`` so the
-        normalized timeline links both classes to the finding for report QA."""
-        if not self._prefetch_exec_findings:
-            return
-        ua_exes: dict[str, tuple[str, str | None]] = {}  # exe -> (tcid, ts)
-        for entry in by_class.get("registry", [])[:20]:
-            path = str(entry["path"])
-            if PurePosixPath(path.replace("\\", "/")).name.lower() != "ntuser.dat":
-                continue
-            ua_args = {
-                "case_id": self.handle["id"],
-                "hive_path": path,
-                "key_path": (r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"),
-                "recursive": True,
-                "limit": 500,
-            }
-            ua_out = rust.call_tool("registry_query", ua_args)
-            ua_err = ua_out.get("_error", {}).get("message") if "_error" in ua_out else None
-            if ua_err:
-                ua_out = {"_error": {"message": ua_err}, "entries": []}
-            ua_entries = ua_out.get("entries", [])
-            ua_tcid = self._record_tool(
-                py,
-                "registry_query",
-                self._output_hash(ua_out),
-                {
-                    "artifact_path": path,
-                    "key_path": "UserAssist",
-                    "entries_returned": len(ua_entries),
-                    **({"error": ua_err} if ua_err else {}),
-                },
-                arguments=ua_args,
-            )
-            for e in ua_entries:
-                ts = e.get("last_write_time_iso")
-                for value in e.get("values", []):
-                    exe = _userassist_exe(str(value.get("name", "")))
-                    if exe:
-                        ua_exes.setdefault(exe, (ua_tcid, ts))
+        normalized timeline links both classes to the finding for report QA.
 
+        Reads the index the per-hive triage loop already built
+        (:meth:`_collect_registry_execution_candidates`) rather than issuing its
+        own UserAssist ``registry_query`` per hive: the old shape both duplicated
+        20 tool calls per run and made UserAssist reachable ONLY when a prefetch
+        finding already existed."""
         upgraded = 0
         for exe_base, finding in self._prefetch_exec_findings:
-            hit = ua_exes.get(exe_base)
+            hit = self._userassist_exec_index.get(exe_base)
             if not hit or finding.get("confidence") == "CONFIRMED":
                 continue
             corr_tcid, ts = hit
@@ -12035,6 +15634,8 @@ class Investigation:
         print("\n=== extracted disk artifact investigation ===")
         by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in EXTRACTED_DISK_CLASSES}
         by_class["yara_target"] = []
+        for web_class in sorted(WEB_TIER_CLASSES):
+            by_class[web_class] = []
         for entry in entries:
             artifact_class = str(entry.get("artifact_class") or "")
             if artifact_class in by_class:
@@ -12073,7 +15674,11 @@ class Investigation:
                 {
                     "case_id": self.handle["id"],
                     "mft_path": str(e["path"]),
-                    "limit": 5000,
+                    # Scan the whole table: user profiles and Program Files sort
+                    # tens of thousands of records past Windows/, so a small cap
+                    # returns an OS-only view of the volume (see
+                    # DISK_MFT_ROW_LIMIT).
+                    "limit": DISK_MFT_ROW_LIMIT,
                 },
             )
             for e in mft_entries
@@ -12147,6 +15752,20 @@ class Investigation:
             tool_candidates = mft_hacking_tool_candidates(rows)
             if tool_candidates:
                 self._emit_mft_hacking_tool_finding(tool_candidates, path, tcid)
+            # Exfil/staging leads: the wiper and cloud-sync footprints are
+            # collected here but emitted after the whole disk sweep, so they can
+            # cite the prefetch/browser classes that have not run yet.
+            for cand in mft_anti_forensic_tool_candidates(rows):
+                self._disk_wiper_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
+            for cand in mft_cloud_sync_candidates(rows):
+                self._disk_cloud_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
+            # Index the MFT rows so the web lane can cite a creation time for an
+            # extracted web-root script from a SECOND reader of the same file.
+            self._index_mft_web_paths(rows, tcid)
 
         usn_entries = by_class["usnjrnl"][:3]
         usn_specs: list[tuple[str, dict[str, Any]]] = [
@@ -12156,8 +15775,9 @@ class Investigation:
                     "case_id": self.handle["id"],
                     "usnjrnl_path": str(e["path"]),
                     # Scan the full journal: staged-then-deleted archives (T1560.001)
-                    # often sit late in the $J, past a small cap.
-                    "limit": 200000,
+                    # often sit late in the $J, past a small cap (see
+                    # DISK_USN_ROW_LIMIT).
+                    "limit": DISK_USN_ROW_LIMIT,
                 },
             )
             for e in usn_entries
@@ -12236,6 +15856,10 @@ class Investigation:
             for e in prefetch_entries
         ]
         prefetch_outs = self._parallel_tool_calls(rust, prefetch_specs, timeout=600.0)
+        # Successfully-parsed prefetch names, collected for the dual-use
+        # encryption detector that runs once after the loop (aggregate per-case
+        # findings, not one per .pf).
+        encryption_observations: list[dict[str, Any]] = []
         for entry, (_name, args), out in zip(
             prefetch_entries, prefetch_specs, prefetch_outs, strict=True
         ):
@@ -12283,6 +15907,16 @@ class Investigation:
                     {"run_count": out.get("run_count", 0), "prefetch_path": path},
                 )
             print(f"  prefetch_parse: {path} runs={out.get('run_count', 0)}")
+            # Index EVERY successfully parsed prefetch, not just hint matches:
+            # this is the second artifact class a registry (UserAssist /
+            # Compatibility Assistant) execution lead needs, and a payload
+            # nobody has named yet still leaves a .pf.
+            parsed_exe = str(out.get("executable_name") or "")
+            if parsed_exe and not error:
+                self._prefetch_exec_index.setdefault(
+                    PurePosixPath(parsed_exe.replace("\\", "/")).name.lower(),
+                    (tcid, next(iter(out.get("last_run_times_iso") or []), None)),
+                )
             hint = suspicious_prefetch_tool_hint(str(exe))
             if hint and out.get("run_count", 0):
                 tool_description, technique = hint
@@ -12305,6 +15939,22 @@ class Investigation:
                 # this lead to a CONFIRMED, two-artifact-class execution finding.
                 exe_base = PurePosixPath(str(exe).replace("\\", "/")).name.lower()
                 self._prefetch_exec_findings.append((exe_base, prefetch_finding))
+            if not error:
+                encryption_observations.append(
+                    {
+                        "executable_name": out.get("executable_name"),
+                        "artifact_name": PurePosixPath(path.replace("\\", "/")).name,
+                        "run_count": out.get("run_count", 0),
+                        "artifact_path": path,
+                        "tool_call_id": tcid,
+                    }
+                )
+
+        # Dual-use encryption tooling. Deliberately NOT routed through
+        # _prefetch_exec_findings: that list gets promoted to CONFIRMED by
+        # UserAssist corroboration, which would escalate the verdict on a host
+        # whose only "evil" is that someone encrypts their files.
+        self._emit_encryption_tooling_findings(encryption_observations)
 
         lnk_entries = sorted(by_class.get("lnk", []), key=_lnk_triage_sort_key)[:80]
         lnk_specs: list[tuple[str, dict[str, Any]]] = [
@@ -12702,6 +16352,10 @@ class Investigation:
                         self._emit_ie_history_illicit_finding(illicit_candidates, path, tcid)
                 print(f"  plaso_parse/{parser_name}: {path} events={len(events)}")
 
+        # Carved mail stores (Outlook .pst/.ost, Outlook Express .dbx). Routed
+        # here rather than off a live mount so the lane runs rootless.
+        self.investigate_mail_stores(rust, py, by_class["mail_store"])
+
         browser_entries = (by_class["browser_history"] + by_class["browser_db"])[:20]
         browser_specs: list[tuple[str, dict[str, Any]]] = [
             (
@@ -12758,6 +16412,13 @@ class Investigation:
                         tcid,
                         {"visit_count": row.get("visit_count"), "history_path": path},
                     )
+            # Cloud-storage / webmail endpoints in the history corroborate a
+            # sync-client footprint from a second artifact class; collected here
+            # and emitted with the rest of the channel evidence below.
+            for cand in browser_cloud_service_candidates(rows):
+                self._browser_cloud_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
             print(
                 f"  browser_history: {path} family={out.get('browser_family')} "
                 f"rows={out.get('rows_seen', 0)}"
@@ -12770,9 +16431,17 @@ class Investigation:
         for entry in _prioritize_registry_hives(by_class["registry"])[:20]:
             path = str(entry["path"])
             for key_path in self._registry_triage_keys(path):
-                registry_calls += 1
-                if registry_calls > 60:
-                    break
+                # The per-user execution keys are exempt from the budget: on a
+                # real Windows disk the 60 calls are spent on the SYSTEM
+                # Services sweep and the MRU/shellbag keys long before the
+                # per-user hives are reached, and an execution key that can be
+                # crowded out is one that silently never runs. Budgeted keys
+                # behave exactly as before — once the budget is gone none of
+                # them run, on this hive or any later one.
+                if key_path not in _EXECUTION_TRIAGE_KEYS:
+                    registry_calls += 1
+                    if registry_calls > 60:
+                        continue
                 args = {
                     "case_id": self.handle["id"],
                     "hive_path": path,
@@ -12873,8 +16542,36 @@ class Investigation:
                 )
                 if activity_candidates:
                     self._emit_registry_activity_findings(activity_candidates, path, key_path, tcid)
+                # Per-user execution artifacts (UserAssist + Compatibility
+                # Assistant Store) are indexed here and consumed after the loop
+                # by both the standalone execution leads and the prefetch
+                # promotion — one set of queries, two consumers.
+                self._collect_registry_execution_candidates(rows, path, key_path, tcid)
 
-        self._corroborate_execution_with_userassist(rust, py, by_class)
+        self._emit_registry_execution_findings()
+        self._promote_prefetch_findings_with_userassist()
+
+        # Exfil/staging emitters run last, after MFT, Prefetch, browser and
+        # registry have all had their turn, so each finding cites every
+        # artifact class that actually observed the behaviour.
+        prefetch_rows = self._prefetch_execution_rows()
+        self._emit_anti_forensic_tool_finding(
+            self._disk_wiper_candidates,
+            prefetch_tool_executions(prefetch_rows, anti_forensic_tool_hint),
+        )
+        self._emit_cloud_sync_channel_finding(
+            self._disk_cloud_candidates,
+            prefetch_tool_executions(prefetch_rows, cloud_sync_client_hint),
+            self._browser_cloud_candidates,
+        )
+        # Reset per-image: a case with several disk images runs this sweep once
+        # per image, and carrying image #1's candidates into image #2's finding
+        # would attribute one host's artifacts to another.
+        self._disk_wiper_candidates = []
+        self._disk_cloud_candidates = []
+        self._browser_cloud_candidates = []
+
+        self._investigate_web_tier_artifacts(rust, py, by_class, disk_summary)
 
         if DISK_YARA_RULES:
             for entry in by_class["yara_target"][:50]:
@@ -12958,6 +16655,7 @@ class Investigation:
                     "legacy_evt",
                     "ie_history",
                     "scheduled_task",
+                    "web",
                 }
             ]
         )
@@ -13087,14 +16785,22 @@ class Investigation:
         service). This consumes pcap_triage's `http_requests` to (a) flag contact
         with anonymous/disposable email services and identify the originating
         internal host, (b) attribute authenticated webmail sessions, (c)
-        attribute authenticated social-media sessions, and (d) correlate the
-        anonymous-email send times with the source host's browsing window.
+        attribute authenticated social-media sessions, (d) correlate the
+        anonymous-email send times with the source host's browsing window, and
+        (e) read cookie VALUES for an encoded archive smuggled out through the
+        cookie field.
         """
         requests = out.get("http_requests") or []
         self._add_pcap_timeline_correlation_finding(requests, tcid, artifact_path)
+        self._add_pcap_cookie_archive_findings(requests, tcid, artifact_path)
         anon_seen: set[tuple[str, str]] = set()
         webmail_seen: set[tuple[str, str]] = set()
         social_seen: set[tuple[str, str]] = set()
+        # Destinations whose Host headers are provably not credible (one address
+        # addressed as many unrelated sites). A cookie sent there authenticates
+        # nothing at the site the header names, so account attribution below must
+        # not be read off it.
+        spoofed_dsts = set(host_multiplexed_destinations(requests))
         emitted = 0
         for row in requests:
             if not isinstance(row, dict) or emitted >= 12:
@@ -13104,6 +16810,16 @@ class Investigation:
             method = (str(row.get("method") or "").strip() or "GET").upper()
             if not host:
                 continue
+            # A cookie only attributes an account when it is a session token AND
+            # it actually reached the site the Host header names. A value that
+            # decodes to an archive is a PAYLOAD, and a request to a
+            # Host-multiplexed relay never reached that site at all — reading
+            # either as "authenticated login" invents an account.
+            session_cookie = (
+                bool(row.get("has_cookie"))
+                and not row_cookie_carries_archive(row)
+                and str(row.get("dst") or "").strip() not in spoofed_dsts
+            )
             anon, token = _host_anonymous_email(host)
             if anon and (src, host) not in anon_seen:
                 anon_seen.add((src, host))
@@ -13182,7 +16898,7 @@ class Investigation:
                 )
                 emitted += 1
                 continue
-            if row.get("has_cookie") and _host_is_webmail(host) and (src, host) not in webmail_seen:
+            if session_cookie and _host_is_webmail(host) and (src, host) not in webmail_seen:
                 webmail_seen.add((src, host))
                 self._network_finding(
                     "B",
@@ -13205,7 +16921,7 @@ class Investigation:
                 emitted += 1
                 continue
             social, platform = _host_social_media(host)
-            if row.get("has_cookie") and social and (src, platform) not in social_seen:
+            if session_cookie and social and (src, platform) not in social_seen:
                 social_seen.add((src, platform))
                 self._network_finding(
                     "B",
@@ -13226,6 +16942,164 @@ class Investigation:
                     derived_from=[tcid],
                 )
                 emitted += 1
+
+    def _add_pcap_cookie_archive_findings(
+        self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
+    ) -> None:
+        """Findings for an archive smuggled out inside an HTTP cookie value.
+
+        Three distinct claims come off one observation, each at the tier its own
+        evidence supports:
+
+        * the covert channel itself (CONFIRMED) — the container magic and member
+          path are bytes present in the cited `pcap_triage` output, and the
+          asserted values bind cookie value + Host + destination inside ONE
+          replayed record, so the verifier re-extracts them rather than trusting
+          the wording;
+        * the relay reading of the destination (INFERRED) — Host multiplexing is
+          strong but shared hosting is a real alternative, so it is stated with
+          its counter-hypothesis;
+        * the share the archived file came from (INFERRED) — a member path under
+          an administrative share implies an account with rights to that share,
+          which the capture cannot name.
+
+        Deliberately NOT worded as an exfiltration conclusion: the presence and
+        egress prongs here both come from the network class, which is precisely
+        the single-source case the two-prong gate exists to distrust. The
+        limitation is stated in the finding text instead.
+        """
+        for channel in pcap_cookie_archive_channels(requests)[:3]:
+            self._emit_pcap_cookie_archive_channel(channel, tcid, artifact_path)
+
+    def _emit_pcap_cookie_archive_channel(
+        self, channel: dict[str, Any], tcid: str, artifact_path: str
+    ) -> None:
+        src = channel["src"] or "an internal host"
+        dst = channel["dst"]
+        host = channel["host"]
+        cookie_name = channel["cookie_name"]
+        container = channel["container"]
+        member_path = channel["member_path"]
+        domains = channel["spoofed_domains"]
+        domain_sample = ", ".join(domains[:6])
+        member_clause = f" carrying the member path `{member_path}`" if member_path else ""
+        # A distinctive slice of the observed value — long enough that no other
+        # cookie in the capture matches it, short enough to stay readable in the
+        # report and in the sealed entailment slice.
+        payload_excerpt = channel["cookie_value"][:48]
+
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-cookie-archive-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"pcap_triage read the HTTP cookie `{cookie_name}` that {src} sent to "
+                f"{dst} under Host header `{host}`, and its base64 value decodes to a "
+                f"{container}{member_clause}. A data archive was staged into a cookie "
+                f"field and transferred off the host inside ordinary-looking web "
+                f"requests — a covert channel. The archive bytes are read directly out "
+                f"of the capture, and the transfer is correlated with {len(domains)} "
+                f"unrelated site names all answered by the single address {dst}. "
+                "Single-artifact-class evidence: the on-host collection step and the "
+                "archive's full contents are not corroborated by disk, memory, or "
+                "filesystem artifacts in this evidence set, so treat the scope of what "
+                "left as unmeasured."
+            ),
+            "T1041",
+            confidence="CONFIRMED",
+            derived_from=[tcid],
+            asserted_values=[
+                {
+                    # Co-location: source, destination, Host header AND the
+                    # payload must all be present in ONE replayed row. Without
+                    # the cookie constraint the payload claim could be satisfied
+                    # by the same value riding a different request. (`cookies`
+                    # is a list; the record matcher substring-matches its
+                    # rendering, and a base64 excerpt has no characters that
+                    # rendering would escape.)
+                    "path": "http_requests[*]",
+                    "expected": json.dumps(
+                        {
+                            "src": channel["src"],
+                            "dst": dst,
+                            "host": host,
+                            "cookies": payload_excerpt,
+                        },
+                        sort_keys=True,
+                    ),
+                    "match": "record",
+                },
+                {"path": "http_requests[*].dst", "expected": dst, "match": "exact"},
+                {
+                    "path": "http_requests[*].cookies[*].name",
+                    "expected": cookie_name,
+                    "match": "exact",
+                },
+                {
+                    "path": "http_requests[*].cookies[*].value",
+                    "expected": payload_excerpt,
+                    "match": "contains",
+                },
+            ],
+            counter_hypothesis=(
+                "A site can legitimately round-trip compressed state in its own "
+                "cookie; ruled out because the value decodes to a stand-alone "
+                f"{container} and the destination {dst} answers to {len(domains)} "
+                "unrelated site names, so it is not the site whose cookie this "
+                "claims to be."
+            ),
+        )
+
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-host-spoof-relay-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"{len(domains)} unrelated web domains ({domain_sample}) all appear as "
+                f"the Host header on requests {src} sent to the single destination {dst} "
+                f"in these pcap flows. One address cannot legitimately serve that set, "
+                f"so the Host headers are spoofed and {dst} shows proxy/relay behavior: "
+                "it accepted arbitrary Host values and relayed the traffic onward, and "
+                "one of those same requests carried the encoded archive above. The "
+                "relay software itself is not identifiable from network metadata and "
+                "was not recovered from the host."
+            ),
+            "T1090",
+            confidence="INFERRED",
+            derived_from=[tcid],
+            counter_hypothesis=(
+                "Shared hosting or a CDN legitimately serves many domains from one "
+                "address, which is why Host multiplexing alone is never asserted; the "
+                "relay reading rests on the same destination also receiving a cookie "
+                "whose value decodes to an archive container — a hosting provider does "
+                "not receive its tenants' files inside cookie values."
+            ),
+        )
+
+        share_segment = channel["share_segment"]
+        if not share_segment:
+            return
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-archive-share-source-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"The archive {src} sent inside the `{cookie_name}` cookie names its "
+                f"member as `{member_path}` — the collected data was read from an "
+                f"administrative share (`{share_segment}`), so whichever account "
+                "assembled it had access to that share. Read as unauthorized access to "
+                "the share using valid or compromised credentials. No host auth.log / "
+                "wtmp logon records are present in this evidence set, so the account "
+                "and the logon event itself are uncorroborated; do not name a user from "
+                "this alone."
+            ),
+            "T1078",
+            confidence="INFERRED",
+            derived_from=[tcid],
+        )
 
     def _add_pcap_timeline_correlation_finding(
         self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
@@ -13740,7 +17614,8 @@ class Investigation:
         extracted_entries = [
             entry
             for entry in entries
-            if entry.get("artifact_class") in EXTRACTED_DISK_CLASSES | {"yara_target"}
+            if entry.get("artifact_class")
+            in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}
         ]
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES
@@ -13790,7 +17665,8 @@ class Investigation:
         extracted_entries = [
             entry
             for entry in entries
-            if entry.get("artifact_class") in EXTRACTED_DISK_CLASSES | {"yara_target"}
+            if entry.get("artifact_class")
+            in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}
         ]
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES

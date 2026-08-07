@@ -4,12 +4,12 @@ The agent has access to two MCP servers, both auto-spawned by Claude Code via `.
 
 | Server | Lang | Tools |
 |---|---|---|
-| `findevil-mcp` | Rust (`services/mcp/`) | 32 typed DFIR tools |
+| `findevil-mcp` | Rust (`services/mcp/`) | 33 typed DFIR tools |
 | `findevil-agent-mcp` | Python (`services/agent_mcp/`) | 13 crypto + ACH + memory + ACP + expert-feedback + accuracy tools (post-A5; the `ots_stamp` + `ots_verify` pair was removed) |
 
 Every successful tool call carries `_meta.output_sha256` (hex SHA-256 of the canonical JSON output). Findings cite tool calls by `tool_call_id`. The verifier vetoes any finding that doesn't.
 
-> **This file is the agent read-order catalog of the 45 typed PRODUCT tools** (the only verbs in
+> **This file is the agent read-order catalog of the 46 typed PRODUCT tools** (the only verbs in
 > the audit chain). The *full* set of MCP servers actually registered in `.mcp.json` (incl. the
 > operator-runtime `n8n-mcp`, `playwright`, `puppeteer` that emit no Findings) and the external
 > DFIR binaries + dependency pins are inventoried in
@@ -179,10 +179,20 @@ Args: `{case_id, indx_path: str, limit?}`
 Returns: `{rows[]: INDX column maps, rows_seen, stderr_tail}`
 Use when: a carved NTFS `$I30`/INDX stream may hold slack entries for deleted files (anti-forensic-deletion corroboration). Fixed `INDXParse.py <path>` subprocess; parses its `,\t`-delimited table. INSTALL-FIRST (`pip install INDXParse`). `$INDXPARSE_BIN` then PATH.
 
+### web_triage
+Args: `{case_id, artifact_path, limit?}`
+Returns: `{artifact_kind, lines_seen, requests_parsed, parse_errors, truncated, exploit_hits[{line_number, timestamp, timestamp_iso, client_ip, method, target, status, user_agent, indicators[]}], exploit_hit_count, indicator_counts[], attacker_clients[], script_hits[{line_number, indicator, snippet}], script_indicator_counts[], is_probable_webshell}`
+Use when: a carved web-tier artifact is in scope — an Apache/nginx/IIS request log (`web_log`) or a server-side script from a web root (`webroot_script`). **Pure Rust, in-process — no subprocess.** Auto-detects which kind it was handed. For a log it flags requests carrying SQL-injection (`union select`, tautology, `information_schema`, meta-functions), an encoded quote, path traversal, a webshell invocation, command injection, or a scanner user agent, and normalizes the stamp to ISO for cross-lane timeline correlation. For a script it reports the shell/eval/obfuscation/socket primitives present and whether the combination matches a webshell pattern. HONEST SCOPE: a request log records what the server RECEIVED — it CONFIRMS an exploitation *attempt* against a public-facing app (T1190), never that the injection succeeded; the "it worked" half needs the web root, the application, or the database. A script's primitives are content facts: request input reaching an exec/eval primitive in a web-server-writable directory is a dropped shell (T1505.003); the same primitives inside a shipped application tree have a competing benign reading and stay INFERRED.
+
 ### oe_dbx_parse
 Args: `{case_id, artifact_path}`
 Returns: `{is_oe_dbx, is_message_store, message_subject_count, subjects[], senders[], newsgroups[], hacking_newsgroups[]}`
 Use when: a carved Outlook Express `.dbx` mail/news store is in scope. **Pure Rust, in-process — no subprocess, no external binary** (no other parser reads DBX). Validates the OE file signature (`CF AD 12 FE`) before walking the store and extracts RFC822 `Subject`/`From`/`Newsgroups` headers. HONEST SCOPE: header-level only — no message bodies and no deleted-message recovery — so a recovered subject or newsgroup CONFIRMS store *content* (a mail/news-artifact fact at header granularity), never execution; intent stays a separate `hypothesis:` layer.
+
+### pst_parse
+Args: `{case_id, artifact_path, limit?}`
+Returns: `{is_pst, backend, message_count, messages_truncated, attachment_count, messages[]: {subject, from_display, from_address, reply_to_display, reply_to_address, to[], date, attachments[]: {name, extension, content_type}}}`
+Use when: a carved Outlook `.pst`/`.ost` mail store is in scope (artifact class `mail_store`). Validates the PST signature (`!BDN`) before any subprocess, then exports through libpst (`readpst -e -D -q -o`) or libpff (`pffexport -q -f text -t`) — fixed argv, no shell — and parses each exported RFC822 header block. INSTALL-FIRST (`apt install pst-utils` or `libpff-utils`); `$PST_READER_BIN` then PATH; a host with neither returns typed `BinaryNotFound`. HONEST SCOPE: envelope-level only — no bodies, no deleted-item recovery, and attachment *names/types*, not attachment content. A `reply_to_address` that differs from `from_address` is a header fact (reply-address divergence), not proof of who sent the mail; intent and actor identity stay out of scope.
 
 ---
 

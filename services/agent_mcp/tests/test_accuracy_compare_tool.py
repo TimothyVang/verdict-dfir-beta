@@ -262,3 +262,31 @@ class TestZeroFindingRunStillReturns:
             )
 
         assert not audit_path.exists()
+
+    async def test_not_ready_refusal_is_typed_so_a_caller_can_route_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The shim must let an MCP caller tell "excluded by key" from "broken key".
+
+        Both used to surface as a bare ValueError, so a caller had to string-match
+        the message to know whether the engine had actually been assessed. The
+        typed refusal carries the key's own declaration instead.
+        """
+        from findevil_agent.accuracy import GoldenNotScoreable
+
+        declared = json.loads(self._BENIGN_GOLDEN.read_text(encoding="utf-8"))
+        audit_path = tmp_path / "audit.jsonl"
+
+        with pytest.raises(GoldenNotScoreable) as excinfo:
+            await SPEC.handler(
+                AccuracyCompareInput(
+                    case_dir=str(self._benign_case(tmp_path)),
+                    golden_path=str(self._BENIGN_GOLDEN),
+                    audit_log_path=str(audit_path),
+                )
+            )
+
+        assert excinfo.value.case_id == "synthetic-benign"
+        assert excinfo.value.reason == declared["not_ready_reason"]
+        # Still no audit record: an exclusion is not a diagnostic result.
+        assert not audit_path.exists()

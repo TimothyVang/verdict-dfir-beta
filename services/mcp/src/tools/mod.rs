@@ -34,6 +34,7 @@ pub mod oe_dbx_parse;
 pub mod pcap_triage;
 pub mod plaso_parse;
 pub mod prefetch_parse;
+pub mod pst_parse;
 pub mod regf;
 pub mod registry_query;
 pub mod suricata_eve;
@@ -45,6 +46,7 @@ pub mod vol_pslist;
 pub mod vol_psscan;
 pub mod vol_psxview;
 pub mod vol_run;
+pub mod web_triage;
 pub mod yara_scan;
 pub mod zeek_summary;
 
@@ -99,6 +101,9 @@ pub use plaso_parse::{
 pub use prefetch_parse::{
     path_looks_like_prefetch, prefetch_parse, PrefetchError, PrefetchInput, PrefetchOutput,
 };
+pub use pst_parse::{
+    pst_parse, PstAttachment, PstMessage, PstParseError, PstParseInput, PstParseOutput,
+};
 pub use registry_query::{
     path_looks_like_hive, registry_query, RegistryEntry, RegistryError, RegistryInput,
     RegistryOutput, RegistryValue,
@@ -125,6 +130,10 @@ pub use vol_psxview::{
     vol_psxview, VolPsxviewError, VolPsxviewInput, VolPsxviewOutput, VolPsxviewRow,
 };
 pub use vol_run::{is_allowed_plugin, vol_run, VolRunError, VolRunInput, VolRunOutput};
+pub use web_triage::{
+    web_triage, WebClientCount, WebIndicatorCount, WebRequestHit, WebScriptHit, WebTriageError,
+    WebTriageInput, WebTriageOutput,
+};
 pub use yara_scan::{
     path_looks_like_yara_rules, yara_scan, YaraError, YaraInput, YaraMatch, YaraOutput,
     YaraPatternMatch,

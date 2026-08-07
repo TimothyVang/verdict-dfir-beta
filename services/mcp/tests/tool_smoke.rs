@@ -76,14 +76,27 @@ struct FakeTsk {
 #[cfg(unix)]
 impl FakeTsk {
     fn install(dir: &std::path::Path, files: &[(&str, &str, &[u8])]) -> Self {
+        let allocated: Vec<(&str, &str, &[u8], bool)> = files
+            .iter()
+            .map(|(inode, path, bytes)| (*inode, *path, *bytes, true))
+            .collect();
+        Self::install_with_deleted(dir, &allocated)
+    }
+
+    /// Same as [`Self::install`] but each row carries an `allocated` flag, so a
+    /// test can stage the anti-forensic shape: a directory whose entries all
+    /// come back from `fls` marked deleted (`*`).
+    fn install_with_deleted(dir: &std::path::Path, files: &[(&str, &str, &[u8], bool)]) -> Self {
         use std::fmt::Write as _;
         use std::os::unix::fs::PermissionsExt;
         let blobs = dir.join("blobs");
         fs::create_dir_all(&blobs).unwrap();
         let mut listing = String::new();
-        for (inode, path, bytes) in files {
-            // fls -p line shape: `r/r <inode>:\t<relative/path>`.
-            writeln!(listing, "r/r {inode}:\t{path}").unwrap();
+        for (inode, path, bytes, allocated) in files {
+            // fls -p line shape: `r/r <inode>:\t<relative/path>`; a deleted
+            // entry gets the `*` marker between the type and the inode.
+            let marker = if *allocated { "" } else { "* " };
+            writeln!(listing, "r/r {marker}{inode}:\t{path}").unwrap();
             fs::write(blobs.join(format!("{inode}.bin")), bytes).unwrap();
         }
         let fls_txt = dir.join("fls.txt");
@@ -380,6 +393,101 @@ fn disk_mount_extract_unmount_uses_session_resource_ledger_in_mock_mode() {
     assert!(ledger_text.contains("disk_mount"));
     assert!(ledger_text.contains("disk_extract_artifacts"));
     assert!(ledger_text.contains("unmounted"));
+}
+
+#[test]
+#[cfg(unix)]
+fn disk_extract_artifacts_recovers_a_wiped_prefetch_directory() {
+    // Anti-forensics shape: every .pf in Windows/Prefetch comes back from `fls`
+    // marked deleted. Before this, the extractor dropped all of them, reported
+    // artifact_counts.prefetch = 0, and recorded NO limitation — the gap was
+    // invisible. Now the resident records are recovered, labelled, and the
+    // wipe itself is reported.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _home = HomeGuard::set(tmp.path());
+    let image = write_evidence_image(tmp.path(), b"fake disk image bytes");
+    let handle = case_open(&CaseOpenInput {
+        image_path: image.clone(),
+        expected_sha256: None,
+        label: Some("disk-wiped-prefetch".to_string()),
+    })
+    .expect("case_open ok");
+
+    // Two recoverable .pf (valid Win10 `MAM\x04` signature), one whose inode was
+    // reused by unrelated data, plus a live $MFT for contrast.
+    let _tsk = FakeTsk::install_with_deleted(
+        tmp.path(),
+        &[
+            ("100", "$MFT", b"mft bytes", true),
+            (
+                "101",
+                "Windows/Prefetch/SDELETE.EXE-257E3D6D.pf",
+                b"MAM\x04sdelete prefetch body",
+                false,
+            ),
+            (
+                "102",
+                "Windows/Prefetch/CSRSS.EXE-8C04D631.pf",
+                b"MAM\x04csrss prefetch body",
+                false,
+            ),
+            (
+                "103",
+                "Windows/Prefetch/REUSED.EXE-DEADBEEF.pf",
+                b"\x00\x00\x00\x00 reallocated cluster",
+                false,
+            ),
+        ],
+    );
+
+    let mounted = disk_mount(&DiskMountInput {
+        case_id: handle.id.clone(),
+        image_path: image,
+        mount_point: None,
+        mode: DiskMode::Mock,
+    })
+    .expect("mock mount succeeds");
+
+    let extracted = disk_extract_artifacts(&DiskExtractArtifactsInput {
+        case_id: handle.id,
+        mount_id: mounted.mount_id,
+        artifact_kinds: vec![],
+        limit: 20,
+        max_artifact_bytes: 1024,
+    })
+    .expect("extract artifacts");
+
+    let prefetch: Vec<_> = extracted
+        .artifacts
+        .iter()
+        .filter(|a| a.artifact_class == "prefetch")
+        .collect();
+    assert_eq!(
+        prefetch.len(),
+        2,
+        "the two signature-valid .pf are recovered, the reallocated one is not: {:?}",
+        extracted
+            .artifacts
+            .iter()
+            .map(|a| a.source_path.display().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        prefetch.iter().all(|a| a.recovered_deleted),
+        "recovered rows must be labelled so a reader sees the provenance"
+    );
+    assert!(
+        extracted
+            .artifacts
+            .iter()
+            .any(|a| a.artifact_class == "mft" && !a.recovered_deleted),
+        "allocated artifacts stay unlabelled"
+    );
+    let limitations = extracted.analysis_limitations.join(" | ");
+    assert!(
+        limitations.contains("Prefetch"),
+        "the wipe must be reported, not silent: {limitations:?}"
+    );
 }
 
 #[test]
