@@ -209,3 +209,130 @@ def test_synthetic_decoy_escalating_run_fails_on_planted_bait(tmp_path: Path) ->
     assert r["fp_planted"] >= 1
     assert any(b["violation"] == "named_claim_denylist" for b in r["planted_bait"])
     assert r["pass"] is False
+
+
+# --- CLI exit codes: excluded-by-key is not an accuracy failure ---------------
+#
+# `scripts/score-recall.py` collapsed every refusal into exit 2, and
+# `l3-run-goldens.sh` maps any non-zero to "FAIL ... (see recall-score.json)" —
+# a file exit 2 never writes. So a key that says "do not score me" was reported
+# as an accuracy FAIL with unknown metrics. These pin the four distinct codes:
+#   0 PASS, 1 real FAIL (metrics exist), 2 scorer/lookup ERROR, 3 EXCLUDED by key.
+
+_NOT_READY_GOLDEN_DIR = _REPO_ROOT / "goldens" / "synthetic-benign"
+
+
+def _cli_case(tmp_path: Path, case_id: str, verdict: str, findings: list[dict]) -> Path:
+    case_dir = tmp_path / f"{case_id}-case"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "verdict.json").write_text(
+        json.dumps(
+            {
+                "case_id": case_id,
+                "verdict": verdict,
+                "findings": findings,
+                "tool_calls": [{"tool_call_id": "tc-1", "tool": "case_open"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return case_dir
+
+
+def test_cli_exit_codes_are_named_constants() -> None:
+    assert score_recall.EXIT_PASS == 0
+    assert score_recall.EXIT_FAIL == 1
+    assert score_recall.EXIT_ERROR == 2
+    assert score_recall.EXIT_NOT_SCOREABLE == 3
+
+
+def test_cli_returns_3_and_prints_the_keys_reason_for_a_not_ready_golden(
+    tmp_path: Path, capsys
+) -> None:
+    case_dir = _cli_case(tmp_path, "synthetic-benign", "NO_EVIL", [])
+    declared = json.loads(
+        (_NOT_READY_GOLDEN_DIR / "expected-findings.json").read_text(encoding="utf-8")
+    )
+
+    rc = score_recall.main(
+        ["score-recall.py", str(case_dir), "--golden", str(_NOT_READY_GOLDEN_DIR)]
+    )
+
+    assert rc == score_recall.EXIT_NOT_SCOREABLE
+    out = capsys.readouterr()
+    combined = out.out + out.err
+    assert "EXCLUDED" in combined
+    assert "synthetic-benign" in combined
+    # The reader learns WHY from the key itself, not from a guess.
+    assert declared["not_ready_reason"] in combined
+    # Never presented as an accuracy result.
+    assert "FAIL" not in combined
+
+
+def test_cli_exclusion_writes_a_machine_readable_marker_not_a_score(tmp_path: Path) -> None:
+    case_dir = _cli_case(tmp_path, "synthetic-benign", "NO_EVIL", [])
+
+    rc = score_recall.main(
+        ["score-recall.py", str(case_dir), "--golden", str(_NOT_READY_GOLDEN_DIR), "--quiet"]
+    )
+
+    assert rc == score_recall.EXIT_NOT_SCOREABLE
+    # No score file: there is no score. A board that reads recall-score.json must
+    # not find a document it can mistake for metrics.
+    assert not (case_dir / "recall-score.json").exists()
+    marker = case_dir / "recall-excluded.json"
+    assert marker.is_file()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["excluded"] is True
+    assert payload["case_id"] == "synthetic-benign"
+    assert payload["scoring_status"] == "not_ready"
+    assert payload["reason"]
+    assert "pass" not in payload
+    assert "recall_percent" not in payload
+
+
+def test_cli_still_returns_2_for_an_unpopulated_stub_golden(tmp_path: Path) -> None:
+    stub_dir = tmp_path / "stub-golden"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    (stub_dir / "expected-findings.json").write_text(
+        json.dumps(
+            {
+                "case_id": "stub-key",
+                "verdict": "UNKNOWN",
+                "min_recall_percent": None,
+                "findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    case_dir = _cli_case(tmp_path, "stub-key", "UNKNOWN", [])
+
+    rc = score_recall.main(["score-recall.py", str(case_dir), "--golden", str(stub_dir)])
+
+    assert rc == score_recall.EXIT_ERROR
+    assert not (case_dir / "recall-excluded.json").exists()
+
+
+def test_cli_still_returns_1_for_a_real_accuracy_failure(tmp_path: Path) -> None:
+    golden_dir = tmp_path / "real-golden"
+    golden_dir.mkdir(parents=True, exist_ok=True)
+    (golden_dir / "expected-findings.json").write_text(
+        json.dumps(
+            {
+                "case_id": "real-key",
+                "verdict": "SUSPICIOUS",
+                "min_recall_percent": 100,
+                "findings": [_finding("g1", _A)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    case_dir = _cli_case(tmp_path, "real-key", "SUSPICIOUS", [])
+
+    rc = score_recall.main(
+        ["score-recall.py", str(case_dir), "--golden", str(golden_dir), "--quiet"]
+    )
+
+    assert rc == score_recall.EXIT_FAIL
+    # A real FAIL still leaves the metrics the runner's message points at.
+    assert (case_dir / "recall-score.json").is_file()

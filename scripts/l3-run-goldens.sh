@@ -231,10 +231,32 @@ for fixture in "${FIXTURES[@]}"; do
   mkdir -p "${run_case_dir}"
   cp "${verdict_json}" "${run_case_dir}/verdict.json"
   log "scoring recall vs ${expected}"
-  if python3 scripts/score-recall.py "${run_case_dir}" --golden "${golden_dir}"; then
+  # score-recall.py exits 0 PASS / 1 FAIL / 2 ERROR / 3 EXCLUDED-by-key. Mapping
+  # every non-zero to FAIL is what made `synthetic-benign` — whose key carries
+  # scoring_status=not_ready — read as an accuracy failure with no metrics, and
+  # pointed the operator at a recall-score.json that path never writes. Same
+  # 3=NOT_READY / 2=ERROR split the fixture-readiness gate above already uses.
+  # `set -e` is on: a bare non-zero would abort the whole sweep, so capture the
+  # code instead of letting it kill the loop.
+  score_exit=0
+  python3 scripts/score-recall.py "${run_case_dir}" --golden "${golden_dir}" || score_exit=$?
+  if [[ "${score_exit}" -eq 0 ]]; then
     log "PASS ${fixture}: recall >= target and verdict consistent"
-  else
+  elif [[ "${score_exit}" -eq 3 ]]; then
+    # The KEY declared itself unscoreable. Not a pass, not a failure — excluded.
+    # OVERALL_EXIT is deliberately untouched: no accuracy claim, for or against
+    # the engine, can be made from a golden that asked not to be scored.
+    score_excluded_reason="$(
+      jq -r '.reason // "golden declares scoring_status=not_ready"' \
+        "${run_case_dir}/recall-excluded.json" 2>/dev/null \
+        || printf 'golden declares scoring_status=not_ready'
+    )"
+    log "EXCLUDED ${fixture}: not scoreable by its own key — ${score_excluded_reason}"
+  elif [[ "${score_exit}" -eq 1 ]]; then
     log "FAIL ${fixture}: recall below target or verdict mismatch (see ${run_case_dir}/recall-score.json)"
+    OVERALL_EXIT=1
+  else
+    log "FAIL ${fixture}: scorer ERROR (exit ${score_exit}) — no score was produced"
     OVERALL_EXIT=1
   fi
 done

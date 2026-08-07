@@ -171,3 +171,101 @@ class TestScriptStillImportsCore:
         # And both produce byte-identical results on the same fixture.
         case_dir = _write_verdict(tmp_path / "case", "CONFIRMED_EVIL", _SEVEN_OF_FOURTEEN)
         assert mod.score(case_dir, _NIST_GOLDEN) == accuracy.score(case_dir, _NIST_GOLDEN)
+
+
+class TestNotScoreableGoldenIsExcludedNotFailed:
+    """A key that declares ``scoring_status: not_ready`` is EXCLUDED, not failed.
+
+    The key itself says "do not score me". Reporting that as an accuracy failure
+    with no metrics (``FAIL recall=-% prec=not-measured``) blames the engine for a
+    dataset the maintainers already marked unusable. The refusal stays a raise —
+    an unignorable signal beats a ``{"excluded": True}`` flag a caller can forget
+    to check — but it is now a TYPED refusal carrying the key's own reason, so a
+    caller can route it to its own exclusion channel instead of its error channel.
+    """
+
+    _NOT_READY = ("synthetic-benign", "synthetic-decoy", "otrf-apt3-mordor")
+
+    def test_not_ready_raises_a_typed_error_that_is_still_a_value_error(
+        self, tmp_path: Path
+    ) -> None:
+        golden = _REPO_ROOT / "goldens" / "synthetic-decoy" / "expected-findings.json"
+        case_dir = _write_verdict(tmp_path / "decoy", "NO_EVIL", [])
+
+        with pytest.raises(accuracy.GoldenNotScoreable) as excinfo:
+            accuracy.score(case_dir, golden)
+
+        # Backwards compatible: every existing `except ValueError` still catches it.
+        assert isinstance(excinfo.value, ValueError)
+
+    def test_the_typed_error_carries_the_keys_own_reason_and_identity(self, tmp_path: Path) -> None:
+        golden_path = _REPO_ROOT / "goldens" / "synthetic-benign" / "expected-findings.json"
+        declared = json.loads(golden_path.read_text(encoding="utf-8"))
+        case_dir = _write_verdict(tmp_path / "benign", "NO_EVIL", [])
+
+        with pytest.raises(accuracy.GoldenNotScoreable) as excinfo:
+            accuracy.score(case_dir, golden_path)
+
+        exc = excinfo.value
+        assert exc.case_id == "synthetic-benign"
+        # Verbatim from the key — nothing invented, nothing paraphrased.
+        assert exc.reason == declared["not_ready_reason"]
+        assert Path(exc.golden_path) == golden_path
+        assert exc.scoring_status == "not_ready"
+
+    def test_a_malformed_scoring_status_is_an_error_not_an_exclusion(self, tmp_path: Path) -> None:
+        # "not_ready" is a declaration; a typo is a broken key. They must not
+        # collapse into the same channel, or a corrupt key silently disappears
+        # from the board instead of being fixed.
+        golden = tmp_path / "bad" / "expected-findings.json"
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(
+            json.dumps(
+                {
+                    "case_id": "bad-status",
+                    "scoring_status": "nearly_ready",
+                    "verdict": "NO_EVIL",
+                    "min_recall_percent": 0,
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        case_dir = _write_verdict(tmp_path / "bad-case", "NO_EVIL", [])
+
+        with pytest.raises(ValueError) as excinfo:
+            accuracy.score(case_dir, golden)
+        assert not isinstance(excinfo.value, accuracy.GoldenNotScoreable)
+
+    def test_a_null_min_recall_stub_is_an_error_not_an_exclusion(self, tmp_path: Path) -> None:
+        # An unpopulated stub never declared itself unscoreable — it is simply
+        # incomplete, and a maintainer has to populate it. Excluding it quietly
+        # would hide that.
+        golden = tmp_path / "stub" / "expected-findings.json"
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(
+            json.dumps(
+                {
+                    "case_id": "stub-key",
+                    "verdict": "UNKNOWN",
+                    "min_recall_percent": None,
+                    "findings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        case_dir = _write_verdict(tmp_path / "stub-case", "UNKNOWN", [])
+
+        with pytest.raises(ValueError) as excinfo:
+            accuracy.score(case_dir, golden)
+        assert not isinstance(excinfo.value, accuracy.GoldenNotScoreable)
+
+    def test_every_committed_not_ready_key_raises_the_typed_error(self, tmp_path: Path) -> None:
+        # All three rows the goldens board currently prints as accuracy failures.
+        for case_id in self._NOT_READY:
+            golden = _REPO_ROOT / "goldens" / case_id / "expected-findings.json"
+            case_dir = _write_verdict(tmp_path / case_id, "NO_EVIL", [])
+            with pytest.raises(accuracy.GoldenNotScoreable) as excinfo:
+                accuracy.score(case_dir, golden)
+            assert excinfo.value.case_id == case_id, case_id
+            assert excinfo.value.reason, case_id

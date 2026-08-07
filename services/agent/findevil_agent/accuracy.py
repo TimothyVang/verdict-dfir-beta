@@ -31,6 +31,14 @@ Negative-assertion coverage: of the negative assertions a correct run must AVOID
 (every ``anti_fact`` / ``known_negative`` / denylisted name in the key), how many
 did the run correctly stay away from. 100% coverage means zero planted-bait
 hallucinations.
+
+Not every key is scoreable. A golden carrying ``scoring_status: not_ready``
+declares that it must not be graded (the fixture behind it is a placeholder, or
+its telemetry is not engine-supported), and :func:`score` refuses with
+:class:`GoldenNotScoreable` — a typed refusal carrying the key's own
+``not_ready_reason``. That is an EXCLUSION, not an accuracy failure: a caller that
+reports it as a FAIL is charging the engine for a dataset gap the maintainers had
+already written down.
 """
 
 from __future__ import annotations
@@ -106,6 +114,43 @@ _EVIL_WORDS = frozenset({"CONFIRMED_EVIL", "SUSPICIOUS", "SUSPICION", "EVIL"})
 _BENIGN_WORDS = frozenset({"NO_EVIL", "BENIGN"})
 _NEUTRAL_WORDS = frozenset({"UNKNOWN", "INDETERMINATE"})
 _VALID_SCORING_STATUSES = frozenset({"ready", "not_ready"})
+
+
+class GoldenNotScoreable(ValueError):
+    """The answer key itself declares that it must not be scored.
+
+    Distinct from every other refusal in this module, which mean the key is BROKEN
+    (an unsupported ``scoring_status`` value, a ``min_recall_percent: null`` stub).
+    Those are maintainer bugs and must stay loud. This one is a maintainer
+    *decision* already written into the key, so a caller should route it to an
+    EXCLUDED channel rather than to an accuracy-failure or an error channel.
+
+    Why this stays an exception instead of :func:`score` returning
+    ``{"excluded": True, "reason": ...}``: a returned flag is silently ignorable.
+    Every caller -- ``scripts/score-recall.py``, the ``accuracy_compare`` MCP shim,
+    any future board -- would have to remember to check it, and the one that forgets
+    reads the rest of the dict (no ``pass``, no ``recall_percent``) as a *result*,
+    which is exactly the dishonest reporting this class exists to stop. It would
+    also push the shim's non-Optional output model into a second, mostly-null
+    shape. An exception cannot be ignored. Subclassing ``ValueError`` keeps every
+    existing ``except ValueError`` caller working unchanged, and the attributes
+    carry the key's own words so no caller has to parse the message string.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        case_id: str | None,
+        golden_path: Path | str,
+        scoring_status: str,
+        reason: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.case_id = case_id
+        self.golden_path = str(golden_path)
+        self.scoring_status = scoring_status
+        self.reason = reason
 
 
 def _tokens(*parts: str | None) -> set[str]:
@@ -349,21 +394,36 @@ def _negative_coverage(
 
 
 def _require_scoreable_golden(golden: dict[str, Any], golden_path: Path) -> None:
-    """Reject incomplete or malformed answer keys before computing metrics."""
+    """Reject incomplete or malformed answer keys before computing metrics.
 
+    Two different refusals, deliberately different exception types:
+
+      * an unsupported ``scoring_status`` is a BROKEN key -> plain ``ValueError``.
+        A typo must be fixed, not quietly dropped from the board.
+      * ``scoring_status: not_ready`` is the key DECLARING itself unscoreable ->
+        :class:`GoldenNotScoreable`, carrying the key's own ``not_ready_reason``
+        so the caller can report an exclusion instead of an accuracy failure.
+    """
+
+    case_id = golden.get("case_id") or golden_path.parent.name
     scoring_status = golden.get("scoring_status", "ready")
     if scoring_status not in _VALID_SCORING_STATUSES:
         raise ValueError(
-            f"golden '{golden.get('case_id') or golden_path.parent.name}' has unsupported "
+            f"golden '{case_id}' has unsupported "
             f"scoring_status {scoring_status!r}; expected one of "
             f"{sorted(_VALID_SCORING_STATUSES)}"
         )
     if scoring_status == "not_ready":
-        reason = golden.get("not_ready_reason")
-        reason_suffix = f": {reason.strip()}" if isinstance(reason, str) and reason.strip() else ""
-        raise ValueError(
-            f"golden '{golden.get('case_id') or golden_path.parent.name}' has "
-            f"scoring_status=not_ready and is not scoreable{reason_suffix}"
+        raw_reason = golden.get("not_ready_reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) and raw_reason.strip() else None
+        reason_suffix = f": {reason}" if reason else ""
+        raise GoldenNotScoreable(
+            f"golden '{case_id}' has "
+            f"scoring_status=not_ready and is not scoreable{reason_suffix}",
+            case_id=str(case_id) if case_id else None,
+            golden_path=golden_path,
+            scoring_status=scoring_status,
+            reason=reason,
         )
 
 
@@ -558,4 +618,4 @@ def score(case_dir: Path, golden_path: Path) -> dict[str, Any]:
     }
 
 
-__all__ = ["newest_case_dir", "resolve_golden", "score"]
+__all__ = ["GoldenNotScoreable", "newest_case_dir", "resolve_golden", "score"]
