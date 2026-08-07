@@ -559,6 +559,78 @@ def rust_replay_command() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# The machine-readable error class the Rust MCP server puts in a JSON-RPC
+# ``error.data.kind`` when a tool could not run because its EXTERNAL BINARY is
+# not installed (services/mcp/src/server.rs::MISSING_PREREQUISITE, fed by the
+# ``PrerequisiteGap`` trait over every shell-out tool's ``BinaryNotFound``).
+#
+# It exists because the alternative is guessing from prose. ``pst_parse``'s
+# absence message ("no PST reader found: install libpst (readpst) ...") contains
+# none of ``_ABSENCE_MARKERS``, while its SubprocessFailed message names
+# ``readpst`` and would match a naive marker — so a substring classifier gets
+# this exactly backwards in both directions.
+MISSING_PREREQUISITE = "missing_prerequisite"
+
+
+def missing_prerequisite(out: dict[str, Any] | None) -> str | None:
+    """The failure message when ``out`` is an unmet EXTERNAL-BINARY prerequisite.
+
+    Returns ``None`` for a success, for an untyped error, and — critically — for
+    a real failure of a tool whose binary IS present. A tool that cannot run at
+    all on this host is a coverage gap for one lane; the same tool failing on an
+    artifact it could reach is a failure that must still surface.
+    """
+    if not isinstance(out, dict):
+        return None
+    err = out.get("_error")
+    if not isinstance(err, dict) or err.get("kind") != MISSING_PREREQUISITE:
+        return None
+    return str(err.get("message") or "required external binary is not installed")
+
+
+def error_placeholder(err: dict[str, Any] | None, **empty_shape: Any) -> dict[str, Any]:
+    """An empty-shaped stand-in for a failed tool result that KEEPS its typed error.
+
+    Lanes replace a failed result with an empty-shaped dict so the rest of the
+    lane reads it without branching. Rebuilding that dict as
+    ``{"_error": {"message": text}}`` silently drops the JSON-RPC ``data.kind``
+    the server attached, which is the only honest way to tell an unmet
+    external-binary prerequisite from a real failure. Carry the whole payload.
+    """
+    return {"_error": dict(err or {}), **empty_shape}
+
+
+class McpRpcError(RuntimeError):
+    """A JSON-RPC error response from an MCP server, with its typed payload.
+
+    Subclasses ``RuntimeError`` so every existing ``except RuntimeError`` site
+    keeps working; ``code``/``data`` are the wire fields that would otherwise be
+    flattened into the message string and lost.
+    """
+
+    def __init__(self, message: str, *, code: int | None = None, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
+
+def _tool_error_payload(exc: BaseException) -> dict[str, Any]:
+    """The ``_error`` body a failed ``call_tool`` returns.
+
+    ``kind`` is copied out of the server's ``error.data`` when it sent one; a
+    server (or a transport failure) that carries no typed class simply leaves it
+    absent, and callers see the same message-only shape as before.
+    """
+    payload: dict[str, Any] = {"message": str(exc)}
+    code = getattr(exc, "code", None)
+    if code is not None:
+        payload["code"] = code
+    data = getattr(exc, "data", None)
+    if isinstance(data, dict) and data.get("kind"):
+        payload["kind"] = str(data["kind"])
+    return payload
+
+
 class SshMcpClient:
     # Set when the spawn itself fails (no ssh client on this host): the client
     # then behaves as an already-closed server so callers get the same fast
@@ -683,8 +755,11 @@ class SshMcpClient:
         if env is None:
             raise RuntimeError(f"{self.label}: server closed stdout")
         if "error" in env:
-            raise RuntimeError(
-                f"{self.label} {method}: {env['error'].get('message', env['error'])}"
+            err = env["error"] if isinstance(env["error"], dict) else {}
+            raise McpRpcError(
+                f"{self.label} {method}: {err.get('message', env['error'])}",
+                code=err.get("code"),
+                data=err.get("data"),
             )
         return env.get("result", {})
 
@@ -692,7 +767,7 @@ class SshMcpClient:
         try:
             result = self.call("tools/call", {"name": name, "arguments": args}, timeout=timeout)
         except RuntimeError as e:
-            return {"_error": {"message": str(e)}}
+            return {"_error": _tool_error_payload(e)}
         try:
             text = result["content"][0]["text"]
             body = json.loads(text)
@@ -11982,6 +12057,50 @@ class Investigation:
             # Liveness is advisory; never let it interrupt the case.
             pass
 
+    def _mark_prerequisite_skip(
+        self,
+        tool: str,
+        extra: dict[str, Any] | None,
+        result: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Turn an unmet-external-binary refusal into a GRACEFUL, RECORDED skip.
+
+        Nineteen tools shell out to a third-party binary and degrade to a typed
+        ``BinaryNotFound`` when it is absent. That is an unmet prerequisite for
+        ONE lane on THIS host — not the case failing. Recording it as a plain
+        ``{"error": ...}`` tool_call made it one: ``accuracy._run_completed``
+        counts a tool that errored and never succeeded as an unrecovered failure,
+        so a GN7000 without libpst turned m57-jean and nist-data-leakage from an
+        honest ``FAIL recall=0`` into ``NOT_READY`` — unscoreable, which is
+        strictly worse than scoring badly.
+
+        So the call is marked ``skipped`` (the scorer excludes it, exactly as it
+        already excludes a guardrail ``rejected``) and the host-level gap is
+        appended ONCE to ``analysis_limitations`` — visible, not silent, the same
+        treatment an unset ``$FIND_EVIL_DISK_YARA_RULES`` gets.
+
+        The boundary is enforced upstream by the TYPE: only the server's
+        ``missing_prerequisite`` class reaches here, so a tool that failed on
+        evidence it could actually reach still records as a failure.
+
+        The failure streak is deliberately untouched: a skip is not a success (no
+        evidence was read, so it must not reset the streak) and not a liveness
+        failure (the host is simply missing an optional tool).
+        """
+        reason = missing_prerequisite(result)
+        if not reason:
+            return extra
+        marked = dict(extra or {})
+        marked.setdefault("error", reason)
+        marked["skipped"] = True
+        marked["skip_reason"] = MISSING_PREREQUISITE
+        limitation = (
+            f"{tool} is unavailable on this host, so its lane contributed no coverage: {reason}"
+        )
+        if limitation not in self.analysis_limitations:
+            self.analysis_limitations.append(limitation)
+        return marked
+
     def _record_tool(
         self,
         py: SshMcpClient,
@@ -11989,7 +12108,13 @@ class Investigation:
         output_hash: str,
         extra: dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
     ) -> str:
+        # ``result`` is the raw tool result this record describes. Passing it is
+        # what lets ONE place decide whether the call was an unmet external-binary
+        # prerequisite (a recorded skip) or a real failure — on the server's typed
+        # error class, not on the wording of the message.
+        extra = self._mark_prerequisite_skip(tool, extra, result)
         # A SUCCESSFUL tool call breaks any consecutive-failure streak, so a
         # single transient error never trips the HEARTBEAT escalation. A
         # *failed* tool still records its error-placeholder output here (every
@@ -12109,8 +12234,11 @@ class Investigation:
                 msg = str(res["_error"].get("message", "tool error"))
                 # A rejected/errored tool call is still logged to the audit chain
                 # (CLAUDE.md). No tcid is returned to the model, so a finding can never
-                # rest on a failed call, but the attempt stays in custody.
-                self._record_tool(py, name, "", extra={"error": msg}, arguments=args)
+                # rest on a failed call, but the attempt stays in custody. ``result``
+                # carries the server's typed error class, so an agent that reaches for
+                # a tool whose binary this host lacks records a skip rather than a
+                # case-level failure — the same rule the deterministic lanes follow.
+                self._record_tool(py, name, "", extra={"error": msg}, arguments=args, result=res)
                 return (None, None, msg)
             if isinstance(res, dict):
                 sha = str(res.get("_mcp_output_sha256", ""))
@@ -12475,11 +12603,7 @@ class Investigation:
                 pslist_error,
                 "defer (psscan signature-scan still covers process recovery)",
             )
-            pslist = {
-                "_error": {"message": pslist_error},
-                "processes": [],
-                "processes_seen": 0,
-            }
+            pslist = error_placeholder(pslist.get("_error"), processes=[], processes_seen=0)
         ps = pslist.get("processes", [])
         ps_seen = pslist.get("processes_seen", 0)
         pslist_extra = {"processes_returned": len(ps), "processes_seen": ps_seen}
@@ -12491,6 +12615,7 @@ class Investigation:
             self._output_hash(pslist),
             pslist_extra,
             arguments=pslist_args,
+            result=pslist,
         )
         tcid_pslist = self.tool_calls[-1]["tool_call_id"]
         for proc in ps[:500]:
@@ -12527,11 +12652,7 @@ class Investigation:
                 malfind_error,
                 "defer (injection triage skipped; rely on psscan/psxview signals)",
             )
-            mal = {
-                "_error": {"message": malfind_error},
-                "injections": [],
-                "injections_seen": 0,
-            }
+            mal = error_placeholder(mal.get("_error"), injections=[], injections_seen=0)
         injs = mal.get("injections", [])
         malfind_extra = {"injections_returned": len(injs)}
         if malfind_error:
@@ -12542,6 +12663,7 @@ class Investigation:
             self._output_hash(mal),
             malfind_extra,
             arguments=malfind_args,
+            result=mal,
         )
         yara_out: dict[str, Any] | None = None
         tcid_yara: str | None = None
@@ -12613,11 +12735,7 @@ class Investigation:
                 psscan_error,
                 "defer (no signature-scan process recovery this run)",
             )
-            psscan_out = {
-                "_error": {"message": psscan_error},
-                "processes": [],
-                "processes_seen": 0,
-            }
+            psscan_out = error_placeholder(psscan_out.get("_error"), processes=[], processes_seen=0)
         psscan = psscan_out.get("processes", [])
         psscan_count = psscan_out.get("processes_seen", len(psscan))
         psscan_extra = {"processes_seen": psscan_count}
@@ -12629,6 +12747,7 @@ class Investigation:
             self._output_hash(psscan_out),
             psscan_extra,
             arguments=psscan_args,
+            result=psscan_out,
         )
         for proc in psscan[:500]:
             name = proc.get("image_name") or proc.get("ImageFileName") or "unknown"
@@ -12672,11 +12791,9 @@ class Investigation:
                     psxview_error,
                     "defer (no cross-view DKOM corroboration this run)",
                 )
-                psxview_out = {
-                    "_error": {"message": psxview_error},
-                    "processes": [],
-                    "processes_seen": 0,
-                }
+                psxview_out = error_placeholder(
+                    psxview_out.get("_error"), processes=[], processes_seen=0
+                )
             psxview = psxview_out.get("processes", [])
             psxview_extra = {"processes_seen": psxview_out.get("processes_seen", len(psxview))}
             if psxview_error:
@@ -12687,6 +12804,7 @@ class Investigation:
                 self._output_hash(psxview_out),
                 psxview_extra,
                 arguments=psxview_args,
+                result=psxview_out,
             )
             print(f"  vol_psxview: {len(psxview)} rows")
         else:
@@ -12913,12 +13031,12 @@ class Investigation:
                     cmdline_error,
                     "defer (no command-line recovery this run)",
                 )
-                cmdline_out = {
-                    "_error": {"message": cmdline_error},
-                    "plugin": "windows.cmdline",
-                    "rows": [],
-                    "rows_seen": 0,
-                }
+                cmdline_out = error_placeholder(
+                    cmdline_out.get("_error"),
+                    plugin="windows.cmdline",
+                    rows=[],
+                    rows_seen=0,
+                )
             cmdline_rows = cmdline_out.get("rows", []) or []
             cmdline_extra: dict[str, Any] = {
                 "tool": "windows.cmdline",
@@ -12933,6 +13051,7 @@ class Investigation:
                 self._output_hash(cmdline_out),
                 cmdline_extra,
                 arguments=cmdline_args,
+                result=cmdline_out,
             )
             print(f"  vol_run windows.cmdline: {len(cmdline_rows)} rows")
 
@@ -12961,12 +13080,12 @@ class Investigation:
                     consoles_error,
                     "defer (command-line rows stand alone; no screen-buffer corroboration)",
                 )
-                consoles_out = {
-                    "_error": {"message": consoles_error},
-                    "plugin": "windows.consoles",
-                    "rows": [],
-                    "rows_seen": 0,
-                }
+                consoles_out = error_placeholder(
+                    consoles_out.get("_error"),
+                    plugin="windows.consoles",
+                    rows=[],
+                    rows_seen=0,
+                )
             consoles_rows = consoles_out.get("rows", []) or []
             consoles_extra: dict[str, Any] = {
                 "tool": "windows.consoles",
@@ -12981,6 +13100,7 @@ class Investigation:
                 self._output_hash(consoles_out),
                 consoles_extra,
                 arguments=consoles_args,
+                result=consoles_out,
             )
             print(f"  vol_run windows.consoles: {len(consoles_rows)} rows")
 
@@ -13032,12 +13152,12 @@ class Investigation:
                         cmdscan_error,
                         "defer (no console command history recovered this run)",
                     )
-                    cmdscan_out = {
-                        "_error": {"message": cmdscan_error},
-                        "plugin": "windows.cmdscan",
-                        "rows": [],
-                        "rows_seen": 0,
-                    }
+                    cmdscan_out = error_placeholder(
+                        cmdscan_out.get("_error"),
+                        plugin="windows.cmdscan",
+                        rows=[],
+                        rows_seen=0,
+                    )
                 cmdscan_rows = cmdscan_out.get("rows", []) or []
                 cmdscan_extra: dict[str, Any] = {
                     "tool": "windows.cmdscan",
@@ -13052,6 +13172,7 @@ class Investigation:
                     self._output_hash(cmdscan_out),
                     cmdscan_extra,
                     arguments=cmdscan_args,
+                    result=cmdscan_out,
                 )
                 print(f"  vol_run windows.cmdscan: {len(cmdscan_rows)} rows")
 
@@ -13128,12 +13249,7 @@ class Investigation:
         error = out.get("_error", {}).get("message") if "_error" in out else None
         if error:
             self.analysis_limitations.append(f"hayabusa_scan failed for {evtx_dir}: {error}")
-            out = {
-                "_error": {"message": error},
-                "alerts": [],
-                "alerts_seen": 0,
-                "stderr_tail": "",
-            }
+            out = error_placeholder(out.get("_error"), alerts=[], alerts_seen=0, stderr_tail="")
         alerts = out.get("alerts", out.get("events", []))
         if not isinstance(alerts, list):
             alerts = []
@@ -13148,6 +13264,7 @@ class Investigation:
                 **({"error": error} if error else {}),
             },
             arguments=args,
+            result=out,
         )
         for alert in alerts[:500]:
             if not isinstance(alert, dict):
@@ -15140,11 +15257,15 @@ class Investigation:
                     **({"error": error} if error else {}),
                 },
                 arguments=args,
+                result=out,
             )
             if error:
-                # A host without libpst/libpff returns a typed BinaryNotFound.
-                # Record the coverage gap honestly instead of implying the mail
-                # store held nothing.
+                # A host without libpst/libpff returns a typed BinaryNotFound, and
+                # ``result=out`` above marks THAT case as a recorded skip so an
+                # absent optional package cannot make the whole case unscoreable.
+                # A PST that exists and fails to parse is a real failure and still
+                # records as one. Either way the store went unread, so say which
+                # one and why rather than implying it held nothing.
                 self.analysis_limitations.append(
                     f"{tool} could not read the mail store {path}: {error}"
                 )
@@ -15980,12 +16101,7 @@ class Investigation:
                 # MountedDevices coverage as one named course_correction
                 # (idempotent across all failing .lnk entries this lane).
                 self._lnk_lecmd_absent_fallback(py, error)
-                out = {
-                    "_error": {"message": error},
-                    "tool": "lecmd",
-                    "rows": [],
-                    "rows_seen": 0,
-                }
+                out = error_placeholder(out.get("_error"), tool="lecmd", rows=[], rows_seen=0)
             rows = out.get("rows", []) or []
             tcid = self._record_tool(
                 py,
@@ -15998,6 +16114,7 @@ class Investigation:
                     **({"error": error} if error else {}),
                 },
                 arguments=args,
+                result=out,
             )
             _merge_disk_tool_summary(
                 disk_summary,
@@ -16057,12 +16174,7 @@ class Investigation:
                     self.analysis_limitations.append(
                         f"ez_parse/{tool_name} failed for {path}: {error}"
                     )
-                    out = {
-                        "_error": {"message": error},
-                        "tool": tool_name,
-                        "rows": [],
-                        "rows_seen": 0,
-                    }
+                    out = error_placeholder(out.get("_error"), tool=tool_name, rows=[], rows_seen=0)
                 rows = out.get("rows", []) or []
                 tcid = self._record_tool(
                     py,
@@ -16076,6 +16188,7 @@ class Investigation:
                         **({"error": error} if error else {}),
                     },
                     arguments=args,
+                    result=out,
                 )
                 _merge_disk_tool_summary(
                     disk_summary,
@@ -16128,12 +16241,12 @@ class Investigation:
                     )
                     if self._is_deterministic_absence(error):
                         self._note_tool_absent(py, "plaso_parse", error, fallback="ez_parse")
-                    out = {
-                        "_error": {"message": error},
-                        "parser": "recycle_bin_info2",
-                        "events": [],
-                        "events_seen": 0,
-                    }
+                    out = error_placeholder(
+                        out.get("_error"),
+                        parser="recycle_bin_info2",
+                        events=[],
+                        events_seen=0,
+                    )
                 events = out.get("events", []) or []
                 tcid = self._record_tool(
                     py,
@@ -16146,6 +16259,7 @@ class Investigation:
                         **({"error": error} if error else {}),
                     },
                     arguments=args,
+                    result=out,
                 )
                 parser_events = [
                     {**event, "parser": "recycle_bin_info2"}
@@ -16192,12 +16306,7 @@ class Investigation:
                 error = out.get("_error", {}).get("message") if "_error" in out else None
                 if error:
                     self.analysis_limitations.append(f"ez_parse/rbcmd failed for {path}: {error}")
-                    out = {
-                        "_error": {"message": error},
-                        "tool": "rbcmd",
-                        "rows": [],
-                        "rows_seen": 0,
-                    }
+                    out = error_placeholder(out.get("_error"), tool="rbcmd", rows=[], rows_seen=0)
                 rows = out.get("rows", []) or []
                 tcid = self._record_tool(
                     py,
@@ -16210,6 +16319,7 @@ class Investigation:
                         **({"error": error} if error else {}),
                     },
                     arguments=args,
+                    result=out,
                 )
                 parser_rows = [{**row, "parser": "rbcmd"} for row in rows if isinstance(row, dict)]
                 _merge_disk_tool_summary(
@@ -16281,12 +16391,9 @@ class Investigation:
                     )
                     if self._is_deterministic_absence(error):
                         self._note_tool_absent(py, "plaso_parse", error, fallback="mft_timeline")
-                    out = {
-                        "_error": {"message": error},
-                        "parser": parser_name,
-                        "events": [],
-                        "events_seen": 0,
-                    }
+                    out = error_placeholder(
+                        out.get("_error"), parser=parser_name, events=[], events_seen=0
+                    )
                 events = out.get("events", []) or []
                 tcid = self._record_tool(
                     py,
@@ -16300,6 +16407,7 @@ class Investigation:
                         **({"error": error} if error else {}),
                     },
                     arguments=args,
+                    result=out,
                 )
                 parser_events = [
                     {**event, "parser": parser_name} for event in events if isinstance(event, dict)
@@ -17330,7 +17438,7 @@ class Investigation:
             error = out.get("_error", {}).get("message") if "_error" in out else None
             if error:
                 self.analysis_limitations.append(f"pcap_triage failed for {path}: {error}")
-                out = {"_error": {"message": error}, "packets_seen": 0}
+                out = error_placeholder(out.get("_error"), packets_seen=0)
             tcid = self._record_tool(
                 py,
                 "pcap_triage",
@@ -17343,6 +17451,7 @@ class Investigation:
                     **({"error": error} if error else {}),
                 },
                 arguments=args,
+                result=out,
             )
             self._add_network_summary_findings("pcap_triage", out, tcid, path)
             self._add_pcap_http_request_findings(out, tcid, path)
