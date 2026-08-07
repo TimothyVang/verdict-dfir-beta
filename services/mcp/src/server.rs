@@ -68,6 +68,7 @@ use crate::tools::{
     vol_psscan::vol_psscan,
     vol_psxview::vol_psxview,
     vol_run::vol_run,
+    web_triage::web_triage,
     yara_scan::yara_scan,
     zeek_summary::zeek_summary,
     AusearchInput, BrowserHistoryInput, CaseOpenInput, CloudAuditInput, DiskExtractArtifactsInput,
@@ -75,7 +76,8 @@ use crate::tools::{
     JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput, NfdumpQueryInput,
     OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, RegistryInput,
     SuricataEveInput, SysmonNetworkInput, UsnJrnlInput, VelCollectInput, VolMalfindInput,
-    VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, YaraInput, ZeekSummaryInput,
+    VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, WebTriageInput, YaraInput,
+    ZeekSummaryInput,
 };
 use crate::CRATE_VERSION;
 
@@ -501,6 +503,19 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<SysmonNetworkInput>(),
             handler: |args| dispatch_sysmon_network_query(args),
+        },
+        ToolEntry {
+            name: "web_triage",
+            description: "Parse a web-tier artifact carved off a disk image: an Apache/nginx/IIS request log, or a server-side script from a web root. Auto-detects which. For a request log it returns the flagged requests with their client IP, method, target, status, user agent, line number, and the exploitation indicators that fired (SQL injection union/tautology/information_schema/meta-function, encoded quote, path traversal, webshell invocation, command injection, scanner user agent), plus per-indicator and per-client counts. For a script it returns the shell/eval/obfuscation/socket primitives found with line numbers and snippets, and whether the combination matches a webshell pattern. Pure Rust, no subprocess. Use AFTER disk_extract_artifacts on web_log / webroot_script artifacts. ERRORS: artifact not found/not a regular file/unreadable.",
+            annotations: ToolAnnotations {
+                title: "Triage Web Log or Web-Root Script",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<WebTriageInput>(),
+            handler: |args| dispatch_web_triage(args),
         },
         ToolEntry {
             name: "zeek_summary",
@@ -1467,6 +1482,20 @@ fn dispatch_sysmon_network_query(args: Value) -> Result<Value, ToolError> {
     }
 }
 
+fn dispatch_web_triage(args: Value) -> Result<Value, ToolError> {
+    let input: WebTriageInput = parse_args(args)?;
+    match web_triage(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(
+            e @ (crate::tools::WebTriageError::NotFound(_)
+            | crate::tools::WebTriageError::NotRegular(_)),
+        ) => Err(ToolError::InvalidParams(format!("{e}"))),
+        Err(e) => Err(ToolError::Internal(format!("web_triage: {e}"))),
+    }
+}
+
 fn dispatch_zeek_summary(args: Value) -> Result<Value, ToolError> {
     let input: ZeekSummaryInput = parse_args(args)?;
     match zeek_summary(&input) {
@@ -1923,6 +1952,7 @@ mod tests {
             "vel_collect",
             "browser_history",
             "oe_dbx_parse",
+            "web_triage",
         ];
         assert_eq!(names.len(), expected.len());
         for want in expected {

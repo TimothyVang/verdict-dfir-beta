@@ -119,6 +119,10 @@ pub use crate::tools::vol_psxview::{
 pub use crate::tools::vol_run::{
     is_allowed_plugin, vol_run, VolRunError, VolRunInput, VolRunOutput,
 };
+pub use crate::tools::web_triage::{
+    web_triage, WebClientCount, WebIndicatorCount, WebRequestHit, WebScriptHit, WebTriageError,
+    WebTriageInput, WebTriageOutput,
+};
 pub use crate::tools::yara_scan::{
     path_looks_like_yara_rules, yara_scan, YaraError, YaraInput, YaraMatch, YaraOutput,
     YaraPatternMatch,

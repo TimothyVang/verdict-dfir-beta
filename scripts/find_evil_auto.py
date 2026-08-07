@@ -58,8 +58,11 @@ try:
         MEMORY_EXTS as _PLAYBOOK_MEMORY_EXTS,
         RAW_DISK_EXTS as _PLAYBOOK_RAW_DISK_EXTS,
         REGISTRY_HIVE_NAMES as _PLAYBOOK_REGISTRY_HIVE_NAMES,
+        WEBROOT_SCRIPT_EXTS as _PLAYBOOK_WEBROOT_SCRIPT_EXTS,
         classify_artifact_path as _playbook_classify,
         detect_evidence_type as _playbook_detect,
+        path_is_web_request_log as _playbook_is_web_log,
+        path_is_webroot_script as _playbook_is_webroot_script,
     )
 
     _PLAYBOOK_AVAILABLE = True
@@ -817,8 +820,102 @@ YARA_TARGET_EXTS = (
 )
 NETWORK_CLASSES = {"pcap", "zeek", "sysmon_network"}
 CLOUD_CLASSES = {"cloud"}
+
+# Web-tier artifact classes. Deliberately NOT folded into
+# EXTRACTED_DISK_CLASSES: that set drives the decoded-Windows-artifact dispatch
+# (ez_parse / plaso_parse / registry_query / mft_timeline). The web tier has its
+# own reader (``web_triage``) and its own emitters, so it gets its own lane and
+# its own routing set.
+WEB_TIER_CLASSES = {"web_log", "webroot_script"}
+
+WEBROOT_SCRIPT_EXTS: tuple[str, ...] = (
+    _PLAYBOOK_WEBROOT_SCRIPT_EXTS
+    if _PLAYBOOK_AVAILABLE
+    else (
+        ".php",
+        ".php3",
+        ".php4",
+        ".php5",
+        ".php7",
+        ".phps",
+        ".phtml",
+        ".asp",
+        ".aspx",
+        ".ashx",
+        ".asmx",
+        ".jsp",
+        ".jspx",
+        ".jspf",
+        ".cfm",
+        ".cgi",
+    )
+)
+
+_WEB_ROOT_MARKERS: tuple[str, ...] = (
+    "htdocs/",
+    "wwwroot/",
+    "inetpub/",
+    "public_html/",
+    "www/",
+    "webapps/",
+    "webroot/",
+)
+_WEB_LOG_NAMES = frozenset(
+    {
+        "access.log",
+        "access_log",
+        "error.log",
+        "error_log",
+        "ssl_access.log",
+        "ssl_request.log",
+        "other_vhosts_access.log",
+    }
+)
+_WEB_LOG_DIR_MARKERS: tuple[str, ...] = (
+    "/apache/logs/",
+    "/apache2/",
+    "/httpd/",
+    "/nginx/",
+    "/lighttpd/",
+    "/logs/w3svc",
+    "inetpub/logs/",
+)
+
+
+def path_is_web_request_log(lower_name: str, lower_path: str) -> bool:
+    """True for a web server's request/error log (Apache, nginx, IIS W3C).
+
+    Delegates to the playbook package when it is importable so the host engine
+    and the packaged agent never drift; the inline body is the bare-python3
+    fallback (the host runs 3.10 and cannot import ``findevil_agent``).
+    """
+    if _PLAYBOOK_AVAILABLE:
+        return _playbook_is_web_log(lower_name, lower_path)
+    in_log_dir = lower_path.startswith("apache/logs/") or any(
+        marker in lower_path for marker in _WEB_LOG_DIR_MARKERS
+    )
+    canonical = (
+        lower_name in _WEB_LOG_NAMES
+        or lower_name.startswith("access.log.")
+        or lower_name.startswith("access_log.")
+        or (lower_name.startswith("u_ex") and lower_name.endswith(".log"))
+    )
+    return (in_log_dir and canonical) or lower_name.endswith(".access")
+
+
+def path_is_webroot_script(lower_name: str, lower_path: str) -> bool:
+    """True for a server-side script living under a web document root."""
+    if _PLAYBOOK_AVAILABLE:
+        return _playbook_is_webroot_script(lower_name, lower_path)
+    in_web_root = any(
+        lower_path.startswith(marker) or f"/{marker}" in lower_path
+        for marker in _WEB_ROOT_MARKERS
+    )
+    return in_web_root and lower_name.endswith(WEBROOT_SCRIPT_EXTS)
+
+
 VELOCIRAPTOR_ZIP_EXTRACT_CLASSES = (
-    EXTRACTED_DISK_CLASSES | NETWORK_CLASSES | {"evtx", "yara_target"}
+    EXTRACTED_DISK_CLASSES | NETWORK_CLASSES | WEB_TIER_CLASSES | {"evtx", "yara_target"}
 )
 
 # Cloud/identity-plane providers allow-listed by the Rust ``cloud_audit`` verb
@@ -1443,6 +1540,18 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "artifact_class": "browser_db",
             "evidence_type": "extracted_disk",
             "parser_tool": "browser_history",
+        }
+    if path_is_web_request_log(lower_name, lower_path):
+        return {
+            "artifact_class": "web_log",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
+        }
+    if path_is_webroot_script(lower_name, lower_path):
+        return {
+            "artifact_class": "webroot_script",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
         }
     if lower_name.endswith(YARA_TARGET_EXTS):
         return {
@@ -2942,6 +3051,186 @@ _DOWNLOADED_APP_ROOTS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Web tier — request-log exploitation and web-root script webshells
+# ---------------------------------------------------------------------------
+
+# Indicators from ``web_triage`` that describe attack STRUCTURE rather than mere
+# encoding. A quote or a SQL comment on its own shows up in ordinary traffic
+# (``?q=o%27brien``), so those never promote a request on their own; every name
+# here is a request shape that has no benign reading.
+WEB_STRUCTURAL_EXPLOIT_INDICATORS = frozenset(
+    {
+        "sqli_union_select",
+        "sqli_boolean_tautology",
+        "sqli_information_schema",
+        "sqli_meta_function",
+        "path_traversal",
+        "webshell_invocation",
+        "command_injection",
+        "scanner_user_agent",
+    }
+)
+
+_WEB_SQLI_INDICATORS = frozenset(
+    {
+        "sqli_union_select",
+        "sqli_boolean_tautology",
+        "sqli_information_schema",
+        "sqli_meta_function",
+    }
+)
+
+# Report order for the structural indicators, most decisive first. A log from a
+# real intrusion carries thousands of flagged lines; the finding quotes one
+# example per behaviour in this order so an analyst sees the strongest evidence
+# rather than whichever request had the longest URL.
+_WEB_INDICATOR_RANK = (
+    "sqli_union_select",
+    "sqli_information_schema",
+    "sqli_meta_function",
+    "sqli_boolean_tautology",
+    "webshell_invocation",
+    "command_injection",
+    "path_traversal",
+    "scanner_user_agent",
+)
+
+
+def web_exploit_rank(indicator: str) -> int:
+    """Position of ``indicator`` in the report order; unknown names sort last."""
+    try:
+        return _WEB_INDICATOR_RANK.index(indicator)
+    except ValueError:
+        return len(_WEB_INDICATOR_RANK)
+
+
+def web_exploit_examples(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One representative request per structural indicator, in report order."""
+    best: dict[str, dict[str, Any]] = {}
+    for cand in candidates:
+        indicator = str(cand.get("indicator") or "")
+        current = best.get(indicator)
+        if current is None or (cand.get("line_number") or 0) < (current.get("line_number") or 0):
+            best[indicator] = cand
+    return [best[name] for name in sorted(best, key=web_exploit_rank)]
+
+# Directories a web server accepts writes into. A server-side script sitting in
+# one of these is not part of the shipped application — the application ships
+# its code in its own tree, not in the folder it saves uploads to.
+_WEB_WRITABLE_DIR_NAMES = frozenset(
+    {
+        "upload",
+        "uploads",
+        "tmp",
+        "temp",
+        "cache",
+        "files",
+        "images",
+        "img",
+        "media",
+        "avatars",
+        "attachments",
+        "data",
+    }
+)
+
+
+def web_exploit_candidates(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Structural exploitation observations in one ``web_triage`` access-log output.
+
+    Pure function. One candidate per (flagged request, structural indicator), so
+    a single request that carries both ``union select`` and
+    ``information_schema`` reports both facts. Requests whose only indicators are
+    an encoded quote or a SQL comment terminator are dropped: those appear in
+    ordinary traffic and are corroboration, not a claim.
+    """
+    if str(out.get("artifact_kind") or "") != "access_log":
+        return []
+    candidates: list[dict[str, Any]] = []
+    for hit in out.get("exploit_hits") or []:
+        if not isinstance(hit, dict):
+            continue
+        for indicator in sorted(str(i) for i in (hit.get("indicators") or [])):
+            if indicator not in WEB_STRUCTURAL_EXPLOIT_INDICATORS:
+                continue
+            candidates.append(
+                {
+                    "indicator": indicator,
+                    "line_number": hit.get("line_number"),
+                    "timestamp": hit.get("timestamp"),
+                    "client_ip": str(hit.get("client_ip") or ""),
+                    "method": str(hit.get("method") or ""),
+                    "target": str(hit.get("target") or ""),
+                    "status": str(hit.get("status") or ""),
+                    "user_agent": str(hit.get("user_agent") or ""),
+                }
+            )
+    return candidates
+
+
+def webshell_script_candidate(out: dict[str, Any]) -> dict[str, Any] | None:
+    """The webshell observation for one ``web_triage`` web-root script output.
+
+    Pure function. Returns ``None`` unless the tool's own primitive combination
+    matched a webshell pattern. ``writable_location`` records whether the script
+    sits in a directory the web server writes into (upload/temp/cache) — that
+    separates a dropped shell from vulnerable application source that happens to
+    call a shell, and the emitter uses it to pick the confidence tier.
+    """
+    if str(out.get("artifact_kind") or "") != "webroot_script":
+        return None
+    if not out.get("is_probable_webshell"):
+        return None
+    path = str(out.get("artifact_path") or "")
+    lower = path.replace("\\", "/").lower()
+    parent = lower.rsplit("/", 2)[-2] if lower.count("/") >= 1 else ""
+    hits = [h for h in (out.get("script_hits") or []) if isinstance(h, dict)]
+    return {
+        "path": path,
+        "writable_location": parent in _WEB_WRITABLE_DIR_NAMES,
+        "directory": parent,
+        "indicators": sorted({str(h.get("indicator")) for h in hits}),
+        "hits": hits[:10],
+    }
+
+
+def web_root_relative_path(path: str) -> str:
+    """The in-image path from the document root down, for display and for
+    matching an extracted script back to its ``$MFT`` row."""
+    lower = str(path).replace("\\", "/").lower()
+    for marker in _WEB_ROOT_MARKERS:
+        index = lower.find(marker)
+        if index != -1:
+            return lower[index:]
+    return lower.rsplit("/", 1)[-1]
+
+
+def web_mft_row_for(rel_path: str, mft_index: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Find the ``$MFT`` row for a web-root-relative path.
+
+    The two readers see different prefixes of the same file: ``web_triage`` is
+    handed the EXTRACTED copy (``<case>/extracted/disk/<id>/xampp/htdocs/...``)
+    while ``mft_timeline`` reports the IN-IMAGE path (``xampp/htdocs/...``), so
+    the join is on the shared tail. A bare filename (no separator) is never
+    suffix-matched — that would bind two unrelated files with the same name.
+    """
+    if not mft_index or not rel_path:
+        return None
+    rel = rel_path.replace("\\", "/").lower().lstrip("/")
+    exact = mft_index.get(rel)
+    if isinstance(exact, dict):
+        return exact
+    if "/" not in rel:
+        return None
+    matches = [
+        row
+        for key, row in mft_index.items()
+        if isinstance(row, dict) and (key.endswith(rel) or rel.endswith(key))
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Classify $MFT rows into hacking-tool artifact candidates.
 
@@ -4189,6 +4478,7 @@ TOOL_ARTIFACT_CLASSES = {
     "sysmon_network_query": "network",
     "usnjrnl_query": "usnjrnl",
     "vel_collect": "velociraptor",
+    "web_triage": "web",
     "vol_malfind": "memory",
     "vol_pslist": "memory",
     "vol_psscan": "memory",
@@ -4343,6 +4633,25 @@ TIMESTAMP_SOURCE_BY_TOOL: dict[str, str] = {
 
 # Windows logon-type numeric codes -> analyst-readable labels (MEMORY.md: Type 3
 # = network, Type 10 = RemoteInteractive/RDP).
+# EVTX record budget for one ``evtx_query`` call. The orchestrator used to ask
+# for 500, which silently dropped the tail of any real Security log — the Ali
+# Hadi case-1 Security.evtx holds 636 records, so every logon after record 500
+# was invisible to the rules below. This matches the Rust tool's own default;
+# a log that still exceeds it is reported as a limitation, never dropped
+# silently (see ``evtx_truncation_limitation``).
+EVTX_QUERY_LIMIT = 10_000
+
+# Timeline events kept per event log. Independent of EVTX_QUERY_LIMIT on
+# purpose: every record is SCANNED for findings, but a 10k-row timeline per log
+# across twenty logs would bury the analyst, so the timeline keeps a window.
+EVTX_TIMELINE_ROWS = 500
+
+# Interactive logon families for EID 4624. Type 10 is RemoteInteractive (RDP);
+# 2/7/11 are console, workstation-unlock, and cached-interactive — all of them
+# mean a human-facing session, which is what a lateral-movement or
+# credential-abuse question is actually about.
+INTERACTIVE_LOGON_TYPES = frozenset({"2", "7", "10", "11"})
+
 LOGON_TYPE_LABELS: dict[str, str] = {
     "2": "Interactive",
     "3": "Network",
@@ -4469,6 +4778,27 @@ def _flatten_evtx_eventdata(data: Any) -> dict[str, str]:
                     if isinstance(text, (str, int, float)):
                         result.setdefault(key, str(text))
     return result
+
+
+def evtx_truncation_limitation(path: str, records_seen: int, row_count: int) -> str | None:
+    """Say so when an event log was bigger than the record budget.
+
+    Truncation itself is a budget decision; leaving it UNSAID is the bug. A run
+    that analysed the first N records of a larger log has scoped coverage, and
+    the verdict must carry that scope rather than read as a full review.
+    """
+    try:
+        seen = int(records_seen)
+        rows = int(row_count)
+    except (TypeError, ValueError):
+        return None
+    if seen < EVTX_QUERY_LIMIT and rows < EVTX_QUERY_LIMIT:
+        return None
+    return (
+        f"evtx_query returned the first {EVTX_QUERY_LIMIT} records of {path}; the log is "
+        "at least that long, so records past the budget were truncated and NOT analysed. "
+        "Conclusions from this log are scoped to the records examined."
+    )
 
 
 def _format_account(account: Any, domain: Any) -> str:
@@ -8292,7 +8622,10 @@ def _disk_summary_template() -> dict[str, Any]:
         "version": 1,
         "scope": "extracted_disk_artifacts_only",
         "artifact_counts": {
-            name: 0 for name in sorted(EXTRACTED_DISK_CLASSES | {"evtx", "yara_target"})
+            name: 0
+            for name in sorted(
+                EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"evtx", "yara_target"}
+            )
         },
         "tool_summaries": {},
         "timeline_event_count": 0,
@@ -9057,13 +9390,41 @@ def evtx_rows_to_findings(
     # parent PID can be resolved to a name. Samples without command-line auditing
     # carry only ProcessId (parent PID), not ParentProcessName.
     pid_to_name: dict[str, str] = {}
+    # Pre-pass: accounts with at least one FAILED logon in this same log. The
+    # interactive-logon rule below arms only for those accounts — a successful
+    # console logon on its own happens on every healthy Windows host every day,
+    # so an unconditional lead would be noise, not signal.
+    failed_logon_accounts: set[str] = set()
+    # account -> every interactive-family 4624 in this log, so the finding can
+    # report the whole session pattern rather than whichever record came first.
+    interactive_logons: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        if _event_id_value(row.get("event_id")) == 4688:
+        eid_pre = _event_id_value(row.get("event_id"))
+        if eid_pre == 4688:
             pre = _extract_evtx_entities(row.get("data") or {}, 4688)
             new_pid = _norm_pid(pre.get("pid"))
             new_name = _win_basename(pre.get("process"))
             if new_pid and new_name:
                 pid_to_name[new_pid] = new_name
+        elif eid_pre == 4625:
+            pre = _extract_evtx_entities(row.get("data") or {}, 4625)
+            account = str(pre.get("account") or "").strip().lower()
+            if account and account not in ("-", "anonymous logon"):
+                failed_logon_accounts.add(account)
+        elif eid_pre == 4624:
+            pre = _extract_evtx_entities(row.get("data") or {}, 4624)
+            logon_type_pre = str(pre.get("logon_type") or "").strip()
+            account = str(pre.get("account") or "").strip().lower()
+            if logon_type_pre in INTERACTIVE_LOGON_TYPES and account:
+                interactive_logons.setdefault(account, []).append(
+                    {
+                        "record_id": row.get("record_id"),
+                        "logon_type": logon_type_pre,
+                        "source_ip": str(pre.get("source_ip") or "").strip(),
+                        "account": pre.get("account"),
+                        "domain": pre.get("domain"),
+                    }
+                )
     for row in rows:
         event_id = _event_id_value(row.get("event_id"))
         channel = str(row.get("channel") or "")
@@ -9232,9 +9593,66 @@ def evtx_rows_to_findings(
                     "domain": ent.get("domain") or ent.get("subject_domain"),
                     "source_ip": ent.get("source_ip"),
                 }
-        elif event_id == 4624 and "rdp_logon" not in seen_kinds:
+        elif event_id == 4624 and not {"rdp_logon", "interactive_logon"} <= seen_kinds:
             ent = _extract_evtx_entities(row.get("data") or {}, event_id)
-            if str(ent.get("logon_type") or "") == "10":
+            logon_type = str(ent.get("logon_type") or "").strip()
+            if logon_type != "10" and logon_type in INTERACTIVE_LOGON_TYPES:
+                # Interactive session that is NOT RDP: console (2), unlock (7),
+                # or cached-interactive (11). Only reported for an account that
+                # also shows failed logons in this log — a session established
+                # for a name someone was also guessing at.
+                account = str(ent.get("account") or "").strip().lower()
+                if (
+                    "interactive_logon" not in seen_kinds
+                    and account
+                    and account in failed_logon_accounts
+                ):
+                    seen_kinds.add("interactive_logon")
+                    sessions = interactive_logons.get(account) or []
+                    who = _format_account(ent.get("account"), ent.get("domain")) or "an account"
+                    types = sorted({s["logon_type"] for s in sessions} or {logon_type})
+                    type_text = ", ".join(
+                        f"{ltype} ({LOGON_TYPE_LABELS.get(ltype, 'Type ' + ltype)})"
+                        for ltype in types
+                    )
+                    sources = sorted(
+                        {s["source_ip"] for s in sessions if s["source_ip"] not in ("", "-")}
+                    )
+                    src_note = ""
+                    if sources:
+                        src_note = f" from {', '.join(sources)}"
+                        if any(src in ("127.0.0.1", "::1") for src in sources):
+                            src_note += (
+                                " (a loopback address, which Windows also reports for an "
+                                "ordinary console logon, so the address alone does not "
+                                "establish a remote or tunnelled origin)"
+                            )
+                    records = ", ".join(str(s["record_id"]) for s in sessions[:6]) or str(record_id)
+                    findings.append(
+                        {
+                            "case_id": case_id,
+                            "finding_id": "f-B-evtx-interactive-logon",
+                            "tool_call_id": tool_call_id,
+                            "artifact_path": artifact_path,
+                            "description": (
+                                f"EVTX Security EID 4624 records {len(sessions) or 1} successful "
+                                f"interactive logon record(s) of type {type_text} for "
+                                f"{who}{src_note} (records {records}), and the same account also "
+                                "has EID 4625 failed logons in this log. A session was "
+                                "established on the host for a name that was also being "
+                                "attempted unsuccessfully; treat this as a valid-accounts / "
+                                "credential-abuse lead until corroborated with in-session "
+                                "activity. The session's transport is unestablished: this log "
+                                "carries no type-10 (RemoteInteractive) record and no "
+                                "TerminalServices channel, so the finding is scoped to the "
+                                "session existing, not to how the operator reached the console."
+                            ),
+                            "confidence": "HYPOTHESIS",
+                            "pool_origin": "B",
+                            "mitre_technique": "T1078",
+                        }
+                    )
+            if logon_type == "10" and "rdp_logon" not in seen_kinds:
                 seen_kinds.add("rdp_logon")
                 who = _format_account(ent.get("account"), ent.get("domain")) or "an account"
                 src = ent.get("source_ip")
@@ -11841,7 +12259,7 @@ class Investigation:
         evtx_args = {
             "case_id": self.handle["id"],
             "evtx_path": evidence_path,
-            "limit": 500,
+            "limit": EVTX_QUERY_LIMIT,
         }
         out = rust.call_tool("evtx_query", evtx_args)
         evtx_error = None
@@ -11879,7 +12297,10 @@ class Investigation:
             arguments=evtx_args,
         )
         print(f"  evtx_query: {len(rows)}/{seen} rows, {pe} parse errors")
-        for row in rows[:500]:
+        truncation = evtx_truncation_limitation(evidence_path, seen, len(rows))
+        if truncation and truncation not in self.analysis_limitations:
+            self.analysis_limitations.append(truncation)
+        for row in rows[:EVTX_TIMELINE_ROWS]:
             event_id = row.get("event_id")
             record_id = row.get("record_id")
             entities = _extract_evtx_entities(row.get("data") or {}, event_id)
@@ -12141,7 +12562,7 @@ class Investigation:
                 artifact_class = artifact.get("artifact_class")
                 if not path:
                     continue
-                if artifact_class in EXTRACTED_DISK_CLASSES | {"yara_target"}:
+                if artifact_class in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}:
                     extracted_entries.append(
                         {
                             "path": path,
@@ -12764,6 +13185,372 @@ class Investigation:
             }
             self.findings_pool_b.append(finding)
             print(f"  pool-B activity finding: {finding['finding_id']} (HYPOTHESIS)")
+
+    def _index_mft_web_paths(self, rows: list[dict[str, Any]], tcid: str) -> None:
+        """Record creation times for web-root paths seen in an ``$MFT`` parse.
+
+        Only web-root paths are kept: the index exists so the webshell finding
+        can cite a creation timestamp read by a DIFFERENT tool than the one that
+        read the file's bytes, and holding the whole MFT would be a needless
+        copy of a 5000-row table.
+        """
+        index = getattr(self, "_mft_web_paths", None)
+        if index is None:
+            index = {}
+            self._mft_web_paths = index
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            raw = str(row.get("full_path") or row.get("name") or "")
+            if not raw:
+                continue
+            lower = raw.replace("\\", "/").lower().lstrip("/")
+            if not lower.endswith(WEBROOT_SCRIPT_EXTS):
+                continue
+            if not any(
+                lower.startswith(marker) or f"/{marker}" in lower
+                for marker in _WEB_ROOT_MARKERS
+            ):
+                continue
+            index.setdefault(
+                lower,
+                {
+                    "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+                    "tool_call_id": tcid,
+                },
+            )
+
+    def _investigate_web_tier_artifacts(
+        self,
+        rust: SshMcpClient,
+        py: SshMcpClient,
+        by_class: dict[str, list[dict[str, Any]]],
+        disk_summary: dict[str, Any],
+    ) -> None:
+        """Parse extracted web-tier artifacts and emit the web-lane findings.
+
+        Two artifact classes, one reader: ``web_triage`` auto-detects a request
+        log from a web-root script. Every finding cites the ``web_triage`` call
+        that produced it, so ``verify_finding`` can re-run the exact parse — the
+        reason this lane is a Rust tool rather than orchestrator-side parsing.
+        """
+        log_entries = by_class.get("web_log", [])[:10]
+        script_entries = by_class.get("webroot_script", [])[:60]
+        if not log_entries and not script_entries:
+            return
+        print(
+            f"\n=== web-tier investigation ({len(log_entries)} log(s), "
+            f"{len(script_entries)} web-root script(s)) ==="
+        )
+        specs: list[tuple[str, dict[str, Any]]] = [
+            (
+                "web_triage",
+                {
+                    "case_id": self.handle["id"],
+                    "artifact_path": str(entry["path"]),
+                    "limit": 200,
+                },
+            )
+            for entry in [*log_entries, *script_entries]
+        ]
+        outs = self._parallel_tool_calls(rust, specs, timeout=900.0)
+        exploit_total = 0
+        webshell_total = 0
+        for (_name, args), out in zip(specs, outs, strict=True):
+            path = str(args["artifact_path"])
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            if error:
+                self.analysis_limitations.append(f"web_triage failed for {path}: {error}")
+                out = {
+                    "_error": {"message": error},
+                    "artifact_kind": "unknown",
+                    "exploit_hits": [],
+                    "exploit_hit_count": 0,
+                    "script_hits": [],
+                    "is_probable_webshell": False,
+                }
+            kind = str(out.get("artifact_kind") or "unknown")
+            tcid = self._record_tool(
+                py,
+                "web_triage",
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "artifact_kind": kind,
+                    "lines_seen": out.get("lines_seen", 0),
+                    "requests_parsed": out.get("requests_parsed", 0),
+                    "exploit_hit_count": out.get("exploit_hit_count", 0),
+                    "is_probable_webshell": bool(out.get("is_probable_webshell")),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            _merge_disk_tool_summary(
+                disk_summary,
+                "web_triage",
+                tcid,
+                {
+                    "artifact_path": path,
+                    "artifact_kind": kind,
+                    "exploit_hit_count": out.get("exploit_hit_count", 0),
+                    "indicators": [
+                        c.get("indicator")
+                        for c in (out.get("indicator_counts") or [])[:8]
+                        if isinstance(c, dict)
+                    ],
+                    "script_indicators": [
+                        c.get("indicator")
+                        for c in (out.get("script_indicator_counts") or [])[:8]
+                        if isinstance(c, dict)
+                    ],
+                    **({"error": error} if error else {}),
+                },
+            )
+            if error:
+                continue
+            for hit in (out.get("exploit_hits") or [])[:200]:
+                if not isinstance(hit, dict):
+                    continue
+                self._timeline_add(
+                    hit.get("timestamp_iso") or hit.get("timestamp"),
+                    "web_triage",
+                    "web",
+                    (
+                        f"web request flagged: {hit.get('method')} {hit.get('target')} "
+                        f"-> {hit.get('status')}"
+                    ),
+                    tcid,
+                    {
+                        "source_ip": hit.get("client_ip"),
+                        "indicators": hit.get("indicators"),
+                        "line_number": hit.get("line_number"),
+                    },
+                )
+            candidates = web_exploit_candidates(out)
+            if candidates:
+                exploit_total += 1
+                self._emit_web_exploit_finding(candidates, out, path, tcid)
+            shell = webshell_script_candidate(out)
+            if shell:
+                webshell_total += 1
+                self._emit_webshell_finding(
+                    shell, out, tcid, getattr(self, "_mft_web_paths", {})
+                )
+        print(
+            f"  web_triage: {len(specs)} artifact(s), {exploit_total} with exploitation "
+            f"indicators, {webshell_total} probable webshell(s)"
+        )
+
+    def _emit_web_exploit_finding(
+        self,
+        candidates: list[dict[str, Any]],
+        out: dict[str, Any],
+        log_path: str,
+        tcid: str,
+    ) -> None:
+        """Emit ONE Pool A finding for exploitation attempts against the web app.
+
+        CONFIRMED, and only about what a request log can actually establish: the
+        requests were RECEIVED and their shape is an attack. The log records the
+        attempt, not its outcome — the response status is quoted so a reader can
+        see what the server answered, but successful exploitation is not claimed
+        here. The webshell finding, if one is emitted, carries the "it worked"
+        half separately.
+        """
+        if not candidates:
+            return
+        clients = sorted({c["client_ip"] for c in candidates if c.get("client_ip")})
+        shown = web_exploit_examples(candidates)
+        indicators = [str(c["indicator"]) for c in shown]
+        # The most decisive observation drives the asserted values: a wrong
+        # anchor here should reject the finding, so it must be the request the
+        # description actually leads with.
+        primary = shown[0]
+        sqli = [i for i in indicators if i in _WEB_SQLI_INDICATORS]
+        examples = "; ".join(
+            f"{c['indicator']} at line {c['line_number']} [{c['timestamp']}] "
+            f"{c['client_ip']} {c['method']} {str(c['target'])[:140]} -> {c['status']}"
+            for c in shown[:5]
+        )
+        lede = (
+            "SQL injection attempts against the web application"
+            if sqli
+            else "Exploitation attempts against the web application"
+        )
+        asserted: list[dict[str, Any]] = [
+            {
+                "path": "exploit_hits[*]",
+                "expected": json.dumps(
+                    {
+                        "client_ip": primary["client_ip"],
+                        "target": primary["target"][:120],
+                    }
+                ),
+                "match": "record",
+            }
+        ]
+        # The attacking client is a hard identity anchor: a wrong IP has no
+        # near-miss reading, so the verifier rejects rather than downgrades.
+        if primary.get("client_ip"):
+            asserted.append(
+                {
+                    "path": "exploit_hits[*].client_ip",
+                    "expected": primary["client_ip"],
+                    "match": "exact",
+                }
+            )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for("f-A-web-exploit-attempt", log_path),
+            "tool_call_id": tcid,
+            "artifact_path": log_path,
+            "description": (
+                f"{lede} are recorded in the web server access log "
+                f"({out.get('exploit_hit_count', len(candidates))} flagged request(s) of "
+                f"{out.get('requests_parsed', 0)} parsed, from "
+                f"{', '.join(clients) or 'an unrecorded client'}). The payloads carry "
+                f"{', '.join(indicators)}, one example each: {examples}. "
+                "Parsed from the server's own "
+                "request log by web_triage; the log is a record of the requests the "
+                "server RECEIVED, so this is an exploitation attempt against a "
+                "public-facing application. The response codes are quoted above as "
+                "observed — whether the injection succeeded is not asserted by this "
+                "finding and needs the application, database, or web-root evidence."
+            ),
+            "confidence": "CONFIRMED",
+            "pool_origin": "A",
+            "mitre_technique": "T1190",
+            "derived_from": [tcid],
+            "asserted_values": asserted,
+        }
+        self.findings_pool_a.append(finding)
+        print(
+            f"  pool-A web finding: {finding['finding_id']} (CONFIRMED, "
+            f"{len(candidates)} indicator hit(s), clients={','.join(clients) or '-'})"
+        )
+
+    def _emit_webshell_finding(
+        self,
+        candidate: dict[str, Any] | None,
+        out: dict[str, Any],
+        tcid: str,
+        mft_index: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        """Emit ONE Pool A finding for a webshell in the web root.
+
+        Confidence is decided by LOCATION, not by wording: a script that reaches
+        an exec/eval primitive from request input AND sits in a directory the web
+        server writes into (upload/temp/cache) is a dropped shell — CONFIRMED.
+        The same primitives inside the shipped application tree are equally real
+        but have a competing benign reading (vulnerable application source), so
+        that stays INFERRED.
+
+        ``$MFT`` corroboration, when the same path was recovered from the
+        filesystem metadata, adds the creation timestamp and a second cited tool
+        call — the file's existence and its creation time then rest on two
+        independent readers.
+        """
+        if not candidate:
+            return
+        path = str(candidate["path"])
+        rel = web_root_relative_path(path)
+        indicators = candidate["indicators"]
+        seen_lines: set[tuple[Any, str]] = set()
+        unique_hits: list[dict[str, Any]] = []
+        for hit in candidate["hits"]:
+            key = (hit.get("line_number"), str(hit.get("snippet") or ""))
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            unique_hits.append(hit)
+        snippets = "; ".join(
+            f"line {h.get('line_number')}: {str(h.get('snippet') or '')[:200]}"
+            for h in unique_hits[:3]
+        )
+        derived = [tcid]
+        mft_note = ""
+        mft_row = web_mft_row_for(rel, mft_index)
+        if mft_row:
+            created = mft_row.get("created")
+            mft_tcid = str(mft_row.get("tool_call_id") or "")
+            if mft_tcid and mft_tcid not in derived:
+                derived.append(mft_tcid)
+            if created:
+                mft_note = (
+                    f" The MFT records a creation time of {created} for the same path "
+                    f"(tool_call {mft_tcid}) — a second, independent reader of the same file."
+                )
+        # Say what the primitives actually are. A shell that reads its commands
+        # off a socket is not "request-driven"; claiming it would be wrong even
+        # though both are webshells.
+        if "request_driven_exec" in indicators:
+            mechanism = "passes request input straight into a command/eval primitive"
+        elif "reverse_shell_socket" in indicators:
+            mechanism = (
+                "opens a raw TCP client socket and evaluates what it reads back — a "
+                "reverse shell rather than a request-driven one"
+            )
+        elif "dotnet_process_start" in indicators or "asp_eval" in indicators:
+            mechanism = "launches a process / evaluates request data through the ASP runtime"
+        else:
+            mechanism = "combines an execution primitive with obfuscation or error suppression"
+        writable = bool(candidate["writable_location"])
+        if writable:
+            confidence = "CONFIRMED"
+            location_note = (
+                f"The script sits in '{candidate['directory']}', a directory the web "
+                "server accepts writes into rather than part of the application's "
+                "shipped code tree."
+            )
+        else:
+            confidence = "INFERRED"
+            location_note = (
+                "The script sits inside the shipped application tree, where the same "
+                "primitives also occur in deliberately vulnerable or legitimately "
+                "shell-invoking source, so a dropped-shell reading is inferred, not "
+                "established."
+            )
+        primary_hit = candidate["hits"][0] if candidate["hits"] else {}
+        asserted: list[dict[str, Any]] = [
+            {
+                "path": "artifact_kind",
+                "expected": "webroot_script",
+                "match": "exact",
+            }
+        ]
+        if primary_hit:
+            asserted.append(
+                {
+                    "path": "script_hits[*]",
+                    "expected": json.dumps(
+                        {
+                            "indicator": str(primary_hit.get("indicator") or ""),
+                            "snippet": str(primary_hit.get("snippet") or "")[:120],
+                        }
+                    ),
+                    "match": "record",
+                }
+            )
+        finding = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for("f-A-webshell", path, force_suffix=True),
+            "tool_call_id": tcid,
+            "artifact_path": path,
+            "description": (
+                f"Webshell script written to the web root at {rel}: the file "
+                f"{mechanism} ({', '.join(indicators)}) — {snippets}. "
+                f"{location_note}{mft_note} Read by web_triage over the "
+                "extracted file's own bytes, so this rests on the script's content, "
+                "not on a filename or a signature pack."
+            ),
+            "confidence": confidence,
+            "pool_origin": "A",
+            "mitre_technique": "T1505.003",
+            "derived_from": derived,
+            "asserted_values": asserted,
+        }
+        self.findings_pool_a.append(finding)
+        print(f"  pool-A webshell finding: {finding['finding_id']} ({confidence}) {rel}")
 
     def _emit_mft_hacking_tool_finding(
         self,
@@ -13681,6 +14468,8 @@ class Investigation:
         print("\n=== extracted disk artifact investigation ===")
         by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in EXTRACTED_DISK_CLASSES}
         by_class["yara_target"] = []
+        for web_class in sorted(WEB_TIER_CLASSES):
+            by_class[web_class] = []
         for entry in entries:
             artifact_class = str(entry.get("artifact_class") or "")
             if artifact_class in by_class:
@@ -13808,6 +14597,9 @@ class Investigation:
                 self._disk_cloud_candidates.append(
                     {**cand, "tool_call_id": tcid, "artifact_path": path}
                 )
+            # Index the MFT rows so the web lane can cite a creation time for an
+            # extracted web-root script from a SECOND reader of the same file.
+            self._index_mft_web_paths(rows, tcid)
 
         usn_entries = by_class["usnjrnl"][:3]
         usn_specs: list[tuple[str, dict[str, Any]]] = [
@@ -14609,6 +15401,8 @@ class Investigation:
         self._disk_cloud_candidates = []
         self._browser_cloud_candidates = []
 
+        self._investigate_web_tier_artifacts(rust, py, by_class, disk_summary)
+
         if DISK_YARA_RULES:
             for entry in by_class["yara_target"][:50]:
                 path = str(entry["path"])
@@ -14691,6 +15485,7 @@ class Investigation:
                     "legacy_evt",
                     "ie_history",
                     "scheduled_task",
+                    "web",
                 }
             ]
         )
@@ -15649,7 +16444,8 @@ class Investigation:
         extracted_entries = [
             entry
             for entry in entries
-            if entry.get("artifact_class") in EXTRACTED_DISK_CLASSES | {"yara_target"}
+            if entry.get("artifact_class")
+            in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}
         ]
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES
@@ -15699,7 +16495,8 @@ class Investigation:
         extracted_entries = [
             entry
             for entry in entries
-            if entry.get("artifact_class") in EXTRACTED_DISK_CLASSES | {"yara_target"}
+            if entry.get("artifact_class")
+            in EXTRACTED_DISK_CLASSES | WEB_TIER_CLASSES | {"yara_target"}
         ]
         network_entries = [
             entry for entry in entries if entry.get("artifact_class") in NETWORK_CLASSES

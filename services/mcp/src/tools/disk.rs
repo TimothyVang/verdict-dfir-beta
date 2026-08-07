@@ -68,6 +68,8 @@ pub enum ArtifactKind {
     MacosActivity,
     MacosLaunchd,
     MacosFsevents,
+    WebLog,
+    WebrootScript,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -1306,6 +1308,10 @@ fn class_priority(class: &str) -> u8 {
         "macos_activity" => 22,
         "macos_launchd" => 23,
         "macos_fsevents" => 24,
+        // Web tier: a small, high-signal set (a handful of request logs; the
+        // web root's scripts) that must not be crowded out by the generic sweep.
+        "web_log" => 25,
+        "webroot_script" => 26,
         // Generic content sweep is always last.
         "yara_target" => 50,
         _ => 99,
@@ -1322,9 +1328,51 @@ fn class_priority(class: &str) -> u8 {
 /// task-scheduler, defender, winrm, wmi, terminal-services, applocker); tier 2
 /// = the per-provider operational tail.
 fn artifact_subrank(class: &str, rel_path: &str) -> u8 {
-    if class != "evtx" {
+    match class {
+        "evtx" => evtx_subrank(rel_path),
+        "webroot_script" => webroot_script_subrank(rel_path),
+        _ => 0,
+    }
+}
+
+/// Draw order within `webroot_script`. A web root holds hundreds of shipped
+/// application scripts and only a handful of files the web server itself can
+/// write; a dropped shell lands in the writable ones. Tier 0 = a script in an
+/// upload/temp/cache directory (attacker-writable by design); tier 1 = a script
+/// sitting directly at the document root (also unusual for a packaged app);
+/// tier 2 = the shipped application tree.
+fn webroot_script_subrank(rel_path: &str) -> u8 {
+    let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
+    let dir = lower.rsplit_once('/').map_or("", |(d, _)| d);
+    if [
+        "upload",
+        "uploads",
+        "tmp",
+        "temp",
+        "cache",
+        "files",
+        "images",
+        "img",
+        "media",
+        "avatars",
+        "attachments",
+        "data",
+    ]
+    .iter()
+    .any(|w| dir.ends_with(&format!("/{w}")) || dir == *w)
+    {
         return 0;
     }
+    if ["htdocs", "wwwroot", "public_html", "www", "webroot"]
+        .iter()
+        .any(|root| dir.ends_with(root))
+    {
+        return 1;
+    }
+    2
+}
+
+fn evtx_subrank(rel_path: &str) -> u8 {
     let lower = rel_path.replace('\\', "/").to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or("");
     if name == "security.evtx"
@@ -1521,9 +1569,83 @@ fn classify_artifact_path(rel: &str) -> Option<&'static str> {
     let rel = rel.replace('\\', "/").to_ascii_lowercase();
     let name = rel.rsplit('/').next().unwrap_or(rel.as_str());
     classify_windows_specific(name, &rel)
+        .or_else(|| classify_web_tier(name, &rel))
         .or_else(|| classify_linux(name, &rel))
         .or_else(|| classify_macos(name, &rel))
         .or_else(|| classify_windows_generic(&rel))
+}
+
+/// Web-tier classes. OS-agnostic on purpose: Apache ships inside XAMPP on
+/// Windows, IIS writes W3C logs under `inetpub`, and the same stack on Linux
+/// puts logs under `/var/log`. Tried before the Linux and generic sweeps so
+/// `var/log/apache2/access.log` reaches the request-log parser instead of the
+/// untyped `linux_log` bucket, and a webroot under `users/` reaches the
+/// webshell heuristic instead of the generic yara sweep.
+fn classify_web_tier(name: &str, rel: &str) -> Option<&'static str> {
+    if is_web_request_log(name, rel) {
+        Some("web_log")
+    } else if is_webroot_script(name, rel) {
+        Some("webroot_script")
+    } else {
+        None
+    }
+}
+
+/// A web server's request/error log. Matched on the server's *log directory*
+/// plus the canonical filename, so a `.pid` or an installer log sitting in the
+/// same directory is not mistaken for request traffic.
+fn is_web_request_log(name: &str, rel: &str) -> bool {
+    let in_server_log_dir = [
+        "/apache/logs/",
+        "/apache2/",
+        "/httpd/",
+        "/nginx/",
+        "/lighttpd/",
+        "/logs/w3svc",
+    ]
+    .iter()
+    .any(|dir| rel.contains(dir))
+        || rel.starts_with("apache/logs/")
+        || rel.contains("inetpub/logs/");
+    let canonical_name = matches!(
+        name,
+        "access.log"
+            | "access_log"
+            | "error.log"
+            | "error_log"
+            | "ssl_access.log"
+            | "ssl_request.log"
+            | "other_vhosts_access.log"
+    ) || (name.starts_with("access.log.") || name.starts_with("access_log."))
+        || (name.starts_with("u_ex") && has_extension(name, "log"));
+    // `*.access` (per-vhost nginx/lighttpd naming) is self-describing.
+    (in_server_log_dir && canonical_name) || has_extension(name, "access")
+}
+
+/// A server-side script living in a web root — the place a webshell lands.
+/// Requires BOTH a document-root marker in the path and an executable
+/// server-script extension: static content is not a script, and a build script
+/// outside a web root is not web-reachable.
+fn is_webroot_script(name: &str, rel: &str) -> bool {
+    let in_web_root = [
+        "htdocs/",
+        "wwwroot/",
+        "inetpub/",
+        "public_html/",
+        "www/",
+        "webapps/",
+        "web-root/",
+        "webroot/",
+    ]
+    .iter()
+    .any(|root| rel.starts_with(root) || rel.contains(&format!("/{root}")));
+    in_web_root
+        && [
+            "php", "php3", "php4", "php5", "php7", "phps", "phtml", "asp", "aspx", "ashx", "asmx",
+            "jsp", "jspx", "jspf", "cfm", "cgi",
+        ]
+        .iter()
+        .any(|ext| has_extension(name, ext))
 }
 
 /// Windows filesystem + registry + decoded execution/persistence/anti-forensic
@@ -1668,6 +1790,8 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
             "macos_activity",
             "macos_launchd",
             "macos_fsevents",
+            "web_log",
+            "webroot_script",
         ]
     } else {
         kinds
@@ -1699,6 +1823,8 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
                 ArtifactKind::MacosActivity => "macos_activity",
                 ArtifactKind::MacosLaunchd => "macos_launchd",
                 ArtifactKind::MacosFsevents => "macos_fsevents",
+                ArtifactKind::WebLog => "web_log",
+                ArtifactKind::WebrootScript => "webroot_script",
             })
             .collect()
     };
@@ -1799,8 +1925,9 @@ mod tests {
         classify_candidates, mock_list, order_partitions_by_preference, parse_fls_line,
         parse_mmls_filesystem_partitions, partition_byte_offsets, prefetch_wipe_limitation,
         recovered_content_matches, safe_join, select_artifacts, unmount_steps, wanted_kinds,
-        ArtifactCandidate, ListedFile, MmlsPartition, MAX_RECOVERED_DELETED,
+        ArtifactCandidate, ArtifactKind, ListedFile, MmlsPartition, MAX_RECOVERED_DELETED,
     };
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     /// Single-partition candidate shorthand for the fair-share tests.
@@ -2184,6 +2311,169 @@ mod tests {
             classify_artifact_path(".fseventsd/0000000000abcd12"),
             Some("macos_fsevents")
         );
+    }
+
+    /// Env-gated selection check against a REAL image listing.
+    /// `WEB_TIER_FLS_LISTING=/path/to/fls-output cargo test -p findevil-mcp
+    /// --lib selection_over_a_real_image_listing -- --nocapture`
+    #[test]
+    fn selection_over_a_real_image_listing_keeps_the_web_tier() {
+        let Ok(listing) = std::env::var("WEB_TIER_FLS_LISTING") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&listing).expect("listing readable");
+        let mut candidates: Vec<ArtifactCandidate> = Vec::new();
+        for line in text.lines() {
+            let Some(row) = parse_fls_line(line) else {
+                continue;
+            };
+            if let Some(class) = classify_artifact_path(&row.rel_path) {
+                candidates.push(cand(class, &row.inode, &row.rel_path));
+            }
+        }
+        let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
+        for c in &candidates {
+            *by_class.entry(c.class).or_insert(0) += 1;
+        }
+        println!("candidates by class: {by_class:?}");
+        let selected = select_artifacts(candidates, 500);
+        let mut sel_by_class: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in &selected {
+            *sel_by_class.entry(s.class).or_insert(0) += 1;
+        }
+        println!("selected {} of 500: {sel_by_class:?}", selected.len());
+        for want in [
+            "xampp/apache/logs/access.log",
+            "xampp/htdocs/DVWA/hackable/uploads/phpshell.php",
+            "xampp/htdocs/DVWA/hackable/uploads/phpshell2.php",
+        ] {
+            let hit = selected.iter().any(|c| c.rel_path == want);
+            println!("  selected {want}: {hit}");
+            assert!(hit, "budget dropped {want}");
+        }
+    }
+
+    #[test]
+    fn classify_artifact_path_matches_web_tier_classes() {
+        // Web server request logs — the primary record of an exploitation
+        // attempt against a public-facing app. Apache (incl. XAMPP on Windows),
+        // Apache on Linux (no `.log` suffix), IIS W3C, and nginx.
+        assert_eq!(
+            classify_artifact_path("xampp/apache/logs/access.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("xampp\\apache\\logs\\error.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/apache2/access.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/httpd/access_log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("inetpub/logs/LogFiles/W3SVC1/u_ex150902.log"),
+            Some("web_log")
+        );
+        assert_eq!(
+            classify_artifact_path("var/log/nginx/site.access"),
+            Some("web_log")
+        );
+        // Not every file under an apache logs dir is a request log.
+        assert_eq!(classify_artifact_path("xampp/apache/logs/httpd.pid"), None);
+        assert_eq!(
+            classify_artifact_path("xampp/apache/logs/install.log"),
+            None
+        );
+
+        // Server-side scripts living in a web root — where a webshell lands.
+        assert_eq!(
+            classify_artifact_path("xampp/htdocs/DVWA/hackable/uploads/phpshell.php"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("inetpub/wwwroot/cmd.aspx"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("var/www/html/index.php"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("home/bob/public_html/shell.phtml"),
+            Some("webroot_script")
+        );
+        assert_eq!(
+            classify_artifact_path("opt/tomcat/webapps/ROOT/cmd.jsp"),
+            Some("webroot_script")
+        );
+        // Static web content is not a script; a script outside a web root is
+        // not a webroot script.
+        assert_eq!(classify_artifact_path("xampp/htdocs/index.html"), None);
+        assert_eq!(classify_artifact_path("tools/build.php"), None);
+    }
+
+    #[test]
+    fn web_tier_classes_win_over_generic_and_linux_sweeps() {
+        // A webroot under a user's home must classify as webroot_script, not the
+        // generic `users/` yara sweep, or the webshell heuristic never sees it.
+        assert_eq!(
+            classify_artifact_path("Users/web/public_html/shell.php"),
+            Some("webroot_script")
+        );
+        // Apache logs under /var/log must classify as web_log, not linux_log —
+        // linux_log has no request parser.
+        assert_eq!(
+            classify_artifact_path("var/log/apache2/access.log"),
+            Some("web_log")
+        );
+        // A non-web file under /var/log still classifies as linux_log.
+        assert_eq!(
+            classify_artifact_path("var/log/auth.log"),
+            Some("linux_log")
+        );
+    }
+
+    #[test]
+    fn webroot_script_subrank_puts_writable_dirs_before_shipped_app_tree() {
+        // A web root holds hundreds of shipped application scripts; the ones an
+        // attacker can write sit in upload/temp/cache dirs. The fair-share
+        // budget per class is small, so those must be drawn first.
+        let uploads = "xampp/htdocs/DVWA/hackable/uploads/phpshell.php";
+        let shipped = "xampp/htdocs/dashboard/faq.php";
+        assert!(
+            artifact_subrank("webroot_script", uploads)
+                < artifact_subrank("webroot_script", shipped)
+        );
+        assert!(
+            artifact_subrank("webroot_script", "inetpub/wwwroot/upload/x.aspx")
+                < artifact_subrank("webroot_script", "inetpub/wwwroot/app/views/list.aspx")
+        );
+        // Other classes keep a flat sub-rank.
+        assert_eq!(
+            artifact_subrank("registry", "Windows/System32/config/SAM"),
+            0
+        );
+    }
+
+    #[test]
+    fn wanted_kinds_default_includes_web_tier_classes() {
+        let wanted = wanted_kinds(&[]);
+        for class in ["web_log", "webroot_script"] {
+            assert!(wanted.contains_key(class), "default set missing {class}");
+        }
+        let explicit = wanted_kinds(&[ArtifactKind::WebLog, ArtifactKind::WebrootScript]);
+        assert!(explicit.contains_key("web_log"));
+        assert!(explicit.contains_key("webroot_script"));
+    }
+
+    #[test]
+    fn class_priority_ranks_web_tier_before_generic_yara_sweep() {
+        assert!(class_priority("web_log") < class_priority("yara_target"));
+        assert!(class_priority("webroot_script") < class_priority("yara_target"));
     }
 
     #[test]
