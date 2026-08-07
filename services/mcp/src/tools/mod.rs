@@ -45,6 +45,7 @@ pub mod vol_pslist;
 pub mod vol_psscan;
 pub mod vol_psxview;
 pub mod vol_run;
+pub mod web_triage;
 pub mod yara_scan;
 pub mod zeek_summary;
 
@@ -125,6 +126,10 @@ pub use vol_psxview::{
     vol_psxview, VolPsxviewError, VolPsxviewInput, VolPsxviewOutput, VolPsxviewRow,
 };
 pub use vol_run::{is_allowed_plugin, vol_run, VolRunError, VolRunInput, VolRunOutput};
+pub use web_triage::{
+    web_triage, WebClientCount, WebIndicatorCount, WebRequestHit, WebScriptHit, WebTriageError,
+    WebTriageInput, WebTriageOutput,
+};
 pub use yara_scan::{
     path_looks_like_yara_rules, yara_scan, YaraError, YaraInput, YaraMatch, YaraOutput,
     YaraPatternMatch,

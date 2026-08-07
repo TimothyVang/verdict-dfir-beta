@@ -5,7 +5,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-4D5DFF.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/MCP-compatible-4D5DFF.svg" alt="MCP compatible">
-  <img src="https://img.shields.io/badge/tools-45%20typed%20%C2%B7%20read--only-FF6257.svg" alt="45 typed read-only tools">
+  <img src="https://img.shields.io/badge/tools-46%20typed%20%C2%B7%20read--only-FF6257.svg" alt="46 typed read-only tools">
   <a href="https://timothyvang.github.io/verdict-dfir/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-73D9C2" alt="Documentation"></a>
   <img src="https://img.shields.io/badge/rust-1.88-orange.svg" alt="Rust 1.88">
   <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11">
@@ -18,7 +18,7 @@
 > and updated images. For the stable release, see
 > [verdict-dfir](https://github.com/TimothyVang/verdict-dfir).
 
-<p align="center"><b>Show Me the Evidence — 45 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
+<p align="center"><b>Show Me the Evidence — 46 typed, read-only, audit-chained forensic MCP tools any AI agent can plug into and drive, with custody you can verify offline.</b></p>
 
 <p align="center">
   <a href="https://timothyvang.github.io/verdict-dfir/"><b>Docs</b></a> ·
@@ -41,7 +41,7 @@
 **VERDICT is DFIR (digital forensics & incident response) for agents** — a typed, read-only,
 audit-chained forensic tool surface any AI agent can plug into and drive. Point an agent at a
 Windows-host investigation (memory images, EVTX logs, disk artifacts, network captures) and it works
-through **45 narrow, schema-validated, read-only MCP (Model Context Protocol) tools**, so every
+through **46 narrow, schema-validated, read-only MCP (Model Context Protocol) tools**, so every
 Finding cites the exact tool call that produced it. The result is an evidence-bound verdict backed by
 a cryptographic chain of custody any third party can verify offline. The three verdict words are
 scoped tightly: **`SUSPICIOUS`** means reportable evidence was found, **`INDETERMINATE`** means
@@ -64,7 +64,7 @@ validate the interpretation or establish detection quality.
 
 <p align="center"><sub><b>Drives:</b> memory images · EVTX · disk images (<code>.E01</code>/<code>.dd</code>) · packet captures · registry · MFT · Prefetch · Velociraptor · whole multi-host case folders</sub></p>
 
-- **Plug it into your agent** — two standard MCP stdio servers (32 Rust + 13 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
+- **Plug it into your agent** — two standard MCP stdio servers (33 Rust + 13 Python tools); point your agent at memory/disk/EVTX/PCAP and it has a forensic verb set in seconds.
 - **Stay read-only by design** — no `execute_shell`; every tool is a narrow, schema-validated read-only verb, and evidence is hashed first and never mutated.
 - **Verify it offline** — runs seal into a hash-chained audit log → Merkle root → signed manifest; `manifest_verify` confirms the whole chain offline.
 
@@ -280,7 +280,7 @@ Every Case runs the same nine-stage pipeline, each stage landing live on the das
 
 Three design choices carry the weight:
 
-1. **A typed MCP tool surface — no `execute_shell`.** 45 narrow, schema-validated product tools: 32
+1. **A typed MCP tool surface — no `execute_shell`.** 46 narrow, schema-validated product tools: 33
    Rust DFIR tools (`case_open`, `vol_pslist`/`psscan`/`psxview`, `mft_timeline`, `evtx_query`,
    `hayabusa_scan`, `yara_scan`, `registry_query`, `prefetch_parse`, `pcap_triage`, and allow-listed
    long-tail wrappers) plus 13 Python crypto/analysis tools. Copyleft and source-available engines
@@ -328,12 +328,12 @@ subprocesses** → **two typed MCP servers** → the **supported agent loop** �
 custody** → the **presentation** layer, with trust boundaries marked.
 
 <p align="center">
-  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 32 Rust tools and findevil-agent-mcp 13 Python tools), the supported agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
+  <img src="docs/diagrams/architecture-poster.png" alt="VERDICT architecture and chain of custody: the read-only evidence vault, SIFT tool subprocesses, two typed MCP servers (findevil-mcp 33 Rust tools and findevil-agent-mcp 13 Python tools), the supported agent loop, the hash-chained and signed custody chain, and the presentation layer, with trust boundaries marked" width="900">
 </p>
 
 The same pipeline mapped to the repository — entrypoints (`scripts/`), the agent loop governed by
 `agent-config/`, the `.mcp.json` surface (product servers `findevil-mcp` + `findevil-agent-mcp` =
-45 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
+46 audit-chained tools, plus the n8n / playwright / puppeteer / qmd convenience servers that never
 emit findings), the SIFT DFIR tools, the read-only evidence vault, the custody chain
 (`audit.jsonl` → `manifest_finalize` → `manifest_verify`), and the outputs:
 
@@ -566,7 +566,7 @@ carries a real verdict and `manifest_verify.json` reports `overall: true`.
 ```
 .
 ├── agent-config/        — runtime agent identity (SOUL / AGENTS / PLAYBOOK / TOOLS / MEMORY)
-├── services/mcp/        — Rust MCP server (32 typed DFIR tools)
+├── services/mcp/        — Rust MCP server (33 typed DFIR tools)
 ├── services/agent_mcp/  — Python MCP server (13 crypto / ACH / memory tools)
 ├── services/agent/      — findevil_agent package (crypto chain + ACH primitives)
 ├── apps/web/            — Next.js dashboard (live audit-stream viewer + design system)

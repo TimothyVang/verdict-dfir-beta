@@ -184,6 +184,93 @@ _BROWSER_PROFILE_MARKERS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Web tier
+# ---------------------------------------------------------------------------
+
+# Server-side script extensions. A file with one of these under a document root
+# is web-reachable code — the shape a webshell takes.
+WEBROOT_SCRIPT_EXTS: tuple[str, ...] = (
+    ".php",
+    ".php3",
+    ".php4",
+    ".php5",
+    ".php7",
+    ".phps",
+    ".phtml",
+    ".asp",
+    ".aspx",
+    ".ashx",
+    ".asmx",
+    ".jsp",
+    ".jspx",
+    ".jspf",
+    ".cfm",
+    ".cgi",
+)
+
+# Document-root markers, OS-agnostic: Apache ships inside XAMPP on Windows, IIS
+# serves from inetpub/wwwroot, and the same stacks on Linux use /var/www or a
+# per-user public_html.
+WEB_ROOT_MARKERS: tuple[str, ...] = (
+    "htdocs/",
+    "wwwroot/",
+    "inetpub/",
+    "public_html/",
+    "www/",
+    "webapps/",
+    "webroot/",
+)
+
+# Canonical request/error log filenames. Matched together with the server's log
+# DIRECTORY so a `.pid` or an installer log in the same folder is not mistaken
+# for request traffic.
+_WEB_LOG_NAMES = frozenset(
+    {
+        "access.log",
+        "access_log",
+        "error.log",
+        "error_log",
+        "ssl_access.log",
+        "ssl_request.log",
+        "other_vhosts_access.log",
+    }
+)
+
+_WEB_LOG_DIR_MARKERS: tuple[str, ...] = (
+    "/apache/logs/",
+    "/apache2/",
+    "/httpd/",
+    "/nginx/",
+    "/lighttpd/",
+    "/logs/w3svc",
+    "inetpub/logs/",
+)
+
+
+def path_is_web_request_log(lower_name: str, lower_path: str) -> bool:
+    """True for a web server's request/error log (Apache, nginx, IIS W3C)."""
+    in_log_dir = lower_path.startswith("apache/logs/") or any(
+        marker in lower_path for marker in _WEB_LOG_DIR_MARKERS
+    )
+    canonical = (
+        lower_name in _WEB_LOG_NAMES
+        or lower_name.startswith("access.log.")
+        or lower_name.startswith("access_log.")
+        or (lower_name.startswith("u_ex") and lower_name.endswith(".log"))
+    )
+    # `*.access` is the self-describing per-vhost nginx/lighttpd naming.
+    return (in_log_dir and canonical) or lower_name.endswith(".access")
+
+
+def path_is_webroot_script(lower_name: str, lower_path: str) -> bool:
+    """True for a server-side script living under a web document root."""
+    in_web_root = any(
+        lower_path.startswith(marker) or f"/{marker}" in lower_path for marker in WEB_ROOT_MARKERS
+    )
+    return in_web_root and lower_name.endswith(WEBROOT_SCRIPT_EXTS)
+
+
 def _history_name_is_browser(lower_path: str) -> bool:
     return any(marker in lower_path for marker in _BROWSER_PROFILE_MARKERS)
 
@@ -342,6 +429,18 @@ def classify_artifact_path(path: str) -> dict[str, str | None]:
             "artifact_class": "browser_db",
             "evidence_type": "extracted_disk",
             "parser_tool": "browser_history",
+        }
+    if path_is_web_request_log(name, lower_path):
+        return {
+            "artifact_class": "web_log",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
+        }
+    if path_is_webroot_script(name, lower_path):
+        return {
+            "artifact_class": "webroot_script",
+            "evidence_type": "extracted_disk",
+            "parser_tool": "web_triage",
         }
     if name.endswith(YARA_TARGET_EXTS):
         return {
