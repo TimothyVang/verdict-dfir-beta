@@ -84,6 +84,11 @@ pub struct PstAttachment {
 /// One message's RFC822 envelope.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PstMessage {
+    /// Mail folder the message was exported from, relative to the export root
+    /// (e.g. `Personal Folders/Sent Items`). PST-internal, so it is stable
+    /// across runs; empty for a message at the export root. This is what
+    /// separates mail the host RECEIVED from mail it SENT.
+    pub folder: String,
     /// `Subject` header, unfolded.
     pub subject: String,
     /// Display name from `From`, e.g. `Alison Smith`. Empty for a bare address.
@@ -386,10 +391,22 @@ fn collect_export_messages(dir: &Path, limit: usize) -> Vec<PstMessage> {
         let Some(mut message) = parse_message_headers(&text) else {
             continue;
         };
+        message.folder = export_folder(dir, &file);
         merge_attachments(&mut message, sibling_attachments(&file));
         seen.insert(message);
     }
     seen.into_iter().take(limit).collect()
+}
+
+/// The message's mail folder: its directory relative to the export root, with
+/// `/` separators. Carries no part of the per-run export path, so it is stable
+/// for `verify_finding` replay.
+fn export_folder(root: &Path, message_file: &Path) -> String {
+    message_file
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
 }
 
 /// Files a mail export puts an RFC822 header block in. libpst `-e` writes
@@ -514,6 +531,8 @@ fn parse_message_headers(raw: &str) -> Option<PstMessage> {
     }
 
     Some(PstMessage {
+        // Filled in by `collect_export_messages`, which knows the export root.
+        folder: String::new(),
         subject: clamp(envelope.get("subject").map_or("", String::as_str)),
         from_display,
         from_address,
@@ -742,7 +761,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("Inbox")).unwrap();
-        std::fs::create_dir_all(root.join("Sent Items")).unwrap();
         std::fs::write(
             root.join("Inbox/0001.eml"),
             "From: b@x.com\r\nTo: jean@m57.biz\r\nSubject: bbb\r\n\r\nx\r\n",
@@ -753,9 +771,10 @@ mod tests {
             "From: a@x.com\r\nTo: jean@m57.biz\r\nSubject: aaa\r\n\r\nx\r\n",
         )
         .unwrap();
-        // duplicate of 0002 in another folder — deduped
+        // Same envelope exported twice from the same folder (libpst and libpff
+        // can both emit a duplicate item) — one message, not two.
         std::fs::write(
-            root.join("Sent Items/InternetHeaders.txt"),
+            root.join("Inbox/InternetHeaders.txt"),
             "From: a@x.com\r\nTo: jean@m57.biz\r\nSubject: aaa\r\n\r\n",
         )
         .unwrap();
@@ -765,6 +784,57 @@ mod tests {
         assert_eq!(msgs[0].subject, "aaa");
         assert_eq!(msgs[1].subject, "bbb");
         assert_eq!(collect_export_messages(root, 100), msgs); // determinism
+    }
+
+    #[test]
+    fn the_same_envelope_in_two_folders_stays_two_messages() {
+        // Inbox + Sent Items copies of one envelope are two separate forensic
+        // facts (received vs sent), so folder is part of the dedup key.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for folder in ["Inbox", "Sent Items"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(
+                root.join(folder).join("0001.eml"),
+                "From: a@x.com\r\nTo: b@y.com\r\nSubject: same\r\n\r\nx\r\n",
+            )
+            .unwrap();
+        }
+        let msgs = collect_export_messages(root, 100);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0].folder, "Inbox");
+        assert_eq!(msgs[1].folder, "Sent Items");
+    }
+
+    #[test]
+    fn mail_folder_comes_from_the_export_tree_not_the_temp_path() {
+        // Which folder a message sits in is the difference between mail the
+        // host RECEIVED and mail it SENT — the export tree is the only place
+        // that survives, and the folder name is PST-internal, so it stays
+        // stable across runs (unlike the per-run export root).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Personal Folders/Sent Items")).unwrap();
+        std::fs::write(
+            root.join("Personal Folders/Sent Items/0001.eml"),
+            "From: a@x.com\r\nTo: b@y.com\r\nSubject: s\r\n\r\nx\r\n",
+        )
+        .unwrap();
+
+        let msgs = collect_export_messages(root, 100);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].folder, "Personal Folders/Sent Items");
+    }
+
+    #[test]
+    fn a_message_at_the_export_root_has_an_empty_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("0001.eml"),
+            "From: a@x.com\r\nTo: b@y.com\r\nSubject: s\r\n\r\nx\r\n",
+        )
+        .unwrap();
+        assert_eq!(collect_export_messages(dir.path(), 100)[0].folder, "");
     }
 
     #[test]
