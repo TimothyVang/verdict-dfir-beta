@@ -871,6 +871,17 @@ SUSPICIOUS_PREFETCH_TOOL_HINTS = (
     ("ETHEREAL", "Ethereal packet-capture tool", "T1040"),
     ("MIRC", "mIRC client that can support IRC-based communications", "T1204.002"),
     ("LOOKATLAN", "Look@LAN network discovery tool", "T1046"),
+    # Anti-forensics: secure-deletion utilities overwrite file content so the
+    # data cannot be carved back. Their OWN prefetch entry surviving is the
+    # tell — indicator removal on the host (T1070.004).
+    (
+        "SDELETE",
+        "SDelete secure-deletion / anti-forensic file-wiping tool",
+        "T1070.004",
+    ),
+    ("ERASER", "Eraser secure-deletion / anti-forensic file-wiping tool", "T1070.004"),
+    ("CCLEANER", "CCleaner artifact/trace-cleaning tool", "T1070.004"),
+    ("BLEACHBIT", "BleachBit artifact/trace-cleaning tool", "T1070.004"),
 )
 MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = int(
     os.environ.get("FINDEVIL_VELOCIRAPTOR_ZIP_MAX_MEMBER_BYTES", str(512 * 1024 * 1024))
@@ -1195,26 +1206,61 @@ def detect_encryption_tooling(
 
     return findings
 
+# UserAssist bookkeeping value names that are not program-execution records.
+# ``UEME_RUNPIDL`` is a folder/shortcut open; the CTL* names are session and
+# UI counters. Everything else under an execution GUID's Count subkey is a path.
+_USERASSIST_NON_EXEC_PREFIXES = (
+    "ueme_runpidl",
+    "ueme_ctl",
+    "ueme_uistart",
+    "ueme_uiqcut",
+)
 
-def _userassist_exe(encoded_name: str) -> str | None:
-    """Decode a UserAssist value name (ROT13) and return the executed .exe
-    basename, or None for non-execution entries (shortcut/RUNPIDL records).
 
-    UserAssist (NTUSER\\...\\Explorer\\UserAssist\\<GUID>\\Count) records
-    per-user GUI program execution. ``UEME_RUNPATH:<full path>`` entries name
-    a launched executable; ``UEME_RUNPIDL`` entries are folder/shortcut opens
-    and are not execution evidence.
+def _userassist_path(encoded_name: str) -> str | None:
+    """Decode a UserAssist value name (ROT13) into the executed program path, or
+    None for non-execution entries.
+
+    UserAssist (``NTUSER\\...\\Explorer\\UserAssist\\<GUID>\\Count``) records
+    per-user GUI program execution. Two on-disk shapes exist and BOTH must
+    decode — supporting only the first is why a Windows 10 image's UserAssist
+    read as empty:
+
+    * **XP / 2003:** ``UEME_RUNPATH:<full path>`` names a launched executable.
+    * **Windows 7 and later:** the prefix is gone; the value name IS the path,
+      either absolute (``C:\\Users\\Public\\Downloads\\X.exe``) or relative to a
+      KNOWNFOLDERID (``{1AC14E77-...}\\cmd.exe`` = System32).
+
+    Returns the decoded path with its original case. Only ``.exe`` targets are
+    execution evidence — a ``.lnk`` value name is a shortcut launch record and
+    names the shortcut, not the binary.
     """
     if not encoded_name:
         return None
     try:
-        decoded = codecs.decode(encoded_name, "rot_13").lower()
+        decoded = codecs.decode(encoded_name, "rot_13")
     except (UnicodeDecodeError, LookupError, ValueError):
         return None
-    if "ueme_runpath" not in decoded:
+    lowered = decoded.lower()
+    if lowered.startswith(_USERASSIST_NON_EXEC_PREFIXES):
         return None
-    tail = decoded.rsplit(":", 1)[-1]
-    base = PurePosixPath(tail.replace("\\", "/")).name
+    if lowered.startswith("ueme_runpath"):
+        # Legacy form: everything after the FIRST colon is the path (the path
+        # itself contains a drive-letter colon, so rsplit would truncate it).
+        decoded = decoded.split(":", 1)[-1].lstrip()
+        lowered = decoded.lower()
+    if not lowered.endswith(".exe"):
+        return None
+    return decoded or None
+
+
+def _userassist_exe(encoded_name: str) -> str | None:
+    """Decode a UserAssist value name and return the executed .exe basename
+    (lowercased), or None for non-execution entries."""
+    path = _userassist_path(encoded_name)
+    if path is None:
+        return None
+    base = PurePosixPath(path.replace("\\", "/")).name.lower()
     return base if base.endswith(".exe") else None
 
 
@@ -2195,6 +2241,148 @@ def registry_service_recon_candidates(
     return out
 
 
+# --- per-user execution artifacts (UserAssist + Program Compatibility Assistant)
+
+_USERASSIST_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+_COMPAT_STORE_KEY = (
+    r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags"
+    r"\Compatibility Assistant\Store"
+)
+
+# Roots any *unprivileged* account can write AND that no legitimate installer
+# uses as a program's home. These are the classic staging/masquerading
+# locations, and a binary executed from one is a real DFIR tell on any Windows
+# host. "Shared" because they are visible to every local account, unlike a
+# per-user profile folder.
+_SHARED_WRITABLE_ROOTS: tuple[tuple[str, str], ...] = (
+    ("\\users\\public\\", "the shared Public user profile"),
+    ("\\users\\all users\\", "the shared All Users profile"),
+    ("\\documents and settings\\all users\\", "the shared All Users profile"),
+    ("\\programdata\\", "ProgramData"),
+    ("\\windows\\temp\\", "the Windows temp directory"),
+    ("\\perflogs\\", "PerfLogs"),
+)
+# Per-user writable roots. Executing a downloaded installer out of one of these
+# is the single most common BENIGN pattern on a Windows host, so a hit here is
+# a lead, never on its own proof of anything malicious.
+_USER_PROFILE_WRITABLE_ROOTS: tuple[str, ...] = (
+    "\\appdata\\",
+    "\\downloads\\",
+    "\\desktop\\",
+    "\\documents\\",
+    "\\local settings\\",
+    "\\temp\\",
+)
+# Bare drive-root temp/staging directories (``C:\Temp\x.exe``).
+_DRIVE_ROOT_WRITABLE_RE = re.compile(
+    r"^[a-z]:\\(temp|tmp|intel|recovery)\\", re.IGNORECASE
+)
+
+
+def _execution_path_writable_root(exe_path: str) -> tuple[str, bool] | None:
+    """Classify where an executed binary lived.
+
+    Returns ``(label, shared)`` when the path sits under a user-writable root —
+    ``shared`` marks the world-writable staging roots no installer legitimately
+    uses — or None for system/vendor-owned locations (``C:\\Windows``,
+    ``C:\\Program Files``) and KNOWNFOLDERID-relative UserAssist names, which
+    every Windows host carries by the dozen. Pure, so the policy is testable
+    without an Investigation.
+    """
+    if not exe_path:
+        return None
+    normalized = exe_path.replace("/", "\\")
+    if normalized.startswith("{"):
+        # KNOWNFOLDERID-relative (System32, Program Files, Start Menu): the
+        # binary is vendor-owned, not user-written.
+        return None
+    lowered = normalized.lower()
+    # A path with no directory component tells us nothing about writability.
+    if "\\" not in lowered:
+        return None
+    for marker, label in _SHARED_WRITABLE_ROOTS:
+        if marker in lowered:
+            return label, True
+    if _DRIVE_ROOT_WRITABLE_RE.match(lowered):
+        return "a drive-root staging directory", True
+    if (
+        lowered.startswith(("c:\\windows\\", "\\windows\\"))
+        or "\\program files" in lowered
+    ):
+        return None
+    for marker in _USER_PROFILE_WRITABLE_ROOTS:
+        if marker in lowered:
+            return "the user's own profile", False
+    if lowered.startswith(("c:\\users\\", "\\users\\", "c:\\documents and settings\\")):
+        return "the user's own profile", False
+    return None
+
+
+def registry_execution_candidates(
+    rows: list[dict[str, Any]], key_path: str | None
+) -> list[dict[str, Any]]:
+    """Classify UserAssist / Compatibility-Assistant rows into execution candidates.
+
+    Pure function. Two independent per-user execution artifacts live in
+    NTUSER.DAT and both record the FULL PATH of the program that ran:
+
+    * ``...\\Explorer\\UserAssist\\<GUID>\\Count`` — per-user GUI execution. The
+      value name is the ROT13 of the path.
+    * ``...\\AppCompatFlags\\Compatibility Assistant\\Store`` — the Program
+      Compatibility Assistant's record of a program it observed running. The
+      value name is the literal path.
+
+    Only paths under a user-writable root become candidates (see
+    :func:`_execution_path_writable_root`): a stock ``C:\\Windows`` or
+    ``C:\\Program Files`` binary appears in these keys on every machine and
+    carries no signal. The raw value name is carried through so a downstream
+    finding can assert it against the re-run ``registry_query`` output.
+    """
+    key = str(key_path or "").replace("/", "\\").lower()
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        row_key = str(row.get("key_path") or "").replace("/", "\\")
+        row_key_lower = row_key.lower()
+        is_userassist = "\\userassist\\" in row_key_lower and row_key_lower.endswith(
+            "\\count"
+        )
+        is_compat_store = row_key_lower.endswith("compatibility assistant\\store")
+        if not is_userassist and not is_compat_store:
+            # Fall back to the requested key when the row omits its own path.
+            is_userassist = "\\userassist" in key and not row_key
+            is_compat_store = (
+                key.endswith("compatibility assistant\\store") and not row_key
+            )
+        if not is_userassist and not is_compat_store:
+            continue
+        for value in row.get("values") or []:
+            if not isinstance(value, dict):
+                continue
+            name = str(value.get("name") or "")
+            exe_path = _userassist_path(name) if is_userassist else name
+            if not exe_path or not exe_path.lower().endswith(".exe"):
+                continue
+            placement = _execution_path_writable_root(exe_path)
+            if placement is None:
+                continue
+            label, shared = placement
+            out.append(
+                {
+                    "kind": "userassist_exec" if is_userassist else "compatstore_exec",
+                    "exe_path": exe_path,
+                    "exe_name": PurePosixPath(exe_path.replace("\\", "/")).name.lower(),
+                    "value_name": name,
+                    "writable_root": label,
+                    "shared_root": shared,
+                    "hive_key": row_key or str(key_path or ""),
+                    "last_write_time_iso": row.get("last_write_time_iso"),
+                }
+            )
+    return out
+
+
 # Triage keys whose payload lives in nested subkeys (everything else is flat).
 _RECURSIVE_TRIAGE_KEYS = frozenset(
     {
@@ -2208,8 +2396,23 @@ _RECURSIVE_TRIAGE_KEYS = frozenset(
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedMRU",
         r"Software\Microsoft\Windows\Shell\BagMRU",
         r"Software\Microsoft\Windows\ShellNoRoam\BagMRU",
+        # UserAssist's value names live two levels down, under <GUID>\Count.
+        _USERASSIST_KEY,
     }
 )
+
+# Triage keys EXEMPT from the per-run registry_query budget. On a real Windows
+# disk that budget is already exhausted by the SYSTEM Services sweep and the
+# MRU/shellbag keys before the later per-user hives are reached — an execution
+# key that can be crowded out is a key that silently never runs, which is the
+# failure this whole lane exists to fix. The exemption is bounded: two keys per
+# NTUSER.DAT, and the hive list is already capped.
+_EXECUTION_TRIAGE_KEYS = frozenset({_USERASSIST_KEY, _COMPAT_STORE_KEY})
+
+# Cap on standalone registry execution leads per run. A busy user profile can
+# hold dozens of these; shared-root placements are emitted first so the cap
+# never drops a high-signal one in favour of ordinary user downloads.
+_MAX_REGISTRY_EXEC_FINDINGS = 8
 
 _USBSTOR_SERIAL_RE = re.compile(
     r"\\enum\\usbstor\\disk&ven_(?P<ven>[^&\\]*)&prod_(?P<prod>[^&\\]*)[^\\]*\\(?P<serial>[^\\]+)$",
@@ -9496,6 +9699,19 @@ class Investigation:
         # (exe basename lower, finding dict) for prefetch suspicious-tool findings,
         # used to corroborate execution against UserAssist after registry parsing.
         self._prefetch_exec_findings: list[tuple[str, dict[str, Any]]] = []
+        # Per-user execution artifacts indexed off the NTUSER.DAT triage keys
+        # (UserAssist + Program Compatibility Assistant Store). Populated by
+        # _collect_registry_execution_candidates so both the standalone
+        # execution leads and the prefetch promotion read ONE set of queries —
+        # and so UserAssist is consulted whether or not prefetch found anything.
+        self._userassist_exec_index: dict[str, tuple[str, str | None]] = {}
+        self._registry_exec_candidates: list[tuple[str, str, dict[str, Any]]] = []
+        # EVERY prefetch the lane parsed (exe basename -> tool_call_id, ts), not
+        # just the ones that matched a suspicious-tool hint. This is the second
+        # ARTIFACT CLASS a registry execution lead needs; keying it off the hint
+        # list instead would make corroboration depend on a name allowlist
+        # rather than on the evidence actually parsed.
+        self._prefetch_exec_index: dict[str, tuple[str, str | None]] = {}
         self.evtx_summary: dict[str, Any] | None = None
         # EVTX summary is accumulated across every evtx_query call (one per
         # file). A trailing empty log used to reset records_seen to 0 because
@@ -11212,6 +11428,31 @@ class Investigation:
             else:
                 self.findings_pool_a.append(finding)
 
+    def _record_disk_extract_limitations(
+        self, extracted: dict[str, Any], evidence_path: str
+    ) -> None:
+        """Fold the scoped gaps ``disk_extract_artifacts`` observed into the
+        case's analysis limitations.
+
+        Today that is a Prefetch directory holding zero allocated files (the
+        secure-deletion shape). The tool can see it — it is looking at the raw
+        ``fls`` listing — and the engine cannot, so a limitation the engine
+        drops on the floor leaves exactly the silent gap this lane exists to
+        close: ``artifact_counts.prefetch = 0`` reading identically to a host
+        that simply never ran anything.
+        """
+        for limitation in extracted.get("analysis_limitations") or []:
+            text = str(limitation).strip()
+            if text and text not in self.analysis_limitations:
+                self.analysis_limitations.append(text)
+                print(f"  disk_extract_artifacts limitation: {text[:160]}")
+        recovered = int(extracted.get("artifacts_recovered_deleted") or 0)
+        if recovered:
+            print(
+                f"  disk_extract_artifacts recovered {recovered} deleted-but-resident "
+                f"artifact(s) from {evidence_path}"
+            )
+
     def investigate_disk(
         self, rust: SshMcpClient, py: SshMcpClient, evidence_path: str | None = None
     ) -> None:
@@ -11366,6 +11607,7 @@ class Investigation:
                 self.analysis_limitations.append(
                     f"disk_extract_artifacts skipped {skipped_oversize} oversized artifact(s); rerun with a targeted extraction plan if those paths are needed."
                 )
+            self._record_disk_extract_limitations(extracted, evidence_path)
 
             evtx_entries: list[dict[str, Any]] = []
             for artifact in artifacts:
@@ -11469,6 +11711,13 @@ class Investigation:
             return [
                 r"Software\Microsoft\Windows\CurrentVersion\Run",
                 r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                # Per-user execution artifacts, queried UNCONDITIONALLY: these
+                # used to be reachable only through the prefetch-corroboration
+                # path, so a host whose Prefetch directory had been wiped was
+                # never asked what the user actually ran. Both are budget-exempt
+                # (see _EXECUTION_TRIAGE_KEYS).
+                _USERASSIST_KEY,
+                _COMPAT_STORE_KEY,
                 r"Software\Microsoft\Search Assistant\ACMru",
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery",
                 r"Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs",
@@ -12418,59 +12667,214 @@ class Investigation:
             f"(HYPOTHESIS, {len(groups)} hacking group(s) across {len(stores)} folder(s))"
         )
 
-    def _corroborate_execution_with_userassist(
+    def _collect_registry_execution_candidates(
         self,
-        rust: SshMcpClient,
-        py: SshMcpClient,
-        by_class: dict[str, list[dict[str, Any]]],
+        rows: list[dict[str, Any]],
+        hive_path: str,
+        key_path: str | None,
+        tcid: str,
     ) -> None:
+        """Index one UserAssist / Compatibility-Assistant ``registry_query`` result.
+
+        Called from the per-hive triage loop, so the keys are read ONCE (with a
+        recorded tool call, timeline entry and disk-summary merge) and every
+        consumer below reads this index instead of re-querying. Two consumers:
+        :meth:`_emit_registry_execution_findings` (standalone execution leads)
+        and :meth:`_promote_prefetch_findings_with_userassist` (the existing
+        prefetch upgrade).
+        """
+        # Every decoded .exe, writable-root or not, feeds the prefetch promotion:
+        # a hacking tool that ran out of C:\Program Files still corroborates its
+        # prefetch entry. The writable-root filter applies only to the
+        # standalone leads below, which have no prefetch finding behind them.
+        row_key_is_userassist = (
+            "\\userassist" in str(key_path or "").replace("/", "\\").lower()
+        )
+        if row_key_is_userassist:
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                ts = row.get("last_write_time_iso")
+                for value in row.get("values") or []:
+                    if not isinstance(value, dict):
+                        continue
+                    exe = _userassist_exe(str(value.get("name", "")))
+                    if exe:
+                        self._userassist_exec_index.setdefault(exe, (tcid, ts))
+        for cand in registry_execution_candidates(rows, key_path):
+            self._registry_exec_candidates.append((hive_path, tcid, cand))
+
+    def _emit_registry_execution_findings(self) -> None:
+        """Emit execution leads from the per-user registry execution artifacts.
+
+        Two independent axes decide the tier, and BOTH must clear for CONFIRMED.
+
+        **Artifact classes (the SOUL.md / CLAUDE.md execution bar).** UserAssist
+        and the Compatibility Assistant Store are two independent execution
+        ARTIFACTS, but both live in the registry — that is ONE artifact class.
+        The rule counts classes, and ``report_qa``'s
+        ``execution_requires_two_current_artifact_classes`` gate counts them the
+        same way, so a registry-only pair can never rise above HYPOTHESIS
+        without both over-claiming and failing the engine's own release gate.
+        Prefetch recording the same binary is a genuinely different class and is
+        what lifts the lead.
+
+        **Placement.** Even two classes do not make a run reportable. A user
+        running an installer they downloaded into their OWN profile
+        (``...\\AppData\\Local\\Downloads\\setup.exe``) is the most common
+        benign pattern on any Windows host and both registry keys record it;
+        CONFIRMED there is a false positive by ordinary DFIR standards, and
+        because ``compute_verdict`` escalates on ANY CONFIRMED finding it would
+        flip a benign host's verdict too. A binary run from a SHARED,
+        world-writable root (``C:\\Users\\Public\\``, ``ProgramData``,
+        ``Windows\\Temp``) is different in kind — no legitimate installer runs a
+        program from there.
+
+        So: CONFIRMED = second class AND shared root; INFERRED = second class,
+        per-user root; HYPOTHESIS = registry only. A per-user path with a single
+        registry artifact is not emitted at all — one key recording a downloaded
+        installer is noise on every host.
+        """
+        if not self._registry_exec_candidates:
+            return
+        # exe_path -> {"hive", "tcids": {kind: tcid}, "cands": [...]}
+        grouped: dict[str, dict[str, Any]] = {}
+        for hive_path, tcid, cand in self._registry_exec_candidates:
+            key = f"{hive_path}::{str(cand.get('exe_path') or '').lower()}"
+            slot = grouped.setdefault(
+                key,
+                {"hive": hive_path, "sources": {}, "cand": cand},
+            )
+            slot["sources"].setdefault(str(cand.get("kind")), (tcid, cand))
+            if cand.get("kind") == "userassist_exec":
+                # Prefer the UserAssist row as the primary citation: its value
+                # name is the fact the finding asserts.
+                slot["cand"] = cand
+        # Shared-root placements first so a per-hive cap never drops the
+        # high-signal ones in favour of ordinary user downloads.
+        ordered = sorted(
+            grouped.values(),
+            key=lambda slot: (
+                not slot["cand"].get("shared_root"),
+                str(slot["cand"]["exe_path"]),
+            ),
+        )
+        emitted = 0
+        for slot in ordered:
+            if emitted >= _MAX_REGISTRY_EXEC_FINDINGS:
+                break
+            cand = slot["cand"]
+            hive_path = str(slot["hive"])
+            exe_path = str(cand.get("exe_path") or "")
+            exe_name = str(cand.get("exe_name") or "")
+            shared = bool(cand.get("shared_root"))
+            sources: dict[str, tuple[str, dict[str, Any]]] = slot["sources"]
+            registry_artifacts = [
+                "UserAssist (per-user GUI execution)"
+                if kind == "userassist_exec"
+                else "the Program Compatibility Assistant Store"
+                for kind in sources
+            ]
+            derived = [tcid for tcid, _ in sources.values()]
+            # Prefetch is the only genuinely DIFFERENT artifact class available
+            # here; the two registry keys are one class no matter how many of
+            # them agree.
+            pf_hit = self._prefetch_exec_index.get(exe_name)
+            pf_tcid = pf_hit[0] if pf_hit else None
+            if pf_tcid and pf_tcid not in derived:
+                derived.append(pf_tcid)
+            second_class = bool(pf_tcid)
+            if not second_class and not shared and len(sources) < 2:
+                continue
+            primary_tcid, primary_cand = sources.get(
+                "userassist_exec", next(iter(sources.values()))
+            )
+            if second_class:
+                confidence = "CONFIRMED" if shared else "INFERRED"
+            else:
+                confidence = "HYPOTHESIS"
+            placement = (
+                f"{cand.get('writable_root')} — a shared, world-writable location no "
+                "legitimate installer runs a program from"
+                if shared
+                else f"{cand.get('writable_root')} (a user-writable location; running a "
+                "downloaded program from there is also an ordinary benign pattern)"
+            )
+            registry_text = " and ".join(registry_artifacts)
+            corroboration = (
+                f"Two artifact classes record the run: the registry ({registry_text}) "
+                "and Windows Prefetch."
+                if second_class
+                else f"The registry records it ({registry_text}), but that is a single "
+                "artifact class, so the run is a lead rather than a corroborated "
+                "execution fact — a second class (prefetch, MFT, EVTX) is needed."
+            )
+            safe = re.sub(r"[^a-z0-9]+", "-", exe_name).strip("-") or "exe"
+            finding = {
+                "case_id": self.handle["id"],
+                "finding_id": self._finding_id_for(f"f-A-userassist-exec-{safe}", hive_path),
+                "tool_call_id": primary_tcid,
+                "artifact_path": hive_path,
+                "description": (
+                    f"{exe_path} was executed by this user account. It lives under "
+                    f"{placement}. {corroboration} "
+                    f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
+                    "This states execution and placement only — it does not, on its own, "
+                    "establish what the program did."
+                ),
+                "confidence": confidence,
+                "pool_origin": "A",
+                "mitre_technique": "T1204.002",
+                "derived_from": derived,
+                # The re-run registry_query output must still carry the value
+                # name this finding decoded, so a misread cannot ride a valid
+                # tool_call_id. UserAssist names are ROT13-encoded, hence the
+                # encoded form is what is asserted.
+                "asserted_values": [
+                    {
+                        "path": "entries[*].values[*].name",
+                        "expected": str(primary_cand.get("value_name") or ""),
+                        "match": "exact",
+                    }
+                ],
+            }
+            self.findings_pool_a.append(finding)
+            emitted += 1
+            if pf_tcid:
+                # report_qa counts a finding's artifact classes off the TIMELINE
+                # events linked to it, so the prefetch class has to reach the
+                # timeline or the two-class execution gate fails the very claim
+                # prefetch is what justifies.
+                fid = str(finding["finding_id"])
+                self.execution_corroboration.setdefault(fid, []).append(pf_tcid)
+                self._timeline_add(
+                    (pf_hit[1] if pf_hit else None)
+                    or cand.get("last_write_time_iso")
+                    or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "prefetch_parse",
+                    "prefetch",
+                    f"Windows Prefetch records execution of {exe_name}",
+                    pf_tcid,
+                    {"executable_name": exe_name},
+                )
+            print(f"  pool-A execution finding: {finding['finding_id']} ({confidence})")
+
+    def _promote_prefetch_findings_with_userassist(self) -> None:
         """Promote a prefetch execution lead to CONFIRMED when a UserAssist entry
         (per-user GUI execution, in NTUSER.DAT) records the same binary. Prefetch
         and UserAssist are two independent artifact classes, so together they clear
         the SOUL.md >=2-artifact-class bar for an execution claim. The registry
         tool_call_id is recorded in ``self.execution_corroboration`` so the
-        normalized timeline links both classes to the finding for report QA."""
-        if not self._prefetch_exec_findings:
-            return
-        ua_exes: dict[str, tuple[str, str | None]] = {}  # exe -> (tcid, ts)
-        for entry in by_class.get("registry", [])[:20]:
-            path = str(entry["path"])
-            if PurePosixPath(path.replace("\\", "/")).name.lower() != "ntuser.dat":
-                continue
-            ua_args = {
-                "case_id": self.handle["id"],
-                "hive_path": path,
-                "key_path": (r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"),
-                "recursive": True,
-                "limit": 500,
-            }
-            ua_out = rust.call_tool("registry_query", ua_args)
-            ua_err = ua_out.get("_error", {}).get("message") if "_error" in ua_out else None
-            if ua_err:
-                ua_out = {"_error": {"message": ua_err}, "entries": []}
-            ua_entries = ua_out.get("entries", [])
-            ua_tcid = self._record_tool(
-                py,
-                "registry_query",
-                self._output_hash(ua_out),
-                {
-                    "artifact_path": path,
-                    "key_path": "UserAssist",
-                    "entries_returned": len(ua_entries),
-                    **({"error": ua_err} if ua_err else {}),
-                },
-                arguments=ua_args,
-            )
-            for e in ua_entries:
-                ts = e.get("last_write_time_iso")
-                for value in e.get("values", []):
-                    exe = _userassist_exe(str(value.get("name", "")))
-                    if exe:
-                        ua_exes.setdefault(exe, (ua_tcid, ts))
+        normalized timeline links both classes to the finding for report QA.
 
+        Reads the index the per-hive triage loop already built
+        (:meth:`_collect_registry_execution_candidates`) rather than issuing its
+        own UserAssist ``registry_query`` per hive: the old shape both duplicated
+        20 tool calls per run and made UserAssist reachable ONLY when a prefetch
+        finding already existed."""
         upgraded = 0
         for exe_base, finding in self._prefetch_exec_findings:
-            hit = ua_exes.get(exe_base)
+            hit = self._userassist_exec_index.get(exe_base)
             if not hit or finding.get("confidence") == "CONFIRMED":
                 continue
             corr_tcid, ts = hit
@@ -12799,6 +13203,16 @@ class Investigation:
                     {"run_count": out.get("run_count", 0), "prefetch_path": path},
                 )
             print(f"  prefetch_parse: {path} runs={out.get('run_count', 0)}")
+            # Index EVERY successfully parsed prefetch, not just hint matches:
+            # this is the second artifact class a registry (UserAssist /
+            # Compatibility Assistant) execution lead needs, and a payload
+            # nobody has named yet still leaves a .pf.
+            parsed_exe = str(out.get("executable_name") or "")
+            if parsed_exe and not error:
+                self._prefetch_exec_index.setdefault(
+                    PurePosixPath(parsed_exe.replace("\\", "/")).name.lower(),
+                    (tcid, next(iter(out.get("last_run_times_iso") or []), None)),
+                )
             hint = suspicious_prefetch_tool_hint(str(exe))
             if hint and out.get("run_count", 0):
                 tool_description, technique = hint
@@ -13302,9 +13716,17 @@ class Investigation:
         for entry in _prioritize_registry_hives(by_class["registry"])[:20]:
             path = str(entry["path"])
             for key_path in self._registry_triage_keys(path):
-                registry_calls += 1
-                if registry_calls > 60:
-                    break
+                # The per-user execution keys are exempt from the budget: on a
+                # real Windows disk the 60 calls are spent on the SYSTEM
+                # Services sweep and the MRU/shellbag keys long before the
+                # per-user hives are reached, and an execution key that can be
+                # crowded out is one that silently never runs. Budgeted keys
+                # behave exactly as before — once the budget is gone none of
+                # them run, on this hive or any later one.
+                if key_path not in _EXECUTION_TRIAGE_KEYS:
+                    registry_calls += 1
+                    if registry_calls > 60:
+                        continue
                 args = {
                     "case_id": self.handle["id"],
                     "hive_path": path,
@@ -13405,8 +13827,14 @@ class Investigation:
                 )
                 if activity_candidates:
                     self._emit_registry_activity_findings(activity_candidates, path, key_path, tcid)
+                # Per-user execution artifacts (UserAssist + Compatibility
+                # Assistant Store) are indexed here and consumed after the loop
+                # by both the standalone execution leads and the prefetch
+                # promotion — one set of queries, two consumers.
+                self._collect_registry_execution_candidates(rows, path, key_path, tcid)
 
-        self._corroborate_execution_with_userassist(rust, py, by_class)
+        self._emit_registry_execution_findings()
+        self._promote_prefetch_findings_with_userassist()
 
         if DISK_YARA_RULES:
             for entry in by_class["yara_target"][:50]:
