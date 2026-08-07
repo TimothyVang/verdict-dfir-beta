@@ -29,6 +29,7 @@ same SHA-256 (chain of custody) but a fresh case_id and fresh manifest.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7960,6 +7961,223 @@ def _host_is_suspicious(host: str) -> tuple[bool, str]:
     return False, ""
 
 
+# --- HTTP cookie payloads: archives smuggled through a cookie field ---------
+#
+# A cookie value is a client-controlled opaque string, which makes it a standing
+# covert channel: an archive can be base64-encoded and pushed out a few kilobytes
+# per request while every packet still reads as ordinary web browsing. Detection
+# has to look at the VALUE — a `has_cookie` boolean cannot tell a session id from
+# a container in flight.
+#
+# Container magics recognized on the decoded prefix. Each is >=3 bytes so a random
+# base64 session id cannot land on one by accident (a 3-byte magic is ~1 in 1.7e7,
+# a 4-byte magic ~1 in 4.3e9); 2-byte magics are deliberately excluded.
+ARCHIVE_CONTAINER_MAGICS: tuple[tuple[bytes, str], ...] = (
+    (b"PK\x03\x04", "ZIP archive (local file header)"),
+    (b"PK\x05\x06", "ZIP archive (end-of-central-directory record)"),
+    (b"PK\x07\x08", "ZIP archive (data-descriptor / spanned record)"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"\xfd7zXZ\x00", "XZ compressed stream"),
+    (b"BZh9", "bzip2 archive"),
+    (b"\x1f\x8b\x08", "gzip compressed stream"),
+)
+# Floor on encoded length. Short values (session ids, GUIDs, counters) are the
+# false-positive population; a container header plus any useful metadata is well
+# past this.
+ARCHIVE_COOKIE_MIN_B64_LEN = 32
+# Floor on DECODED length, so a value that base64-decodes to only a few bytes
+# cannot satisfy a magic and nothing else.
+ARCHIVE_COOKIE_MIN_DECODED_LEN = 24
+_B64_ALPHABET = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+# ZIP local file header: magic(4) ... name_len@26 extra_len@28 name@30.
+_ZIP_LOCAL_HEADER_MAGIC = b"PK\x03\x04"
+_ZIP_NAME_LEN_OFFSET = 26
+_ZIP_NAME_OFFSET = 30
+_MAX_MEMBER_PATH_LEN = 200
+# Administrative / hidden-share path shapes. An archive member that came from one
+# of these was read from a share, which by definition needed an account with
+# rights to it. General SMB/host-share vocabulary, not one dataset's directory.
+_ADMIN_SHARE_SEGMENT_RE = re.compile(r"^(admin[_ -]?share|admin\$|ipc\$|print\$|[a-z]\$)$")
+# How many distinct registrable domains one destination address must answer to
+# before its Host headers stop being credible. Real virtual hosting exists, so
+# this alone is never a finding — it only ever qualifies a payload observation.
+HOST_MULTIPLEX_MIN_DOMAINS = 5
+# Second-level suffixes that are registry-operated, so the registrable name is
+# one label further left (bbc.co.uk, not co.uk).
+_MULTIPART_TLD_SECOND_LABELS = {"co", "com", "net", "org", "ac", "gov", "edu", "or", "ne"}
+
+
+def _decode_base64_prefix(value: str) -> bytes | None:
+    """Decode the leading base64 of ``value``, or None if it is not base64.
+
+    Tolerates a truncated prefix (the tool caps cookie values) by trimming to a
+    whole number of 4-character groups, and accepts the URL-safe alphabet.
+    """
+    text = (value or "").strip()
+    if len(text) < ARCHIVE_COOKIE_MIN_B64_LEN or not _B64_ALPHABET.match(text):
+        return None
+    body = text.replace("-", "+").replace("_", "/").rstrip("=")
+    body = body[: len(body) // 4 * 4]
+    if len(body) < ARCHIVE_COOKIE_MIN_B64_LEN:
+        return None
+    try:
+        # binascii.Error (what b64decode raises on bad padding/alphabet) is a
+        # ValueError subclass, so this catches both.
+        blob = base64.b64decode(body, validate=True)
+    except (ValueError, TypeError):
+        return None
+    return blob if len(blob) >= ARCHIVE_COOKIE_MIN_DECODED_LEN else None
+
+
+def _zip_local_member_path(blob: bytes) -> str:
+    """The member path from a ZIP local file header, or "" when unreadable.
+
+    A ZIP's first member name is the single most useful fact about a smuggled
+    archive: it says WHICH file was collected and from where.
+    """
+    if not blob.startswith(_ZIP_LOCAL_HEADER_MAGIC) or len(blob) < _ZIP_NAME_OFFSET:
+        return ""
+    name_len = int.from_bytes(blob[_ZIP_NAME_LEN_OFFSET : _ZIP_NAME_LEN_OFFSET + 2], "little")
+    if not 0 < name_len <= _MAX_MEMBER_PATH_LEN:
+        return ""
+    raw = blob[_ZIP_NAME_OFFSET : _ZIP_NAME_OFFSET + name_len]
+    if len(raw) < name_len:
+        return ""
+    name = raw.decode("utf-8", "replace").strip("\x00").strip()
+    # A real member path is printable text; anything else means we mis-parsed.
+    return name if name and name.isprintable() else ""
+
+
+def cookie_payload_archive(value: str) -> tuple[str, str] | None:
+    """``(container_label, member_path)`` when a cookie value carries an encoded
+    archive/container, else None. ``member_path`` is "" when the container
+    exposes no readable member name.
+    """
+    blob = _decode_base64_prefix(value)
+    if blob is None:
+        return None
+    for magic, label in ARCHIVE_CONTAINER_MAGICS:
+        if blob.startswith(magic):
+            return label, _zip_local_member_path(blob)
+    return None
+
+
+def archive_member_share_segment(member_path: str) -> str:
+    """The administrative/hidden-share path segment in ``member_path``, or "".
+
+    Keys on the share-name SHAPE (``ADMIN$``, ``C$``, ``IPC$``, ``Admin_share``),
+    never on a particular dataset's directory name.
+    """
+    for segment in re.split(r"[\\/]+", str(member_path or "")):
+        candidate = segment.strip()
+        if candidate and _ADMIN_SHARE_SEGMENT_RE.match(candidate.lower()):
+            return candidate
+    return ""
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort eTLD+1 for a Host header (``vids.myspace.com`` ->
+    ``myspace.com``). IP-literal and single-label hosts are returned as-is.
+    """
+    clean = str(host or "").strip().strip(".").lower().split(":")[0]
+    if not clean or _is_external_ip(clean):
+        return clean
+    labels = [label for label in clean.split(".") if label]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if len(labels[-1]) == 2 and labels[-2] in _MULTIPART_TLD_SECOND_LABELS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def host_multiplexed_destinations(requests: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """External destinations whose observed Host headers name too many unrelated
+    sites to be genuine: ``{dst_ip: [registrable domains]}``.
+
+    A `Host:` header is client-supplied. When one address is addressed as a dozen
+    unrelated registrable domains, the headers cannot all be true of it — which is
+    what an open relay/proxy looks like from the client side.
+    """
+    by_dst: dict[str, set[str]] = {}
+    for row in requests:
+        if not isinstance(row, dict):
+            continue
+        dst = str(row.get("dst") or "").strip()
+        domain = registrable_domain(str(row.get("host") or ""))
+        if not dst or not domain or not _is_external_ip(dst):
+            continue
+        by_dst.setdefault(dst, set()).add(domain)
+    return {
+        dst: sorted(domains)
+        for dst, domains in by_dst.items()
+        if len(domains) >= HOST_MULTIPLEX_MIN_DOMAINS
+    }
+
+
+def pcap_cookie_archive_channels(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Requests that carry an encoded archive in a cookie to a Host-multiplexed
+    destination — the two-prong covert-channel observation.
+
+    Both prongs are required. The payload alone could be a site legitimately
+    round-tripping compressed state in a cookie; the multiplexing alone is
+    ordinary shared hosting or a CDN. Together they are a client pushing a
+    container to an address that lies about what site it is.
+    """
+    multiplexed = host_multiplexed_destinations(requests)
+    if not multiplexed:
+        return []
+    channels: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in requests:
+        if not isinstance(row, dict):
+            continue
+        dst = str(row.get("dst") or "").strip()
+        domains = multiplexed.get(dst)
+        if not domains:
+            continue
+        for cookie in row.get("cookies") or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "").strip()
+            hit = cookie_payload_archive(value)
+            if not hit:
+                continue
+            container, member_path = hit
+            key = (dst, name, value[:32])
+            if key in seen:
+                continue
+            seen.add(key)
+            channels.append(
+                {
+                    "src": str(row.get("src") or "").strip(),
+                    "dst": dst,
+                    "host": str(row.get("host") or "").strip(),
+                    "method": (str(row.get("method") or "GET").strip() or "GET"),
+                    "cookie_name": name,
+                    "cookie_value": value,
+                    "container": container,
+                    "member_path": member_path,
+                    "share_segment": archive_member_share_segment(member_path),
+                    "spoofed_domains": list(domains),
+                }
+            )
+    return channels
+
+
+def row_cookie_carries_archive(row: dict[str, Any]) -> bool:
+    """True when any cookie on this request is an encoded container.
+
+    Such a cookie is a payload, not a session token, so the webmail/social-media
+    ACCOUNT-attribution readings of `has_cookie` must not be applied to it.
+    """
+    for cookie in row.get("cookies") or []:
+        if isinstance(cookie, dict) and cookie_payload_archive(str(cookie.get("value") or "")):
+            return True
+    return False
+
+
 def _conversation_is_notable(row: dict[str, Any]) -> tuple[bool, str]:
     dst = row.get("dst") or row.get("destination_ip")
     if not _is_external_ip(dst):
@@ -13087,14 +13305,22 @@ class Investigation:
         service). This consumes pcap_triage's `http_requests` to (a) flag contact
         with anonymous/disposable email services and identify the originating
         internal host, (b) attribute authenticated webmail sessions, (c)
-        attribute authenticated social-media sessions, and (d) correlate the
-        anonymous-email send times with the source host's browsing window.
+        attribute authenticated social-media sessions, (d) correlate the
+        anonymous-email send times with the source host's browsing window, and
+        (e) read cookie VALUES for an encoded archive smuggled out through the
+        cookie field.
         """
         requests = out.get("http_requests") or []
         self._add_pcap_timeline_correlation_finding(requests, tcid, artifact_path)
+        self._add_pcap_cookie_archive_findings(requests, tcid, artifact_path)
         anon_seen: set[tuple[str, str]] = set()
         webmail_seen: set[tuple[str, str]] = set()
         social_seen: set[tuple[str, str]] = set()
+        # Destinations whose Host headers are provably not credible (one address
+        # addressed as many unrelated sites). A cookie sent there authenticates
+        # nothing at the site the header names, so account attribution below must
+        # not be read off it.
+        spoofed_dsts = set(host_multiplexed_destinations(requests))
         emitted = 0
         for row in requests:
             if not isinstance(row, dict) or emitted >= 12:
@@ -13104,6 +13330,16 @@ class Investigation:
             method = (str(row.get("method") or "").strip() or "GET").upper()
             if not host:
                 continue
+            # A cookie only attributes an account when it is a session token AND
+            # it actually reached the site the Host header names. A value that
+            # decodes to an archive is a PAYLOAD, and a request to a
+            # Host-multiplexed relay never reached that site at all — reading
+            # either as "authenticated login" invents an account.
+            session_cookie = (
+                bool(row.get("has_cookie"))
+                and not row_cookie_carries_archive(row)
+                and str(row.get("dst") or "").strip() not in spoofed_dsts
+            )
             anon, token = _host_anonymous_email(host)
             if anon and (src, host) not in anon_seen:
                 anon_seen.add((src, host))
@@ -13182,7 +13418,7 @@ class Investigation:
                 )
                 emitted += 1
                 continue
-            if row.get("has_cookie") and _host_is_webmail(host) and (src, host) not in webmail_seen:
+            if session_cookie and _host_is_webmail(host) and (src, host) not in webmail_seen:
                 webmail_seen.add((src, host))
                 self._network_finding(
                     "B",
@@ -13205,7 +13441,7 @@ class Investigation:
                 emitted += 1
                 continue
             social, platform = _host_social_media(host)
-            if row.get("has_cookie") and social and (src, platform) not in social_seen:
+            if session_cookie and social and (src, platform) not in social_seen:
                 social_seen.add((src, platform))
                 self._network_finding(
                     "B",
@@ -13226,6 +13462,164 @@ class Investigation:
                     derived_from=[tcid],
                 )
                 emitted += 1
+
+    def _add_pcap_cookie_archive_findings(
+        self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
+    ) -> None:
+        """Findings for an archive smuggled out inside an HTTP cookie value.
+
+        Three distinct claims come off one observation, each at the tier its own
+        evidence supports:
+
+        * the covert channel itself (CONFIRMED) — the container magic and member
+          path are bytes present in the cited `pcap_triage` output, and the
+          asserted values bind cookie value + Host + destination inside ONE
+          replayed record, so the verifier re-extracts them rather than trusting
+          the wording;
+        * the relay reading of the destination (INFERRED) — Host multiplexing is
+          strong but shared hosting is a real alternative, so it is stated with
+          its counter-hypothesis;
+        * the share the archived file came from (INFERRED) — a member path under
+          an administrative share implies an account with rights to that share,
+          which the capture cannot name.
+
+        Deliberately NOT worded as an exfiltration conclusion: the presence and
+        egress prongs here both come from the network class, which is precisely
+        the single-source case the two-prong gate exists to distrust. The
+        limitation is stated in the finding text instead.
+        """
+        for channel in pcap_cookie_archive_channels(requests)[:3]:
+            self._emit_pcap_cookie_archive_channel(channel, tcid, artifact_path)
+
+    def _emit_pcap_cookie_archive_channel(
+        self, channel: dict[str, Any], tcid: str, artifact_path: str
+    ) -> None:
+        src = channel["src"] or "an internal host"
+        dst = channel["dst"]
+        host = channel["host"]
+        cookie_name = channel["cookie_name"]
+        container = channel["container"]
+        member_path = channel["member_path"]
+        domains = channel["spoofed_domains"]
+        domain_sample = ", ".join(domains[:6])
+        member_clause = f" carrying the member path `{member_path}`" if member_path else ""
+        # A distinctive slice of the observed value — long enough that no other
+        # cookie in the capture matches it, short enough to stay readable in the
+        # report and in the sealed entailment slice.
+        payload_excerpt = channel["cookie_value"][:48]
+
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-cookie-archive-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"pcap_triage read the HTTP cookie `{cookie_name}` that {src} sent to "
+                f"{dst} under Host header `{host}`, and its base64 value decodes to a "
+                f"{container}{member_clause}. A data archive was staged into a cookie "
+                f"field and transferred off the host inside ordinary-looking web "
+                f"requests — a covert channel. The archive bytes are read directly out "
+                f"of the capture, and the transfer is correlated with {len(domains)} "
+                f"unrelated site names all answered by the single address {dst}. "
+                "Single-artifact-class evidence: the on-host collection step and the "
+                "archive's full contents are not corroborated by disk, memory, or "
+                "filesystem artifacts in this evidence set, so treat the scope of what "
+                "left as unmeasured."
+            ),
+            "T1041",
+            confidence="CONFIRMED",
+            derived_from=[tcid],
+            asserted_values=[
+                {
+                    # Co-location: source, destination, Host header AND the
+                    # payload must all be present in ONE replayed row. Without
+                    # the cookie constraint the payload claim could be satisfied
+                    # by the same value riding a different request. (`cookies`
+                    # is a list; the record matcher substring-matches its
+                    # rendering, and a base64 excerpt has no characters that
+                    # rendering would escape.)
+                    "path": "http_requests[*]",
+                    "expected": json.dumps(
+                        {
+                            "src": channel["src"],
+                            "dst": dst,
+                            "host": host,
+                            "cookies": payload_excerpt,
+                        },
+                        sort_keys=True,
+                    ),
+                    "match": "record",
+                },
+                {"path": "http_requests[*].dst", "expected": dst, "match": "exact"},
+                {
+                    "path": "http_requests[*].cookies[*].name",
+                    "expected": cookie_name,
+                    "match": "exact",
+                },
+                {
+                    "path": "http_requests[*].cookies[*].value",
+                    "expected": payload_excerpt,
+                    "match": "contains",
+                },
+            ],
+            counter_hypothesis=(
+                "A site can legitimately round-trip compressed state in its own "
+                "cookie; ruled out because the value decodes to a stand-alone "
+                f"{container} and the destination {dst} answers to {len(domains)} "
+                "unrelated site names, so it is not the site whose cookie this "
+                "claims to be."
+            ),
+        )
+
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-host-spoof-relay-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"{len(domains)} unrelated web domains ({domain_sample}) all appear as "
+                f"the Host header on requests {src} sent to the single destination {dst} "
+                f"in these pcap flows. One address cannot legitimately serve that set, "
+                f"so the Host headers are spoofed and {dst} shows proxy/relay behavior: "
+                "it accepted arbitrary Host values and relayed the traffic onward, and "
+                "one of those same requests carried the encoded archive above. The "
+                "relay software itself is not identifiable from network metadata and "
+                "was not recovered from the host."
+            ),
+            "T1090",
+            confidence="INFERRED",
+            derived_from=[tcid],
+            counter_hypothesis=(
+                "Shared hosting or a CDN legitimately serves many domains from one "
+                "address, which is why Host multiplexing alone is never asserted; the "
+                "relay reading rests on the same destination also receiving a cookie "
+                "whose value decodes to an archive container — a hosting provider does "
+                "not receive its tenants' files inside cookie values."
+            ),
+        )
+
+        share_segment = channel["share_segment"]
+        if not share_segment:
+            return
+        self._network_finding(
+            "A",
+            self._finding_id_for(f"f-A-pcap-archive-share-source-{dst}", artifact_path),
+            tcid,
+            artifact_path,
+            (
+                f"The archive {src} sent inside the `{cookie_name}` cookie names its "
+                f"member as `{member_path}` — the collected data was read from an "
+                f"administrative share (`{share_segment}`), so whichever account "
+                "assembled it had access to that share. Read as unauthorized access to "
+                "the share using valid or compromised credentials. No host auth.log / "
+                "wtmp logon records are present in this evidence set, so the account "
+                "and the logon event itself are uncorroborated; do not name a user from "
+                "this alone."
+            ),
+            "T1078",
+            confidence="INFERRED",
+            derived_from=[tcid],
+        )
 
     def _add_pcap_timeline_correlation_finding(
         self, requests: list[dict[str, Any]], tcid: str, artifact_path: str
