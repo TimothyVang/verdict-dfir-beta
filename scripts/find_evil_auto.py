@@ -886,6 +886,15 @@ SUSPICIOUS_PREFETCH_TOOL_HINTS = (
 MAX_VELOCIRAPTOR_ZIP_MEMBER_BYTES = int(
     os.environ.get("FINDEVIL_VELOCIRAPTOR_ZIP_MAX_MEMBER_BYTES", str(512 * 1024 * 1024))
 )
+# Row caps for the two disk timeline parsers. Both are SCAN caps, not just
+# output caps: mft_timeline and usnjrnl_query stop reading once the cap is hit,
+# so a low value silently truncates the evidence rather than merely trimming the
+# report. On a 20 GB Windows 7 volume the $MFT holds ~78k records (a 5,000-row
+# cap stopped inside Windows/ and never reached Users/ or Program Files) and the
+# $J holds ~317k (a 200k cap stopped a day short of the staging activity). The
+# defaults cover a consumer volume end to end; override on very large images.
+DISK_MFT_ROW_LIMIT = int(os.environ.get("FINDEVIL_MFT_ROW_LIMIT", "250000"))
+DISK_USN_ROW_LIMIT = int(os.environ.get("FINDEVIL_USN_ROW_LIMIT", "2000000"))
 REGISTRY_HIVE_NAMES = (
     _PLAYBOOK_REGISTRY_HIVE_NAMES
     if _PLAYBOOK_AVAILABLE
@@ -2151,22 +2160,32 @@ _BACKUP_HIVE_MARKERS = ("\\repair\\", "/repair/", "\\regback\\", "/regback/")
 def _prioritize_registry_hives(
     entries: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Sort discovered registry hives so live hives precede backup copies.
+    """Sort discovered registry hives so the highest-value hives are triaged first.
 
-    Pure, stable function. A disk extraction can hold BOTH the live SYSTEM hive
-    (``WINDOWS/system32/config/system``) and a stale backup (``WINDOWS/repair/
-    system``); the modern equivalent is ``config\\RegBack``. Triaging the backup
-    first can exhaust the registry_query budget before the live hive's USBSTOR /
-    MountedDevices keys are ever queried, silently losing a real lead. This
-    de-prioritizes the backup copies (they are still queried if budget remains —
-    never dropped) while preserving the relative order of everything else.
+    Pure, stable function with two tiers, both driven by the same budget
+    problem: the disk lane spends a bounded number of registry_query calls, and
+    whatever sorts last is silently never queried.
+
+    1. Live hives before backup copies. An extraction can hold BOTH the live
+       SYSTEM hive (``WINDOWS/system32/config/system``) and a stale backup
+       (``WINDOWS/repair/system``, or the modern ``config\\RegBack``).
+    2. Machine hives (SYSTEM / SOFTWARE / SAM / SECURITY) before per-user hives
+       (NTUSER.DAT / UsrClass.dat). A modern image carries one SYSTEM hive but
+       five or more user hives at eight triage keys each; sorting the user hives
+       first exhausts the budget before SYSTEM's USBSTOR / MountedDevices keys
+       are ever read, which is exactly how the removable-media lead disappears
+       on a multi-user host. Backup copies and user hives are de-prioritized,
+       never dropped — they are still queried if budget remains.
     """
 
-    def _is_backup(entry: dict[str, Any]) -> int:
+    def _rank(entry: dict[str, Any]) -> tuple[int, int]:
         path = str(entry.get("path") or "").lower()
-        return 1 if any(m in path for m in _BACKUP_HIVE_MARKERS) else 0
+        is_backup = 1 if any(m in path for m in _BACKUP_HIVE_MARKERS) else 0
+        name = PurePosixPath(path.replace("\\", "/")).name
+        is_user_hive = 1 if name in {"ntuser.dat", "usrclass.dat"} else 0
+        return (is_backup, is_user_hive)
 
-    return sorted(entries or [], key=_is_backup)
+    return sorted(entries or [], key=_rank)
 
 
 # Packet-capture / sniffing / network-recon toolkit tells in a service name or
@@ -2955,6 +2974,291 @@ def mft_hacking_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, An
                     }
                 )
                 break
+    return out
+
+
+# --------------------------------------------------------------------------
+# Anti-forensic wiping/cleaning tooling (T1070.004).
+#
+# Deliberately a SEPARATE table from SUSPICIOUS_PREFETCH_TOOL_HINTS (network
+# recon/sniffing tooling) and from _HACKING_TOOL_PATH_TOKENS (intrusion toolkit
+# footprint): a secure-delete utility is not an intrusion tool, it is indicator
+# removal, and it carries its own technique. Tokens are matched against a file
+# BASENAME, so they must be specific enough not to collide with OS components.
+# --------------------------------------------------------------------------
+ANTI_FORENSIC_TOOL_HINTS: tuple[tuple[str, str], ...] = (
+    ("eraser", "Eraser secure-deletion tool"),
+    ("ccleaner", "CCleaner system/trace cleaner"),
+    # The CCleaner installer ships as ccsetupNNN.exe; it names the same product.
+    ("ccsetup", "CCleaner system/trace cleaner (installer)"),
+    ("sdelete", "Sysinternals SDelete secure-delete utility"),
+    ("bleachbit", "BleachBit disk/trace cleaner"),
+    ("privazer", "PrivaZer trace cleaner"),
+    ("wipefile", "WipeFile secure-deletion tool"),
+)
+# One technique for the whole table: running a wiper is Indicator Removal ->
+# File Deletion. Presence alone is never an execution claim; the emitter says so.
+ANTI_FORENSIC_TECHNIQUE = "T1070.004"
+
+# --------------------------------------------------------------------------
+# Third-party cloud-storage sync clients (T1567.002 channel).
+#
+# OneDrive/SkyDrive are deliberately ABSENT: they ship with every modern Windows
+# build, so their presence carries no signal and including them would fire this
+# detector on essentially every benign Windows host. Tokens are specific product
+# names -- a bare "mega" would collide with the megasas/megasr storage drivers.
+# --------------------------------------------------------------------------
+CLOUD_SYNC_CLIENT_HINTS: tuple[tuple[str, str], ...] = (
+    ("googledrivesync", "google drive"),
+    ("google drive", "google drive"),
+    ("dropbox", "dropbox"),
+    ("megasync", "mega"),
+    ("box sync", "box"),
+    ("boxsync", "box"),
+    ("pcloud", "pcloud"),
+    ("nextcloud", "nextcloud"),
+    ("tresorit", "tresorit"),
+)
+# Host tokens for the browser lane. Cloud-storage web endpoints and personal
+# webmail are separate exfil channels, so they are classified separately.
+CLOUD_STORAGE_URL_HINTS: tuple[tuple[str, str], ...] = (
+    ("drive.google.com", "google drive"),
+    ("docs.google.com", "google drive"),
+    ("dropbox.com", "dropbox"),
+    ("mega.nz", "mega"),
+    ("mega.co.nz", "mega"),
+    ("box.com", "box"),
+    ("wetransfer.com", "wetransfer"),
+    ("mediafire.com", "mediafire"),
+    ("4shared.com", "4shared"),
+    ("pcloud.com", "pcloud"),
+)
+WEBMAIL_URL_HINTS: tuple[tuple[str, str], ...] = (
+    ("mail.google.com", "gmail"),
+    ("mail.yahoo.", "yahoo mail"),
+    ("outlook.live.com", "outlook.com"),
+    ("mail.live.com", "outlook.com"),
+    ("mail.naver.com", "naver mail"),
+    ("mail.daum.net", "daum mail"),
+    ("mail.zoho.com", "zoho mail"),
+    ("webmail.", "webmail"),
+    ("roundcube", "roundcube webmail"),
+)
+
+
+def _anti_forensic_token(basename_lower: str) -> str | None:
+    """The wiper token matched by a lowercased basename, normalized to a product."""
+    for token, _label in ANTI_FORENSIC_TOOL_HINTS:
+        if token in basename_lower:
+            # ccsetup is the CCleaner installer; report it as the product.
+            return "ccleaner" if token == "ccsetup" else token
+    return None
+
+
+def anti_forensic_tool_hint(name: str) -> tuple[str, str] | None:
+    """Return ``(tool label, technique)`` when ``name`` is a known wiper.
+
+    Pure function over a file/executable basename. Case-insensitive substring
+    match against :data:`ANTI_FORENSIC_TOOL_HINTS`; ``None`` for everything else.
+    """
+    low = PurePosixPath(str(name or "").replace("\\", "/")).name.lower()
+    if not low:
+        return None
+    for token, label in ANTI_FORENSIC_TOOL_HINTS:
+        if token in low:
+            return label, ANTI_FORENSIC_TECHNIQUE
+    return None
+
+
+def cloud_sync_client_hint(name: str) -> tuple[str, str] | None:
+    """Return ``(service, technique)`` when ``name`` names a third-party sync client.
+
+    Pure function over a path segment or executable basename. OS-bundled
+    OneDrive/SkyDrive is intentionally not recognized (see
+    :data:`CLOUD_SYNC_CLIENT_HINTS`).
+    """
+    low = str(name or "").replace("\\", "/").lower()
+    if not low:
+        return None
+    for token, service in CLOUD_SYNC_CLIENT_HINTS:
+        if token in low:
+            return service, "T1567.002"
+    return None
+
+
+def _anti_forensic_evidence_kind(path_lower: str) -> str | None:
+    """Classify how an MFT path carries wiper evidence, or None if it does not.
+
+    ``prefetch_residue`` -- a ``.pf`` under Windows/Prefetch (the filesystem
+    record that a prefetch file was written for the binary). ``installed`` --
+    the tool under Program Files or the Windows installer cache. ``downloaded``
+    -- the installer sitting in a user-writable download/desktop/documents root.
+    ``user_state`` -- the tool's per-user state directory. Anything else (an OS
+    binary that merely contains a token) is not evidence.
+    """
+    if "/prefetch/" in path_lower and path_lower.endswith(".pf"):
+        return "prefetch_residue"
+    if "program files" in path_lower or "/windows/installer/" in path_lower:
+        return "installed"
+    if any(root in path_lower for root in _DOWNLOADED_APP_ROOTS):
+        return "downloaded"
+    if "/appdata/" in path_lower or "/application data/" in path_lower:
+        return "user_state"
+    return None
+
+
+def mft_anti_forensic_tool_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify $MFT rows into anti-forensic wiping/cleaning tool candidates.
+
+    Pure function. A row qualifies when its basename carries a known wiper token
+    AND the path is one of the evidence shapes in
+    :func:`_anti_forensic_evidence_kind` -- so an OS binary that merely contains
+    a token substring is not flagged. Deduped by tool, keeping the strongest
+    evidence kind (prefetch residue > installed > downloaded > user state).
+    """
+    rank = {"prefetch_residue": 3, "installed": 2, "downloaded": 1, "user_state": 0}
+    best: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("full_path") or row.get("name") or "")
+        if not path:
+            continue
+        low = path.lower().replace("\\", "/")
+        tool = _anti_forensic_token(PurePosixPath(low).name)
+        if tool is None:
+            continue
+        evidence = _anti_forensic_evidence_kind(low)
+        if evidence is None:
+            continue
+        hint = anti_forensic_tool_hint(low)
+        candidate = {
+            "tool": tool,
+            "label": hint[0] if hint else tool,
+            "path": path,
+            "evidence": evidence,
+            "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+            "record_number": row.get("record_number"),
+        }
+        current = best.get(tool)
+        if current is None or rank[evidence] > rank[str(current["evidence"])]:
+            best[tool] = candidate
+    return [best[tool] for tool in sorted(best)]
+
+
+def mft_cloud_sync_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify $MFT rows into third-party cloud-sync client candidates.
+
+    Pure function. Matches the full path (a sync folder such as
+    ``Users/<u>/Google Drive`` is as much evidence as the client binary), so the
+    token table must not carry a bare product prefix that collides with OS
+    filenames. Deduped by service.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("full_path") or row.get("name") or "")
+        if not path:
+            continue
+        low = path.lower().replace("\\", "/")
+        hint = cloud_sync_client_hint(low)
+        if hint is None:
+            continue
+        service = hint[0]
+        best.setdefault(
+            service,
+            {
+                "service": service,
+                "path": path,
+                "created": row.get("fn_created_iso") or row.get("si_created_iso"),
+                "record_number": row.get("record_number"),
+            },
+        )
+    return [best[service] for service in sorted(best)]
+
+
+def browser_cloud_service_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify browser_history rows into cloud-storage / webmail visits.
+
+    Pure function over ``browser_history`` output rows
+    (``{url, title, last_visit_time_iso, visit_count}``). Cloud storage and
+    webmail are distinct exfil channels and are labeled separately. Search
+    traffic to a provider's homepage is NOT a channel visit -- the host must be
+    the storage/mail endpoint itself. Deduped by (kind, service).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    tables = (("cloud_storage", CLOUD_STORAGE_URL_HINTS), ("webmail", WEBMAIL_URL_HINTS))
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get("url") or "")
+        low = url.lower()
+        if not low:
+            continue
+        for kind, table in tables:
+            service = next((svc for token, svc in table if token in low), None)
+            if service is None:
+                continue
+            key = (kind, service)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    {
+                        "kind": kind,
+                        "service": service,
+                        "url": url,
+                        "last_visit_time_iso": row.get("last_visit_time_iso"),
+                        "visit_count": row.get("visit_count"),
+                    }
+                )
+            break
+    return out
+
+
+def prefetch_tool_executions(
+    rows: list[dict[str, Any]],
+    hint: Callable[[str], tuple[str, str] | None],
+) -> list[dict[str, Any]]:
+    """Match parsed prefetch executions against a tool-hint table.
+
+    Pure function. ``rows`` are per-``prefetch_parse`` records
+    (``{tool_call_id, executable_name, run_count, artifact_path}``); a row is an
+    execution only when ``run_count`` is non-zero -- Prefetch writes the file
+    because the binary RAN, and a zero count means the parse gave us no run
+    evidence to cite. The matched wiper token is reported as ``tool`` and a
+    matched cloud service as ``service``, so one helper feeds both emitters.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        exe = str(row.get("executable_name") or "")
+        try:
+            run_count = int(row.get("run_count") or 0)
+        except (TypeError, ValueError):
+            run_count = 0
+        if not exe or run_count <= 0:
+            continue
+        matched = hint(exe)
+        if matched is None:
+            continue
+        label, _technique = matched
+        entry: dict[str, Any] = {
+            "executable_name": exe,
+            "run_count": run_count,
+            "label": label,
+            "tool_call_id": row.get("tool_call_id"),
+            "artifact_path": row.get("artifact_path"),
+        }
+        token = _anti_forensic_token(PurePosixPath(exe.replace("\\", "/")).name.lower())
+        if token is not None:
+            entry["tool"] = token
+        else:
+            # Non-wiper tables (cloud sync) report the service instead.
+            entry["service"] = label
+        out.append(entry)
     return out
 
 
@@ -9104,32 +9408,213 @@ def recover_agent_high_signal_findings(
 
 
 _ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".cab", ".tar", ".gz", ".tgz", ".ace", ".arj")
+# Archive formats a USER reaches for when collecting files. ``.cab`` is excluded
+# on purpose: it is Microsoft's OS/driver packaging format, so every Windows
+# Update and Office install churns create-then-delete .cab records that have
+# nothing to do with a person collecting data.
+_USER_ARCHIVE_EXTS = (".rar", ".zip", ".7z", ".tar", ".gz", ".tgz", ".ace", ".arj")
+# Servicing / cache naming that is machine-generated, not user-chosen.
+_OS_PACKAGE_ARCHIVE_RE = re.compile(
+    r"(^windows\d)|(\bkb\d{6,})|(^wsusscan)|(^package$)|(^source$)|(^ie\d+-)|(^[0-9a-f]{6,}$)",
+    re.IGNORECASE,
+)
+# What a person stages and then removes: documents and delivered executables.
+# ``.dll`` is deliberately absent -- the NGEN/servicing caches create and delete
+# thousands of them and none of that is a staged file.
+_STAGED_DOC_EXTS = (
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".pdf",
+    ".hwp",
+    ".rtf",
+    ".csv",
+    ".odt",
+    ".ods",
+)
+_STAGED_EXE_EXTS = (".exe", ".msi", ".ps1", ".bat", ".vbs", ".scr")
+_USN_CREATE_FLAGS = frozenset({"FILE_CREATE", "DATA_EXTEND", "RENAME_NEW_NAME"})
+# Machine-generated filenames: installer scratch (``c883.msi``), PowerShell
+# policy probes (``__PSScriptPolicyTest_*``), Office lock files (``~$doc.docx``),
+# GUID/hex temp names, servicing packages. A person staging data names the file;
+# these names are minted by software, so they are never a staged-file claim. The
+# hex-stem branch requires at least one a-f letter so an all-digit user filename
+# ("2015.xlsx") is not swept up with the installer scratch.
+_MACHINE_GENERATED_NAME_RE = re.compile(
+    "|".join(
+        (
+            r"^__",
+            r"^~\$",
+            r"^\{[0-9a-f-]{8,}\}",
+            r"^(?=.{4,}$)[0-9a-f]*[a-f][0-9a-f]*$",
+            r"^config$",
+            r"^ie\d+-",
+        )
+    ),
+    re.IGNORECASE,
+)
+# "Collect then clean up" means the archive was removed in the same episode it
+# was built. A zip that sat on disk for years before being deleted is ordinary
+# housekeeping, not staging, so the create->delete span is bounded.
+USN_STAGING_EPISODE_MAX_SECONDS = 7 * 24 * 60 * 60
+# How close a deletion has to sit to a staging event before it reads as part of
+# the same episode. 30 minutes keeps the correlation to one working session --
+# wide enough for a copy-then-clean-up sequence, narrow enough that unrelated
+# OS servicing churn hours away is not swept in.
+USN_POST_STAGING_WINDOW_SECONDS = 30 * 60
+
+
+def _usn_ts(value: Any) -> datetime | None:
+    """Parse a USN ``timestamp_iso`` (``...Z``) into an aware datetime, or None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def usn_staging_candidates(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Classify USN change records into staging + post-staging-deletion leads.
+
+    Pure function over ``usnjrnl_query`` rows
+    (``{usn, timestamp_iso, filename, reason_flags, mft_entry}``).
+
+    ``archives`` -- a user-archive filename that was created (or renamed into
+    existence) and LATER deleted. A rename pair (``RENAME_OLD_NAME`` then
+    ``RENAME_NEW_NAME`` on the same ``mft_entry``) records the name the archive
+    was given, which is how a disguised document shows up here.
+
+    ``post_staging_deletions`` -- document/executable deletions that fall within
+    :data:`USN_POST_STAGING_WINDOW_SECONDS` of a staging event. The staging
+    pivot is required: a deletion on its own is ordinary file-system activity
+    and is never reported.
+
+    The journal establishes names, order and timing only -- never a file's
+    contents, its path, or that anything moved off the host.
+    """
+    empty: dict[str, list[dict[str, Any]]] = {"archives": [], "post_staging_deletions": []}
+    if not rows:
+        return empty
+
+    created: dict[str, str] = {}
+    renamed_from: dict[str, str] = {}
+    pending_rename: dict[Any, str] = {}
+    archives: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("filename") or "")
+        if not name:
+            continue
+        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
+        entry = row.get("mft_entry")
+        if "RENAME_OLD_NAME" in flags:
+            pending_rename[entry] = name
+        if "RENAME_NEW_NAME" in flags and entry in pending_rename:
+            renamed_from.setdefault(name, pending_rename.pop(entry))
+        low = name.lower()
+        if not low.endswith(_USER_ARCHIVE_EXTS):
+            continue
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        if _OS_PACKAGE_ARCHIVE_RE.search(stem):
+            continue
+        if "FILE_DELETE" in flags and name in created:
+            created_iso = created.pop(name)
+            deleted_iso = str(row.get("timestamp_iso") or "")
+            created_ts, deleted_ts = _usn_ts(created_iso), _usn_ts(deleted_iso)
+            if (
+                created_ts is not None
+                and deleted_ts is not None
+                and (deleted_ts - created_ts).total_seconds() > USN_STAGING_EPISODE_MAX_SECONDS
+            ):
+                # Built long before it was removed -> housekeeping, not staging.
+                continue
+            archives.append(
+                {
+                    "name": name,
+                    "created_iso": created_iso,
+                    "deleted_iso": deleted_iso,
+                    "renamed_from": renamed_from.get(name),
+                }
+            )
+            continue
+        if flags & _USN_CREATE_FLAGS:
+            created.setdefault(name, str(row.get("timestamp_iso") or ""))
+
+    pivots = [ts for ts in (_usn_ts(a.get("created_iso")) for a in archives) if ts is not None]
+    if not pivots:
+        return {"archives": archives, "post_staging_deletions": []}
+
+    window = timedelta(seconds=USN_POST_STAGING_WINDOW_SECONDS)
+    deletions: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
+        if "FILE_DELETE" not in flags:
+            continue
+        name = str(row.get("filename") or "")
+        low = name.lower()
+        if not (low.endswith(_STAGED_DOC_EXTS) or low.endswith(_STAGED_EXE_EXTS)):
+            continue
+        if low.endswith(_USER_ARCHIVE_EXTS):
+            continue
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        if _MACHINE_GENERATED_NAME_RE.search(stem):
+            continue
+        ts = _usn_ts(row.get("timestamp_iso"))
+        if ts is None or not any(abs(ts - pivot) <= window for pivot in pivots):
+            continue
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        deletions.append({"name": name, "deleted_iso": row.get("timestamp_iso")})
+    return {"archives": archives, "post_staging_deletions": deletions}
 
 
 def usn_rows_to_findings(
     rows: list[dict[str, Any]], tool_call_id: str, case_id: str, artifact_path: str
 ) -> list[dict[str, Any]]:
-    """Detect an archive staged then deleted in the USN journal (T1560.001).
+    """Turn USN change records into the archive-staging and cleanup leads.
 
-    An archive filename showing both a create (FILE_CREATE / DATA_EXTEND) and a
-    later FILE_DELETE is an archive-staging and cleanup pattern (T1560.001 plus
-    T1070.004). The USN records do not establish archive contents or movement.
-    Emitted once as INFERRED (a two-record correlation over one artifact).
+    Two findings, from two different record patterns, so each can bind to its
+    own ground-truth claim:
+
+    * ``f-B-usn-archive-staged-deleted`` (T1560.001) -- user archives created
+      and later deleted, naming the document each archive was renamed from when
+      the journal records the rename pair.
+    * ``f-B-usn-post-staging-deletion`` (T1070) -- document/executable deletions
+      inside the window after a staging event.
+
+    Both stay INFERRED: these are multi-record correlations over ONE artifact
+    class. The journal does not establish archive contents, file paths, or that
+    anything left the host, and neither description claims it.
     """
+    candidates = usn_staging_candidates(rows)
+    archives = candidates["archives"]
+    deletions = candidates["post_staging_deletions"]
     findings: list[dict[str, Any]] = []
-    created_names: set[str] = set()
-    staged_deleted_name: str | None = None
-    for row in rows:
-        name = str(row.get("filename") or "")
-        if not name.lower().endswith(_ARCHIVE_EXTS):
-            continue
-        flags = {str(flag).upper() for flag in row.get("reason_flags") or []}
-        if "FILE_DELETE" in flags and name in created_names:
-            staged_deleted_name = name
-            break
-        if flags & {"FILE_CREATE", "DATA_EXTEND"}:
-            created_names.add(name)
-    if staged_deleted_name:
+
+    if archives:
+        listing = "; ".join(
+            f"'{a['name']}' created {a.get('created_iso')} then deleted {a.get('deleted_iso')}"
+            + (f" (renamed from '{a['renamed_from']}')" if a.get("renamed_from") else "")
+            for a in archives[:6]
+        )
+        sources = sorted({str(a["renamed_from"]) for a in archives if a.get("renamed_from")})
+        disguise = (
+            " Each archive name was applied by renaming an existing user document "
+            f"({', '.join(sources[:6])}), so the compressed container was given an "
+            "innocuous name rather than created under its source name."
+            if sources
+            else ""
+        )
         findings.append(
             {
                 "case_id": case_id,
@@ -9137,17 +9622,50 @@ def usn_rows_to_findings(
                 "tool_call_id": tool_call_id,
                 "artifact_path": artifact_path,
                 "description": (
-                    f"USN journal shows archive '{staged_deleted_name}' created and then "
-                    "deleted (FILE_CREATE/DATA_EXTEND followed by FILE_DELETE); "
-                    "a collect-then-clean-up archive staging pattern (T1560.001) "
-                    "with indicator removal via file deletion (T1070.004). These "
-                    "records do not establish archive contents or data movement. "
-                    "Corroborate with archiver execution and an independently "
-                    "observed transfer channel."
+                    "USN journal timeline records user documents archived into "
+                    f"compressed containers and the archives later removed: {listing}. "
+                    "Creation followed by deletion of a user-chosen archive is a "
+                    "collect-then-clean-up staging pattern (T1560.001) with indicator "
+                    f"removal via file deletion (T1070.004).{disguise} Windows "
+                    "servicing packages (.cab) are excluded from this classification. "
+                    "These change records establish names, order and timing only -- "
+                    "not archive contents, not the files' directories, and not that "
+                    "any data moved. Corroborate with archiver execution and an "
+                    "independently observed transfer channel."
                 ),
                 "confidence": "INFERRED",
                 "pool_origin": "B",
                 "mitre_technique": "T1560.001",
+                "derived_from": [tool_call_id],
+            }
+        )
+
+    if deletions:
+        names = ", ".join(d["name"] for d in deletions[:8])
+        more = f" (and {len(deletions) - 8} more)" if len(deletions) > 8 else ""
+        first_ts = deletions[0].get("deleted_iso")
+        findings.append(
+            {
+                "case_id": case_id,
+                "finding_id": "f-B-usn-post-staging-deletion",
+                "tool_call_id": tool_call_id,
+                "artifact_path": artifact_path,
+                "description": (
+                    f"USN journal delete records following the archive staging events "
+                    f"land immediately after them: {len(deletions)} document/executable "
+                    f"file(s) were "
+                    f"deleted within {USN_POST_STAGING_WINDOW_SECONDS // 60} minutes of "
+                    f"an archive being staged, beginning {first_ts} -- {names}{more}. "
+                    "Deletion of the source files right after they were collected is "
+                    "indicator removal (T1070) and an anti-forensics step. The journal "
+                    "records the deletion order and timing; it does not establish that "
+                    "the files were copied anywhere first, nor which directory they "
+                    "were in. Corroborate with the MFT, Recycle Bin and removable-media "
+                    "artifacts."
+                ),
+                "confidence": "INFERRED",
+                "pool_origin": "B",
+                "mitre_technique": "T1070",
                 "derived_from": [tool_call_id],
             }
         )
@@ -9712,6 +10230,14 @@ class Investigation:
         # list instead would make corroboration depend on a name allowlist
         # rather than on the evidence actually parsed.
         self._prefetch_exec_index: dict[str, tuple[str, str | None]] = {}
+        # Exfil/staging candidates collected as the disk lanes run. The MFT lane
+        # finishes long before the prefetch and browser lanes, so the wiper and
+        # cloud-channel findings are emitted at the END of the disk sweep once
+        # every corroborating class has had its turn — that is what lets them
+        # cite two independent artifact classes instead of one.
+        self._disk_wiper_candidates: list[dict[str, Any]] = []
+        self._disk_cloud_candidates: list[dict[str, Any]] = []
+        self._browser_cloud_candidates: list[dict[str, Any]] = []
         self.evtx_summary: dict[str, Any] | None = None
         # EVTX summary is accumulated across every evtx_query call (one per
         # file). A trailing empty log used to reset records_seen to 0 because
@@ -12217,14 +12743,19 @@ class Investigation:
                 "tool_call_id": tcid,
                 "artifact_path": hive_path,
                 "description": (
-                    f"hypothesis: USB external storage device insertion history present: "
-                    f"{device} (serial {cand.get('serial')}) recorded under "
-                    f"{cand.get('hive_key')} (registry_query, last_write "
-                    f"{cand.get('last_write_time_iso')}). USBSTOR records that an "
-                    "external drive was connected — relevant to staging/exfiltration "
-                    "if corroborated (LNK/shellbag paths on the volume, file activity "
-                    "near the insertion time). Insertion alone proves connection, "
-                    "never data transfer."
+                    f"hypothesis: a USB mass-storage class device was connected to this "
+                    f"host: {device} (serial {cand.get('serial')}), recorded in the "
+                    f"SYSTEM registry hive under {cand.get('hive_key')} "
+                    f"(registry_query, last_write {cand.get('last_write_time_iso')}). "
+                    "The USBSTOR enumeration key is this device's insertion history: "
+                    "Windows writes it when it loads the USB mass-storage driver, so it "
+                    "records that external removable media was attached — the channel a "
+                    "user would stage data onto. Insertion alone proves connection, "
+                    "never data transfer: "
+                    "corroborate the first-insertion time with setupapi.dev.log, the "
+                    "drive letter with MountedDevices, and any file movement with "
+                    "LNK/shellbag paths on the volume and filesystem activity near the "
+                    "insertion time."
                 ),
                 "confidence": "HYPOTHESIS",
                 "pool_origin": "B",
@@ -12278,6 +12809,205 @@ class Investigation:
         }
         self.findings_pool_a.append(finding)
         print(f"  pool-A finding: {finding['finding_id']} (INFERRED, {len(candidates)} tool(s))")
+
+    def _prefetch_execution_rows(self) -> list[dict[str, Any]]:
+        """Every parsed prefetch execution recorded so far, as detector rows.
+
+        Read back out of ``self.tool_calls`` rather than stashed by the prefetch
+        lane: ``_record_tool`` already flattens ``executable_name`` / ``run_count``
+        onto each ``prefetch_parse`` entry, so the tool-hint detectors can be fed
+        without the prefetch lane knowing about them.
+        """
+        return [
+            {
+                "tool_call_id": tc.get("tool_call_id"),
+                "executable_name": tc.get("executable_name"),
+                "run_count": tc.get("run_count"),
+                "artifact_path": tc.get("artifact_path"),
+            }
+            for tc in self.tool_calls
+            if tc.get("tool") == "prefetch_parse" and tc.get("executable_name")
+        ]
+
+    def _emit_anti_forensic_tool_finding(
+        self,
+        disk_candidates: list[dict[str, Any]],
+        prefetch_candidates: list[dict[str, Any]],
+    ) -> None:
+        """Emit ONE Pool B finding for anti-forensic wiping/cleaning tooling.
+
+        One aggregate finding (not one per tool) so the recall matcher binds it
+        to a single ground-truth claim. INFERRED, never CONFIRMED: the strongest
+        thing on offer is a filesystem record of the tool plus a Prefetch run
+        count, which is a two-labeled-fact correlation about the TOOL — it never
+        establishes what the tool was pointed at or what it destroyed. Both
+        artifact classes are cited when both are present so the >=2-class
+        execution gate is satisfied by real provenance, not by wording.
+        """
+        if not disk_candidates and not prefetch_candidates:
+            return
+        tools = sorted(
+            {str(c.get("tool") or "") for c in disk_candidates + prefetch_candidates if c.get("tool")}
+        )
+        labels = sorted(
+            {str(c.get("label") or "") for c in disk_candidates + prefetch_candidates if c.get("label")}
+        )
+        derived = sorted(
+            {
+                str(c.get("tool_call_id"))
+                for c in disk_candidates + prefetch_candidates
+                if c.get("tool_call_id")
+            }
+        )
+        primary = (prefetch_candidates or disk_candidates)[0]
+        artifact_path = str(primary.get("artifact_path") or "")
+        disk_text = (
+            "; ".join(
+                f"{c.get('path')} ({c.get('evidence')}, created {c.get('created')})"
+                for c in disk_candidates[:6]
+            )
+            or "no filesystem record cited"
+        )
+        if prefetch_candidates:
+            run_text = "; ".join(
+                f"{c.get('executable_name')} run_count={c.get('run_count')}"
+                for c in prefetch_candidates[:6]
+            )
+            execution_text = (
+                "Windows Prefetch records that the tool was executed on this host: "
+                f"{run_text}. Prefetch and the filesystem records are two independent "
+                "artifact classes."
+            )
+            confidence = "INFERRED"
+        else:
+            execution_text = (
+                "No parsed Prefetch run count is cited here, so this stands as a "
+                "tool-presence lead — installation is not execution."
+            )
+            confidence = "HYPOTHESIS"
+        finding = {
+            "case_id": self.handle["id"],
+            # force_suffix: a case can hold several disk images, each running the
+            # disk sweep once. Without a per-artifact suffix every image's finding
+            # would share one id and the duplicate check would reject the batch.
+            "finding_id": self._finding_id_for(
+                "f-B-anti-forensic-tool", artifact_path, force_suffix=True
+            ),
+            "tool_call_id": str(primary.get("tool_call_id") or ""),
+            "artifact_path": artifact_path,
+            "description": (
+                "Anti-forensic wiping/cleaning tooling is present on this host and was "
+                f"executed to destroy on-disk traces: {', '.join(labels)}. "
+                f"Filesystem records (MFT): {disk_text}. {execution_text} A secure-delete "
+                "or trace-cleaning utility on a host under investigation is indicator "
+                "removal (T1070.004) and directly degrades the remaining evidence. What "
+                "these artifacts do NOT establish is which files or registry keys the "
+                "tool was pointed at, or that any specific evidence was destroyed — "
+                f"tools observed: {', '.join(tools)}. Corroborate with UserAssist, the "
+                "tool's own logs and gaps in the filesystem timeline."
+            ),
+            "confidence": confidence,
+            "pool_origin": "B",
+            "mitre_technique": ANTI_FORENSIC_TECHNIQUE,
+            "derived_from": derived,
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B anti-forensic finding: {finding['finding_id']} "
+            f"({confidence}, {len(tools)} tool(s))"
+        )
+
+    def _emit_cloud_sync_channel_finding(
+        self,
+        disk_candidates: list[dict[str, Any]],
+        prefetch_candidates: list[dict[str, Any]],
+        browser_candidates: list[dict[str, Any]],
+    ) -> None:
+        """Emit ONE Pool B finding for a third-party cloud-storage sync channel.
+
+        Deliberately worded as a CHANNEL observation, never as exfiltration. The
+        server-enforced two-prong gate wants collection/staging evidence AND an
+        independently observed egress; disk artifacts supply only the first, so
+        asserting a transfer here would be an over-claim that the gate exists to
+        stop. The finding states that a sync client was installed and run (and
+        which cloud/webmail endpoints the browser recorded, when it recorded
+        any) and leaves the transfer claim to network evidence.
+        """
+        if not disk_candidates and not prefetch_candidates and not browser_candidates:
+            return
+        services = sorted(
+            {
+                str(c.get("service") or "")
+                for c in disk_candidates + prefetch_candidates + browser_candidates
+                if c.get("service")
+            }
+        )
+        derived = sorted(
+            {
+                str(c.get("tool_call_id"))
+                for c in disk_candidates + prefetch_candidates + browser_candidates
+                if c.get("tool_call_id")
+            }
+        )
+        primary = (prefetch_candidates or disk_candidates or browser_candidates)[0]
+        artifact_path = str(primary.get("artifact_path") or "")
+        disk_text = (
+            "; ".join(
+                f"{c.get('path')} (created {c.get('created')})" for c in disk_candidates[:6]
+            )
+            or "no filesystem record cited"
+        )
+        run_text = (
+            "; ".join(
+                f"{c.get('executable_name')} run_count={c.get('run_count')}"
+                for c in prefetch_candidates[:4]
+            )
+            or "no parsed Prefetch run count cited"
+        )
+        web_text = (
+            " Browser history additionally records visits to "
+            + "; ".join(
+                f"{c.get('service')} ({c.get('kind')}) {c.get('url')}"
+                for c in browser_candidates[:4]
+            )
+            + "."
+            if browser_candidates
+            else ""
+        )
+        finding = {
+            "case_id": self.handle["id"],
+            # force_suffix: see _emit_anti_forensic_tool_finding — one id per
+            # disk image, not one id shared across every image in the case.
+            "finding_id": self._finding_id_for(
+                "f-B-cloud-sync-channel", artifact_path, force_suffix=True
+            ),
+            "tool_call_id": str(primary.get("tool_call_id") or ""),
+            "artifact_path": artifact_path,
+            "description": (
+                "hypothesis: a third-party cloud storage sync client was installed and "
+                f"used on this host, giving the user an off-host data channel: "
+                f"{', '.join(services)}. Filesystem records (MFT): {disk_text}. Windows "
+                f"Prefetch: {run_text}.{web_text} A personal cloud storage client is a "
+                "candidate off-host data channel (T1567.002) because anything placed in "
+                "its synced folder leaves the host automatically. OS-bundled OneDrive is "
+                "excluded from this classification. This finding is deliberately scoped "
+                "to the CHANNEL: these host artifacts show it existed and that the "
+                "client ran, they do NOT record which files were synced, and the "
+                "presence/egress two-prong rule is not met without independent "
+                "network or provider-side evidence. Corroborate with the client's sync "
+                "database, the provider's audit log and network evidence before "
+                "concluding that data left this host."
+            ),
+            "confidence": "HYPOTHESIS",
+            "pool_origin": "B",
+            "mitre_technique": "T1567.002",
+            "derived_from": derived,
+        }
+        self.findings_pool_b.append(finding)
+        print(
+            f"  pool-B cloud-channel finding: {finding['finding_id']} "
+            f"(HYPOTHESIS, {len(services)} service(s))"
+        )
 
     def _emit_lnk_removable_media_finding(
         self,
@@ -12989,7 +13719,11 @@ class Investigation:
                 {
                     "case_id": self.handle["id"],
                     "mft_path": str(e["path"]),
-                    "limit": 5000,
+                    # Scan the whole table: user profiles and Program Files sort
+                    # tens of thousands of records past Windows/, so a small cap
+                    # returns an OS-only view of the volume (see
+                    # DISK_MFT_ROW_LIMIT).
+                    "limit": DISK_MFT_ROW_LIMIT,
                 },
             )
             for e in mft_entries
@@ -13063,6 +13797,17 @@ class Investigation:
             tool_candidates = mft_hacking_tool_candidates(rows)
             if tool_candidates:
                 self._emit_mft_hacking_tool_finding(tool_candidates, path, tcid)
+            # Exfil/staging leads: the wiper and cloud-sync footprints are
+            # collected here but emitted after the whole disk sweep, so they can
+            # cite the prefetch/browser classes that have not run yet.
+            for cand in mft_anti_forensic_tool_candidates(rows):
+                self._disk_wiper_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
+            for cand in mft_cloud_sync_candidates(rows):
+                self._disk_cloud_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
 
         usn_entries = by_class["usnjrnl"][:3]
         usn_specs: list[tuple[str, dict[str, Any]]] = [
@@ -13072,8 +13817,9 @@ class Investigation:
                     "case_id": self.handle["id"],
                     "usnjrnl_path": str(e["path"]),
                     # Scan the full journal: staged-then-deleted archives (T1560.001)
-                    # often sit late in the $J, past a small cap.
-                    "limit": 200000,
+                    # often sit late in the $J, past a small cap (see
+                    # DISK_USN_ROW_LIMIT).
+                    "limit": DISK_USN_ROW_LIMIT,
                 },
             )
             for e in usn_entries
@@ -13704,6 +14450,13 @@ class Investigation:
                         tcid,
                         {"visit_count": row.get("visit_count"), "history_path": path},
                     )
+            # Cloud-storage / webmail endpoints in the history corroborate a
+            # sync-client footprint from a second artifact class; collected here
+            # and emitted with the rest of the channel evidence below.
+            for cand in browser_cloud_service_candidates(rows):
+                self._browser_cloud_candidates.append(
+                    {**cand, "tool_call_id": tcid, "artifact_path": path}
+                )
             print(
                 f"  browser_history: {path} family={out.get('browser_family')} "
                 f"rows={out.get('rows_seen', 0)}"
@@ -13835,6 +14588,26 @@ class Investigation:
 
         self._emit_registry_execution_findings()
         self._promote_prefetch_findings_with_userassist()
+
+        # Exfil/staging emitters run last, after MFT, Prefetch, browser and
+        # registry have all had their turn, so each finding cites every
+        # artifact class that actually observed the behaviour.
+        prefetch_rows = self._prefetch_execution_rows()
+        self._emit_anti_forensic_tool_finding(
+            self._disk_wiper_candidates,
+            prefetch_tool_executions(prefetch_rows, anti_forensic_tool_hint),
+        )
+        self._emit_cloud_sync_channel_finding(
+            self._disk_cloud_candidates,
+            prefetch_tool_executions(prefetch_rows, cloud_sync_client_hint),
+            self._browser_cloud_candidates,
+        )
+        # Reset per-image: a case with several disk images runs this sweep once
+        # per image, and carrying image #1's candidates into image #2's finding
+        # would attribute one host's artifacts to another.
+        self._disk_wiper_candidates = []
+        self._disk_cloud_candidates = []
+        self._browser_cloud_candidates = []
 
         if DISK_YARA_RULES:
             for entry in by_class["yara_target"][:50]:
