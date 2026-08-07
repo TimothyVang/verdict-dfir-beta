@@ -10451,6 +10451,359 @@ def detect_console_activity(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Recovered-command detector (memory lane)
+# ---------------------------------------------------------------------------
+# detect_console_activity states that console artifacts are PRESENT. This
+# detector answers the narrower question a DFIR analyst actually cares about:
+# did volatility recover a COMMAND? Two genuine sources, both allow-listed
+# vol_run plugins:
+#
+#   * windows.consoles / windows.cmdscan — a CommandHistory row whose ``Data``
+#     column holds a command the operator typed into the console. Both plugins
+#     render the same TreeGrid columns (PID, Process, ConsoleInfo, Property,
+#     Address, Data).
+#   * windows.cmdline — an interpreter invoked WITH a command payload
+#     (``cmd.exe /c ...``, ``powershell -enc ...``). A bare
+#     ``"C:\\Windows\\system32\\cmd.exe"`` is an open shell, not a recovered
+#     command, and deliberately emits nothing.
+#
+# Tier discipline, pinned by services/agent/tests/test_memory_command_execution.py:
+#
+#   * A T1059* tag makes _claims_execution() true. The report-QA gate
+#     execution_requires_two_current_artifact_classes rejects a CONFIRMED or
+#     INFERRED execution claim whose classes are a subset of
+#     {memory, yara, evtx}, and _ablate_single_class_execution independently
+#     downgrades a single-class CONFIRMED execution claim. So a memory-only
+#     recovered command is emitted at HYPOTHESIS — a scoped lead — and cannot
+#     escalate the verdict. That is the engine's >=2-artifact-class law applied
+#     honestly, not a hedge.
+#   * The CONFIRMED tier additionally needs a TELL. Same reasoning as
+#     registry_persistence_candidates: compute_verdict treats any CONFIRMED
+#     finding as SUSPICIOUS, so an administrator typing ``dir`` must not flip a
+#     healthy host. Only a recovered command carrying a hostile tell
+#     (encoded/hidden PowerShell, shadow-copy destruction, log clearing,
+#     account manipulation, LOLBin download) reaches CONFIRMED, and only when a
+#     second, non-memory artifact class corroborates it.
+
+# Command interpreters whose recovered command payload is a T1059 sub-technique.
+# conhost.exe is deliberately absent: it is the console HOST, its command line
+# is always the bare conhost path, and it never carries a command payload.
+_INTERPRETER_TECHNIQUE: dict[str, str] = {
+    "cmd.exe": "T1059.003",
+    "powershell.exe": "T1059.001",
+    "pwsh.exe": "T1059.001",
+}
+
+# Switches that mean "everything after this is a command for the interpreter".
+# Anything else on the command line (window size, colour, working directory) is
+# shell configuration, not a command. PowerShell accepts unambiguous switch
+# prefixes, so the prefixes are enumerated rather than guessed at match time.
+_CMD_PAYLOAD_SWITCHES: tuple[str, ...] = ("/c", "/k", "/r")
+_PWSH_PAYLOAD_SWITCHES: tuple[str, ...] = (
+    "-c",
+    "-com",
+    "-comm",
+    "-comma",
+    "-comman",
+    "-command",
+    "-e",
+    "-ec",
+    "-en",
+    "-enc",
+    "-enco",
+    "-encod",
+    "-encode",
+    "-encoded",
+    "-encodedc",
+    "-encodedcommand",
+    "-f",
+    "-fi",
+    "-fil",
+    "-file",
+)
+_COMMAND_PAYLOAD_SWITCHES: dict[str, tuple[str, ...]] = {
+    "cmd.exe": _CMD_PAYLOAD_SWITCHES,
+    "powershell.exe": _PWSH_PAYLOAD_SWITCHES,
+    "pwsh.exe": _PWSH_PAYLOAD_SWITCHES,
+}
+
+# Vol3 renders an unreadable PEB as an Args string starting with this text.
+_UNREADABLE_ARGS_PREFIX = "required memory"
+
+# A windows.consoles / windows.cmdscan Property naming a typed command.
+_CONSOLE_COMMAND_PROPERTY = re.compile(r"CommandHistory_\d+_Command_\d+", re.IGNORECASE)
+
+# volatility3's refusal to build a conhost symbol table for an unsupported
+# Windows build. windows.consoles and windows.cmdscan share that code path, so
+# this error from one is proof the other cannot succeed on the same image.
+_CONHOST_UNSUPPORTED_RE = re.compile(
+    r"this version of windows is not supported", re.IGNORECASE
+)
+
+# Hostile tells in a RECOVERED command. Each is a behaviour an analyst would
+# escalate on sight, not a name that merely looks unusual. The gate exists so
+# the CONFIRMED tier (and therefore compute_verdict's SUSPICIOUS escalation)
+# cannot be reached by ordinary administration.
+SUSPICIOUS_COMMAND_TELLS: tuple[tuple[str, str], ...] = (
+    ("-enc ", "base64-encoded PowerShell command"),
+    ("-encodedcommand", "base64-encoded PowerShell command"),
+    ("frombase64string", "inline base64 decoding"),
+    ("-w hidden", "hidden PowerShell window"),
+    ("-windowstyle hidden", "hidden PowerShell window"),
+    ("invoke-expression", "dynamic code evaluation"),
+    ("iex(", "dynamic code evaluation"),
+    ("iex ", "dynamic code evaluation"),
+    ("downloadstring", "in-memory remote payload fetch"),
+    ("downloadfile", "remote payload fetch"),
+    ("invoke-webrequest", "remote payload fetch"),
+    ("-urlcache", "certutil used as a downloader"),
+    ("bitsadmin /transfer", "bitsadmin used as a downloader"),
+    ("vssadmin delete shadows", "shadow-copy destruction"),
+    ("wbadmin delete catalog", "backup catalog destruction"),
+    ("bcdedit /set", "boot configuration tampering"),
+    ("wevtutil cl", "event-log clearing"),
+    ("clear-eventlog", "event-log clearing"),
+    ("cipher /w", "free-space wiping"),
+    ("net user", "local account manipulation"),
+    ("net1 user", "local account manipulation"),
+    ("net localgroup administrators", "administrator group manipulation"),
+    ("schtasks /create", "scheduled-task creation"),
+    ("sc create", "service creation"),
+    ("psexec", "remote execution tooling"),
+    ("process call create", "WMI remote process creation"),
+    ("mimikatz", "credential-dumping tooling"),
+    ("rundll32 javascript", "rundll32 script execution"),
+)
+
+
+def _command_tells(command: str) -> list[str]:
+    """Hostile tells present in a recovered command, sorted and de-duplicated."""
+    lowered = " ".join(str(command or "").lower().split())
+    return sorted({label for token, label in SUSPICIOUS_COMMAND_TELLS if token in lowered})
+
+
+def _strip_leading_image(args: str) -> str:
+    """The command line with its leading executable token removed.
+
+    Handles the quoted (``"C:\\...\\cmd.exe" /c dir``) and bare
+    (``powershell.exe -enc ...``) forms Vol3 emits. Returns "" when nothing
+    follows the image path — the bare interactive shell.
+    """
+    text = str(args or "").strip()
+    if text.startswith('"'):
+        closing = text.find('"', 1)
+        return "" if closing == -1 else text[closing + 1 :].strip()
+    parts = text.split(None, 1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def recovered_command_payload(process: str, args: str) -> str | None:
+    """The command an interpreter was invoked WITH, or ``None``.
+
+    ``None`` means "no command was recovered": a non-interpreter process, an
+    unreadable PEB, a bare interpreter path, or an interpreter carrying only
+    configuration switches. Pure and deterministic, so the offline verifier
+    reaches the same answer from the same row.
+    """
+    switches = _COMMAND_PAYLOAD_SWITCHES.get(str(process or "").strip().lower())
+    if not switches:
+        return None
+    text = str(args or "").strip()
+    if not text or text.lower().startswith(_UNREADABLE_ARGS_PREFIX):
+        return None
+    tokens = _strip_leading_image(text).split()
+    for index, token in enumerate(tokens):
+        if token.lower() in switches:
+            return " ".join(tokens[index:]).strip() or None
+    return None
+
+
+def console_history_commands(
+    rows: list[dict[str, Any]] | None,
+) -> list[tuple[int | None, str, str]]:
+    """``(pid, property, command)`` for every recovered command-history row.
+
+    Rows are the generic ``vol_run`` shape for ``windows.consoles`` /
+    ``windows.cmdscan``. Only ``CommandHistory_<n>_Command_<m>`` properties are
+    typed commands; screen geometry, titles and alias rows are console metadata
+    and are skipped.
+    """
+    hits: list[tuple[int | None, str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        prop = str(row.get("Property") or row.get("property") or "")
+        if not _CONSOLE_COMMAND_PROPERTY.search(prop):
+            continue
+        data = row.get("Data", row.get("data"))
+        if not isinstance(data, str) or not data.strip():
+            continue
+        try:
+            pid: int | None = int(row.get("PID", row.get("pid")))
+        except (TypeError, ValueError):
+            pid = None
+        hits.append((pid, prop, data.strip()))
+    return hits
+
+
+def cmdline_command_payloads(
+    rows: list[dict[str, Any]] | None,
+) -> list[tuple[int | None, str, str, str]]:
+    """``(pid, process, args, payload)`` for interpreters invoked with a command."""
+    hits: list[tuple[int | None, str, str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        proc = str(row.get("Process") or row.get("process") or "")
+        args = str(row.get("Args", row.get("args")) or "")
+        payload = recovered_command_payload(proc, args)
+        if not payload:
+            continue
+        try:
+            pid: int | None = int(row.get("PID", row.get("pid")))
+        except (TypeError, ValueError):
+            pid = None
+        hits.append((pid, proc, args, payload))
+    return hits
+
+
+def _recovered_command_confidence(tells: list[str], corroborating_classes: tuple[str, ...]) -> str:
+    """Tier for a recovered-command finding.
+
+    Memory is the only artifact class this lane cites on its own, and a T1059
+    tag makes the finding an execution claim, so a memory-only recovery is a
+    HYPOTHESIS lead. With a genuine second (non-memory) artifact class the
+    finding reaches INFERRED, and CONFIRMED only when the recovered command
+    also carries a hostile tell.
+    """
+    if not {c for c in corroborating_classes if c and c != "memory"}:
+        return "HYPOTHESIS"
+    return "CONFIRMED" if tells else "INFERRED"
+
+
+def _recovered_command_claim(
+    history_rows: list[dict[str, Any]] | None,
+    cmdline_rows: list[dict[str, Any]] | None,
+    tcid_history: str | None,
+    tcid_cmdline: str | None,
+) -> tuple[str, str, str, list[str], list[dict[str, Any]]] | None:
+    """``(tool_call_id, technique, source_sentence, commands, asserted_values)``.
+
+    Console history wins over a command line when both are available: a typed
+    command is stronger evidence than a process's own invocation. Returns
+    ``None`` when nothing was recovered.
+    """
+    history_hits = console_history_commands(history_rows)
+    if history_hits and tcid_history:
+        pids = sorted({pid for pid, _prop, _cmd in history_hits if pid is not None})
+        scope = f" for console host pid {', '.join(str(p) for p in pids)}" if pids else ""
+        first_pid, first_prop, first_cmd = history_hits[0]
+        return (
+            tcid_history,
+            "T1059.003",
+            (
+                f"volatility console command-history recovery returned "
+                f"{len(history_hits)} typed command(s){scope}"
+            ),
+            [command for _pid, _prop, command in history_hits],
+            [
+                {
+                    "path": "rows[*]",
+                    "expected": json.dumps({"Property": first_prop, "Data": first_cmd}),
+                    "match": "record",
+                }
+            ],
+        )
+    payload_hits = cmdline_command_payloads(cmdline_rows)
+    if not payload_hits or not tcid_cmdline:
+        return None
+    first_pid, first_proc, first_args, _first_payload = payload_hits[0]
+    return (
+        tcid_cmdline,
+        _INTERPRETER_TECHNIQUE.get(first_proc.lower(), "T1059"),
+        (
+            f"volatility windows.cmdline recovered the command line of "
+            f"{first_proc.lower()} (pid {first_pid}), which was invoked with a command"
+        ),
+        [payload for _pid, _proc, _args, payload in payload_hits],
+        [
+            {
+                "path": "rows[*]",
+                "expected": json.dumps({"Process": first_proc, "Args": first_args}),
+                "match": "record",
+            }
+        ],
+    )
+
+
+def detect_command_execution(
+    cmdline_rows: list[dict[str, Any]] | None,
+    history_rows: list[dict[str, Any]] | None,
+    tcid_cmdline: str | None,
+    tcid_history: str | None,
+    case_id: str,
+    evidence_path: str,
+    corroborating_tcids: tuple[str, ...] = (),
+    corroborating_classes: tuple[str, ...] = (),
+    finding_id_for: Callable[[str], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pool-B finding for a command volatility actually RECOVERED from memory.
+
+    Fires only on real recovered output — a console command-history row, or an
+    interpreter command line carrying a command payload. ``asserted_values``
+    bind the interpreter/property and the recovered command text inside ONE
+    row, so the verifier's deterministic entailment check re-extracts the exact
+    claim from the re-run ``vol_run`` output and a misread cannot launder
+    through a valid ``tool_call_id``.
+    """
+    claim = _recovered_command_claim(history_rows, cmdline_rows, tcid_history, tcid_cmdline)
+    if claim is None:
+        return []
+    primary_tcid, technique, source, commands, asserted = claim
+    tells = sorted({tell for command in commands for tell in _command_tells(command)})
+    confidence = _recovered_command_confidence(tells, corroborating_classes)
+    tell_sentence = (
+        f" The recovered command carries {', '.join(tells)}."
+        if tells
+        else (
+            " No hostile tell is present in the recovered text; this is reported as a "
+            "recovered command, not as a malicious one."
+        )
+    )
+    scope_sentence = (
+        (
+            " Memory is the only artifact class supporting this claim, so it is scoped as a "
+            "lead: attributing execution to an actor needs a second artifact class."
+        )
+        if confidence == "HYPOTHESIS"
+        else ""
+    )
+    derived = [primary_tcid]
+    if tcid_cmdline and tcid_cmdline not in derived:
+        derived.append(tcid_cmdline)
+    for tcid in corroborating_tcids:
+        if tcid and tcid not in derived:
+            derived.append(tcid)
+    return [
+        {
+            "case_id": case_id,
+            "finding_id": (finding_id_for or (lambda base: base))("f-B-recovered-command"),
+            "tool_call_id": primary_tcid,
+            "artifact_path": evidence_path,
+            "description": (
+                f"Recovered command from memory: {source}. Command text: "
+                f"{'; '.join(commands[:3])}.{tell_sentence}{scope_sentence}"
+            ),
+            "confidence": confidence,
+            "pool_origin": "B",
+            "mitre_technique": technique,
+            "derived_from": derived,
+            "asserted_values": asserted,
+        }
+    ]
+
+
 def write_timeline_csv(timeline: list[dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "ts",
@@ -12124,6 +12477,7 @@ class Investigation:
 
         consoles_rows: list[dict[str, Any]] = []
         tcid_consoles: str | None = None
+        consoles_error: str | None = None
         if _console_command_rows(cmdline_rows):
             consoles_args = {
                 "case_id": self.handle["id"],
@@ -12132,7 +12486,6 @@ class Investigation:
                 "limit": 200,
             }
             consoles_out = rust.call_tool("vol_run", consoles_args)
-            consoles_error = None
             if "_error" in consoles_out:
                 consoles_error = str(
                     consoles_out["_error"].get("message", "vol_run windows.consoles failed")
@@ -12170,6 +12523,85 @@ class Investigation:
             )
             print(f"  vol_run windows.consoles: {len(consoles_rows)} rows")
 
+        # windows.cmdscan — the SECOND console-history attempt. windows.consoles
+        # walks the conhost screen buffer; windows.cmdscan brute-force scans for
+        # CommandHistory structures and can recover typed commands the screen
+        # buffer no longer holds. Only worth the scan when consoles recovered no
+        # command-history row.
+        #
+        # Deliberate skip: both plugins resolve the same conhost symbol table
+        # (volatility3 consoles.Consoles.create_conhost_symbol_table), so an
+        # unsupported-Windows-version failure from consoles means cmdscan fails
+        # identically. Measured on the lab host against the MemLabs Lab 1 Win7
+        # x64 image with volatility3 2.28.0: both plugins raise
+        # "NotImplementedError: This version of Windows is not supported:
+        # 6.1 15.7601!" from that same call. Re-running the doomed lookup buys
+        # no evidence, so the shared limitation is recorded once instead.
+        cmdscan_rows: list[dict[str, Any]] = []
+        tcid_cmdscan: str | None = None
+        if tcid_consoles and not console_history_commands(consoles_rows):
+            if consoles_error and _CONHOST_UNSUPPORTED_RE.search(consoles_error):
+                self.analysis_limitations.append(
+                    "vol_run windows.cmdscan skipped: windows.consoles already failed with "
+                    "volatility's \"This version of Windows is not supported\" error and "
+                    "cmdscan resolves the same conhost symbol table, so no console command "
+                    "history is recoverable from this image with this volatility build"
+                )
+                print("  vol_run windows.cmdscan: skipped (conhost symbols unsupported)")
+            else:
+                cmdscan_args = {
+                    "case_id": self.handle["id"],
+                    "memory_path": evidence_path,
+                    "plugin": "windows.cmdscan",
+                    "limit": 200,
+                }
+                cmdscan_out = rust.call_tool("vol_run", cmdscan_args)
+                cmdscan_error = None
+                if "_error" in cmdscan_out:
+                    cmdscan_error = str(
+                        cmdscan_out["_error"].get("message", "vol_run windows.cmdscan failed")
+                    )
+                    print(f"  vol_run windows.cmdscan error: {cmdscan_error[:80]}")
+                    self.analysis_limitations.append(
+                        f"vol_run windows.cmdscan failed: {cmdscan_error}"
+                    )
+                    self._course_correct(
+                        py,
+                        "vol_run",
+                        cmdscan_error,
+                        "defer (no console command history recovered this run)",
+                    )
+                    cmdscan_out = {
+                        "_error": {"message": cmdscan_error},
+                        "plugin": "windows.cmdscan",
+                        "rows": [],
+                        "rows_seen": 0,
+                    }
+                cmdscan_rows = cmdscan_out.get("rows", []) or []
+                cmdscan_extra: dict[str, Any] = {
+                    "tool": "windows.cmdscan",
+                    "rows_returned": len(cmdscan_rows),
+                    "rows_seen": cmdscan_out.get("rows_seen", len(cmdscan_rows)),
+                }
+                if cmdscan_error:
+                    cmdscan_extra["error"] = cmdscan_error
+                tcid_cmdscan = self._record_tool(
+                    py,
+                    "vol_run",
+                    self._output_hash(cmdscan_out),
+                    cmdscan_extra,
+                    arguments=cmdscan_args,
+                )
+                print(f"  vol_run windows.cmdscan: {len(cmdscan_rows)} rows")
+
+        # Cite the plugin whose output actually holds the recovered commands.
+        if console_history_commands(cmdscan_rows):
+            history_rows, tcid_history = cmdscan_rows, tcid_cmdscan
+        elif console_history_commands(consoles_rows):
+            history_rows, tcid_history = consoles_rows, tcid_consoles
+        else:
+            history_rows, tcid_history = [], None
+
         if tcid_cmdline:
             # Cite the process views as corroboration ONLY when they actually
             # contain a console host observed by windows.cmdline.
@@ -12192,6 +12624,31 @@ class Investigation:
             self.findings_pool_b.extend(console_findings)
             if console_findings:
                 print(f"  console activity: {len(console_findings)} presence finding(s)")
+
+            # Finding 6 — a command volatility actually RECOVERED (console
+            # history, or an interpreter invoked with a command payload). The
+            # corroborating tool calls available here are process views, which
+            # are the SAME artifact class as vol_run ("memory"), so the finding
+            # is emitted as a scoped HYPOTHESIS lead: a T1059 tag is an
+            # execution claim and SOUL.md's >=2-artifact-class rule does not
+            # let one class carry it. detect_command_execution takes the
+            # non-memory classes as a parameter so a future cross-lane
+            # corroboration (EVTX 4688 / Sysmon 1 quoting the same command) can
+            # raise the tier without re-deriving the claim.
+            recovered = detect_command_execution(
+                cmdline_rows,
+                history_rows,
+                tcid_cmdline,
+                tcid_history,
+                self.handle["id"],
+                evidence_path,
+                corroborating_tcids=tuple(corroborating),
+                corroborating_classes=("memory",),
+                finding_id_for=lambda base: self._finding_id_for(base, evidence_path),
+            )
+            self.findings_pool_b.extend(recovered)
+            if recovered:
+                print(f"  recovered commands: {len(recovered)} finding(s)")
 
         # Save psscan for the report
         self.local_artifacts["psscan_json"] = json.dumps(psscan or [], separators=(",", ":"))
