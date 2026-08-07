@@ -45,12 +45,11 @@ def _msg(**over):
 
 def _scenario():
     """A store carrying all four mail signals, built from generic addresses."""
-    principal = _msg(from_display="Pat Morgan", from_address=f"pat.morgan@{INTERNAL}")
+    principal = _msg(from_display=f"pat.morgan@{INTERNAL}", from_address=f"pat.morgan@{INTERNAL}")
     phish = _msg(
         subject="urgent request",
-        from_display="Pat Morgan",
-        from_address=f"pat.morgan@{OUTSIDE}",
-        reply_to_address=f"pat.morgan.reply@{OUTSIDE}",
+        from_display=f"pat.morgan@{INTERNAL}",
+        from_address=f"outsider@{OUTSIDE}",
         to=[f"cfo@{INTERNAL}"],
         date="Tue, 15 Jul 2008 10:00:00 -0700",
     )
@@ -58,14 +57,13 @@ def _scenario():
         subject="RE: urgent request",
         folder="Personal Folders/Sent Items",
         from_address=f"cfo@{INTERNAL}",
-        to=[f"pat.morgan@{OUTSIDE}"],
+        to=[f"outsider@{OUTSIDE}"],
         date="Tue, 15 Jul 2008 10:30:00 -0700",
     )
     followup = _msg(
         subject="RE: RE: urgent request",
-        from_display="Pat Morgan",
-        from_address=f"pat.morgan@{OUTSIDE}",
-        reply_to_address=f"pat.morgan.reply@{OUTSIDE}",
+        from_display=f"pat.morgan@{INTERNAL}",
+        from_address=f"outsider@{OUTSIDE}",
         to=[f"cfo@{INTERNAL}"],
         date="Tue, 15 Jul 2008 11:00:00 -0700",
     )
@@ -73,7 +71,7 @@ def _scenario():
         subject="RE: RE: urgent request",
         folder="Personal Folders/Sent Items",
         from_address=f"cfo@{INTERNAL}",
-        to=[f"pat.morgan@{OUTSIDE}"],
+        to=[f"outsider@{OUTSIDE}"],
         date="Tue, 15 Jul 2008 11:30:00 -0700",
         attachments=[
             {
@@ -97,8 +95,8 @@ class TestMailStoreEmitters:
         assert f["artifact_path"] == STORE
         assert f["mitre_technique"] == "T1534"
         desc = f["description"].lower()
-        assert "reply-to" in desc and "diverges" in desc
-        assert f"pat.morgan@{OUTSIDE}" in desc
+        assert "reply address" in desc and "diverges" in desc
+        assert f"outsider@{OUTSIDE}" in desc
 
     def test_impersonation_finding_names_the_display_name_and_the_divergence(self) -> None:
         inv = _inv()
@@ -107,7 +105,7 @@ class TestMailStoreEmitters:
         assert f["confidence"] == "CONFIRMED"
         assert f["mitre_technique"] == "T1566.001"
         desc = f["description"]
-        assert "Pat Morgan" in desc
+        assert f"pat.morgan@{INTERNAL}" in desc
         assert "impersonating" in desc.lower()
         # honesty boundary: a header fact, never an authorship claim
         assert "who composed" in desc.lower() or "who sent" in desc.lower()
@@ -120,7 +118,7 @@ class TestMailStoreEmitters:
         assert f["mitre_technique"] == "T1567"
         desc = f["description"]
         assert "employee-roster.xls" in desc
-        assert f"pat.morgan@{OUTSIDE}" in desc
+        assert f"outsider@{OUTSIDE}" in desc
         assert "spreadsheet" in desc.lower()
 
     def test_thread_escalation_is_an_inferred_lead(self) -> None:
@@ -132,6 +130,8 @@ class TestMailStoreEmitters:
         assert "thread" in desc and "conversation" in desc
 
     def test_impersonation_without_a_divergence_is_only_inferred(self) -> None:
+        # A plain display NAME (not an address) reused from an outside address:
+        # an impersonation candidate, but nothing shows the reply path diverging.
         inv = _inv()
         msgs = [
             _msg(from_display="Pat Morgan", from_address=f"pat.morgan@{INTERNAL}"),
@@ -172,3 +172,12 @@ class TestMailStoreEmitters:
         inv._emit_mail_store_findings(_scenario(), STORE, "tc-pst")
         for f in inv.findings_pool_a:
             assert not fea._claims_exfiltration(f), f["finding_id"]
+
+    def test_findings_do_not_read_as_execution_claims(self) -> None:
+        # The >=2-artifact-class execution gate fires on execution WORDING as
+        # well as technique labels. A mail store proves no execution, so no
+        # mail finding may read like one.
+        inv = _inv()
+        inv._emit_mail_store_findings(_scenario(), STORE, "tc-pst")
+        for f in inv.findings_pool_a:
+            assert not fea._claims_execution(f), f["finding_id"]

@@ -33,6 +33,7 @@ from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import email.utils
 import hashlib
 import ipaddress
 import json
@@ -2953,34 +2954,97 @@ def _is_external(address: Any, internal_domains: set[str]) -> bool:
     return bool(domain) and domain not in internal_domains
 
 
-def mail_reply_to_divergence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Messages whose ``Reply-To`` address differs from their ``From`` address.
+def _registrable_domain(domain: str) -> str:
+    """The organisation-level domain: the last two labels of `domain`.
 
-    A pure header comparison -- the two fields either match or they do not, and
-    both come straight out of the parsed store. A reply to such a message goes
-    somewhere other than the address it appears to come from; that is the
-    classic reply-address divergence (spoofing) tell. It is a statement about
-    the headers, not about who sent the mail.
+    A newsletter sent from ``newsletters@n.example.org`` with
+    ``Reply-To: do-not-reply@example.org`` is one organisation's own bulk
+    mailer, not a spoof, so a divergence inside one registrable domain must not
+    be reported. This is the deliberately crude PSL-free rule: it can merge two
+    parties under a shared public suffix (``a.co.uk`` and ``b.co.uk``), which
+    only ever SUPPRESSES a report -- the safe direction for a CONFIRMED claim.
+    """
+    labels = [label for label in str(domain or "").split(".") if label]
+    if len(labels) < 2:
+        return ".".join(labels)
+    return ".".join(labels[-2:])
+
+
+def _same_organisation(left: Any, right: Any) -> bool:
+    a, b = _registrable_domain(_email_domain(left)), _registrable_domain(_email_domain(right))
+    return bool(a) and a == b
+
+
+def _displayed_address(display: Any) -> str:
+    """The address a display name IS, when the display name is itself an
+    address. Mail clients show the display name, so a display name that reads
+    as an address is the identity the reader believes they are corresponding
+    with -- and it need not be the address a reply reaches."""
+    text = _normalize_address(display)
+    return text if "@" in text and " " not in text else ""
+
+
+def mail_reply_address_divergence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages where the address shown is not the address mail actually goes to.
+
+    Three pure header comparisons, all of the same shape -- a DISPLAYED address
+    beside the ACTUAL one, differing across an organisation boundary:
+
+    * ``reply_to_vs_from``        -- ``Reply-To`` differs from ``From``.
+    * ``sender_display_vs_from``  -- the ``From`` display name is itself an
+      address, and not the sending address (the RFC822
+      ``actual@host (displayed@host)`` form).
+    * ``recipient_display_vs_to`` -- a recipient's stored display name is an
+      address that is not among the addresses the message was actually sent to.
+
+    Divergences inside one organisation (bulk mailers, shared reply mailboxes)
+    are excluded: they are ordinary mail-system behaviour, not a spoofing tell.
     """
     out: list[dict[str, Any]] = []
     for message in messages or []:
         if not isinstance(message, dict):
             continue
+        row = {
+            "folder": str(message.get("folder") or ""),
+            "subject": str(message.get("subject") or ""),
+            "date": str(message.get("date") or ""),
+            "from_address": _normalize_address(message.get("from_address")),
+            "from_display": str(message.get("from_display") or ""),
+        }
         sender = _normalize_address(message.get("from_address"))
         reply_to = _normalize_address(message.get("reply_to_address"))
-        if not reply_to or not sender or reply_to == sender:
+        if reply_to and sender and reply_to != sender and not _same_organisation(sender, reply_to):
+            out.append(
+                {**row, "basis": "reply_to_vs_from", "displayed": sender, "actual": reply_to}
+            )
             continue
-        out.append(
-            {
-                "folder": str(message.get("folder") or ""),
-                "subject": str(message.get("subject") or ""),
-                "from_address": sender,
-                "from_display": str(message.get("from_display") or ""),
-                "reply_to_address": reply_to,
-                "date": str(message.get("date") or ""),
-                "domain_divergent": _email_domain(sender) != _email_domain(reply_to),
-            }
-        )
+
+        shown = _displayed_address(message.get("from_display"))
+        if shown and sender and shown != sender and not _same_organisation(shown, sender):
+            out.append(
+                {**row, "basis": "sender_display_vs_from", "displayed": shown, "actual": sender}
+            )
+            continue
+
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        for display in message.get("to_display") or []:
+            shown = _displayed_address(display)
+            if not shown or shown in recipients:
+                continue
+            actual = next(
+                (r for r in recipients if r and not _same_organisation(shown, r)),
+                "",
+            )
+            if actual:
+                out.append(
+                    {
+                        **row,
+                        "basis": "recipient_display_vs_to",
+                        "displayed": shown,
+                        "actual": actual,
+                    }
+                )
+                break
     return out
 
 
@@ -3100,8 +3164,62 @@ def mail_attachment_egress_candidates(
     return out
 
 
+# libpff renders a MAPI timestamp as `Mon DD, YYYY HH:MM:SS.fffffffff UTC`.
+_MAIL_MAPI_DATE_RE = re.compile(
+    r"^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*UTC$"
+)
+_MAIL_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _mail_date_instant(value: Any) -> datetime | None:
+    """A message date as an aware UTC instant, or None when it will not parse.
+
+    A store carries TWO date formats: RFC822 transport dates on mail it
+    received, and libpff's MAPI property rendering on mail the host composed.
+    Sorting those as text is meaningless -- "Jul 20" sorts before
+    "Sat, 19 Jul" -- so any reported span must order on parsed instants, and
+    report nothing at all when a value does not parse.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _MAIL_MAPI_DATE_RE.match(text)
+    if match:
+        month = _MAIL_MONTHS.get(match.group(1).lower())
+        if not month:
+            return None
+        try:
+            return datetime(
+                int(match.group(3)),
+                month,
+                int(match.group(2)),
+                int(match.group(4)),
+                int(match.group(5)),
+                int(match.group(6)),
+                # timezone.utc, not datetime.UTC: this module is also run by
+                # maintainer scripts under a bare python3, which can be 3.10.
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _thread_key(subject: Any) -> str:
-    """Subject with every reply/forward prefix stripped, lowercased."""
+    """Subject with every reply/forward prefix stripped, lowercased. Used to
+    report the distinct topics an exchange covered, not to group it."""
     text = " ".join(str(subject or "").split()).lower()
     changed = True
     while changed:
@@ -3113,61 +3231,101 @@ def _thread_key(subject: Any) -> str:
     return text
 
 
-def mail_thread_escalation(
+def mail_counterparty_escalation(
     messages: list[dict[str, Any]], internal_domains: set[str]
 ) -> list[dict[str, Any]]:
-    """Sustained conversations that involve a counterparty outside the
-    organisation's own mail domain.
+    """Two-way exchanges with one address outside the organisation's own domain.
 
-    Groups messages by subject with reply/forward prefixes stripped, then keeps
-    threads of at least ``_THREAD_MIN_MESSAGES`` messages that have at least one
-    external participant. The row reports the shape of the exchange -- how many
-    messages, over what dates, with whom, and how many carried a ``Reply-To``
-    divergence -- so a downstream lead can describe an escalating exchange
-    without asserting anyone's intent.
+    Grouped by WHO the exchange is with, not by subject text. Subject threading
+    fragments a real conversation the moment a reply rewrites the subject, and
+    it lumps a mailbox's bulk mail into one enormous pseudo-thread -- a store
+    of newsletters produces a single 167-message "thread" that means nothing.
+    Grouping by counterparty models the exchange an analyst cares about.
+
+    An exchange qualifies only when mail went BOTH ways: inbound volume alone
+    is a mailing list, not a conversation, which is what keeps newsletters and
+    alert feeds out of the result on any host. The row reports the shape --
+    message counts per direction, the topics covered, the date span, how many
+    messages carried a reply-address divergence, and what left the organisation
+    -- so a downstream lead can describe the exchange without asserting intent.
     """
     if not internal_domains:
         return []
-    threads: dict[str, list[dict[str, Any]]] = {}
+    diverging_keys = {
+        (row["folder"], row["subject"], row["date"])
+        for row in mail_reply_address_divergence(messages)
+    }
+    groups: dict[str, dict[str, Any]] = {}
     for message in messages or []:
         if not isinstance(message, dict):
             continue
-        key = _thread_key(message.get("subject"))
-        if not key:
-            continue
-        threads.setdefault(key, []).append(message)
+        sender = _normalize_address(message.get("from_address"))
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        inbound = _is_external(sender, internal_domains)
+        counterparties = (
+            [sender] if inbound else [r for r in recipients if _is_external(r, internal_domains)]
+        )
+        for counterparty in counterparties:
+            if not counterparty:
+                continue
+            group = groups.setdefault(
+                counterparty,
+                {
+                    "counterparty": counterparty,
+                    "message_count": 0,
+                    "inbound_count": 0,
+                    "outbound_count": 0,
+                    "diverging_message_count": 0,
+                    "subjects": set(),
+                    "dates": set(),
+                    "outbound_attachments": set(),
+                },
+            )
+            group["message_count"] += 1
+            group["inbound_count" if inbound else "outbound_count"] += 1
+            key = (
+                str(message.get("folder") or ""),
+                str(message.get("subject") or ""),
+                str(message.get("date") or ""),
+            )
+            if key in diverging_keys:
+                group["diverging_message_count"] += 1
+            topic = _thread_key(message.get("subject"))
+            if topic:
+                group["subjects"].add(topic)
+            if message.get("date"):
+                group["dates"].add(str(message.get("date")))
+            if not inbound:
+                for attachment in message.get("attachments") or []:
+                    if isinstance(attachment, dict) and attachment.get("name"):
+                        group["outbound_attachments"].add(str(attachment["name"]))
 
     out: list[dict[str, Any]] = []
-    for key in sorted(threads):
-        group = threads[key]
-        if len(group) < _THREAD_MIN_MESSAGES:
+    for counterparty in sorted(groups):
+        group = groups[counterparty]
+        # Two-way contact is the floor: a one-directional feed is not an
+        # exchange no matter how many messages it carries.
+        if not (group["inbound_count"] and group["outbound_count"]):
             continue
-        participants: set[str] = set()
-        for message in group:
-            participants.add(_normalize_address(message.get("from_address")))
-            participants.update(_normalize_address(r) for r in (message.get("to") or []))
-        external = sorted(p for p in participants if _is_external(p, internal_domains))
-        if not external:
-            continue
-        dates = sorted({str(m.get("date") or "") for m in group if m.get("date")})
-        diverging = len(mail_reply_to_divergence(group))
-        attachments = sorted(
-            {
-                str(a.get("name") or "")
-                for m in group
-                for a in (m.get("attachments") or [])
-                if isinstance(a, dict) and a.get("name")
-            }
+        # Only report a span when every date in the exchange parses; a
+        # partially ordered span would be a guess presented as a fact.
+        instants = [(_mail_date_instant(d), d) for d in group["dates"]]
+        dates = (
+            [d for _, d in sorted(instants, key=lambda pair: pair[0])]
+            if instants and all(i is not None for i, _ in instants)
+            else []
         )
         out.append(
             {
-                "thread": key,
-                "message_count": len(group),
-                "diverging_message_count": diverging,
-                "external_participants": external,
+                "counterparty": counterparty,
+                "message_count": group["message_count"],
+                "inbound_count": group["inbound_count"],
+                "outbound_count": group["outbound_count"],
+                "diverging_message_count": group["diverging_message_count"],
+                "subjects": sorted(group["subjects"]),
+                "outbound_attachments": sorted(group["outbound_attachments"]),
                 "first_date": dates[0] if dates else "",
                 "last_date": dates[-1] if dates else "",
-                "attachments": attachments,
             }
         )
     return out
@@ -12276,12 +12434,12 @@ class Investigation:
         if not internal:
             return
         domain_text = ", ".join(sorted(internal))
-        divergences = mail_reply_to_divergence(messages)
-        diverging_subjects = {row["subject"] for row in divergences}
+        divergences = mail_reply_address_divergence(messages)
+        diverging_keys = {(r["folder"], r["subject"], r["date"]) for r in divergences}
 
         if divergences:
             sample = "; ".join(
-                f"From {row['from_address']} but Reply-To {row['reply_to_address']} "
+                f"displayed {row['displayed']} but mail actually reaches {row['actual']} "
                 f"(subject '{row['subject']}', folder '{row['folder']}', {row['date']})"
                 for row in divergences[:4]
             )
@@ -12292,21 +12450,22 @@ class Investigation:
                 confidence="CONFIRMED",
                 mitre="T1534",
                 description=(
-                    f"The Reply-To header diverges from the From header on "
-                    f"{len(divergences)} message(s) in this mail store: {sample}. A reply "
-                    "to such an email is addressed to a mailbox other than the one the "
-                    "message appears to come from — the reply-address divergence "
-                    "(spoofing) indicator. Both values were parsed from the stored "
-                    "RFC822 headers; this is a fact about the headers the store holds, "
-                    "not about who sent or composed the message."
+                    f"The reply address diverges from the displayed address on "
+                    f"{len(divergences)} email message(s) in this mail store: {sample}. A "
+                    "reply to such a message is addressed to a mailbox other than the one "
+                    "the message displays — the reply-address divergence (spoofing) "
+                    "indicator. Both values were parsed from the message headers the store "
+                    "holds, and divergences inside a single organisation (bulk mailers, "
+                    "shared reply mailboxes) were excluded. This is a fact about those "
+                    "headers, not a statement about who sent or composed the message."
                 ),
                 asserted_values=[
                     {
                         "path": "messages[*]",
                         "expected": json.dumps(
                             {
+                                "subject": divergences[0]["subject"],
                                 "from_address": divergences[0]["from_address"],
-                                "reply_to_address": divergences[0]["reply_to_address"],
                             }
                         ),
                         "match": "record",
@@ -12315,7 +12474,7 @@ class Investigation:
             )
 
         for row in mail_impersonation_candidates(messages, internal)[:1]:
-            corroborated = row["subject"] in diverging_subjects or bool(row["reply_to_address"])
+            corroborated = (row["folder"], row["subject"], row["date"]) in diverging_keys
             if row["basis"] == "internal_display_name_external_sender":
                 basis_text = (
                     f"the From display name '{row['display_name']}' is one this store "
@@ -12376,7 +12535,8 @@ class Investigation:
                     f"from {row['from_address']} to {recipients}, outside the "
                     f"organisation's own mail domain ({domain_text}). Subject: "
                     f"'{row['subject']}'; mail folder '{row['folder']}'; {row['date']}. "
-                    "Parsed from the mail store's message headers — the store records the "
+                    "Parsed from the message headers of the mail store carved off the "
+                    "disk image (artifact class mail_store) — the store records the "
                     "attachment's name and media type and the addresses it went to; the "
                     "header-level parser never read the file's contents, so what the "
                     "spreadsheet held is not established here."
@@ -12390,12 +12550,24 @@ class Investigation:
                 ],
             )
 
-        for row in mail_thread_escalation(messages, internal)[:1]:
-            if not row["diverging_message_count"] and not row["attachments"]:
-                # A long external thread with no divergence and no outbound
-                # attachment is ordinary business mail, not a lead.
+        for row in mail_counterparty_escalation(messages, internal)[:1]:
+            if not row["diverging_message_count"] and not row["outbound_attachments"]:
+                # A two-way exchange with no divergence and nothing leaving the
+                # organisation is ordinary business mail, not a lead.
                 continue
-            attachments = ", ".join(row["attachments"]) or "no attachment"
+            topics = "; ".join(f"'{s}'" for s in row["subjects"][:4]) or "no subject"
+            if row["outbound_attachments"]:
+                shape = (
+                    "The message timeline across the exchange shows escalation from the "
+                    "opening message to a data transfer: "
+                    f"{', '.join(row['outbound_attachments'])} left the organisation as an "
+                    "attachment on a message sent from this mailbox."
+                )
+            else:
+                shape = (
+                    "The message timeline across the exchange shows a sustained two-way "
+                    "conversation rather than one-directional mail."
+                )
             self._append_mail_finding(
                 base="f-A-mail-thread-escalation",
                 store_path=store_path,
@@ -12403,16 +12575,15 @@ class Investigation:
                 confidence="INFERRED",
                 mitre=None,
                 description=(
-                    f"A reconstructed email conversation thread of {row['message_count']} "
-                    f"messages ('{row['thread']}') runs between this mailbox and "
-                    f"{', '.join(row['external_participants'])} outside the organisation's "
-                    f"own mail domain ({domain_text}), from {row['first_date']} to "
-                    f"{row['last_date']}. {row['diverging_message_count']} of those messages "
-                    f"carry a Reply-To divergence, and the exchange carries: {attachments}. "
-                    "The message timeline across the thread shows escalation from the "
-                    "opening message to a data transfer. INFERRED from the message "
-                    "envelopes the store holds — the conversation shape is a parsed fact; "
-                    "the participants' intent is not established by a host artifact."
+                    f"A reconstructed email conversation thread with {row['counterparty']}, "
+                    f"outside the organisation's own mail domain ({domain_text}): "
+                    f"{row['message_count']} messages ({row['inbound_count']} received, "
+                    f"{row['outbound_count']} sent) across the topics {topics}, from "
+                    f"{row['first_date']} to {row['last_date']}. "
+                    f"{row['diverging_message_count']} of those messages carry a "
+                    f"reply-address divergence. {shape} INFERRED from the message envelopes "
+                    "the mail store holds — the conversation's shape is a parsed fact; the "
+                    "participants' intent is not established by a host artifact."
                 ),
                 asserted_values=None,
             )

@@ -101,8 +101,13 @@ pub struct PstMessage {
     /// A value here that differs from `from_address` is the classic
     /// reply-address spoofing tell.
     pub reply_to_address: String,
-    /// Addresses from `To` (capped).
+    /// Addresses of the `To` recipients (sorted, deduped, capped).
     pub to: Vec<String>,
+    /// Display names the store recorded for those recipients (sorted, deduped,
+    /// capped). A SET, not positionally paired with `to`: a display name here
+    /// that names an inside identity while every address in `to` is outside is
+    /// the recipient-side analogue of a spoofed sender.
+    pub to_display: Vec<String>,
     /// `Date` header verbatim (RFC822 form; not normalized).
     pub date: String,
     /// Attachments (capped, sorted).
@@ -371,56 +376,98 @@ fn nanosecond_tag() -> u128 {
 /// Walk an export tree and return every message envelope it holds, deduped and
 /// sorted (hence deterministic across runs and machines).
 ///
-/// Both backends are covered by one walk: libpst `-e` writes `<n>.eml` files,
-/// libpff writes a per-item directory holding `InternetHeaders.txt` plus an
-/// `Attachments/` directory. Both header files are RFC822, so one parser reads
-/// both.
+/// Both backends are covered by one walk. libpst `-e` writes `<n>.eml`, one
+/// RFC822 message per file. libpff writes a directory per item carrying
+/// `InternetHeaders.txt` (the RFC822 transport headers), `OutlookHeaders.txt`
+/// (the MAPI properties), `Recipients.txt`, and an `Attachments/` directory.
+///
+/// Reading only the RFC822 headers is not enough: a message the host COMPOSED
+/// never acquired transport headers, so libpff writes an EMPTY
+/// `InternetHeaders.txt` for every sent item — and sent items are where an
+/// outbound attachment lives. The Outlook properties and the recipient table
+/// fill in whatever the transport headers left empty.
 fn collect_export_messages(dir: &Path, limit: usize) -> Vec<PstMessage> {
-    let mut files = Vec::new();
-    walk_export(dir, 0, &mut files);
-    files.sort();
+    let mut sources = Vec::new();
+    walk_export(dir, 0, &mut sources);
+    sources.sort();
 
     let mut seen: BTreeSet<PstMessage> = BTreeSet::new();
-    for file in files {
+    for source in sources {
         if seen.len() >= limit {
             break;
         }
-        let Some(text) = read_capped(&file) else {
+        let Some(mut message) = read_message(&source) else {
             continue;
         };
-        let Some(mut message) = parse_message_headers(&text) else {
-            continue;
-        };
-        message.folder = export_folder(dir, &file);
-        merge_attachments(&mut message, sibling_attachments(&file));
+        message.folder = export_folder(dir, &source);
+        merge_attachments(&mut message, sibling_attachments(&source));
         seen.insert(message);
     }
     seen.into_iter().take(limit).collect()
 }
 
+/// One message source in an export tree: a libpst `.eml` file, or a libpff item
+/// directory.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MessageSource {
+    Eml(PathBuf),
+    PffItem(PathBuf),
+}
+
+impl MessageSource {
+    /// The directory the message belongs to (its mail folder, before the
+    /// export root is stripped).
+    fn folder_dir(&self) -> Option<&Path> {
+        match self {
+            // A `.eml` sits directly in its folder; a libpff item directory IS
+            // the message, so its folder is one level up.
+            Self::Eml(path) | Self::PffItem(path) => path.parent(),
+        }
+    }
+}
+
+/// Build one envelope from a message source, or `None` when it carries none.
+fn read_message(source: &MessageSource) -> Option<PstMessage> {
+    match source {
+        MessageSource::Eml(path) => parse_message_headers(&read_capped(path)?),
+        MessageSource::PffItem(dir) => {
+            let internet = read_capped(&dir.join("InternetHeaders.txt")).unwrap_or_default();
+            let outlook = read_capped(&dir.join("OutlookHeaders.txt")).unwrap_or_default();
+            let recipients = read_capped(&dir.join("Recipients.txt")).unwrap_or_default();
+            let base = parse_message_headers(&internet);
+            fill_from_outlook_properties(base, &outlook, &recipients)
+        }
+    }
+}
+
 /// The message's mail folder: its directory relative to the export root, with
-/// `/` separators. Carries no part of the per-run export path, so it is stable
-/// for `verify_finding` replay.
-fn export_folder(root: &Path, message_file: &Path) -> String {
-    message_file
-        .parent()
-        .and_then(|parent| parent.strip_prefix(root).ok())
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default()
+/// `/` separators and libpff's `<name>.export` wrapper stripped. Every
+/// component is PST-internal, so the value carries no part of the per-run
+/// export path and stays stable for `verify_finding` replay.
+fn export_folder(root: &Path, source: &MessageSource) -> String {
+    let Some(rel) = source
+        .folder_dir()
+        .and_then(|dir| dir.strip_prefix(root).ok())
+    else {
+        return String::new();
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().replace('\\', "/"))
+        .filter(|part| !part.is_empty() && !part.ends_with(".export"))
+        .collect();
+    parts.join("/")
 }
 
-/// Files a mail export puts an RFC822 header block in. libpst `-e` writes
-/// `<n>.eml`; libpff writes `InternetHeaders.txt` per item directory.
-fn is_message_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == "internetheaders.txt"
-        || Path::new(&lower)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
-}
-
-fn walk_export(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+/// Collect every message source under `dir`. A directory holding either header
+/// file is one libpff item (and is not descended into for further items); any
+/// `.eml` file is one libpst message.
+fn walk_export(dir: &Path, depth: usize, out: &mut Vec<MessageSource>) {
     if depth > MAX_EXPORT_DEPTH || out.len() >= MAX_EXPORT_FILES {
+        return;
+    }
+    if is_pff_item_dir(dir) {
+        out.push(MessageSource::PffItem(dir.to_path_buf()));
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -439,11 +486,23 @@ fn walk_export(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         } else if file_type.is_file()
             && path
                 .file_name()
-                .is_some_and(|n| is_message_file(&n.to_string_lossy()))
+                .is_some_and(|n| is_eml_file(&n.to_string_lossy()))
         {
-            out.push(path);
+            out.push(MessageSource::Eml(path));
         }
     }
+}
+
+/// A libpff item directory carries `InternetHeaders.txt` and/or
+/// `OutlookHeaders.txt` beside the message body.
+fn is_pff_item_dir(dir: &Path) -> bool {
+    dir.join("OutlookHeaders.txt").is_file() || dir.join("InternetHeaders.txt").is_file()
+}
+
+fn is_eml_file(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
 }
 
 fn read_capped(path: &Path) -> Option<String> {
@@ -456,12 +515,17 @@ fn read_capped(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// libpff writes a message's attachments as real files under a sibling
-/// `Attachments/` directory; libpst inlines them as MIME parts. Reading the
-/// directory covers the libpff layout.
-fn sibling_attachments(message_file: &Path) -> Vec<PstAttachment> {
-    let Some(dir) = message_file.parent().map(|p| p.join("Attachments")) else {
-        return Vec::new();
+/// libpff writes a message's attachments as real files under an `Attachments/`
+/// directory inside the item; libpst inlines them as MIME parts (handled by
+/// [`mime_attachments`]). Reading the directory covers the libpff layout.
+fn sibling_attachments(source: &MessageSource) -> Vec<PstAttachment> {
+    let dir = match source {
+        MessageSource::PffItem(item) => item.join("Attachments"),
+        // A libpst `.eml` has no attachment directory; its parts are inline.
+        MessageSource::Eml(path) => match path.parent() {
+            Some(parent) => parent.join("Attachments"),
+            None => return Vec::new(),
+        },
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -470,7 +534,7 @@ fn sibling_attachments(message_file: &Path) -> Vec<PstAttachment> {
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
+            let name = strip_export_index(&e.file_name().to_string_lossy());
             let extension = extension_of(&name);
             PstAttachment {
                 name,
@@ -482,6 +546,22 @@ fn sibling_attachments(message_file: &Path) -> Vec<PstAttachment> {
     out.sort();
     out.truncate(MAX_ATTACHMENTS);
     out
+}
+
+/// Drop libpff's `<n>_` attachment index prefix. The exporter adds it so two
+/// attachments with the same name in one message cannot collide on disk; it is
+/// not part of the filename the message carried, and quoting it in a Finding
+/// would misreport the attachment's name. Only a leading run of digits followed
+/// by `_` is removed, and only when a name remains.
+fn strip_export_index(name: &str) -> String {
+    let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return name.to_string();
+    }
+    match name[digits.len()..].strip_prefix('_') {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => name.to_string(),
+    }
 }
 
 fn merge_attachments(message: &mut PstMessage, extra: Vec<PstAttachment>) {
@@ -539,9 +619,135 @@ fn parse_message_headers(raw: &str) -> Option<PstMessage> {
         reply_to_display,
         reply_to_address,
         to,
+        to_display: Vec::new(),
         date: clamp(envelope.get("date").map_or("", String::as_str)),
         attachments: mime_attachments(&lines),
     })
+}
+
+// ---------------------------------------------------------------------------
+// libpff Outlook-property / recipient-table parsing
+// ---------------------------------------------------------------------------
+
+/// Fill an envelope's empty fields from libpff's MAPI-property dumps.
+///
+/// The transport headers win wherever they carry a value — they are what the
+/// recipient's mail system actually saw. `OutlookHeaders.txt` and
+/// `Recipients.txt` supply the rest, which for a SENT message is everything:
+/// mail the host composed never had transport headers, so libpff writes an
+/// empty `InternetHeaders.txt` for it.
+fn fill_from_outlook_properties(
+    base: Option<PstMessage>,
+    outlook: &str,
+    recipients: &str,
+) -> Option<PstMessage> {
+    let props = parse_property_block(outlook);
+    let mut message = base.unwrap_or_else(empty_message);
+
+    if message.subject.is_empty() {
+        message.subject = clamp(props.get("subject").map_or("", String::as_str));
+    }
+    if message.from_address.is_empty() {
+        message.from_address = clamp(
+            props
+                .get("sender email address")
+                .or_else(|| props.get("sent representing email address"))
+                .map_or("", String::as_str),
+        );
+    }
+    if message.from_display.is_empty() {
+        message.from_display = clamp(
+            props
+                .get("sender name")
+                .or_else(|| props.get("sent representing name"))
+                .map_or("", String::as_str),
+        );
+    }
+    if message.date.is_empty() {
+        message.date = clamp(
+            props
+                .get("client submit time")
+                .or_else(|| props.get("delivery time"))
+                .map_or("", String::as_str),
+        );
+    }
+
+    let (addresses, displays) = parse_recipients(recipients);
+    if message.to.is_empty() {
+        message.to = addresses;
+    }
+    if message.to_display.is_empty() {
+        message.to_display = displays;
+    }
+
+    (!message.from_address.is_empty() || !message.to.is_empty()).then_some(message)
+}
+
+const fn empty_message() -> PstMessage {
+    PstMessage {
+        folder: String::new(),
+        subject: String::new(),
+        from_display: String::new(),
+        from_address: String::new(),
+        reply_to_display: String::new(),
+        reply_to_address: String::new(),
+        to: Vec::new(),
+        to_display: Vec::new(),
+        date: String::new(),
+        attachments: Vec::new(),
+    }
+}
+
+/// libpff property dumps are `Key:` + tab run + value, one per line. Keys are
+/// lowercased; the first occurrence of a key wins.
+fn parse_property_block(text: &str) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if !key.is_empty() && !value.is_empty() {
+            out.entry(key).or_insert_with(|| value.to_string());
+        }
+    }
+    out
+}
+
+/// `To` recipients from libpff's recipient table: `(addresses, display names)`,
+/// each sorted, deduped and capped. `Cc`/`Bcc` entries are excluded so `to`
+/// means the same thing whichever backend produced the export.
+fn parse_recipients(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut addresses: BTreeSet<String> = BTreeSet::new();
+    let mut displays: BTreeSet<String> = BTreeSet::new();
+    for block in text.split("\n\n") {
+        let props = parse_property_block(block);
+        let kind = props
+            .get("recipient type")
+            .map(|k| k.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !kind.is_empty() && kind != "to" {
+            continue;
+        }
+        if let Some(address) = props.get("email address") {
+            if !address.is_empty() {
+                addresses.insert(clamp(address));
+            }
+        }
+        if let Some(display) = props
+            .get("recipient display name")
+            .or_else(|| props.get("display name"))
+        {
+            if !display.is_empty() {
+                displays.insert(clamp(display));
+            }
+        }
+    }
+    (
+        addresses.into_iter().take(MAX_RECIPIENTS).collect(),
+        displays.into_iter().take(MAX_RECIPIENTS).collect(),
+    )
 }
 
 /// RFC822 unfolding: a line starting with space/tab continues the previous one.
@@ -572,8 +778,15 @@ fn split_header(line: &str) -> Option<(String, String)> {
     Some((field.to_ascii_lowercase(), value.trim().to_string()))
 }
 
-/// Split `"Display Name" <addr@host>` into its two halves. A bare address
-/// yields an empty display name.
+/// Split a mailbox into `(display name, address)`.
+///
+/// Three forms, all of which appear in real stores:
+/// * `"Display Name" <addr@host>` — RFC 2822.
+/// * `addr@host (Display Name)` — the legacy RFC 822 comment form, which is
+///   what 2000s-era mail carries. Reading it backwards would put the sender's
+///   *claimed* identity in the address field and the real address in the
+///   display name, inverting exactly the comparison this tool exists to make.
+/// * `addr@host` — a bare address, so the display name is empty.
 fn split_mailbox(value: &str) -> (String, String) {
     let value = value.trim();
     if let (Some(open), Some(close)) = (value.find('<'), value.rfind('>')) {
@@ -581,6 +794,15 @@ fn split_mailbox(value: &str) -> (String, String) {
             let display = value[..open].trim().trim_matches('"').trim().to_string();
             let address = value[open + 1..close].trim().to_string();
             return (clamp(&display), clamp(&address));
+        }
+    }
+    if let (Some(open), Some(close)) = (value.find('('), value.rfind(')')) {
+        if open < close {
+            let address = value[..open].trim().trim_matches('"').trim();
+            let display = value[open + 1..close].trim();
+            if address.contains('@') {
+                return (clamp(display), clamp(address));
+            }
         }
     }
     if value.contains('@') {
@@ -771,11 +993,11 @@ mod tests {
             "From: a@x.com\r\nTo: jean@m57.biz\r\nSubject: aaa\r\n\r\nx\r\n",
         )
         .unwrap();
-        // Same envelope exported twice from the same folder (libpst and libpff
-        // can both emit a duplicate item) — one message, not two.
+        // Same envelope exported twice from the same folder (a store can hold
+        // two copies of one message) — one message, not two.
         std::fs::write(
-            root.join("Inbox/InternetHeaders.txt"),
-            "From: a@x.com\r\nTo: jean@m57.biz\r\nSubject: aaa\r\n\r\n",
+            root.join("Inbox/0003.eml"),
+            "From: a@x.com\r\nTo: jean@m57.biz\r\nSubject: aaa\r\n\r\ndifferent body\r\n",
         )
         .unwrap();
 
@@ -804,6 +1026,132 @@ mod tests {
         assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].folder, "Inbox");
         assert_eq!(msgs[1].folder, "Sent Items");
+    }
+
+    /// One libpff export item directory, as `pffexport -f text` writes it.
+    fn pff_item(dir: &std::path::Path, internet: &str, outlook: &str, recipients: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("InternetHeaders.txt"), internet).unwrap();
+        std::fs::write(dir.join("OutlookHeaders.txt"), outlook).unwrap();
+        if !recipients.is_empty() {
+            std::fs::write(dir.join("Recipients.txt"), recipients).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_sent_item_with_no_internet_headers_is_read_from_the_outlook_headers() {
+        // Locally composed mail never acquired internet transport headers, so
+        // libpff writes an EMPTY InternetHeaders.txt and the envelope lives in
+        // OutlookHeaders.txt + Recipients.txt. Skipping those items loses every
+        // message the host SENT — exactly where an outbound attachment is.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        pff_item(
+            &root.join("export.export/Top of Personal Folders/Sent Items/Message00016"),
+            "",
+            concat!(
+                "Message:\n",
+                "Client submit time:\t\t\tJul 20, 2008 01:28:47.828125000 UTC\n",
+                "Conversation topic:\t\t\tPlease send me the information now\n",
+                "Subject:\t\t\t\tRE: Please send me the information now\n",
+                "Sender name:\t\t\t\tJean User\n",
+                "Sender email address:\t\t\tjean@m57.biz\n",
+            ),
+            concat!(
+                "Display name:\t\talison@m57.biz\n",
+                "Recipient display name:\talison@m57.biz\n",
+                "Email address:\t\ttuckgorge@gmail.com\n",
+                "Address type:\t\tSMTP\n",
+                "Recipient type:\t\tTo\n",
+            ),
+        );
+
+        let msgs = collect_export_messages(root, 100);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        let m = &msgs[0];
+        assert_eq!(m.subject, "RE: Please send me the information now");
+        assert_eq!(m.from_display, "Jean User");
+        assert_eq!(m.from_address, "jean@m57.biz");
+        assert_eq!(m.to, vec!["tuckgorge@gmail.com".to_string()]);
+        assert_eq!(m.to_display, vec!["alison@m57.biz".to_string()]);
+        assert_eq!(m.date, "Jul 20, 2008 01:28:47.828125000 UTC");
+        assert_eq!(m.folder, "Top of Personal Folders/Sent Items");
+    }
+
+    #[test]
+    fn only_to_recipients_are_surfaced_as_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        pff_item(
+            &root.join("Inbox/Message00001"),
+            "",
+            "Subject:\t\ts\nSender email address:\t\ta@x.com\n",
+            concat!(
+                "Display name:\t\tPrimary\nEmail address:\t\tto@y.com\n",
+                "Recipient type:\t\tTo\n\n",
+                "Display name:\t\tCopied\nEmail address:\t\tcc@y.com\n",
+                "Recipient type:\t\tCc\n",
+            ),
+        );
+        let msgs = collect_export_messages(root, 100);
+        assert_eq!(msgs[0].to, vec!["to@y.com".to_string()]);
+    }
+
+    #[test]
+    fn internet_headers_win_and_outlook_headers_fill_the_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        pff_item(
+            &root.join("Inbox/Message00214"),
+            "To: jean@m57.biz\r\nSubject: Please send me the information now\r\n\r\n",
+            concat!(
+                "Subject:\t\t\t\tOUTLOOK SUBJECT\n",
+                "Sender name:\t\t\t\talison@m57.biz\n",
+                "Sender email address:\t\t\ttuckgorge@gmail.com\n",
+            ),
+            "",
+        );
+        let m = &collect_export_messages(root, 100)[0];
+        // the transport header wins where it has a value ...
+        assert_eq!(m.subject, "Please send me the information now");
+        // ... and the Outlook property fills the field it left empty
+        assert_eq!(m.from_display, "alison@m57.biz");
+        assert_eq!(m.from_address, "tuckgorge@gmail.com");
+    }
+
+    #[test]
+    fn legacy_rfc822_comment_form_splits_display_from_address() {
+        // `addr (Display Name)` is the pre-RFC2822 form, and it is what a real
+        // 2008-era store carries. Reading it backwards would put the sender's
+        // claimed identity in the address field.
+        assert_eq!(
+            split_mailbox("tuckgorge@gmail.com (alison@m57.biz)"),
+            (
+                "alison@m57.biz".to_string(),
+                "tuckgorge@gmail.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn libpff_attachment_index_prefix_is_stripped_from_the_name() {
+        // libpff writes `<n>_<name>` so two attachments with the same name in
+        // one message cannot collide. The index is the exporter's, not part of
+        // the filename the message carried.
+        let dir = tempfile::tempdir().unwrap();
+        let item = dir.path().join("Sent Items/Message00016");
+        std::fs::create_dir_all(item.join("Attachments")).unwrap();
+        std::fs::write(
+            item.join("OutlookHeaders.txt"),
+            "Subject:\t\ts\nSender email address:\t\tjean@m57.biz\n",
+        )
+        .unwrap();
+        std::fs::write(item.join("Attachments/1_m57biz.xls"), b"fake").unwrap();
+
+        let m = &collect_export_messages(dir.path(), 100)[0];
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].name, "m57biz.xls");
+        assert_eq!(m.attachments[0].extension, "xls");
     }
 
     #[test]
