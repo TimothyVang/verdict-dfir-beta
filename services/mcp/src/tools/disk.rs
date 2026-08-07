@@ -1245,9 +1245,16 @@ fn parse_fls_line(line: &str) -> Option<FlsRow> {
     if inode.is_empty() || path.is_empty() {
         return None;
     }
-    // TSK prints inode 0 when the metadata record itself is unavailable; there
-    // is nothing to extract from it and `icat 0` would just fail.
-    if inode.split('-').next().unwrap_or(inode) == "0" {
+    // TSK prints a BARE `0` when the metadata record itself is unavailable;
+    // there is nothing to extract from it and `icat 0` would just fail.
+    //
+    // Compare the WHOLE address, never just its leading entry number: NTFS
+    // numbers the Master File Table's own record zero, so `$MFT` legitimately
+    // addresses `0-128-<id>` on every NTFS volume. Keying on the entry number
+    // silently dropped `$MFT` from every image listing (REG-2) — the highest
+    // priority artifact class on the disk, and the one the MFT timeline lane
+    // is built on.
+    if inode == "0" {
         return None;
     }
     Some(FlsRow {
@@ -1276,8 +1283,63 @@ struct ArtifactCandidate {
     recovered_deleted: bool,
 }
 
-/// Extract order: forensically critical classes first, broad yara targets last,
-/// so the `limit` never crowds out registry/MFT/prefetch.
+/// The artifact classes an investigation is actually built on: every typed,
+/// parser-backed class. [`select_artifacts`] allocates the extraction budget to
+/// these FIRST, and anything not named here draws only from what they leave.
+///
+/// This is a property, not a preference. A flat round-robin gives every class
+/// an equal turn, so the untyped content sweep drew as much budget as `$MFT`
+/// (measured: `yara_target` took 225 of alihadi-01-webserver's 411 extracted
+/// artifacts and 152 of m57-jean's 500), and each newly wired lane shrank every
+/// existing class's share on any image whose candidates outrun the budget.
+///
+/// Listing a class here is the deliberate, reviewed act that lets it share the
+/// core budget — and that re-divides the share of everything already in it, so
+/// the goldens need re-running. A lane added WITHOUT touching this list lands in
+/// the supplementary tier, where it provably cannot shrink what the existing
+/// lanes extract.
+const CORE_ARTIFACT_CLASSES: &[&str] = &[
+    "mft",
+    "usnjrnl",
+    "prefetch",
+    "registry",
+    "reg_txlog",
+    "evtx",
+    "legacy_evt",
+    "amcache",
+    "srum",
+    "lnk",
+    "jumplist",
+    "scheduled_task",
+    "recyclebin",
+    "browser_db",
+    "ie_history",
+    "thumbnail",
+    "linux_account",
+    "linux_log",
+    "linux_shell_history",
+    "linux_ssh",
+    "linux_cron",
+    "macos_unifiedlog",
+    "macos_activity",
+    "macos_launchd",
+    "macos_fsevents",
+    "web_log",
+    "webroot_script",
+    "mail_store",
+];
+
+/// Budget tier: 0 for a [`CORE_ARTIFACT_CLASSES`] member, 1 for everything else
+/// (today only the generic `yara_target` sweep, plus any future lane whose
+/// author has not claimed core budget for it). [`select_artifacts`] drains the
+/// tiers in order; classes *within* a tier share that tier round-robin, so no
+/// class starves its neighbours.
+fn class_tier(class: &str) -> u8 {
+    u8::from(!CORE_ARTIFACT_CLASSES.contains(&class))
+}
+
+/// Extract order *within a tier*: forensically critical classes first, broad
+/// yara targets last, so the `limit` never crowds out registry/MFT/prefetch.
 fn class_priority(class: &str) -> u8 {
     match class {
         "mft" => 0,
@@ -1401,44 +1463,69 @@ fn evtx_subrank(rel_path: &str) -> u8 {
     }
 }
 
-/// Choose up to `limit` artifacts to extract, allocating the budget *fairly
-/// across classes* so no single voluminous class starves the rest. Classes are
-/// visited in [`class_priority`] order and drawn round-robin: every class with
-/// candidates gets a turn each pass, and a class that drains early hands its
-/// unused budget to the others. Within a class, [`artifact_subrank`], then
-/// partition preference (the OS volume ahead of boot/recovery partitions),
-/// then path order decides which artifacts win the class's share. Pure (no
-/// I/O) so the allocation is unit-testable.
+/// Choose up to `limit` artifacts to extract.
+///
+/// Two rules, in this order:
+///
+/// 1. **Tier before share.** [`CORE_ARTIFACT_CLASSES`] are allocated first;
+///    everything else divides only what they leave. Without this, wiring a new
+///    lane into the default sweep silently shrank every existing class's share
+///    on any image whose candidates outrun the budget, and the untyped
+///    `yara_target` sweep drew as much budget as `$MFT` despite
+///    [`class_priority`] documenting it as last.
+/// 2. **Round-robin within a tier**, so no single voluminous class starves its
+///    neighbours: classes are visited in [`class_priority`] order, every class
+///    with candidates gets a turn each pass, and a class that drains early
+///    hands its unused budget to the rest of its tier.
+///
+/// Within a class, [`artifact_subrank`], then partition preference (the OS
+/// volume ahead of boot/recovery partitions), then path order decides which
+/// artifacts win the class's share. Pure (no I/O) so the allocation is
+/// unit-testable.
 fn select_artifacts(candidates: Vec<ArtifactCandidate>, limit: usize) -> Vec<ArtifactCandidate> {
-    let mut buckets: BTreeMap<u8, Vec<ArtifactCandidate>> = BTreeMap::new();
+    let mut buckets: BTreeMap<(u8, u8), Vec<ArtifactCandidate>> = BTreeMap::new();
     for candidate in candidates {
         buckets
-            .entry(class_priority(candidate.class))
+            .entry((class_tier(candidate.class), class_priority(candidate.class)))
             .or_default()
             .push(candidate);
     }
-    let mut queues: Vec<VecDeque<ArtifactCandidate>> = buckets
-        .into_values()
-        .map(|mut bucket| {
-            bucket.sort_by(|a, b| {
-                artifact_subrank(a.class, &a.rel_path)
-                    .cmp(&artifact_subrank(b.class, &b.rel_path))
-                    .then_with(|| a.partition_rank.cmp(&b.partition_rank))
-                    .then_with(|| a.rel_path.cmp(&b.rel_path))
-            });
-            VecDeque::from(bucket)
-        })
-        .collect();
+
+    // A BTreeMap keyed on (tier, priority) iterates tier-major, so consecutive
+    // entries sharing a tier are exactly that tier's round-robin group.
+    let mut tiers: Vec<Vec<VecDeque<ArtifactCandidate>>> = Vec::new();
+    let mut current_tier: Option<u8> = None;
+    for ((tier, _), mut bucket) in buckets {
+        bucket.sort_by(|a, b| {
+            artifact_subrank(a.class, &a.rel_path)
+                .cmp(&artifact_subrank(b.class, &b.rel_path))
+                .then_with(|| a.partition_rank.cmp(&b.partition_rank))
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        if current_tier != Some(tier) {
+            tiers.push(Vec::new());
+            current_tier = Some(tier);
+        }
+        tiers
+            .last_mut()
+            .expect("a tier group is pushed before its first queue")
+            .push(VecDeque::from(bucket));
+    }
 
     let mut selected = Vec::new();
-    while selected.len() < limit && queues.iter().any(|queue| !queue.is_empty()) {
-        for queue in &mut queues {
-            if selected.len() >= limit {
-                break;
+    for queues in &mut tiers {
+        while selected.len() < limit && queues.iter().any(|queue| !queue.is_empty()) {
+            for queue in queues.iter_mut() {
+                if selected.len() >= limit {
+                    break;
+                }
+                if let Some(item) = queue.pop_front() {
+                    selected.push(item);
+                }
             }
-            if let Some(item) = queue.pop_front() {
-                selected.push(item);
-            }
+        }
+        if selected.len() >= limit {
+            break;
         }
     }
     selected
@@ -1937,7 +2024,8 @@ mod tests {
         classify_candidates, mock_list, order_partitions_by_preference, parse_fls_line,
         parse_mmls_filesystem_partitions, partition_byte_offsets, prefetch_wipe_limitation,
         recovered_content_matches, safe_join, select_artifacts, unmount_steps, wanted_kinds,
-        ArtifactCandidate, ArtifactKind, ListedFile, MmlsPartition, MAX_RECOVERED_DELETED,
+        ArtifactCandidate, ArtifactKind, ListedFile, MmlsPartition, CORE_ARTIFACT_CLASSES,
+        MAX_RECOVERED_DELETED,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -2070,6 +2158,56 @@ mod tests {
             None
         );
         assert_eq!(parse_fls_line(""), None);
+    }
+
+    #[test]
+    fn parse_fls_line_keeps_the_master_file_table_at_ntfs_entry_zero() {
+        // REG-2. NTFS numbers the Master File Table's OWN record zero, so on
+        // every NTFS volume `$MFT` addresses `0-128-<id>`. Verbatim row from
+        // `fls -p -r -o 63` over the nist-hacking-case image (SCHARDT.001):
+        //
+        //     r/r 0-128-7:	$MFT
+        //
+        // Rejecting an address because its *entry number* is 0 therefore
+        // discards the single highest-priority artifact class on the disk.
+        // The unrecoverable rows TSK really does mark are printed as a BARE
+        // `0` with no attribute address (see the test above) - that, and only
+        // that, is what the guard may key on.
+        let row = parse_fls_line("r/r 0-128-7:\t$MFT").expect("$MFT parses");
+        assert_eq!(row.inode, "0-128-7");
+        assert_eq!(row.rel_path, "$MFT");
+        assert!(row.allocated, "$MFT is an allocated system file");
+        assert_eq!(classify_artifact_path(&row.rel_path), Some("mft"));
+    }
+
+    #[test]
+    fn an_ntfs_listing_still_yields_an_mft_extraction_candidate() {
+        // The same regression one layer up. With no `mft` artifact extracted
+        // the mft_timeline lane never runs, and on nist-hacking-case that is
+        // the evidence the "hacking tools in Program Files" finding (nhc-004)
+        // stood on. Rows are the real shapes seen on SCHARDT.001.
+        let listed: Vec<ListedFile> = [
+            "r/r 0-128-7:\t$MFT",
+            "r/r 1-128-1:\t$MFTMirr",
+            "r/r 380861-128-4:\tWINDOWS/system32/config/SYSTEM",
+            "r/- * 0:\tDocuments and Settings/Default User/MPC7A4.tmp",
+        ]
+        .iter()
+        .filter_map(|line| parse_fls_line(line))
+        .map(|row| ListedFile {
+            partition_rank: 0,
+            sector_offset: None,
+            inode: row.inode,
+            rel_path: row.rel_path,
+            allocated: row.allocated,
+        })
+        .collect();
+        let candidates = classify_candidates(listed, &wanted_kinds(&[]));
+        assert!(
+            candidates.iter().any(|c| c.class == "mft"),
+            "an NTFS listing must yield an mft candidate, got {:?}",
+            candidates.iter().map(|c| c.class).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2365,6 +2503,42 @@ mod tests {
         }
     }
 
+    /// Opt-in check against a REAL `fls -p -r` listing, run as
+    /// `MFT_FLS_LISTING=<file> cargo test`. Skipped (silently passing) without
+    /// the env var, so it is a developer receipt rather than CI coverage — the
+    /// `parse_fls_line_keeps_the_master_file_table_at_ntfs_entry_zero` unit test
+    /// is what actually guards the regression on every run.
+    #[test]
+    fn selection_over_a_real_image_listing_keeps_the_master_file_table() {
+        let Ok(listing) = std::env::var("MFT_FLS_LISTING") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&listing).expect("listing readable");
+        let mut candidates: Vec<ArtifactCandidate> = Vec::new();
+        let (mut rows, mut dropped) = (0usize, 0usize);
+        for line in text.lines() {
+            rows += 1;
+            let Some(row) = parse_fls_line(line) else {
+                dropped += 1;
+                continue;
+            };
+            if let Some(class) = classify_artifact_path(&row.rel_path) {
+                if row.allocated {
+                    candidates.push(cand(class, &row.inode, &row.rel_path));
+                }
+            }
+        }
+        let selected = select_artifacts(candidates, 500);
+        let by_class = counts_by_class(&selected);
+        println!("{rows} fls rows, {dropped} unparsed; selected {by_class:?}");
+        assert_eq!(
+            by_class.get("mft").copied().unwrap_or(0),
+            1,
+            "the NTFS Master File Table must reach the extraction budget"
+        );
+        assert!(selected.iter().any(|c| c.rel_path == "$MFT"));
+    }
+
     #[test]
     fn classify_artifact_path_matches_web_tier_classes() {
         // Web server request logs — the primary record of an exploitation
@@ -2652,6 +2826,138 @@ mod tests {
                 .any(|c| c.rel_path.ends_with("/Security.evtx")),
             "canonical Security.evtx must win evtx's fair share"
         );
+    }
+
+    /// How many artifacts of each class a selection drew.
+    fn counts_by_class(selected: &[ArtifactCandidate]) -> BTreeMap<&'static str, usize> {
+        let mut out = BTreeMap::new();
+        for c in selected {
+            *out.entry(c.class).or_insert(0) += 1;
+        }
+        out
+    }
+
+    /// A disk whose CORE classes alone already outrun any sane budget.
+    fn saturated_core_disk() -> Vec<ArtifactCandidate> {
+        let mut candidates = vec![cand("mft", "mft", "$MFT")];
+        for i in 0..200 {
+            candidates.push(cand(
+                "prefetch",
+                &format!("p{i}"),
+                &format!("Windows/Prefetch/A{i:04}.pf"),
+            ));
+            candidates.push(cand(
+                "lnk",
+                &format!("l{i}"),
+                &format!("Users/x/R/{i:04}.lnk"),
+            ));
+            candidates.push(cand(
+                "registry",
+                &format!("r{i}"),
+                &format!("Users/u{i:04}/NTUSER.DAT"),
+            ));
+        }
+        candidates
+    }
+
+    #[test]
+    fn wiring_a_new_artifact_class_cannot_shrink_the_core_classes_share() {
+        // The wave-2 shape, generalised: three new classes (web_log,
+        // webroot_script, mail_store) were wired into the default sweep and the
+        // flat round-robin handed each of them the same turn as `$MFT`, so
+        // every existing class's share shrank on any image whose candidates
+        // outrun the budget. Measured on the goldens at the time:
+        // alihadi-01-webserver yara_target 225 -> 154, alihadi-07-sysinternals
+        // lnk 96 -> 85 / reg_txlog 95 -> 84 / scheduled_task 95 -> 85.
+        //
+        // A lane added later must not be able to do that silently. A class the
+        // author has NOT deliberately added to CORE_ARTIFACT_CLASSES draws only
+        // from budget the core classes left behind, so its arrival cannot move
+        // any core count downward.
+        const LIMIT: usize = 100;
+        let before = counts_by_class(&select_artifacts(saturated_core_disk(), LIMIT));
+
+        let mut with_new_lane = saturated_core_disk();
+        for i in 0..200 {
+            // Not in CORE_ARTIFACT_CLASSES: exactly what "the next lane" looks
+            // like before anyone decides it belongs in the core budget.
+            with_new_lane.push(cand(
+                "future_lane",
+                &format!("f{i}"),
+                &format!("Some/New/Evidence/{i:04}.dat"),
+            ));
+        }
+        let after = counts_by_class(&select_artifacts(with_new_lane, LIMIT));
+
+        assert!(!CORE_ARTIFACT_CLASSES.contains(&"future_lane"));
+        for class in ["mft", "prefetch", "lnk", "registry"] {
+            let (b, a) = (
+                before.get(class).copied().unwrap_or(0),
+                after.get(class).copied().unwrap_or(0),
+            );
+            assert!(
+                a >= b,
+                "adding a new class shrank core class {class}: {b} -> {a} \
+                 (before {before:?}, after {after:?})"
+            );
+        }
+        assert_eq!(
+            after.get("future_lane").copied().unwrap_or(0),
+            0,
+            "a saturated core budget leaves the new lane nothing, by design"
+        );
+    }
+
+    #[test]
+    fn the_broad_content_sweep_draws_after_every_typed_class() {
+        // `class_priority` has always documented the generic yara sweep as
+        // "always last ... so the limit never crowds out registry/MFT/prefetch",
+        // but the flat round-robin gave it an equal turn with `$MFT`. On
+        // alihadi-01-webserver that spent 225 of 411 extracted artifacts on the
+        // untyped sweep.
+        const LIMIT: usize = 100;
+        let mut candidates = saturated_core_disk();
+        for i in 0..500 {
+            candidates.push(cand(
+                "yara_target",
+                &format!("y{i}"),
+                &format!("Users/x/Documents/{i:04}.txt"),
+            ));
+        }
+        let selected = counts_by_class(&select_artifacts(candidates, LIMIT));
+        assert_eq!(
+            selected.get("yara_target").copied().unwrap_or(0),
+            0,
+            "typed classes had unmet demand, so the sweep gets nothing: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn supplementary_classes_still_get_the_budget_the_core_leaves_behind() {
+        // The other side of the tier rule: draining core first must not mean
+        // starving a small later lane on a disk that has room for it. Core
+        // demand here is 3; the rest of the budget is shared round-robin by the
+        // supplementary classes, so a 2-file mail store is never crowded out by
+        // a 400-file content sweep.
+        let mut candidates = vec![
+            cand("mft", "mft", "$MFT"),
+            cand("registry", "sys", "WINDOWS/system32/config/SYSTEM"),
+            cand("prefetch", "pf", "WINDOWS/Prefetch/CMD.EXE-1.pf"),
+            cand("mail_store", "pst1", "Users/jean/Outlook.pst"),
+            cand("mail_store", "pst2", "Users/jean/archive.pst"),
+        ];
+        for i in 0..400 {
+            candidates.push(cand(
+                "yara_target",
+                &format!("y{i}"),
+                &format!("Users/x/Documents/{i:04}.txt"),
+            ));
+        }
+        let selected = counts_by_class(&select_artifacts(candidates, 50));
+        assert_eq!(selected.get("mft").copied().unwrap_or(0), 1);
+        assert_eq!(selected.get("mail_store").copied().unwrap_or(0), 2);
+        // 5 core artifacts drawn, 45 of the budget's 50 left for the sweep.
+        assert_eq!(selected.get("yara_target").copied().unwrap_or(0), 45);
     }
 
     #[test]
