@@ -14,7 +14,7 @@ Two numbers that look like a contradiction but aren't:
   are product-default and in the audit chain; the other four are non-product conveniences
   (operator-runtime browser/automation + the optional `qmd` memory sidecar).
 
-Neither number contradicts the other: 46 counts *product tools*, 6 counts *registered servers*.
+Neither number contradicts the other: 47 counts *product tools*, 6 counts *registered servers*.
 
 ---
 
@@ -76,7 +76,7 @@ unit-tested against synthetic fixtures, but they have not yet been exercised on 
 committed case run. The committed sample runs prove the core disk/registry/EVTX/MFT/Prefetch/YARA/
 USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` paths.
 
-### `findevil-mcp` — 33 Rust DFIR tools (`services/mcp/src/tools/`)
+### `findevil-mcp` — 34 Rust DFIR tools (`services/mcp/src/tools/`)
 
 | Tool | Purpose | Source |
 |---|---|---|
@@ -102,6 +102,7 @@ USN/Hayabusa/Sysmon/Zeek/PCAP, `vol_*`, `vel_collect`, and `browser_history` pat
 | `browser_history` | Read visited URLs from a Chrome/Edge `History` or Firefox `places.sqlite` (read-only, in-process via `rusqlite`) | `browser_history.rs` |
 | `web_triage` | Parse a web-tier artifact: an Apache/nginx/IIS request log (flagged requests with client IP, method, target, status, UA, line number, and the exploitation indicators that fired) or a web-root server-side script (shell/eval/obfuscation/socket primitives + whether the combination matches a webshell pattern). Pure Rust, no subprocess | `web_triage.rs` |
 | `oe_dbx_parse` | Read an Outlook Express `.dbx` mail/news store — OE-signature-validated, extracts RFC822 `Subject`/`From`/`Newsgroups` headers (in-process; no other parser reads DBX) | `oe_dbx_parse.rs` |
+| `pst_parse` | Read an Outlook `.pst`/`.ost` mail store — PST-signature-validated, exports via libpst/libpff and returns each message's `From`/`Reply-To`/`To`/`Subject`/`Date` plus attachment names and types | `pst_parse.rs` |
 | `vol_run` | Allow-listed Volatility3 plugin verb (the ~40-plugin memory tail in one tool) — `PluginNotAllowed` before argv | `vol_run.rs` |
 | `ez_parse` | Allow-listed Eric Zimmerman tool verb (LNK/JumpLists/Amcache/ShimCache/RecycleBin/shellbags/WxT) → CSV rows | `ez_parse.rs` |
 | `plaso_parse` | Allow-listed log2timeline parser verb (cross-OS text/binary logs) → normalized timeline events | `plaso_parse.rs` |

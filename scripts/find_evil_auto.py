@@ -34,6 +34,7 @@ from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import email.utils
 import hashlib
 import ipaddress
 import json
@@ -796,6 +797,9 @@ EXTRACTED_DISK_CLASSES = {
     "legacy_evt",
     "ie_history",
     "thumbnail",
+    # Outlook .pst/.ost and Outlook Express .dbx, carved by TSK so the mail
+    # lane runs without a filesystem mount.
+    "mail_store",
 }
 YARA_TARGET_EXTS = (
     ".bat",
@@ -3948,6 +3952,463 @@ def ie_history_illicit_candidates(
             }
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Mail-store detectors (``pst_parse`` / ``oe_dbx_parse`` message envelopes).
+#
+# A host's mail lives in an Outlook ``.pst``/``.ost`` or a legacy Outlook
+# Express ``.dbx``; ``disk_extract_artifacts`` carves both as the ``mail_store``
+# class. These are pure header comparisons over whatever the parser actually
+# returned -- no image-specific names, domains, or subjects anywhere. Each one
+# reports a HEADER fact: what the message claims, not who typed it. Per
+# CLAUDE.md, actor identity and intent stay out of scope for host artifacts.
+# ---------------------------------------------------------------------------
+
+# Attachment tells for a spreadsheet (structured/tabular data). Extension OR
+# media type is enough -- an export can carry either.
+_SPREADSHEET_EXTS = frozenset({"xls", "xlsx", "xlsm", "xlsb", "csv", "ods", "tsv"})
+_SPREADSHEET_MEDIA_TOKENS = ("excel", "spreadsheet", "csv", "ms-excel")
+# Reply/forward prefixes stripped when grouping a conversation. Kept broad
+# enough for the common non-English clients an enterprise store carries.
+_THREAD_PREFIXES = ("re:", "fw:", "fwd:", "aw:", "sv:", "vs:", "tr:", "rv:", "antw:")
+# Floor on messages before an exchange is called a thread. Two messages is a
+# question and an answer; three or more is a sustained conversation.
+_THREAD_MIN_MESSAGES = 3
+
+
+def _email_domain(address: Any) -> str:
+    """Lowercased domain part of an address, or `''` when there is none."""
+    text = str(address or "").strip().lower()
+    _, _, domain = text.rpartition("@")
+    return domain.strip().strip(">").strip()
+
+
+def _normalize_address(address: Any) -> str:
+    return str(address or "").strip().lower()
+
+
+def mail_internal_domains(messages: list[dict[str, Any]]) -> set[str]:
+    """The organisation's own mail domain(s), derived from the store itself.
+
+    A mailbox is dominated by its own organisation's addresses, so the most
+    frequent domain across every ``From``/``To`` address IS the internal one.
+    Deriving it from the evidence (instead of a configured list) keeps every
+    downstream "external" judgement evidence-agnostic: it works for any store
+    from any organisation. Ties resolve alphabetically so the result is
+    deterministic.
+    """
+    counts: dict[str, int] = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        addresses = [message.get("from_address"), *(message.get("to") or [])]
+        for address in addresses:
+            domain = _email_domain(address)
+            if domain:
+                counts[domain] = counts.get(domain, 0) + 1
+    if not counts:
+        return set()
+    top = max(counts.values())
+    return {sorted(d for d, c in counts.items() if c == top)[0]}
+
+
+def _is_external(address: Any, internal_domains: set[str]) -> bool:
+    domain = _email_domain(address)
+    return bool(domain) and domain not in internal_domains
+
+
+def _registrable_domain(domain: str) -> str:
+    """The organisation-level domain: the last two labels of `domain`.
+
+    A newsletter sent from ``newsletters@n.example.org`` with
+    ``Reply-To: do-not-reply@example.org`` is one organisation's own bulk
+    mailer, not a spoof, so a divergence inside one registrable domain must not
+    be reported. This is the deliberately crude PSL-free rule: it can merge two
+    parties under a shared public suffix (``a.co.uk`` and ``b.co.uk``), which
+    only ever SUPPRESSES a report -- the safe direction for a CONFIRMED claim.
+    """
+    labels = [label for label in str(domain or "").split(".") if label]
+    if len(labels) < 2:
+        return ".".join(labels)
+    return ".".join(labels[-2:])
+
+
+def _same_organisation(left: Any, right: Any) -> bool:
+    a, b = _registrable_domain(_email_domain(left)), _registrable_domain(_email_domain(right))
+    return bool(a) and a == b
+
+
+def _displayed_address(display: Any) -> str:
+    """The address a display name IS, when the display name is itself an
+    address. Mail clients show the display name, so a display name that reads
+    as an address is the identity the reader believes they are corresponding
+    with -- and it need not be the address a reply reaches."""
+    text = _normalize_address(display)
+    return text if "@" in text and " " not in text else ""
+
+
+def mail_reply_address_divergence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages where the address shown is not the address mail actually goes to.
+
+    Three pure header comparisons, all of the same shape -- a DISPLAYED address
+    beside the ACTUAL one, differing across an organisation boundary:
+
+    * ``reply_to_vs_from``        -- ``Reply-To`` differs from ``From``.
+    * ``sender_display_vs_from``  -- the ``From`` display name is itself an
+      address, and not the sending address (the RFC822
+      ``actual@host (displayed@host)`` form).
+    * ``recipient_display_vs_to`` -- a recipient's stored display name is an
+      address that is not among the addresses the message was actually sent to.
+
+    Divergences inside one organisation (bulk mailers, shared reply mailboxes)
+    are excluded: they are ordinary mail-system behaviour, not a spoofing tell.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        row = {
+            "folder": str(message.get("folder") or ""),
+            "subject": str(message.get("subject") or ""),
+            "date": str(message.get("date") or ""),
+            "from_address": _normalize_address(message.get("from_address")),
+            "from_display": str(message.get("from_display") or ""),
+        }
+        sender = _normalize_address(message.get("from_address"))
+        reply_to = _normalize_address(message.get("reply_to_address"))
+        if reply_to and sender and reply_to != sender and not _same_organisation(sender, reply_to):
+            out.append(
+                {**row, "basis": "reply_to_vs_from", "displayed": sender, "actual": reply_to}
+            )
+            continue
+
+        shown = _displayed_address(message.get("from_display"))
+        if shown and sender and shown != sender and not _same_organisation(shown, sender):
+            out.append(
+                {**row, "basis": "sender_display_vs_from", "displayed": shown, "actual": sender}
+            )
+            continue
+
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        for display in message.get("to_display") or []:
+            shown = _displayed_address(display)
+            if not shown or shown in recipients:
+                continue
+            actual = next(
+                (r for r in recipients if r and not _same_organisation(shown, r)),
+                "",
+            )
+            if actual:
+                out.append(
+                    {
+                        **row,
+                        "basis": "recipient_display_vs_to",
+                        "displayed": shown,
+                        "actual": actual,
+                    }
+                )
+                break
+    return out
+
+
+def mail_impersonation_candidates(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Messages whose headers claim an inside identity while pointing outside.
+
+    Two independent bases, both pure header comparisons:
+
+    * ``internal_display_name_external_sender`` -- the ``From`` display name is
+      one the store elsewhere pairs with an internal address (so it names a
+      principal of this organisation), but this message's sending address is
+      outside the organisation's own domain.
+    * ``internal_sender_external_reply_to`` -- the ``From`` address is inside the
+      organisation, yet replies are directed outside it.
+
+    Both describe what the headers assert. Neither identifies an author.
+    """
+    if not internal_domains:
+        return []
+    internal_display_names: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        display = str(message.get("from_display") or "").strip().lower()
+        if display and not _is_external(message.get("from_address"), internal_domains):
+            internal_display_names.add(display)
+
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        display = str(message.get("from_display") or "").strip()
+        sender = _normalize_address(message.get("from_address"))
+        reply_to = _normalize_address(message.get("reply_to_address"))
+        sender_external = _is_external(sender, internal_domains)
+        reply_external = bool(reply_to) and _is_external(reply_to, internal_domains)
+        if display and display.lower() in internal_display_names and sender_external:
+            basis = "internal_display_name_external_sender"
+        elif sender and not sender_external and reply_external:
+            basis = "internal_sender_external_reply_to"
+        else:
+            continue
+        out.append(
+            {
+                "basis": basis,
+                "folder": str(message.get("folder") or ""),
+                "subject": str(message.get("subject") or ""),
+                "display_name": display,
+                "from_address": sender,
+                "reply_to_address": reply_to,
+                "recipients": [_normalize_address(r) for r in (message.get("to") or [])],
+                "date": str(message.get("date") or ""),
+            }
+        )
+    return out
+
+
+def _is_spreadsheet_attachment(attachment: Any) -> bool:
+    if not isinstance(attachment, dict):
+        return False
+    extension = str(attachment.get("extension") or "").strip().lower()
+    if not extension:
+        _, _, tail = str(attachment.get("name") or "").rpartition(".")
+        extension = tail.strip().lower()
+    if extension in _SPREADSHEET_EXTS:
+        return True
+    media = str(attachment.get("content_type") or "").lower()
+    return any(token in media for token in _SPREADSHEET_MEDIA_TOKENS)
+
+
+def mail_attachment_egress_candidates(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Messages that carry a spreadsheet attachment from an inside sender to at
+    least one recipient outside the organisation's own mail domain.
+
+    Spreadsheets are the structured-data case: name extension or MIME media
+    type identifies one on any host. This reports the transfer the mail store
+    itself records -- sender, recipients, attachment name and type -- and
+    nothing about the file's contents, which the header-level parser never saw.
+    """
+    if not internal_domains:
+        return []
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        sender = _normalize_address(message.get("from_address"))
+        if not sender or _is_external(sender, internal_domains):
+            continue
+        external = sorted(
+            {
+                _normalize_address(r)
+                for r in (message.get("to") or [])
+                if _is_external(r, internal_domains)
+            }
+        )
+        if not external:
+            continue
+        for attachment in message.get("attachments") or []:
+            if not _is_spreadsheet_attachment(attachment):
+                continue
+            out.append(
+                {
+                    "folder": str(message.get("folder") or ""),
+                    "subject": str(message.get("subject") or ""),
+                    "from_address": sender,
+                    "external_recipients": external,
+                    "attachment": str(attachment.get("name") or ""),
+                    "attachment_type": str(attachment.get("content_type") or "")
+                    or str(attachment.get("extension") or ""),
+                    "date": str(message.get("date") or ""),
+                }
+            )
+    return out
+
+
+# libpff renders a MAPI timestamp as `Mon DD, YYYY HH:MM:SS.fffffffff UTC`.
+_MAIL_MAPI_DATE_RE = re.compile(
+    r"^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*UTC$"
+)
+_MAIL_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _mail_date_instant(value: Any) -> datetime | None:
+    """A message date as an aware UTC instant, or None when it will not parse.
+
+    A store carries TWO date formats: RFC822 transport dates on mail it
+    received, and libpff's MAPI property rendering on mail the host composed.
+    Sorting those as text is meaningless -- "Jul 20" sorts before
+    "Sat, 19 Jul" -- so any reported span must order on parsed instants, and
+    report nothing at all when a value does not parse.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = _MAIL_MAPI_DATE_RE.match(text)
+    if match:
+        month = _MAIL_MONTHS.get(match.group(1).lower())
+        if not month:
+            return None
+        try:
+            return datetime(
+                int(match.group(3)),
+                month,
+                int(match.group(2)),
+                int(match.group(4)),
+                int(match.group(5)),
+                int(match.group(6)),
+                # timezone.utc, not datetime.UTC: this module is also run by
+                # maintainer scripts under a bare python3, which can be 3.10.
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _thread_key(subject: Any) -> str:
+    """Subject with every reply/forward prefix stripped, lowercased. Used to
+    report the distinct topics an exchange covered, not to group it."""
+    text = " ".join(str(subject or "").split()).lower()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _THREAD_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                changed = True
+    return text
+
+
+def mail_counterparty_escalation(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Two-way exchanges with one address outside the organisation's own domain.
+
+    Grouped by WHO the exchange is with, not by subject text. Subject threading
+    fragments a real conversation the moment a reply rewrites the subject, and
+    it lumps a mailbox's bulk mail into one enormous pseudo-thread -- a store
+    of newsletters produces a single 167-message "thread" that means nothing.
+    Grouping by counterparty models the exchange an analyst cares about.
+
+    An exchange qualifies only when mail went BOTH ways: inbound volume alone
+    is a mailing list, not a conversation, which is what keeps newsletters and
+    alert feeds out of the result on any host. The row reports the shape --
+    message counts per direction, the topics covered, the date span, how many
+    messages carried a reply-address divergence, and what left the organisation
+    -- so a downstream lead can describe the exchange without asserting intent.
+    """
+    if not internal_domains:
+        return []
+    diverging_keys = {
+        (row["folder"], row["subject"], row["date"])
+        for row in mail_reply_address_divergence(messages)
+    }
+    groups: dict[str, dict[str, Any]] = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        sender = _normalize_address(message.get("from_address"))
+        recipients = [_normalize_address(r) for r in (message.get("to") or [])]
+        inbound = _is_external(sender, internal_domains)
+        counterparties = (
+            [sender] if inbound else [r for r in recipients if _is_external(r, internal_domains)]
+        )
+        for counterparty in counterparties:
+            if not counterparty:
+                continue
+            group = groups.setdefault(
+                counterparty,
+                {
+                    "counterparty": counterparty,
+                    "message_count": 0,
+                    "inbound_count": 0,
+                    "outbound_count": 0,
+                    "diverging_message_count": 0,
+                    "subjects": set(),
+                    "dates": set(),
+                    "outbound_attachments": set(),
+                },
+            )
+            group["message_count"] += 1
+            group["inbound_count" if inbound else "outbound_count"] += 1
+            key = (
+                str(message.get("folder") or ""),
+                str(message.get("subject") or ""),
+                str(message.get("date") or ""),
+            )
+            if key in diverging_keys:
+                group["diverging_message_count"] += 1
+            topic = _thread_key(message.get("subject"))
+            if topic:
+                group["subjects"].add(topic)
+            if message.get("date"):
+                group["dates"].add(str(message.get("date")))
+            if not inbound:
+                for attachment in message.get("attachments") or []:
+                    if isinstance(attachment, dict) and attachment.get("name"):
+                        group["outbound_attachments"].add(str(attachment["name"]))
+
+    out: list[dict[str, Any]] = []
+    for counterparty in sorted(groups):
+        group = groups[counterparty]
+        # Two-way contact is the floor: a one-directional feed is not an
+        # exchange no matter how many messages it carries.
+        if not (group["inbound_count"] and group["outbound_count"]):
+            continue
+        # Only report a span when every date in the exchange parses; a
+        # partially ordered span would be a guess presented as a fact.
+        instants = [(_mail_date_instant(d), d) for d in group["dates"]]
+        dates = (
+            [d for _, d in sorted(instants, key=lambda pair: pair[0])]
+            if instants and all(i is not None for i, _ in instants)
+            else []
+        )
+        out.append(
+            {
+                "counterparty": counterparty,
+                "message_count": group["message_count"],
+                "inbound_count": group["inbound_count"],
+                "outbound_count": group["outbound_count"],
+                "diverging_message_count": group["diverging_message_count"],
+                "subjects": sorted(group["subjects"]),
+                "outbound_attachments": sorted(group["outbound_attachments"]),
+                "first_date": dates[0] if dates else "",
+                "last_date": dates[-1] if dates else "",
+            }
+        )
+    return out
+
+
+def mail_store_tool_for(artifact_path: Any) -> str | None:
+    """Which parser reads this carved mail store, or None when neither does.
+
+    ``mail_store`` is one extraction class covering two unrelated on-disk
+    formats, so the lane routes by extension: Outlook personal-folders/offline
+    stores go to ``pst_parse``, legacy Outlook Express folders to
+    ``oe_dbx_parse``.
+    """
+    name = PurePosixPath(str(artifact_path or "").replace("\\", "/")).name.lower()
+    if name.endswith((".pst", ".ost")):
+        return "pst_parse"
+    if name.endswith(".dbx"):
+        return "oe_dbx_parse"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -14641,6 +15102,254 @@ class Investigation:
             f"(HYPOTHESIS, {len(groups)} hacking group(s) across {len(stores)} folder(s))"
         )
 
+    def investigate_mail_stores(
+        self, rust: SshMcpClient, py: SshMcpClient, entries: list[dict[str, Any]]
+    ) -> None:
+        """Parse every carved ``mail_store`` artifact and run the mail detectors.
+
+        ``mail_store`` is one extraction class covering two unrelated formats, so
+        each artifact is routed by extension: Outlook ``.pst``/``.ost`` to
+        ``pst_parse``, legacy Outlook Express ``.dbx`` to ``oe_dbx_parse``. Both
+        are audit-chained Rust verbs, so a resulting Finding cites a real
+        ``tool_call_id`` AND survives ``verify_finding`` replay.
+
+        Unlike the OE lane this needs no live mount: ``disk_extract_artifacts``
+        already copied the store into the case directory with The Sleuth Kit, so
+        the cited path is durable and the lane runs on a rootless host.
+        """
+        if not entries:
+            return
+        for entry in entries[:20]:
+            path = str(entry.get("path") or "")
+            tool = mail_store_tool_for(path)
+            if not tool:
+                continue
+            args: dict[str, Any] = {"case_id": self.handle["id"], "artifact_path": path}
+            out = rust.call_tool(tool, args, timeout=1800.0)
+            error = out.get("_error", {}).get("message") if "_error" in out else None
+            messages = out.get("messages") or [] if not error else []
+            tcid = self._record_tool(
+                py,
+                tool,
+                self._output_hash(out),
+                {
+                    "artifact_path": path,
+                    "message_count": out.get("message_count", len(messages)),
+                    "attachment_count": out.get("attachment_count", 0),
+                    "backend": out.get("backend"),
+                    **({"error": error} if error else {}),
+                },
+                arguments=args,
+            )
+            if error:
+                # A host without libpst/libpff returns a typed BinaryNotFound.
+                # Record the coverage gap honestly instead of implying the mail
+                # store held nothing.
+                self.analysis_limitations.append(
+                    f"{tool} could not read the mail store {path}: {error}"
+                )
+                print(f"  {tool}: {path} error={error[:120]}")
+                continue
+            print(f"  {tool}: {path} messages={len(messages)}")
+            self._emit_mail_store_findings(messages, path, tcid)
+
+    def _emit_mail_store_findings(
+        self, messages: list[dict[str, Any]], store_path: str, tcid: str
+    ) -> None:
+        """Emit the mail lane's Pool A findings from one store's envelopes.
+
+        Every claim here is a HEADER fact recovered from the parsed store, and
+        each says so: the store records what the message headers assert, never
+        who composed or transmitted the message (CLAUDE.md keeps actor identity
+        and intent out of scope for host artifacts). CONFIRMED is reserved for
+        the pure comparisons — the two header fields either differ or they do
+        not — with the inferential reading carried at INFERRED.
+        """
+        internal = mail_internal_domains(messages)
+        if not internal:
+            return
+        domain_text = ", ".join(sorted(internal))
+        divergences = mail_reply_address_divergence(messages)
+        diverging_keys = {(r["folder"], r["subject"], r["date"]) for r in divergences}
+
+        if divergences:
+            sample = "; ".join(
+                f"displayed {row['displayed']} but mail actually reaches {row['actual']} "
+                f"(subject '{row['subject']}', folder '{row['folder']}', {row['date']})"
+                for row in divergences[:4]
+            )
+            self._append_mail_finding(
+                base="f-A-mail-reply-to-divergence",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED",
+                mitre="T1534",
+                description=(
+                    f"The reply address diverges from the displayed address on "
+                    f"{len(divergences)} email message(s) in this mail store: {sample}. A "
+                    "reply to such a message is addressed to a mailbox other than the one "
+                    "the message displays — the reply-address divergence (spoofing) "
+                    "indicator. Both values were parsed from the message headers the store "
+                    "holds, and divergences inside a single organisation (bulk mailers, "
+                    "shared reply mailboxes) were excluded. This is a fact about those "
+                    "headers, not a statement about who sent or composed the message."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*]",
+                        "expected": json.dumps(
+                            {
+                                "subject": divergences[0]["subject"],
+                                "from_address": divergences[0]["from_address"],
+                            }
+                        ),
+                        "match": "record",
+                    }
+                ],
+            )
+
+        for row in mail_impersonation_candidates(messages, internal)[:1]:
+            corroborated = (row["folder"], row["subject"], row["date"]) in diverging_keys
+            if row["basis"] == "internal_display_name_external_sender":
+                basis_text = (
+                    f"the From display name '{row['display_name']}' is one this store "
+                    f"elsewhere pairs with an address inside the organisation's own mail "
+                    f"domain ({domain_text}), but this message was sent from "
+                    f"{row['from_address']}, outside it"
+                )
+            else:
+                basis_text = (
+                    f"the From address {row['from_address']} is inside the organisation's "
+                    f"own mail domain ({domain_text}) while its Reply-To "
+                    f"{row['reply_to_address']} is outside it"
+                )
+            reply_text = (
+                f" Its Reply-To is {row['reply_to_address']}." if row["reply_to_address"] else ""
+            )
+            recipients = ", ".join(row["recipients"]) or "the mailbox owner"
+            self._append_mail_finding(
+                base="f-A-mail-impersonation",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED" if corroborated else "INFERRED",
+                mitre="T1566.001",
+                description=(
+                    f"Email impersonating an internal principal, targeting {recipients}: "
+                    f"{basis_text}.{reply_text} Subject: '{row['subject']}' "
+                    f"(folder '{row['folder']}', {row['date']}). This is the "
+                    "spear-phishing header pattern — a message that presents an inside "
+                    "identity while its reply path leaves the organisation. Parsed from "
+                    "the mail store's RFC822 headers. Header fact only: the store records "
+                    "what the headers assert, not who sent or composed the message."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*]",
+                        "expected": json.dumps(
+                            {
+                                "from_display": row["display_name"],
+                                "from_address": row["from_address"],
+                            }
+                        ),
+                        "match": "record",
+                    }
+                ],
+            )
+
+        for row in mail_attachment_egress_candidates(messages, internal)[:1]:
+            recipients = ", ".join(row["external_recipients"])
+            self._append_mail_finding(
+                base="f-A-mail-attachment-egress",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED",
+                mitre="T1567",
+                description=(
+                    f"A spreadsheet attachment left the organisation as an email "
+                    f"attachment: '{row['attachment']}' ({row['attachment_type']}) was sent "
+                    f"from {row['from_address']} to {recipients}, outside the "
+                    f"organisation's own mail domain ({domain_text}). Subject: "
+                    f"'{row['subject']}'; mail folder '{row['folder']}'; {row['date']}. "
+                    "Parsed from the message headers of the mail store carved off the "
+                    "disk image (artifact class mail_store) — the store records the "
+                    "attachment's name and media type and the addresses it went to; the "
+                    "header-level parser never read the file's contents, so what the "
+                    "spreadsheet held is not established here."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*].attachments[*].name",
+                        "expected": row["attachment"],
+                        "match": "exact",
+                    }
+                ],
+            )
+
+        for row in mail_counterparty_escalation(messages, internal)[:1]:
+            if not row["diverging_message_count"] and not row["outbound_attachments"]:
+                # A two-way exchange with no divergence and nothing leaving the
+                # organisation is ordinary business mail, not a lead.
+                continue
+            topics = "; ".join(f"'{s}'" for s in row["subjects"][:4]) or "no subject"
+            if row["outbound_attachments"]:
+                shape = (
+                    "The message timeline across the exchange shows escalation from the "
+                    "opening message to a data transfer: "
+                    f"{', '.join(row['outbound_attachments'])} left the organisation as an "
+                    "attachment on a message sent from this mailbox."
+                )
+            else:
+                shape = (
+                    "The message timeline across the exchange shows a sustained two-way "
+                    "conversation rather than one-directional mail."
+                )
+            self._append_mail_finding(
+                base="f-A-mail-thread-escalation",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="INFERRED",
+                mitre=None,
+                description=(
+                    f"A reconstructed email conversation thread with {row['counterparty']}, "
+                    f"outside the organisation's own mail domain ({domain_text}): "
+                    f"{row['message_count']} messages ({row['inbound_count']} received, "
+                    f"{row['outbound_count']} sent) across the topics {topics}, from "
+                    f"{row['first_date']} to {row['last_date']}. "
+                    f"{row['diverging_message_count']} of those messages carry a "
+                    f"reply-address divergence. {shape} INFERRED from the message envelopes "
+                    "the mail store holds — the conversation's shape is a parsed fact; the "
+                    "participants' intent is not established by a host artifact."
+                ),
+                asserted_values=None,
+            )
+
+    def _append_mail_finding(
+        self,
+        *,
+        base: str,
+        store_path: str,
+        tcid: str,
+        confidence: str,
+        mitre: str | None,
+        description: str,
+        asserted_values: list[dict[str, Any]] | None,
+    ) -> None:
+        finding: dict[str, Any] = {
+            "case_id": self.handle["id"],
+            "finding_id": self._finding_id_for(base, store_path),
+            "tool_call_id": tcid,
+            "artifact_path": store_path,
+            "description": description,
+            "confidence": confidence,
+            "pool_origin": "A",
+            "mitre_technique": mitre,
+            "derived_from": [tcid],
+        }
+        if asserted_values:
+            finding["asserted_values"] = [dict(av) for av in asserted_values]
+        self.findings_pool_a.append(finding)
+        print(f"  pool-A mail finding: {finding['finding_id']} ({confidence})")
+
     def _collect_registry_execution_candidates(
         self,
         rows: list[dict[str, Any]],
@@ -15642,6 +16351,10 @@ class Investigation:
                     if illicit_candidates:
                         self._emit_ie_history_illicit_finding(illicit_candidates, path, tcid)
                 print(f"  plaso_parse/{parser_name}: {path} events={len(events)}")
+
+        # Carved mail stores (Outlook .pst/.ost, Outlook Express .dbx). Routed
+        # here rather than off a live mount so the lane runs rootless.
+        self.investigate_mail_stores(rust, py, by_class["mail_store"])
 
         browser_entries = (by_class["browser_history"] + by_class["browser_db"])[:20]
         browser_specs: list[tuple[str, dict[str, Any]]] = [

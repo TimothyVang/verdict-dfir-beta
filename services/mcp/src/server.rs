@@ -58,6 +58,7 @@ use crate::tools::{
     pcap_triage::pcap_triage,
     plaso_parse::plaso_parse,
     prefetch_parse::prefetch_parse,
+    pst_parse::pst_parse,
     registry_query::registry_query,
     suricata_eve::suricata_eve,
     sysmon_network_query::sysmon_network_query,
@@ -74,7 +75,7 @@ use crate::tools::{
     AusearchInput, BrowserHistoryInput, CaseOpenInput, CloudAuditInput, DiskExtractArtifactsInput,
     DiskMountInput, DiskUnmountInput, EvtxQueryInput, EzParseInput, HayabusaInput, IndxParseInput,
     JournalctlQueryInput, LoginAccountingInput, MacTriageInput, MftInput, NfdumpQueryInput,
-    OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, RegistryInput,
+    OeDbxParseInput, PcapTriageInput, PlasoParseInput, PrefetchInput, PstParseInput, RegistryInput,
     SuricataEveInput, SysmonNetworkInput, UsnJrnlInput, VelCollectInput, VolMalfindInput,
     VolPslistInput, VolPsscanInput, VolPsxviewInput, VolRunInput, WebTriageInput, YaraInput,
     ZeekSummaryInput,
@@ -804,6 +805,36 @@ fn build_registry() -> Vec<ToolEntry> {
             },
             schema: || schema_for::<OeDbxParseInput>(),
             handler: |args| dispatch_oe_dbx_parse(args),
+        },
+        ToolEntry {
+            name: "pst_parse",
+            description: "Parse an Outlook mail store (.pst personal folders / .ost offline \
+                 store) and return each message's RFC822 envelope. No other product tool reads \
+                 a PST (plaso has no PST parser; oe_dbx_parse is Outlook-Express-only; \
+                 browser_history is SQLite-only), so without this the host's mail is invisible. \
+                 Returns per message: subject, from_display/from_address, \
+                 reply_to_display/reply_to_address (a Reply-To that differs from From is the \
+                 classic reply-address spoofing tell), to[], date, and attachments[] with name \
+                 + extension + content_type. Header-level reader, not a body reconstructor; \
+                 output is deduped/sorted and carries no per-run export path, so it is stable \
+                 for verify_finding replay. Returns is_pst=false for non-PST input (e.g. a .dbx \
+                 — use oe_dbx_parse for those) WITHOUT running a subprocess. Use AFTER \
+                 case_open / disk_extract_artifacts (artifact class mail_store); artifact_path \
+                 is one .pst/.ost file. Default limit 2000, ceiling 20000. \
+                 Binary discovery: $PST_READER_BIN first, then readpst (libpst), then \
+                 pffexport (libpff) on PATH. \
+                 ERRORS: ArtifactNotFound (verify the path), BinaryNotFound (install libpst / \
+                 libpff — apt: pst-utils or libpff-utils), SubprocessFailed (check \
+                 stderr_tail), Read (rare IO error).",
+            annotations: ToolAnnotations {
+                title: "Parse Outlook Mail Store (.pst/.ost)",
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            schema: || schema_for::<PstParseInput>(),
+            handler: |args| dispatch_pst_parse(args),
         },
         ToolEntry {
             name: "mac_triage",
@@ -1647,6 +1678,20 @@ fn dispatch_oe_dbx_parse(args: Value) -> Result<Value, ToolError> {
     }
 }
 
+fn dispatch_pst_parse(args: Value) -> Result<Value, ToolError> {
+    let input: PstParseInput = parse_args(args)?;
+    // ArtifactNotFound is a user-input error; surface as -32602.
+    match pst_parse(&input) {
+        Ok(output) => {
+            serde_json::to_value(output).map_err(|e| ToolError::Internal(format!("serialize: {e}")))
+        }
+        Err(e @ crate::tools::PstParseError::ArtifactNotFound(_)) => {
+            Err(ToolError::InvalidParams(format!("{e}")))
+        }
+        Err(e) => Err(ToolError::Internal(format!("pst_parse: {e}"))),
+    }
+}
+
 fn dispatch_mac_triage(args: Value) -> Result<Value, ToolError> {
     let input: MacTriageInput = parse_args(args)?;
     // ModuleNotAllowed / ImageNotFound are user-input errors; surface as -32602.
@@ -1953,6 +1998,7 @@ mod tests {
             "browser_history",
             "oe_dbx_parse",
             "web_triage",
+            "pst_parse",
         ];
         assert_eq!(names.len(), expected.len());
         for want in expected {

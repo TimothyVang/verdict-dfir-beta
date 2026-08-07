@@ -70,6 +70,7 @@ pub enum ArtifactKind {
     MacosFsevents,
     WebLog,
     WebrootScript,
+    MailStore,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -1312,6 +1313,8 @@ fn class_priority(class: &str) -> u8 {
         // web root's scripts) that must not be crowded out by the generic sweep.
         "web_log" => 25,
         "webroot_script" => 26,
+        // Local mail stores (Outlook .pst/.ost, Outlook Express .dbx).
+        "mail_store" => 27,
         // Generic content sweep is always last.
         "yara_target" => 50,
         _ => 99,
@@ -1689,6 +1692,13 @@ fn classify_windows_specific(name: &str, rel: &str) -> Option<&'static str> {
         Some("ie_history")
     } else if name == "thumbs.db" || name.ends_with(".thumbcache") {
         Some("thumbnail")
+    } else if has_extension(name, "pst") || has_extension(name, "ost") || has_extension(name, "dbx")
+    {
+        // Local mail stores: Outlook personal folders (.pst) / offline store
+        // (.ost) and the legacy Outlook Express folder format (.dbx). Carving
+        // them is what lets the mail lane run without a mounted filesystem —
+        // the TSK extractor works rootless, a loopback mount does not.
+        Some("mail_store")
     } else if rel.contains("/system32/tasks/") || rel.starts_with("windows/system32/tasks/") {
         Some("scheduled_task")
     } else if matches!(
@@ -1792,6 +1802,7 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
             "macos_fsevents",
             "web_log",
             "webroot_script",
+            "mail_store",
         ]
     } else {
         kinds
@@ -1825,6 +1836,7 @@ fn wanted_kinds(kinds: &[ArtifactKind]) -> BTreeMap<&'static str, bool> {
                 ArtifactKind::MacosFsevents => "macos_fsevents",
                 ArtifactKind::WebLog => "web_log",
                 ArtifactKind::WebrootScript => "webroot_script",
+                ArtifactKind::MailStore => "mail_store",
             })
             .collect()
     };
@@ -2474,6 +2486,60 @@ mod tests {
     fn class_priority_ranks_web_tier_before_generic_yara_sweep() {
         assert!(class_priority("web_log") < class_priority("yara_target"));
         assert!(class_priority("webroot_script") < class_priority("yara_target"));
+    }
+
+    #[test]
+    fn classify_artifact_path_recognises_mail_stores() {
+        // Outlook personal-folders / offline store and the legacy Outlook
+        // Express folder format. Without a class of their own the mail store is
+        // never carved, so the mail lane has nothing to parse on a rootless run.
+        assert_eq!(
+            classify_artifact_path(
+                "Documents and Settings/Jean/Local Settings/Application Data/Microsoft/Outlook/outlook.pst"
+            ),
+            Some("mail_store")
+        );
+        assert_eq!(
+            classify_artifact_path("Users/bob/AppData/Local/Microsoft/Outlook/bob@corp.com.ost"),
+            Some("mail_store")
+        );
+        assert_eq!(
+            classify_artifact_path(
+                "Documents and Settings/Jean/Local Settings/Application Data/Identities/{GUID}/Microsoft/Outlook Express/Inbox.dbx"
+            ),
+            Some("mail_store")
+        );
+        // Case-insensitive: fls emits the on-disk casing verbatim.
+        assert_eq!(
+            classify_artifact_path("Users/bob/Documents/Outlook Files/ARCHIVE.PST"),
+            Some("mail_store")
+        );
+        // A mail store outside any users/ tree still classifies (it must not
+        // fall through to the generic yara sweep, which never matches here).
+        assert_eq!(
+            classify_artifact_path("data/mail/archive.pst"),
+            Some("mail_store")
+        );
+    }
+
+    #[test]
+    fn wanted_kinds_default_includes_mail_store() {
+        assert!(wanted_kinds(&[]).contains_key("mail_store"));
+    }
+
+    #[test]
+    fn wanted_kinds_maps_explicit_mail_store_request() {
+        let wanted = wanted_kinds(std::slice::from_ref(&super::ArtifactKind::MailStore));
+        assert!(wanted.contains_key("mail_store"));
+        assert_eq!(wanted.len(), 1);
+    }
+
+    #[test]
+    fn class_priority_draws_mail_store_before_generic_yara_sweep() {
+        // A mail store is a decoded high-value class: it must be drawn ahead of
+        // the broad content sweep so the extraction budget cannot crowd it out.
+        assert!(class_priority("mail_store") < class_priority("yara_target"));
+        assert!(class_priority("mail_store") < class_priority("_unmapped_class_"));
     }
 
     #[test]
