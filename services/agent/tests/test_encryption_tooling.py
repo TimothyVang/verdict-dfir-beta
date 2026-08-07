@@ -334,13 +334,24 @@ class TestVerdictFpFloor:
         assert len(inv.findings_pool_b) == 3
         assert inv._prefetch_exec_findings == []
 
-    def test_userassist_corroboration_cannot_reach_the_encryption_findings(self) -> None:
+    def test_userassist_promotion_cannot_reach_the_encryption_findings(self) -> None:
+        """The promotion loop iterates ``_prefetch_exec_findings`` only.
+
+        Exercised with a UserAssist index that DOES name every encryption
+        binary, so this proves the encryption findings are unreachable by
+        construction rather than merely unreached because the index was empty.
+        """
         inv = self._stub_investigation()
+        inv._userassist_exec_index = {
+            "gpg.exe": ("tc-userassist-1", "2024-01-01T00:00:00Z"),
+            "kleopatra.exe": ("tc-userassist-2", "2024-01-01T00:00:00Z"),
+            "bdeunlock.exe": ("tc-userassist-3", "2024-01-01T00:00:00Z"),
+        }
+        inv.execution_corroboration = {}
         fea.Investigation._emit_encryption_tooling_findings(inv, REAL_ALIHADI_09_OBSERVATIONS)
-        # The corroboration loop short-circuits on an empty promotion list, so
-        # the encryption findings keep their INFERRED tier.
-        fea.Investigation._corroborate_execution_with_userassist(inv, None, None, {})
+        fea.Investigation._promote_prefetch_findings_with_userassist(inv)
         assert all(f["confidence"] == "INFERRED" for f in inv.findings_pool_b)
+        assert inv._prefetch_exec_findings == []
 
 
 # ---------------------------------------------------------------------------
