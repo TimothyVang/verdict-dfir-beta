@@ -4283,8 +4283,15 @@ def mail_impersonation_candidates(
         reply_to = _normalize_address(message.get("reply_to_address"))
         sender_external = _is_external(sender, internal_domains)
         reply_external = bool(reply_to) and _is_external(reply_to, internal_domains)
+        shown = _displayed_address(display)
         if display and display.lower() in internal_display_names and sender_external:
             basis = "internal_display_name_external_sender"
+        elif shown and not _is_external(shown, internal_domains) and sender_external:
+            # The display name IS an inside address. That is enough: the
+            # reader is shown an organisational mailbox even if that string
+            # never appears as a From display name on a genuine internal
+            # message in this store.
+            basis = "internal_display_address_external_sender"
         elif sender and not sender_external and reply_external:
             basis = "internal_sender_external_reply_to"
         else:
@@ -4361,6 +4368,67 @@ def mail_attachment_egress_candidates(
                     "date": str(message.get("date") or ""),
                 }
             )
+    return out
+
+
+def mail_attachment_reply_to_divergence_candidates(
+    messages: list[dict[str, Any]], internal_domains: set[str]
+) -> list[dict[str, Any]]:
+    """Spreadsheets sent to the address a spoofed inbound message displayed.
+
+    Distinct from :func:`mail_attachment_egress_candidates`: the ``To`` here is
+    inside the organisation, so this is not proof the file left. The fact is
+    narrower and still general — an outbound spreadsheet continues a
+    conversation whose inbound side displayed that inside address while
+    sending from outside it.
+    """
+    if not internal_domains:
+        return []
+    displayed_to_senders: dict[str, dict[str, Any]] = {}
+    for row in mail_reply_address_divergence(messages):
+        shown = _normalize_address(row.get("displayed"))
+        actual = _normalize_address(row.get("actual"))
+        if not shown or not actual:
+            continue
+        if _is_external(shown, internal_domains) or not _is_external(actual, internal_domains):
+            continue
+        bucket = displayed_to_senders.setdefault(
+            shown, {"senders": set(), "subjects": set()}
+        )
+        bucket["senders"].add(actual)
+        topic = _thread_key(row.get("subject"))
+        if topic:
+            bucket["subjects"].add(topic)
+    if not displayed_to_senders:
+        return []
+    out: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        sender = _normalize_address(message.get("from_address"))
+        if not sender or _is_external(sender, internal_domains):
+            continue
+        topic = _thread_key(message.get("subject"))
+        for recipient in (_normalize_address(r) for r in (message.get("to") or [])):
+            lure = displayed_to_senders.get(recipient)
+            if not lure or topic not in lure["subjects"]:
+                continue
+            for attachment in message.get("attachments") or []:
+                if not _is_spreadsheet_attachment(attachment):
+                    continue
+                out.append(
+                    {
+                        "folder": str(message.get("folder") or ""),
+                        "subject": str(message.get("subject") or ""),
+                        "from_address": sender,
+                        "displayed": recipient,
+                        "actual_senders": sorted(lure["senders"]),
+                        "attachment": str(attachment.get("name") or ""),
+                        "attachment_type": str(attachment.get("content_type") or "")
+                        or str(attachment.get("extension") or ""),
+                        "date": str(message.get("date") or ""),
+                    }
+                )
     return out
 
 
@@ -4465,6 +4533,25 @@ def mail_counterparty_escalation(
         counterparties = (
             [sender] if inbound else [r for r in recipients if _is_external(r, internal_domains)]
         )
+        if not inbound:
+            # A reply addressed to the displayed inside identity of a spoofed
+            # inbound still belongs to that outsider. Only join when this
+            # outbound continues one of that lure's subjects; an unrelated
+            # send to the same inside address is ordinary internal mail.
+            lure_subjects = {
+                _thread_key(row.get("subject"))
+                for row in mail_reply_address_divergence(messages)
+                if _normalize_address(row.get("displayed")) in recipients
+                and _is_external(row.get("actual"), internal_domains)
+                and not _is_external(row.get("displayed"), internal_domains)
+            }
+            topic = _thread_key(message.get("subject"))
+            if topic and topic in lure_subjects:
+                for row in mail_reply_address_divergence(messages):
+                    displayed = _normalize_address(row.get("displayed"))
+                    actual = _normalize_address(row.get("actual"))
+                    if displayed in recipients and actual and _is_external(actual, internal_domains):
+                        counterparties.append(actual)
         for counterparty in counterparties:
             if not counterparty:
                 continue
@@ -15405,6 +15492,12 @@ class Investigation:
                     f"domain ({domain_text}), but this message was sent from "
                     f"{row['from_address']}, outside it"
                 )
+            elif row["basis"] == "internal_display_address_external_sender":
+                basis_text = (
+                    f"the From display name '{row['display_name']}' is itself an address "
+                    f"inside the organisation's own mail domain ({domain_text}), but this "
+                    f"message was sent from {row['from_address']}, outside it"
+                )
             else:
                 basis_text = (
                     f"the From address {row['from_address']} is inside the organisation's "
@@ -15440,6 +15533,36 @@ class Investigation:
                             }
                         ),
                         "match": "record",
+                    }
+                ],
+            )
+
+        for row in mail_attachment_reply_to_divergence_candidates(messages, internal)[:1]:
+            senders = ", ".join(row["actual_senders"])
+            self._append_mail_finding(
+                base="f-A-mail-attachment-reply-to-divergence",
+                store_path=store_path,
+                tcid=tcid,
+                confidence="CONFIRMED",
+                mitre="T1566.001",
+                description=(
+                    f"A spreadsheet attachment was sent from this mailbox as an email "
+                    f"attachment in reply to a spear-phishing header pattern: "
+                    f"'{row['attachment']}' ({row['attachment_type']}) went from "
+                    f"{row['from_address']} to {row['displayed']}, the address an inbound "
+                    f"message displayed while actually sending from {senders}. Subject: "
+                    f"'{row['subject']}'; mail folder '{row['folder']}'; {row['date']}. "
+                    "Parsed from the message headers of the mail store carved off the "
+                    "disk image (artifact class mail_store). Header fact only: the store "
+                    "records the attachment name and the addresses on those messages; it "
+                    "does not establish that the file left the organisation or what the "
+                    "spreadsheet held."
+                ),
+                asserted_values=[
+                    {
+                        "path": "messages[*].attachments[*].name",
+                        "expected": row["attachment"],
+                        "match": "exact",
                     }
                 ],
             )
@@ -15481,10 +15604,10 @@ class Investigation:
             topics = "; ".join(f"'{s}'" for s in row["subjects"][:4]) or "no subject"
             if row["outbound_attachments"]:
                 shape = (
-                    "The message timeline across the exchange shows escalation from the "
-                    "opening message to a data transfer: "
-                    f"{', '.join(row['outbound_attachments'])} left the organisation as an "
-                    "attachment on a message sent from this mailbox."
+                    "The message timeline across the exchange shows social-engineering "
+                    "escalation across messages: "
+                    f"{', '.join(row['outbound_attachments'])} was sent as an attachment "
+                    "from this mailbox during the reconstructed conversation thread."
                 )
             else:
                 shape = (
