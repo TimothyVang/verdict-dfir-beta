@@ -87,8 +87,13 @@ def test_agent_launcher_rejects_successful_engine_with_failed_manifest(
     fake_uv.write_text(
         """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'uv test-double'
+  exit 0
+fi
 if [[ "${1:-}" != "run" ]]; then
-  exec "${REAL_UV}" "$@"
+  printf 'unexpected uv arguments: %s\n' "$*" >&2
+  exit 2
 fi
 summary=""
 while [[ $# -gt 0 ]]; do
@@ -112,7 +117,6 @@ printf '%s\n' 'DONE — verdict: NO_EVIL'
     env.update(
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
-            "REAL_UV": shutil.which("uv") or "uv",
             "FINDEVIL_SKIP_GROUNDING": "1",
         }
     )

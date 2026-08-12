@@ -23,6 +23,7 @@ Two hard constraints shape the confidence policy here and are pinned below:
 from __future__ import annotations
 
 import codecs
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
@@ -51,13 +52,35 @@ def _rot13(text: str) -> str:
     return codecs.encode(text, "rot_13")
 
 
-def _row(key_path: str, names: list[str], lw: str = "2022-11-15T21:21:07Z") -> dict:
+def _userassist_data(last_run_iso: str) -> str:
+    when = datetime.fromisoformat(last_run_iso.replace("Z", "+00:00"))
+    epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
+    ticks = int((when - epoch).total_seconds() * 10_000_000)
+    payload = bytearray(72)
+    payload[60:68] = ticks.to_bytes(8, "little")
+    return payload.hex()
+
+
+def _row(
+    key_path: str,
+    names: list[str],
+    lw: str = "2022-11-15T21:21:07Z",
+    *,
+    data_str: str | None = None,
+) -> dict:
     """One ``registry_query`` entry. UserAssist/CompatStore carry the fact in the
     value NAME; the data is an opaque REG_BINARY blob."""
     return {
         "key_path": key_path,
         "last_write_time_iso": lw,
-        "values": [{"name": n, "value_type": "REG_BINARY", "data_str": "00" * 8} for n in names],
+        "values": [
+            {
+                "name": n,
+                "value_type": "REG_BINARY",
+                "data_str": data_str if data_str is not None else "00" * 8,
+            }
+            for n in names
+        ],
         "subkeys": [],
     }
 
@@ -200,8 +223,17 @@ class TestExecutionFindingEmission:
         inv.handle = {"id": "case-uatest"}
         return inv
 
-    def _record(self, inv, hive: str, key: str, tcid: str, names: list[str]) -> None:
-        rows = [_row(key, names)]
+    def _record(
+        self,
+        inv,
+        hive: str,
+        key: str,
+        tcid: str,
+        names: list[str],
+        *,
+        data_str: str | None = None,
+    ) -> None:
+        rows = [_row(key, names, data_str=data_str)]
         inv._collect_registry_execution_candidates(rows, hive, key, tcid)
 
     def test_two_registry_artifacts_are_one_class_so_the_lead_stays_hypothesis(self) -> None:
@@ -368,6 +400,202 @@ class TestExecutionFindingEmission:
         f = (inv.findings_pool_a + inv.findings_pool_b)[0]
         assert f["confidence"] == "CONFIRMED"
         assert "tc-pf-1" in f["derived_from"]
+
+    def test_matching_deleted_mft_path_uses_userassist_value_time(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": False,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-1",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+            data_str=_userassist_data("2022-11-15T21:19:00.261Z"),
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "CONFIRMED"
+        assert f["derived_from"] == ["tc-ua-1", "tc-mft-1"]
+        assert inv.execution_corroboration[f["finding_id"]] == ["tc-mft-1"]
+        assert "MFT" in f["description"]
+
+    def test_key_last_write_cannot_time_correlate_a_stale_userassist_value(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": False,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-1",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+            data_str=_userassist_data("2019-03-19T13:18:51Z"),
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "HYPOTHESIS"
+        assert "tc-mft-1" not in f["derived_from"]
+
+    def test_deleted_mft_row_needs_a_decodable_userassist_value_time(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": False,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-1",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+            data_str="not-hex",
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "HYPOTHESIS"
+
+    def test_non_system_drive_does_not_join_drive_less_mft_path(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": True,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-1",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"D:\Users\Public\Downloads\SysInternals.exe")],
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "HYPOTHESIS"
+
+    def test_different_extracted_volume_does_not_join(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": True,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-other/mft/$MFT",
+            "tc-mft-other",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "HYPOTHESIS"
+
+    def test_later_allocated_observation_beats_first_stale_deleted_row(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": False,
+                    "fn_created_iso": "2019-03-19T13:18:51Z",
+                },
+                {
+                    "full_path": "Users/Public/Downloads/SysInternals.exe",
+                    "is_allocated": True,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                },
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-1",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "CONFIRMED"
+        assert "tc-mft-1" in f["derived_from"]
+
+    def test_same_basename_at_a_different_mft_path_does_not_corroborate(self) -> None:
+        inv = self._inv()
+        inv._index_mft_execution_paths(
+            [
+                {
+                    "full_path": "Users/bob/Downloads/SysInternals.exe",
+                    "is_allocated": True,
+                    "fn_created_iso": "2022-11-15T21:18:51Z",
+                }
+            ],
+            "/case/extracted/disk/disk-extract-1/mft/$MFT",
+            "tc-mft-other",
+        )
+        self._record(
+            inv,
+            "/case/extracted/disk/disk-extract-1/registry/Users/IEUser/NTUSER.DAT",
+            UA_COUNT_KEY,
+            "tc-ua-1",
+            [_rot13(r"C:\Users\Public\Downloads\SysInternals.exe")],
+        )
+
+        inv._emit_registry_execution_findings()
+
+        f = (inv.findings_pool_a + inv.findings_pool_b)[0]
+        assert f["confidence"] == "HYPOTHESIS"
+        assert "tc-mft-other" not in f["derived_from"]
 
     def test_confirmed_finding_records_the_second_class_on_the_timeline(self) -> None:
         # report_qa's execution_requires_two_current_artifact_classes gate reads

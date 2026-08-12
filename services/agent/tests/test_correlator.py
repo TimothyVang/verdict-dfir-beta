@@ -81,6 +81,18 @@ class TestCrossArtifactRule:
         assert refined[0].confidence == "INFERRED"
         assert "single artifact class" in outcomes[0].reason
 
+    def test_registry_execution_plus_exact_path_mft_is_kept(self) -> None:
+        f = _f(
+            "f-1",
+            "The registry records UserAssist execution of attacker.exe, and the MFT "
+            "independently records the exact executable at the same path.",
+            artifact_path="NTUSER.DAT",
+            confidence="CONFIRMED",
+        )
+        refined, outcomes = correlate([f])
+        assert refined[0].confidence == "CONFIRMED"
+        assert outcomes[0].action == "kept"
+
     def test_unrelated_run_classes_do_not_corroborate(self) -> None:
         # Option-1 regression: another finding touching a different artifact
         # class elsewhere in the run must NOT corroborate this finding's
