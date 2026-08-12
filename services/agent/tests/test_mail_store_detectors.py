@@ -181,6 +181,27 @@ class TestImpersonation:
         msgs = [_msg(from_display="Newsletter", from_address=f"news@{OUTSIDE}")]
         assert fea.mail_impersonation_candidates(msgs, {INTERNAL}) == []
 
+    def test_display_name_that_is_itself_an_internal_address_is_impersonation(self) -> None:
+        # RFC822 ``actual@outside (inside@org)``: the shown identity is an
+        # internal address even if that address never appears as a From
+        # display name elsewhere in the store.
+        msgs = [
+            _msg(
+                from_display=f"boss@{INTERNAL}",
+                from_address=f"outsider@{OUTSIDE}",
+                subject="urgent request",
+            )
+        ]
+        rows = fea.mail_impersonation_candidates(msgs, {INTERNAL})
+        assert len(rows) == 1
+        assert rows[0]["basis"] == "internal_display_address_external_sender"
+        assert rows[0]["display_name"] == f"boss@{INTERNAL}"
+        assert rows[0]["from_address"] == f"outsider@{OUTSIDE}"
+
+    def test_display_name_that_is_an_external_address_is_not_impersonation(self) -> None:
+        msgs = [_msg(from_display=f"news@{OUTSIDE}", from_address=f"news@{OUTSIDE}")]
+        assert fea.mail_impersonation_candidates(msgs, {INTERNAL}) == []
+
 
 class TestSpreadsheetEgress:
     def _sent(self, **over):
@@ -230,6 +251,61 @@ class TestSpreadsheetEgress:
             to=[f"cfo@{INTERNAL}"],
         )
         assert fea.mail_attachment_egress_candidates([msg], {INTERNAL}) == []
+
+    def test_spreadsheet_to_displayed_internal_address_is_not_external_egress(self) -> None:
+        # The store records a send to the displayed inside address. That is
+        # not proof the file left the organisation, so the egress detector
+        # must stay silent.
+        msg = self._sent(to=[f"boss@{INTERNAL}"])
+        assert fea.mail_attachment_egress_candidates([msg], {INTERNAL}) == []
+
+
+class TestSpreadsheetReplyToDivergence:
+    """A spreadsheet sent to the address a spoofed inbound displayed.
+
+    Distinct from egress: the ``To`` is inside the organisation. The fact is
+    that the outbound attachment continues a conversation whose inbound side
+    displayed that inside address while sending from outside it.
+    """
+
+    def _pair(self, outbound_to, outbound_subject="RE: urgent request"):
+        inbound = _msg(
+            subject="urgent request",
+            from_display=f"boss@{INTERNAL}",
+            from_address=f"outsider@{OUTSIDE}",
+            to=[f"cfo@{INTERNAL}"],
+            date="Sat, 19 Jul 2008 18:22:45 -0700",
+        )
+        outbound = _msg(
+            folder="Personal Folders/Sent Items",
+            subject=outbound_subject,
+            from_address=f"cfo@{INTERNAL}",
+            to=[outbound_to],
+            date="Sun, 20 Jul 2008 01:28:47 -0700",
+            attachments=[{"name": "staff-roster.xls", "extension": "xls", "content_type": ""}],
+        )
+        return [inbound, outbound]
+
+    def test_spreadsheet_reply_to_displayed_address_is_a_candidate(self) -> None:
+        rows = fea.mail_attachment_reply_to_divergence_candidates(
+            self._pair(f"boss@{INTERNAL}"), {INTERNAL}
+        )
+        assert len(rows) == 1
+        assert rows[0]["attachment"] == "staff-roster.xls"
+        assert rows[0]["displayed"] == f"boss@{INTERNAL}"
+        assert rows[0]["actual_senders"] == [f"outsider@{OUTSIDE}"]
+
+    def test_unrelated_spreadsheet_to_same_address_is_not_a_candidate(self) -> None:
+        rows = fea.mail_attachment_reply_to_divergence_candidates(
+            self._pair(f"boss@{INTERNAL}", outbound_subject="quarterly numbers"),
+            {INTERNAL},
+        )
+        assert rows == []
+
+    def test_reply_without_spreadsheet_is_not_a_candidate(self) -> None:
+        msgs = self._pair(f"boss@{INTERNAL}")
+        msgs[1]["attachments"] = []
+        assert fea.mail_attachment_reply_to_divergence_candidates(msgs, {INTERNAL}) == []
 
 
 class TestCounterpartyEscalation:
@@ -304,6 +380,44 @@ class TestCounterpartyEscalation:
         rows = fea.mail_counterparty_escalation(self._exchange()[:2], {INTERNAL})
         assert len(rows) == 1
         assert rows[0]["message_count"] == 2
+
+    def test_reply_to_displayed_internal_address_joins_the_spoofed_exchange(self) -> None:
+        # Inbound displayed an inside address; the reply went to that displayed
+        # address, not to the external SMTP sender. The exchange is still with
+        # the outsider — the displayed address is the lure, not a second party.
+        msgs = [
+            _msg(
+                subject="urgent request",
+                from_display=f"boss@{INTERNAL}",
+                from_address=f"outsider@{OUTSIDE}",
+                to=[f"cfo@{INTERNAL}"],
+                date="Sat, 19 Jul 2008 18:22:45 -0700",
+            ),
+            _msg(
+                subject="RE: urgent request",
+                folder="Sent Items",
+                from_address=f"cfo@{INTERNAL}",
+                to=[f"boss@{INTERNAL}"],
+                date="Sun, 20 Jul 2008 01:28:47 -0700",
+                attachments=[{"name": "roster.xls", "extension": "xls", "content_type": ""}],
+            ),
+            _msg(
+                subject="quarterly numbers",
+                folder="Sent Items",
+                from_address=f"cfo@{INTERNAL}",
+                to=[f"boss@{INTERNAL}"],
+                date="Mon, 21 Jul 2008 09:00:00 -0700",
+            ),
+        ]
+        rows = fea.mail_counterparty_escalation(msgs, {INTERNAL})
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["counterparty"] == f"outsider@{OUTSIDE}"
+        assert row["message_count"] == 2
+        assert row["inbound_count"] == 1
+        assert row["outbound_count"] == 1
+        assert row["diverging_message_count"] == 1
+        assert row["outbound_attachments"] == ["roster.xls"]
 
 
 class TestMailStoreRouting:
