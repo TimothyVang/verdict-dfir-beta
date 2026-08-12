@@ -2525,6 +2525,62 @@ def _execution_path_writable_root(exe_path: str) -> tuple[str, bool] | None:
     return None
 
 
+def _normalized_windows_artifact_path(path: str) -> str:
+    """Normalize a full Windows path while preserving its drive identity."""
+    return str(path or "").strip().replace("\\", "/").lower().lstrip("/")
+
+
+def _extracted_volume_namespace(path: str) -> tuple[str, str] | None:
+    """Return the disk-extraction root and partition namespace."""
+    normalized = str(path or "").replace("\\", "/")
+    match = re.search(
+        r"(?P<root>(?:^|/)disk-extract-[^/]+)/(?:mft|registry)"
+        r"(?:/(?P<volume>vol[^/]+))?(?:/|$)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return (
+        match.group("root").lower(),
+        (match.group("volume") or "primary").lower(),
+    )
+
+
+def _userassist_last_run_iso(data_str: Any) -> str | None:
+    """Decode the per-value FILETIME from a Win7+ UserAssist payload."""
+    try:
+        payload = bytes.fromhex(str(data_str or "").strip())
+    except ValueError:
+        return None
+    if len(payload) < 68:
+        return None
+    ticks = int.from_bytes(payload[60:68], "little")
+    if ticks <= 0:
+        return None
+    seconds, remainder = divmod(ticks, 10_000_000)
+    try:
+        when = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(
+            seconds=seconds, microseconds=remainder // 10
+        )
+    except (OverflowError, ValueError):
+        return None
+    return when.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _artifact_timestamps_within(
+    first: Any, second: Any, *, seconds: float
+) -> bool:
+    """Return true only when two valid ISO timestamps are within the bound."""
+    left = _usn_ts(first)
+    right = _usn_ts(second)
+    return bool(
+        left is not None
+        and right is not None
+        and abs((left - right).total_seconds()) <= seconds
+    )
+
+
 def registry_execution_candidates(
     rows: list[dict[str, Any]], key_path: str | None
 ) -> list[dict[str, Any]]:
@@ -2585,6 +2641,11 @@ def registry_execution_candidates(
                     "shared_root": shared,
                     "hive_key": row_key or str(key_path or ""),
                     "last_write_time_iso": row.get("last_write_time_iso"),
+                    "execution_time_iso": (
+                        _userassist_last_run_iso(value.get("data_str"))
+                        if is_userassist
+                        else None
+                    ),
                 }
             )
     return out
@@ -11537,6 +11598,12 @@ class Investigation:
         # list instead would make corroboration depend on a name allowlist
         # rather than on the evidence actually parsed.
         self._prefetch_exec_index: dict[str, tuple[str, str | None]] = {}
+        # All writable-root executable observations, keyed by extracted-volume
+        # namespace plus a drive-aware path. Deleted rows require per-value
+        # UserAssist time adjacency; allocated rows may corroborate directly.
+        self._mft_exec_index: dict[
+            tuple[str, str], list[tuple[str, str | None, bool]]
+        ] = {}
         # Exfil/staging candidates collected as the disk lanes run. The MFT lane
         # finishes long before the prefetch and browser lanes, so the wiper and
         # cloud-channel findings are emitted at the END of the disk sweep once
@@ -15508,6 +15575,38 @@ class Investigation:
         for cand in registry_execution_candidates(rows, key_path):
             self._registry_exec_candidates.append((hive_path, tcid, cand))
 
+    def _index_mft_execution_paths(
+        self, rows: list[dict[str, Any]], mft_path: str, tcid: str
+    ) -> None:
+        """Index every exact executable path within one extracted volume."""
+        namespace = _extracted_volume_namespace(mft_path)
+        if namespace is None:
+            return
+        extraction_root, volume = namespace
+        # MFT rows carry no drive letter. Only the preferred Windows OS volume
+        # can be bound to C: without guessing; secondary partitions are declined.
+        if volume != "primary":
+            return
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            relative = _normalized_windows_artifact_path(row.get("full_path") or "")
+            if not relative.endswith(".exe") or "/" not in relative:
+                continue
+            windows_path = "C:\\" + relative.replace("/", "\\")
+            if _execution_path_writable_root(windows_path) is None:
+                continue
+            timestamp = (
+                row.get("fn_created_iso")
+                or row.get("si_created_iso")
+                or row.get("fn_modified_iso")
+                or row.get("si_modified_iso")
+            )
+            key = (extraction_root, _normalized_windows_artifact_path(windows_path))
+            self._mft_exec_index.setdefault(key, []).append(
+                (tcid, timestamp, bool(row.get("is_allocated")))
+            )
+
     def _emit_registry_execution_findings(self) -> None:
         """Emit execution leads from the per-user registry execution artifacts.
 
@@ -15580,14 +15679,44 @@ class Investigation:
                 for kind in sources
             ]
             derived = [tcid for tcid, _ in sources.values()]
-            # Prefetch is the only genuinely DIFFERENT artifact class available
-            # here; the two registry keys are one class no matter how many of
-            # them agree.
+            # Registry keys are one class no matter how many agree. Prefetch
+            # execution or an exact-path MFT row supplies a genuinely different
+            # class. The MFT join is deliberately path-exact, never basename-only.
             pf_hit = self._prefetch_exec_index.get(exe_name)
-            pf_tcid = pf_hit[0] if pf_hit else None
-            if pf_tcid and pf_tcid not in derived:
-                derived.append(pf_tcid)
-            second_class = bool(pf_tcid)
+            namespace = _extracted_volume_namespace(hive_path)
+            normalized_exe = _normalized_windows_artifact_path(exe_path)
+            mft_observations: list[tuple[str, str | None, bool]] = []
+            if (
+                namespace is not None
+                and namespace[1] == "primary"
+                and normalized_exe.startswith("c:/")
+            ):
+                mft_observations = self._mft_exec_index.get(
+                    (namespace[0], normalized_exe), []
+                )
+            mft_hit = next(
+                (
+                    observation
+                    for observation in mft_observations
+                    if observation[2]
+                    or _artifact_timestamps_within(
+                        observation[1],
+                        cand.get("execution_time_iso"),
+                        seconds=3600,
+                    )
+                ),
+                None,
+            )
+            corroborators = [
+                ("Windows Prefetch", "prefetch_parse", "prefetch", pf_hit),
+                ("the MFT", "mft_timeline", "mft", mft_hit),
+            ]
+            corroborators = [item for item in corroborators if item[3]]
+            for _label, _tool, _artifact_class, hit in corroborators:
+                supporting_tcid = hit[0]
+                if supporting_tcid not in derived:
+                    derived.append(supporting_tcid)
+            second_class = bool(corroborators)
             if not second_class and not shared and len(sources) < 2:
                 continue
             primary_tcid, primary_cand = sources.get(
@@ -15605,14 +15734,24 @@ class Investigation:
                 "downloaded program from there is also an ordinary benign pattern)"
             )
             registry_text = " and ".join(registry_artifacts)
-            corroboration = (
-                f"Two artifact classes record the run: the registry ({registry_text}) "
-                "and Windows Prefetch."
-                if second_class
-                else f"The registry records it ({registry_text}), but that is a single "
-                "artifact class, so the run is a lead rather than a corroborated "
-                "execution fact — a second class (prefetch, MFT, EVTX) is needed."
-            )
+            if pf_hit:
+                corroboration = (
+                    f"The registry ({registry_text}) and Windows Prefetch independently "
+                    "record execution."
+                )
+                if mft_hit:
+                    corroboration += " The MFT also records the exact executable path."
+            elif mft_hit:
+                corroboration = (
+                    f"The registry records execution ({registry_text}), and the MFT "
+                    "independently records the exact executable at the same path."
+                )
+            else:
+                corroboration = (
+                    f"The registry records it ({registry_text}), but that is a single "
+                    "artifact class, so the run is a lead rather than a corroborated "
+                    "execution fact — a second class (prefetch, MFT, EVTX) is needed."
+                )
             safe = re.sub(r"[^a-z0-9]+", "-", exe_name).strip("-") or "exe"
             finding = {
                 "case_id": self.handle["id"],
@@ -15644,23 +15783,31 @@ class Investigation:
             }
             self.findings_pool_a.append(finding)
             emitted += 1
-            if pf_tcid:
+            if corroborators:
                 # report_qa counts a finding's artifact classes off the TIMELINE
-                # events linked to it, so the prefetch class has to reach the
-                # timeline or the two-class execution gate fails the very claim
-                # prefetch is what justifies.
+                # events linked to it, so each corroborating class must reach the
+                # timeline or the two-class gate rejects the claim it supports.
                 fid = str(finding["finding_id"])
-                self.execution_corroboration.setdefault(fid, []).append(pf_tcid)
-                self._timeline_add(
-                    (pf_hit[1] if pf_hit else None)
-                    or cand.get("last_write_time_iso")
-                    or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "prefetch_parse",
-                    "prefetch",
-                    f"Windows Prefetch records execution of {exe_name}",
-                    pf_tcid,
-                    {"executable_name": exe_name},
-                )
+                linked = self.execution_corroboration.setdefault(fid, [])
+                for label, tool, artifact_class, hit in corroborators:
+                    supporting_tcid, timestamp = hit[:2]
+                    if supporting_tcid not in linked:
+                        linked.append(supporting_tcid)
+                    summary = (
+                        f"Windows Prefetch records execution of {exe_name}"
+                        if artifact_class == "prefetch"
+                        else f"MFT records executable at {exe_path}"
+                    )
+                    self._timeline_add(
+                        timestamp
+                        or cand.get("last_write_time_iso")
+                        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        tool,
+                        artifact_class,
+                        summary,
+                        supporting_tcid,
+                        {"executable_name": exe_name, "executable_path": exe_path},
+                    )
             print(f"  pool-A execution finding: {finding['finding_id']} ({confidence})")
 
     def _promote_prefetch_findings_with_userassist(self) -> None:
@@ -15884,8 +16031,9 @@ class Investigation:
                 self._disk_cloud_candidates.append(
                     {**cand, "tool_call_id": tcid, "artifact_path": path}
                 )
-            # Index the MFT rows so the web lane can cite a creation time for an
-            # extracted web-root script from a SECOND reader of the same file.
+            # Index exact executable paths for later Registry execution joins,
+            # and web-root paths for the web lane's independent reader citation.
+            self._index_mft_execution_paths(rows, path, tcid)
             self._index_mft_web_paths(rows, tcid)
 
         usn_entries = by_class["usnjrnl"][:3]

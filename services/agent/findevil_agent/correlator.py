@@ -38,6 +38,9 @@ _SHIMCACHE_RE = re.compile(r"\b(?:shimcache|appcompatcache)\b", re.IGNORECASE)
 # an independent two-artifact-class execution corroboration (peer of Amcache /
 # ShimCache).
 _USERASSIST_RE = re.compile(r"\buserassist\b", re.IGNORECASE)
+_MFT_EXACT_PATH_RE = re.compile(
+    r"\bmft\b.*\bexact executable\b.*\bsame path\b", re.IGNORECASE
+)
 _EDR_RE = re.compile(r"\b(?:sysmon|edr|carbon[\s-]?black|crowdstrike)\b", re.IGNORECASE)
 
 
@@ -84,6 +87,9 @@ def correlate(
                 or _SHIMCACHE_RE.search(own_text)
                 or _USERASSIST_RE.search(own_text)
             )
+        ) or (
+            _USERASSIST_RE.search(own_text)
+            and _MFT_EXACT_PATH_RE.search(own_text)
         ) or _EDR_RE.search(own_text) is not None
 
         # Weak: only Amcache cited.
@@ -109,7 +115,9 @@ def correlate(
                 CorrelationOutcome(
                     finding_id=f.finding_id,
                     action="kept",
-                    reason="execution corroborated in-finding by prefetch+registry pair or EDR telemetry",
+                    reason=(
+                        "execution corroborated in-finding by independent artifact classes"
+                    ),
                 )
             )
         else:
@@ -118,7 +126,9 @@ def correlate(
                 CorrelationOutcome(
                     finding_id=f.finding_id,
                     action="downgraded",
-                    reason="execution claim from a single artifact class without prefetch/EDR corroboration",
+                    reason=(
+                        "execution claim from a single artifact class without strong corroboration"
+                    ),
                 )
             )
 
