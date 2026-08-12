@@ -274,3 +274,42 @@ class TestNotScoreableGoldenIsExcludedNotFailed:
                 accuracy.score(case_dir, golden)
             assert excinfo.value.case_id == case_id, case_id
             assert excinfo.value.reason, case_id
+
+
+class TestAliHadi01SamHintMatchesExistingAccountFinding:
+    """ws-005 must grade the SAM account the engine already emits.
+
+    The staged Security.evtx contains no 4720/4732 bytes. The live run already
+    records SAM\\Domains\\Account\\Users\\Names\\hacker via registry_query.
+    The expected hint must cite that hive, not an EVTX event that is not there.
+    """
+
+    _FINDING = {
+        "finding_id": "f-A-sam-hacker",
+        "description": (
+            "User account 'hacker' with suspicious naming was created on this "
+            "system: it is recorded in the SAM (Security Account Manager) hive "
+            "(SAM\\Domains\\Account\\Users\\Names\\hacker; the Names subkey "
+            "last_write 2015-09-02T09:05:25Z approximates the account-creation "
+            "time)."
+        ),
+        "artifact_path": (
+            "cases/x/extracted/disk/disk-extract/registry/Windows/System32/config/SAM"
+        ),
+        "mitre_technique": "T1136.001",
+    }
+
+    def _ws005(self) -> dict:
+        key = json.loads(
+            (_REPO_ROOT / "goldens/alihadi-01-webserver/expected-findings.json").read_text()
+        )
+        return next(f for f in key["findings"] if f["finding_id"] == "ws-005")
+
+    def test_hint_does_not_require_missing_evtx_account_events(self) -> None:
+        hint = str(self._ws005().get("artifact_hint") or "")
+        assert "4720" not in hint
+        assert "4732" not in hint
+        assert "evtx" not in hint.lower()
+
+    def test_existing_sam_account_finding_is_eligible(self) -> None:
+        assert accuracy._is_eligible(self._ws005(), self._FINDING)

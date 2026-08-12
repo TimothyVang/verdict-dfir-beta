@@ -49,8 +49,8 @@
       "description": "New or elevated account created for persistence",
       "mitre_technique": "T1136.001",
       "confidence": "INFERRED",
-      "artifact_class": "log",
-      "artifact_hint": "Security.evtx EID 4720/4732"
+      "artifact_class": "registry",
+      "artifact_hint": "SAM hive Names key last_write approximating account creation"
     },
     {
       "finding_id": "ws-006",
