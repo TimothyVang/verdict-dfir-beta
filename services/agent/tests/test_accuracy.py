@@ -184,7 +184,12 @@ class TestNotScoreableGoldenIsExcludedNotFailed:
     caller can route it to its own exclusion channel instead of its error channel.
     """
 
-    _NOT_READY = ("synthetic-benign", "synthetic-decoy", "otrf-apt3-mordor")
+    _NOT_READY = (
+        "alihadi-07-sysinternals",
+        "synthetic-benign",
+        "synthetic-decoy",
+        "otrf-apt3-mordor",
+    )
 
     def test_not_ready_raises_a_typed_error_that_is_still_a_value_error(
         self, tmp_path: Path
@@ -261,7 +266,7 @@ class TestNotScoreableGoldenIsExcludedNotFailed:
         assert not isinstance(excinfo.value, accuracy.GoldenNotScoreable)
 
     def test_every_committed_not_ready_key_raises_the_typed_error(self, tmp_path: Path) -> None:
-        # All three rows the goldens board currently prints as accuracy failures.
+        # Every committed key that explicitly lacks a supportable accuracy oracle.
         for case_id in self._NOT_READY:
             golden = _REPO_ROOT / "goldens" / case_id / "expected-findings.json"
             case_dir = _write_verdict(tmp_path / case_id, "NO_EVIL", [])

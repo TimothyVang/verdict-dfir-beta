@@ -10,6 +10,8 @@
   "case_id": "alihadi-07-sysinternals",
   "source_url": "https://archive.org/download/sysinternals-case",
   "license": "Ali Hadi DFIR challenges — free for research/education (answers gated)",
+  "scoring_status": "not_ready",
+  "not_ready_reason": "The practice-case answers are instructor-gated, and the current key does not cite artifact-backed ground truth for its persistence, dropped-payload, payload-Prefetch, or network claims. Keep the fixture available for development, but exclude it from accuracy scoring until those claims are independently sourced and staged evidence supports them.",
   "verdict": "CONFIRMED_EVIL",
   "min_recall_percent": 50,
   "findings": [
