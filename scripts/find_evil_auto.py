@@ -1469,6 +1469,12 @@ def _history_name_is_browser(lower_path: str) -> bool:
     return any(marker in lower_path for marker in _BROWSER_PROFILE_MARKERS)
 
 
+try:  # content verification is additive; never break intake if absent
+    from content_type import verify_declared_type as _verify_declared_type
+except ImportError:  # pragma: no cover
+    _verify_declared_type = None
+
+
 def classify_artifact_path(path: str) -> dict[str, str | None]:
     """Classify a file path into a supported evidence/artifact lane."""
     # Cloud/identity logs route to the cloud_audit lane. Checked before delegating
@@ -1979,6 +1985,26 @@ def finalize_evidence_inventory(
     return inventory
 
 
+def _content_facts(path) -> dict:
+    """Verified type facts for one object, or an explicit unknown.
+
+    Never raises into the walk: a sniffing failure must not lose the object,
+    because a lost object is exactly the silent gap the coverage ledger exists
+    to make loud.
+    """
+    if _verify_declared_type is None:
+        return {}
+    try:
+        got = _verify_declared_type(path)
+    except Exception:
+        return {"content_type": None, "type_agreement": "unknown", "is_container": False}
+    return {
+        "content_type": got["content_type"],
+        "type_agreement": got["agreement"],
+        "is_container": got["is_container"],
+    }
+
+
 def build_local_evidence_inventory(root: str | Path, *, limit: int = 500) -> dict[str, Any]:
     """Build a safe local inventory used by policy smokes and offline reports."""
     root_path = Path(root)
@@ -2041,6 +2067,10 @@ def build_local_evidence_inventory(root: str | Path, *, limit: int = 500) -> dic
                 "size_bytes": path.stat().st_size,
                 "symlink_status": "not_symlink",
                 "custody_status": "custody_registered",
+                # What the bytes say, beside what the name claims. A PE called
+                # notes.txt routes to a text lane on extension alone; recording
+                # the disagreement is what lets a lane notice.
+                **(_content_facts(path) if _verify_declared_type else {}),
             }
         )
 
