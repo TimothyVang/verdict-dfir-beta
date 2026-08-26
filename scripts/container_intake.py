@@ -98,7 +98,8 @@ def inspect_container(path, dest, *, budget: Budget | None = None,
     dest = Path(dest)
     records: list[dict] = []
 
-    def record(obj_path, state, *, reason, member_of=None, size=None):
+    def record(obj_path, state, *, reason, member_of=None, size=None,
+               byte_range=None):
         budget.objects_seen += 1
         records.append({
             "path": str(obj_path),
@@ -107,6 +108,10 @@ def inspect_container(path, dest, *, budget: Budget | None = None,
             "depth": depth,
             "member_of": str(member_of) if member_of else None,
             "size_bytes": size,
+            # Where this object physically lives inside its parent. Without it
+            # a child object cannot be pointed back at the bytes it came from,
+            # so a finding about it is unciteable.
+            "byte_range": byte_range,
         })
 
     if depth > budget.max_depth:
@@ -167,6 +172,9 @@ def inspect_container(path, dest, *, budget: Budget | None = None,
                 out.write(src.read())
             budget.bytes_written += info.file_size
             record(target, EXTRACTED, member_of=path, size=info.file_size,
+                   byte_range={"offset": info.header_offset,
+                               "length": info.compress_size,
+                               "encoding": "deflate" if info.compress_type else "stored"},
                    reason="enumerated")
             if zipfile.is_zipfile(target) or tarfile.is_tarfile(target):
                 records.extend(inspect_container(
@@ -204,6 +212,9 @@ def _walk_tar(path, dest, budget, depth, record, records):
                     out.write(src.read())
                 budget.bytes_written += member.size
                 record(target, EXTRACTED, member_of=path, size=member.size,
+                       byte_range={"offset": member.offset_data,
+                                   "length": member.size,
+                                   "encoding": "stored"},
                        reason="enumerated")
     except (tarfile.TarError, OSError) as exc:
         record(path, UNSUPPORTED, reason=f"tar could not be read: {exc}")
