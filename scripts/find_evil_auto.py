@@ -1944,6 +1944,8 @@ def finalize_evidence_inventory(
     *,
     limit: int,
     truncated: bool = False,
+    discovered: int | None = None,
+    over_budget: int = 0,
 ) -> dict[str, Any]:
     for entry in entries:
         classification = classify_artifact_path(str(entry.get("path", "")))
@@ -1967,17 +1969,27 @@ def finalize_evidence_inventory(
                 json.dumps(child_preimage, separators=(",", ":"), sort_keys=True).encode("utf-8")
             ).hexdigest()[:16],
         )
+    # A budget that reports only "truncated" says the walk stopped, not what it
+    # did not look at. Downstream that reads as coverage over the whole tree:
+    # 500 of 500 inspected is indistinguishable from 500 of 40,000 unless the
+    # denominator travels with the result.
+    discovered_total = len(entries) if discovered is None else discovered
     inventory = {
         "root_path": str(root_path),
         "canonical_root": str(canonical_root),
         "root_is_directory": root_is_directory,
         "limit": limit,
         "truncated": truncated,
+        "discovered": discovered_total,
+        "over_budget": over_budget,
         "entries": entries,
     }
     inventory["summary"] = _inventory_summary(entries)
     inventory["summary"]["limit"] = limit
     inventory["summary"]["truncated"] = truncated
+    inventory["summary"]["discovered"] = discovered_total
+    inventory["summary"]["over_budget"] = over_budget
+    inventory["summary"]["inspected"] = len(entries)
     inventory["inventory_sha256"] = hashlib.sha256(
         json.dumps(inventory, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -2013,9 +2025,22 @@ def build_local_evidence_inventory(root: str | Path, *, limit: int = 500) -> dic
     truncated = False
 
     candidates = [root_path] if root_path.is_file() else sorted(root_path.rglob("*"))
-    for path in candidates:
+    # Exclude VERDICT's own run-dir transients BEFORE counting. Counting them
+    # would let a liveness rewrite move `discovered`, and `discovered` feeds
+    # inventory_sha256 -- which is the digest offline re-verification
+    # reproduces. That is the exact regression VOLATILE_EXCLUDE exists to
+    # prevent, so the denominator has to respect it too.
+    if root_path.is_dir():
+        candidates = [p for p in candidates if not is_volatile_run_file(p.name)]
+    # Count what the walk may actually inventory, so the budget has a
+    # denominator. Without it the caller cannot tell 500 of 500 from 500 of
+    # 40,000.
+    discovered = len(candidates)
+    over_budget = 0
+    for index, path in enumerate(candidates):
         if len(entries) >= limit:
             truncated = True
+            over_budget = len(candidates) - index
             break
         # Skip VERDICT's own transient run-dir files discovered during a
         # directory walk so a liveness rewrite cannot perturb inventory_sha256
@@ -2081,6 +2106,8 @@ def build_local_evidence_inventory(root: str | Path, *, limit: int = 500) -> dic
         entries,
         limit=limit,
         truncated=truncated,
+        discovered=discovered,
+        over_budget=over_budget,
     )
 
 
