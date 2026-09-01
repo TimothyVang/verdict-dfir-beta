@@ -167,3 +167,47 @@ def coverage_objects_from_ledger(ledger: dict) -> dict:
         "over_budget": c["over_budget"],
         "unsupported": c["unsupported"],
     }
+
+
+OBJECT_LEDGER_FILENAME = "object-ledger.json"
+
+
+def write_object_ledger_to_case(root, case_dir, workdir, *, budget: Budget | None = None) -> Path:
+    """Build the ledger and write it where gn7000 seal_case looks.
+
+    orchestrator_common.load_object_ledger reads <case_dir>/object-ledger.json
+    and only returns counts when reconciles is True. Building in memory alone
+    never reaches that reader — this is the missing write path for item 3.
+    """
+    import json
+
+    case_dir = Path(case_dir)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    ledger = build_object_ledger(root, workdir, budget=budget)
+    path = case_dir / OBJECT_LEDGER_FILENAME
+    path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: write object-ledger.json into a case directory."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--root", required=True, help="Evidence root (file or directory)")
+    parser.add_argument("--case-dir", required=True, help="Case directory to write into")
+    parser.add_argument(
+        "--workdir",
+        default=None,
+        help="Scratch dir for container extraction (default: <case-dir>/object-ledger-work)",
+    )
+    args = parser.parse_args(argv)
+    case_dir = Path(args.case_dir)
+    workdir = Path(args.workdir) if args.workdir else case_dir / "object-ledger-work"
+    path = write_object_ledger_to_case(args.root, case_dir, workdir)
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

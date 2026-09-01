@@ -166,3 +166,24 @@ def test_an_overcount_is_also_a_failure(tmp_path: Path) -> None:
         {"discovered": 2, "inspected": 3, "failed": 0,
          "skipped": 0, "over_budget": 0, "unsupported": 0})
     assert ok is False and missing == -1
+
+
+def test_write_object_ledger_to_case_persists_reconciled_json(tmp_path: Path) -> None:
+    """The case dir must carry object-ledger.json so gn7000 seal_case can load it.
+
+    build_object_ledger alone is not enough: orchestrator_common.load_object_ledger
+    reads <case_dir>/object-ledger.json. Without a writer, every sealed case still
+    omits the objects block.
+    """
+    root = _nested_fixture(tmp_path)
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    path = ol.write_object_ledger_to_case(root, case_dir, tmp_path / "work")
+    assert path == case_dir / "object-ledger.json"
+    assert path.is_file()
+    import json
+    led = json.loads(path.read_text())
+    assert led["schema"] == "gn7000.object-ledger/v1"
+    assert led["reconciles"] is True
+    assert led["counts"]["unsupported"] >= 1
+    assert led["counts"]["discovered"] > 1

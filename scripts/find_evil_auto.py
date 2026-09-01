@@ -12764,6 +12764,17 @@ class Investigation:
         print(f"  image_hash = {self.handle['image_hash']}")
         print(f"  size_bytes = {self.handle['image_size_bytes']:,}")
 
+        # PLAN item 3: persist the object ledger where gn7000 seal_case reads it.
+        # Absence here is why sealed cases still omit the coverage objects block.
+        try:
+            from object_ledger import write_object_ledger_to_case
+            case_path = Path(self.handle.get("case_dir") or self.case_dir)
+            ledger_path = write_object_ledger_to_case(
+                self.evidence, case_path, case_path / "object-ledger-work")
+            print(f"  object_ledger = {ledger_path}")
+        except Exception as exc:  # noqa: BLE001 — ledger failure must not abort custody
+            print(f"  object_ledger skipped: {exc}")
+
     def investigate_memory(
         self, rust: SshMcpClient, py: SshMcpClient, evidence_path: str | None = None
     ) -> None:
